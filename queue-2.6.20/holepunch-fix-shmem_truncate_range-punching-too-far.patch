@@ -1,0 +1,112 @@
+From hugh_dickins@symantec.com Fri Apr 13 10:25:06 2007
+From: Hugh Dickins <hugh@veritas.com>
+Date: Fri, 13 Apr 2007 18:25:00 +0100 (BST)
+Subject: holepunch: fix shmem_truncate_range punching too far
+To: Greg KH <gregkh@suse.de>, Adrian Bunk <bunk@stusta.de>
+Cc: Miklos Szeredi <mszeredi@suse.cz>, stable@kernel.org
+Message-ID: <Pine.LNX.4.64.0704131819410.7279@blonde.wat.veritas.com>
+
+From: Hugh Dickins <hugh@veritas.com>
+
+Miklos Szeredi observes BUG_ON(!entry) in shmem_writepage() triggered
+in rare circumstances, because shmem_truncate_range() erroneously
+removes partially truncated directory pages at the end of the range:
+later reclaim on pages pointing to these removed directories triggers
+the BUG.  Indeed, and it can also cause data loss beyond the hole.
+
+Fix this as in the patch proposed by Miklos, but distinguish between
+"limit" (how far we need to search: ignore truncation's next_index
+optimization in the holepunch case - if there are races it's more
+consistent to act on the whole range specified) and "upper_limit"
+(how far we can free directory pages: generally we must be careful
+to keep partially punched pages, but can relax at end of file -
+i_size being held stable by i_mutex).
+
+Signed-off-by: Hugh Dickins <hugh@veritas.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+
+---
+ mm/shmem.c |   32 +++++++++++++++++++++-----------
+ 1 file changed, 21 insertions(+), 11 deletions(-)
+
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@ -481,7 +481,8 @@ static void shmem_truncate_range(struct 
+ 	long nr_swaps_freed = 0;
+ 	int offset;
+ 	int freed;
+-	int punch_hole = 0;
++	int punch_hole;
++	unsigned long upper_limit;
+ 
+ 	inode->i_ctime = inode->i_mtime = CURRENT_TIME;
+ 	idx = (start + PAGE_CACHE_SIZE - 1) >> PAGE_CACHE_SHIFT;
+@@ -492,11 +493,18 @@ static void shmem_truncate_range(struct 
+ 	info->flags |= SHMEM_TRUNCATE;
+ 	if (likely(end == (loff_t) -1)) {
+ 		limit = info->next_index;
++		upper_limit = SHMEM_MAX_INDEX;
+ 		info->next_index = idx;
++		punch_hole = 0;
+ 	} else {
+-		limit = (end + PAGE_CACHE_SIZE - 1) >> PAGE_CACHE_SHIFT;
+-		if (limit > info->next_index)
+-			limit = info->next_index;
++		if (end + 1 >= inode->i_size) {	/* we may free a little more */
++			limit = (inode->i_size + PAGE_CACHE_SIZE - 1) >>
++							PAGE_CACHE_SHIFT;
++			upper_limit = SHMEM_MAX_INDEX;
++		} else {
++			limit = (end + 1) >> PAGE_CACHE_SHIFT;
++			upper_limit = limit;
++		}
+ 		punch_hole = 1;
+ 	}
+ 
+@@ -520,10 +528,10 @@ static void shmem_truncate_range(struct 
+ 	 * If there are no indirect blocks or we are punching a hole
+ 	 * below indirect blocks, nothing to be done.
+ 	 */
+-	if (!topdir || (punch_hole && (limit <= SHMEM_NR_DIRECT)))
++	if (!topdir || limit <= SHMEM_NR_DIRECT)
+ 		goto done2;
+ 
+-	BUG_ON(limit <= SHMEM_NR_DIRECT);
++	upper_limit -= SHMEM_NR_DIRECT;
+ 	limit -= SHMEM_NR_DIRECT;
+ 	idx = (idx > SHMEM_NR_DIRECT)? (idx - SHMEM_NR_DIRECT): 0;
+ 	offset = idx % ENTRIES_PER_PAGE;
+@@ -543,7 +551,7 @@ static void shmem_truncate_range(struct 
+ 		if (*dir) {
+ 			diroff = ((idx - ENTRIES_PER_PAGEPAGE/2) %
+ 				ENTRIES_PER_PAGEPAGE) / ENTRIES_PER_PAGE;
+-			if (!diroff && !offset) {
++			if (!diroff && !offset && upper_limit >= stage) {
+ 				*dir = NULL;
+ 				nr_pages_to_free++;
+ 				list_add(&middir->lru, &pages_to_free);
+@@ -570,9 +578,11 @@ static void shmem_truncate_range(struct 
+ 			}
+ 			stage = idx + ENTRIES_PER_PAGEPAGE;
+ 			middir = *dir;
+-			*dir = NULL;
+-			nr_pages_to_free++;
+-			list_add(&middir->lru, &pages_to_free);
++			if (upper_limit >= stage) {
++				*dir = NULL;
++				nr_pages_to_free++;
++				list_add(&middir->lru, &pages_to_free);
++			}
+ 			shmem_dir_unmap(dir);
+ 			cond_resched();
+ 			dir = shmem_dir_map(middir);
+@@ -598,7 +608,7 @@ static void shmem_truncate_range(struct 
+ 		}
+ 		if (offset)
+ 			offset = 0;
+-		else if (subdir && !page_private(subdir)) {
++		else if (subdir && upper_limit - idx >= ENTRIES_PER_PAGE) {
+ 			dir[diroff] = NULL;
+ 			nr_pages_to_free++;
+ 			list_add(&subdir->lru, &pages_to_free);
