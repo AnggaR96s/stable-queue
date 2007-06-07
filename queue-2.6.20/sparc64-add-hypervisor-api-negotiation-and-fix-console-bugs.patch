@@ -1,0 +1,879 @@
+From stable-bounces@linux.kernel.org  Wed Jun  6 22:54:25 2007
+Date: Wed, 06 Jun 2007 22:54:33 -0700 (PDT)
+Message-Id: <20070606.225433.58454202.davem@davemloft.net>
+To: stable@kernel.org
+From: David Miller <davem@davemloft.net>
+Cc: bunk@stusta.de
+Subject: SPARC64: Add hypervisor API negotiation and fix console bugs.
+
+Hypervisor interfaces need to be negotiated in order to use
+some API calls reliably.  So add a small set of interfaces
+to request API versions and query current settings.
+
+This allows us to fix some bugs in the hypervisor console:
+
+1) If we can negotiate API group CORE of at least major 1
+   minor 1 we can use con_read and con_write which can improve
+   console performance quite a bit.
+
+2) When we do a console write request, we should hold the
+   spinlock around the whole request, not a byte at a time.
+   What would happen is that it's easy for output from
+   different cpus to get mixed with each other.
+
+3) Use consistent udelay() based polling, udelay(1) each
+   loop with a limit of 1000 polls to handle stuck hypervisor
+   console.
+
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Chris Wright <chrisw@sous-sol.org>
+
+---
+ arch/sparc64/kernel/Makefile     |    2 
+ arch/sparc64/kernel/entry.S      |   94 +++++++++++++
+ arch/sparc64/kernel/hvapi.c      |  189 ++++++++++++++++++++++++++
+ arch/sparc64/kernel/setup.c      |    3 
+ drivers/serial/sunhv.c           |  276 ++++++++++++++++++++++++++++-----------
+ include/asm-sparc64/hypervisor.h |   83 +++++++++++
+ 6 files changed, 574 insertions(+), 73 deletions(-)
+
+--- linux-2.6.20.12.orig/arch/sparc64/kernel/Makefile
++++ linux-2.6.20.12/arch/sparc64/kernel/Makefile
+@@ -12,7 +12,7 @@ obj-y		:= process.o setup.o cpu.o idprom
+ 		   irq.o ptrace.o time.o sys_sparc.o signal.o \
+ 		   unaligned.o central.o pci.o starfire.o semaphore.o \
+ 		   power.o sbus.o iommu_common.o sparc64_ksyms.o chmc.o \
+-		   visemul.o prom.o of_device.o
++		   visemul.o prom.o of_device.o hvapi.o
+ 
+ obj-$(CONFIG_STACKTRACE) += stacktrace.o
+ obj-$(CONFIG_PCI)	 += ebus.o isa.o pci_common.o pci_iommu.o \
+--- linux-2.6.20.12.orig/arch/sparc64/kernel/entry.S
++++ linux-2.6.20.12/arch/sparc64/kernel/entry.S
+@@ -1843,3 +1843,97 @@ sun4v_cpu_state:
+ 	mov	%o1, %o0
+ 1:	retl
+ 	 nop
++
++	/* %o0:	API group number
++	 * %o1: pointer to unsigned long major number storage
++	 * %o2: pointer to unsigned long minor number storage
++	 *
++	 * returns %o0: status
++	 */
++	.globl	sun4v_get_version
++sun4v_get_version:
++	mov	HV_CORE_GET_VER, %o5
++	mov	%o1, %o3
++	mov	%o2, %o4
++	ta	HV_CORE_TRAP
++	stx	%o1, [%o3]
++	retl
++	 stx	%o2, [%o4]
++
++	/* %o0: API group number
++	 * %o1: desired major number
++	 * %o2: desired minor number
++	 * %o3: pointer to unsigned long actual minor number storage
++	 *
++	 * returns %o0: status
++	 */
++	.globl	sun4v_set_version
++sun4v_set_version:
++	mov	HV_CORE_SET_VER, %o5
++	mov	%o3, %o4
++	ta	HV_CORE_TRAP
++	retl
++	 stx	%o1, [%o4]
++
++	/* %o0: pointer to unsigned long status
++	 *
++	 * returns %o0: signed character
++	 */
++	.globl	sun4v_con_getchar
++sun4v_con_getchar:
++	mov	%o0, %o4
++	mov	HV_FAST_CONS_GETCHAR, %o5
++	clr	%o0
++	clr	%o1
++	ta	HV_FAST_TRAP
++	stx	%o0, [%o4]
++	retl
++	 sra	%o1, 0, %o0
++
++	/* %o0: signed long character
++	 *
++	 * returns %o0: status
++	 */
++	.globl	sun4v_con_putchar
++sun4v_con_putchar:
++	mov	HV_FAST_CONS_PUTCHAR, %o5
++	ta	HV_FAST_TRAP
++	retl
++	 sra	%o0, 0, %o0
++
++	/* %o0: buffer real address
++	 * %o1: buffer size
++	 * %o2: pointer to unsigned long bytes_read
++	 *
++	 * returns %o0: status
++	 */
++	.globl	sun4v_con_read
++sun4v_con_read:
++	mov	%o2, %o4
++	mov	HV_FAST_CONS_READ, %o5
++	ta	HV_FAST_TRAP
++	brnz	%o0, 1f
++	 cmp	%o1, -1		/* break */
++	be,a,pn	%icc, 1f
++	 mov	%o1, %o0
++	cmp	%o1, -2		/* hup */
++	be,a,pn	%icc, 1f
++	 mov	%o1, %o0
++	stx	%o1, [%o4]
++1:	retl
++	 nop
++
++	/* %o0: buffer real address
++	 * %o1: buffer size
++	 * %o2: pointer to unsigned long bytes_written
++	 *
++	 * returns %o0: status
++	 */
++	.globl	sun4v_con_write
++sun4v_con_write:
++	mov	%o2, %o4
++	mov	HV_FAST_CONS_WRITE, %o5
++	ta	HV_FAST_TRAP
++	stx	%o1, [%o4]
++	retl
++	 nop
+--- /dev/null
++++ linux-2.6.20.12/arch/sparc64/kernel/hvapi.c
+@@ -0,0 +1,189 @@
++/* hvapi.c: Hypervisor API management.
++ *
++ * Copyright (C) 2007 David S. Miller <davem@davemloft.net>
++ */
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/slab.h>
++
++#include <asm/hypervisor.h>
++#include <asm/oplib.h>
++
++/* If the hypervisor indicates that the API setting
++ * calls are unsupported, by returning HV_EBADTRAP or
++ * HV_ENOTSUPPORTED, we assume that API groups with the
++ * PRE_API flag set are major 1 minor 0.
++ */
++struct api_info {
++	unsigned long group;
++	unsigned long major;
++	unsigned long minor;
++	unsigned int refcnt;
++	unsigned int flags;
++#define FLAG_PRE_API		0x00000001
++};
++
++static struct api_info api_table[] = {
++	{ .group = HV_GRP_SUN4V,	.flags = FLAG_PRE_API	},
++	{ .group = HV_GRP_CORE,		.flags = FLAG_PRE_API	},
++	{ .group = HV_GRP_INTR,					},
++	{ .group = HV_GRP_SOFT_STATE,				},
++	{ .group = HV_GRP_PCI,		.flags = FLAG_PRE_API	},
++	{ .group = HV_GRP_LDOM,					},
++	{ .group = HV_GRP_SVC_CHAN,	.flags = FLAG_PRE_API	},
++	{ .group = HV_GRP_NCS,		.flags = FLAG_PRE_API	},
++	{ .group = HV_GRP_NIAG_PERF,	.flags = FLAG_PRE_API	},
++	{ .group = HV_GRP_FIRE_PERF,				},
++	{ .group = HV_GRP_DIAG,		.flags = FLAG_PRE_API	},
++};
++
++static DEFINE_SPINLOCK(hvapi_lock);
++
++static struct api_info *__get_info(unsigned long group)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(api_table); i++) {
++		if (api_table[i].group == group)
++			return &api_table[i];
++	}
++	return NULL;
++}
++
++static void __get_ref(struct api_info *p)
++{
++	p->refcnt++;
++}
++
++static void __put_ref(struct api_info *p)
++{
++	if (--p->refcnt == 0) {
++		unsigned long ignore;
++
++		sun4v_set_version(p->group, 0, 0, &ignore);
++		p->major = p->minor = 0;
++	}
++}
++
++/* Register a hypervisor API specification.  It indicates the
++ * API group and desired major+minor.
++ *
++ * If an existing API registration exists '0' (success) will
++ * be returned if it is compatible with the one being registered.
++ * Otherwise a negative error code will be returned.
++ *
++ * Otherwise an attempt will be made to negotiate the requested
++ * API group/major/minor with the hypervisor, and errors returned
++ * if that does not succeed.
++ */
++int sun4v_hvapi_register(unsigned long group, unsigned long major,
++			 unsigned long *minor)
++{
++	struct api_info *p;
++	unsigned long flags;
++	int ret;
++
++	spin_lock_irqsave(&hvapi_lock, flags);
++	p = __get_info(group);
++	ret = -EINVAL;
++	if (p) {
++		if (p->refcnt) {
++			ret = -EINVAL;
++			if (p->major == major) {
++				*minor = p->minor;
++				ret = 0;
++			}
++		} else {
++			unsigned long actual_minor;
++			unsigned long hv_ret;
++
++			hv_ret = sun4v_set_version(group, major, *minor,
++						   &actual_minor);
++			ret = -EINVAL;
++			if (hv_ret == HV_EOK) {
++				*minor = actual_minor;
++				p->major = major;
++				p->minor = actual_minor;
++				ret = 0;
++			} else if (hv_ret == HV_EBADTRAP ||
++				   HV_ENOTSUPPORTED) {
++				if (p->flags & FLAG_PRE_API) {
++					if (major == 1) {
++						p->major = 1;
++						p->minor = 0;
++						*minor = 0;
++						ret = 0;
++					}
++				}
++			}
++		}
++
++		if (ret == 0)
++			__get_ref(p);
++	}
++	spin_unlock_irqrestore(&hvapi_lock, flags);
++
++	return ret;
++}
++EXPORT_SYMBOL(sun4v_hvapi_register);
++
++void sun4v_hvapi_unregister(unsigned long group)
++{
++	struct api_info *p;
++	unsigned long flags;
++
++	spin_lock_irqsave(&hvapi_lock, flags);
++	p = __get_info(group);
++	if (p)
++		__put_ref(p);
++	spin_unlock_irqrestore(&hvapi_lock, flags);
++}
++EXPORT_SYMBOL(sun4v_hvapi_unregister);
++
++int sun4v_hvapi_get(unsigned long group,
++		    unsigned long *major,
++		    unsigned long *minor)
++{
++	struct api_info *p;
++	unsigned long flags;
++	int ret;
++
++	spin_lock_irqsave(&hvapi_lock, flags);
++	ret = -EINVAL;
++	p = __get_info(group);
++	if (p && p->refcnt) {
++		*major = p->major;
++		*minor = p->minor;
++		ret = 0;
++	}
++	spin_unlock_irqrestore(&hvapi_lock, flags);
++
++	return ret;
++}
++EXPORT_SYMBOL(sun4v_hvapi_get);
++
++void __init sun4v_hvapi_init(void)
++{
++	unsigned long group, major, minor;
++
++	group = HV_GRP_SUN4V;
++	major = 1;
++	minor = 0;
++	if (sun4v_hvapi_register(group, major, &minor))
++		goto bad;
++
++	group = HV_GRP_CORE;
++	major = 1;
++	minor = 1;
++	if (sun4v_hvapi_register(group, major, &minor))
++		goto bad;
++
++	return;
++
++bad:
++	prom_printf("HVAPI: Cannot register API group "
++		    "%lx with major(%u) minor(%u)\n",
++		    group, major, minor);
++	prom_halt();
++}
+--- linux-2.6.20.12.orig/arch/sparc64/kernel/setup.c
++++ linux-2.6.20.12/arch/sparc64/kernel/setup.c
+@@ -269,6 +269,7 @@ void __init per_cpu_patch(void)
+ 
+ void __init sun4v_patch(void)
+ {
++	extern void sun4v_hvapi_init(void);
+ 	struct sun4v_1insn_patch_entry *p1;
+ 	struct sun4v_2insn_patch_entry *p2;
+ 
+@@ -300,6 +301,8 @@ void __init sun4v_patch(void)
+ 
+ 		p2++;
+ 	}
++
++	sun4v_hvapi_init();
+ }
+ 
+ #ifdef CONFIG_SMP
+--- linux-2.6.20.12.orig/drivers/serial/sunhv.c
++++ linux-2.6.20.12/drivers/serial/sunhv.c
+@@ -1,6 +1,6 @@
+ /* sunhv.c: Serial driver for SUN4V hypervisor console.
+  *
+- * Copyright (C) 2006 David S. Miller (davem@davemloft.net)
++ * Copyright (C) 2006, 2007 David S. Miller (davem@davemloft.net)
+  */
+ 
+ #include <linux/module.h>
+@@ -35,57 +35,51 @@
+ #define CON_BREAK	((long)-1)
+ #define CON_HUP		((long)-2)
+ 
+-static inline long hypervisor_con_getchar(long *status)
+-{
+-	register unsigned long func asm("%o5");
+-	register unsigned long arg0 asm("%o0");
+-	register unsigned long arg1 asm("%o1");
+-
+-	func = HV_FAST_CONS_GETCHAR;
+-	arg0 = 0;
+-	arg1 = 0;
+-	__asm__ __volatile__("ta	%6"
+-			     : "=&r" (func), "=&r" (arg0), "=&r" (arg1)
+-			     : "0" (func), "1" (arg0), "2" (arg1),
+-			       "i" (HV_FAST_TRAP));
++#define IGNORE_BREAK	0x1
++#define IGNORE_ALL	0x2
+ 
+-	*status = arg0;
++static char *con_write_page;
++static char *con_read_page;
+ 
+-	return (long) arg1;
+-}
++static int hung_up = 0;
+ 
+-static inline long hypervisor_con_putchar(long ch)
++static void transmit_chars_putchar(struct uart_port *port, struct circ_buf *xmit)
+ {
+-	register unsigned long func asm("%o5");
+-	register unsigned long arg0 asm("%o0");
++	while (!uart_circ_empty(xmit)) {
++		long status = sun4v_con_putchar(xmit->buf[xmit->tail]);
+ 
+-	func = HV_FAST_CONS_PUTCHAR;
+-	arg0 = ch;
+-	__asm__ __volatile__("ta	%4"
+-			     : "=&r" (func), "=&r" (arg0)
+-			     : "0" (func), "1" (arg0), "i" (HV_FAST_TRAP));
++		if (status != HV_EOK)
++			break;
+ 
+-	return (long) arg0;
++		xmit->tail = (xmit->tail + 1) & (UART_XMIT_SIZE - 1);
++		port->icount.tx++;
++	}
+ }
+ 
+-#define IGNORE_BREAK	0x1
+-#define IGNORE_ALL	0x2
++static void transmit_chars_write(struct uart_port *port, struct circ_buf *xmit)
++{
++	while (!uart_circ_empty(xmit)) {
++		unsigned long ra = __pa(xmit->buf + xmit->tail);
++		unsigned long len, status, sent;
+ 
+-static int hung_up = 0;
++		len = CIRC_CNT_TO_END(xmit->head, xmit->tail,
++				      UART_XMIT_SIZE);
++		status = sun4v_con_write(ra, len, &sent);
++		if (status != HV_EOK)
++			break;
++		xmit->tail = (xmit->tail + sent) & (UART_XMIT_SIZE - 1);
++		port->icount.tx += sent;
++	}
++}
+ 
+-static struct tty_struct *receive_chars(struct uart_port *port)
++static int receive_chars_getchar(struct uart_port *port, struct tty_struct *tty)
+ {
+-	struct tty_struct *tty = NULL;
+ 	int saw_console_brk = 0;
+ 	int limit = 10000;
+ 
+-	if (port->info != NULL)		/* Unopened serial console */
+-		tty = port->info->tty;
+-
+ 	while (limit-- > 0) {
+ 		long status;
+-		long c = hypervisor_con_getchar(&status);
+-		unsigned char flag;
++		long c = sun4v_con_getchar(&status);
+ 
+ 		if (status == HV_EWOULDBLOCK)
+ 			break;
+@@ -110,27 +104,90 @@ static struct tty_struct *receive_chars(
+ 			continue;
+ 		}
+ 
+-		flag = TTY_NORMAL;
+ 		port->icount.rx++;
+-		if (c == CON_BREAK) {
+-			port->icount.brk++;
+-			if (uart_handle_break(port))
+-				continue;
+-			flag = TTY_BREAK;
+-		}
+ 
+ 		if (uart_handle_sysrq_char(port, c))
+ 			continue;
+ 
+-		if ((port->ignore_status_mask & IGNORE_ALL) ||
+-		    ((port->ignore_status_mask & IGNORE_BREAK) &&
+-		     (c == CON_BREAK)))
++		tty_insert_flip_char(tty, c, TTY_NORMAL);
++	}
++
++	return saw_console_brk;
++}
++
++static int receive_chars_read(struct uart_port *port, struct tty_struct *tty)
++{
++	int saw_console_brk = 0;
++	int limit = 10000;
++
++	while (limit-- > 0) {
++		unsigned long ra = __pa(con_read_page);
++		unsigned long bytes_read, i;
++		long stat = sun4v_con_read(ra, PAGE_SIZE, &bytes_read);
++
++		if (stat != HV_EOK) {
++			bytes_read = 0;
++
++			if (stat == CON_BREAK) {
++				if (uart_handle_break(port))
++					continue;
++				saw_console_brk = 1;
++				*con_read_page = 0;
++				bytes_read = 1;
++			} else if (stat == CON_HUP) {
++				hung_up = 1;
++				uart_handle_dcd_change(port, 0);
++				continue;
++			} else {
++				/* HV_EWOULDBLOCK, etc.  */
++				break;
++			}
++		}
++
++		if (hung_up) {
++			hung_up = 0;
++			uart_handle_dcd_change(port, 1);
++		}
++
++		for (i = 0; i < bytes_read; i++)
++			uart_handle_sysrq_char(port, con_read_page[i]);
++
++		if (tty == NULL)
+ 			continue;
+ 
+-		tty_insert_flip_char(tty, c, flag);
++		port->icount.rx += bytes_read;
++
++		tty_insert_flip_string(tty, con_read_page, bytes_read);
+ 	}
+ 
+-	if (saw_console_brk)
++	return saw_console_brk;
++}
++
++struct sunhv_ops {
++	void (*transmit_chars)(struct uart_port *port, struct circ_buf *xmit);
++	int (*receive_chars)(struct uart_port *port, struct tty_struct *tty);
++};
++
++static struct sunhv_ops bychar_ops = {
++	.transmit_chars = transmit_chars_putchar,
++	.receive_chars = receive_chars_getchar,
++};
++
++static struct sunhv_ops bywrite_ops = {
++	.transmit_chars = transmit_chars_write,
++	.receive_chars = receive_chars_read,
++};
++
++static struct sunhv_ops *sunhv_ops = &bychar_ops;
++
++static struct tty_struct *receive_chars(struct uart_port *port)
++{
++	struct tty_struct *tty = NULL;
++
++	if (port->info != NULL)		/* Unopened serial console */
++		tty = port->info->tty;
++
++	if (sunhv_ops->receive_chars(port, tty))
+ 		sun_do_break();
+ 
+ 	return tty;
+@@ -147,15 +204,7 @@ static void transmit_chars(struct uart_p
+ 	if (uart_circ_empty(xmit) || uart_tx_stopped(port))
+ 		return;
+ 
+-	while (!uart_circ_empty(xmit)) {
+-		long status = hypervisor_con_putchar(xmit->buf[xmit->tail]);
+-
+-		if (status != HV_EOK)
+-			break;
+-
+-		xmit->tail = (xmit->tail + 1) & (UART_XMIT_SIZE - 1);
+-		port->icount.tx++;
+-	}
++	sunhv_ops->transmit_chars(port, xmit);
+ 
+ 	if (uart_circ_chars_pending(xmit) < WAKEUP_CHARS)
+ 		uart_write_wakeup(port);
+@@ -212,7 +261,7 @@ static void sunhv_start_tx(struct uart_p
+ 	struct circ_buf *xmit = &port->info->xmit;
+ 
+ 	while (!uart_circ_empty(xmit)) {
+-		long status = hypervisor_con_putchar(xmit->buf[xmit->tail]);
++		long status = sun4v_con_putchar(xmit->buf[xmit->tail]);
+ 
+ 		if (status != HV_EOK)
+ 			break;
+@@ -231,9 +280,10 @@ static void sunhv_send_xchar(struct uart
+ 	spin_lock_irqsave(&port->lock, flags);
+ 
+ 	while (limit-- > 0) {
+-		long status = hypervisor_con_putchar(ch);
++		long status = sun4v_con_putchar(ch);
+ 		if (status == HV_EOK)
+ 			break;
++		udelay(1);
+ 	}
+ 
+ 	spin_unlock_irqrestore(&port->lock, flags);
+@@ -254,15 +304,15 @@ static void sunhv_break_ctl(struct uart_
+ {
+ 	if (break_state) {
+ 		unsigned long flags;
+-		int limit = 1000000;
++		int limit = 10000;
+ 
+ 		spin_lock_irqsave(&port->lock, flags);
+ 
+ 		while (limit-- > 0) {
+-			long status = hypervisor_con_putchar(CON_BREAK);
++			long status = sun4v_con_putchar(CON_BREAK);
+ 			if (status == HV_EOK)
+ 				break;
+-			udelay(2);
++			udelay(1);
+ 		}
+ 
+ 		spin_unlock_irqrestore(&port->lock, flags);
+@@ -359,38 +409,99 @@ static struct uart_driver sunhv_reg = {
+ 
+ static struct uart_port *sunhv_port;
+ 
+-static inline void sunhv_console_putchar(struct uart_port *port, char c)
++/* Copy 's' into the con_write_page, decoding "\n" into
++ * "\r\n" along the way.  We have to return two lengths
++ * because the caller needs to know how much to advance
++ * 's' and also how many bytes to output via con_write_page.
++ */
++static int fill_con_write_page(const char *s, unsigned int n,
++			       unsigned long *page_bytes)
+ {
++	const char *orig_s = s;
++	char *p = con_write_page;
++	int left = PAGE_SIZE;
++
++	while (n--) {
++		if (*s == '\n') {
++			if (left < 2)
++				break;
++			*p++ = '\r';
++			left--;
++		} else if (left < 1)
++			break;
++		*p++ = *s++;
++		left--;
++	}
++	*page_bytes = p - con_write_page;
++	return s - orig_s;
++}
++
++static void sunhv_console_write_paged(struct console *con, const char *s, unsigned n)
++{
++	struct uart_port *port = sunhv_port;
+ 	unsigned long flags;
+-	int limit = 1000000;
+ 
+ 	spin_lock_irqsave(&port->lock, flags);
++	while (n > 0) {
++		unsigned long ra = __pa(con_write_page);
++		unsigned long page_bytes;
++		unsigned int cpy = fill_con_write_page(s, n,
++						       &page_bytes);
++
++		n -= cpy;
++		s += cpy;
++		while (page_bytes > 0) {
++			unsigned long written;
++			int limit = 1000000;
++
++			while (limit--) {
++				unsigned long stat;
++
++				stat = sun4v_con_write(ra, page_bytes,
++						       &written);
++				if (stat == HV_EOK)
++					break;
++				udelay(1);
++			}
++			if (limit <= 0)
++				break;
++			page_bytes -= written;
++			ra += written;
++		}
++	}
++	spin_unlock_irqrestore(&port->lock, flags);
++}
++
++static inline void sunhv_console_putchar(struct uart_port *port, char c)
++{
++	int limit = 1000000;
+ 
+ 	while (limit-- > 0) {
+-		long status = hypervisor_con_putchar(c);
++		long status = sun4v_con_putchar(c);
+ 		if (status == HV_EOK)
+ 			break;
+-		udelay(2);
++		udelay(1);
+ 	}
+-
+-	spin_unlock_irqrestore(&port->lock, flags);
+ }
+ 
+-static void sunhv_console_write(struct console *con, const char *s, unsigned n)
++static void sunhv_console_write_bychar(struct console *con, const char *s, unsigned n)
+ {
+ 	struct uart_port *port = sunhv_port;
++	unsigned long flags;
+ 	int i;
+ 
++	spin_lock_irqsave(&port->lock, flags);
+ 	for (i = 0; i < n; i++) {
+ 		if (*s == '\n')
+ 			sunhv_console_putchar(port, '\r');
+ 		sunhv_console_putchar(port, *s++);
+ 	}
++	spin_unlock_irqrestore(&port->lock, flags);
+ }
+ 
+ static struct console sunhv_console = {
+ 	.name	=	"ttyHV",
+-	.write	=	sunhv_console_write,
++	.write	=	sunhv_console_write_bychar,
+ 	.device	=	uart_console_device,
+ 	.flags	=	CON_PRINTBUFFER,
+ 	.index	=	-1,
+@@ -410,6 +521,7 @@ static inline struct console *SUNHV_CONS
+ static int __devinit hv_probe(struct of_device *op, const struct of_device_id *match)
+ {
+ 	struct uart_port *port;
++	unsigned long minor;
+ 	int err;
+ 
+ 	if (op->irqs[0] == 0xffffffff)
+@@ -419,6 +531,22 @@ static int __devinit hv_probe(struct of_
+ 	if (unlikely(!port))
+ 		return -ENOMEM;
+ 
++	minor = 1;
++	if (sun4v_hvapi_register(HV_GRP_CORE, 1, &minor) == 0 &&
++	    minor >= 1) {
++		err = -ENOMEM;
++		con_write_page = kzalloc(PAGE_SIZE, GFP_KERNEL);
++		if (!con_write_page)
++			goto out_free_port;
++
++		con_read_page = kzalloc(PAGE_SIZE, GFP_KERNEL);
++		if (!con_read_page)
++			goto out_free_con_write_page;
++
++		sunhv_console.write = sunhv_console_write_paged;
++		sunhv_ops = &bywrite_ops;
++	}
++
+ 	sunhv_port = port;
+ 
+ 	port->line = 0;
+@@ -437,7 +565,7 @@ static int __devinit hv_probe(struct of_
+ 
+ 	err = uart_register_driver(&sunhv_reg);
+ 	if (err)
+-		goto out_free_port;
++		goto out_free_con_read_page;
+ 
+ 	sunhv_reg.tty_driver->name_base = sunhv_reg.minor - 64;
+ 	sunserial_current_minor += 1;
+@@ -463,6 +591,12 @@ out_unregister_driver:
+ 	sunserial_current_minor -= 1;
+ 	uart_unregister_driver(&sunhv_reg);
+ 
++out_free_con_read_page:
++	kfree(con_read_page);
++
++out_free_con_write_page:
++	kfree(con_write_page);
++
+ out_free_port:
+ 	kfree(port);
+ 	sunhv_port = NULL;
+--- linux-2.6.20.12.orig/include/asm-sparc64/hypervisor.h
++++ linux-2.6.20.12/include/asm-sparc64/hypervisor.h
+@@ -940,6 +940,54 @@ struct hv_fault_status {
+  */
+ #define HV_FAST_CONS_PUTCHAR		0x61
+ 
++/* con_read()
++ * TRAP:	HV_FAST_TRAP
++ * FUNCTION:	HV_FAST_CONS_READ
++ * ARG0:	buffer real address
++ * ARG1:	buffer size in bytes
++ * RET0:	status
++ * RET1:	bytes read or BREAK or HUP
++ * ERRORS:	EWOULDBLOCK	No character available.
++ *
++ * Reads characters into a buffer from the console device.  If no
++ * character is available then an EWOULDBLOCK error is returned.
++ * If a character is available, then the returned status is EOK
++ * and the number of bytes read into the given buffer is provided
++ * in RET1.
++ *
++ * A virtual BREAK is represented by the 64-bit RET1 value -1.
++ *
++ * A virtual HUP signal is represented by the 64-bit RET1 value -2.
++ *
++ * If BREAK or HUP are indicated, no bytes were read into buffer.
++ */
++#define HV_FAST_CONS_READ		0x62
++
++/* con_write()
++ * TRAP:	HV_FAST_TRAP
++ * FUNCTION:	HV_FAST_CONS_WRITE
++ * ARG0:	buffer real address
++ * ARG1:	buffer size in bytes
++ * RET0:	status
++ * RET1:	bytes written
++ * ERRORS:	EWOULDBLOCK	Output buffer currently full, would block
++ *
++ * Send a characters in buffer to the console device.  Breaks must be
++ * sent using con_putchar().
++ */
++#define HV_FAST_CONS_WRITE		0x63
++
++#ifndef __ASSEMBLY__
++extern long sun4v_con_getchar(long *status);
++extern long sun4v_con_putchar(long c);
++extern long sun4v_con_read(unsigned long buffer,
++			   unsigned long size,
++			   unsigned long *bytes_read);
++extern unsigned long sun4v_con_write(unsigned long buffer,
++				     unsigned long size,
++				     unsigned long *bytes_written);
++#endif
++
+ /* Trap trace services.
+  *
+  * The hypervisor provides a trap tracing capability for privileged
+@@ -2121,8 +2169,41 @@ struct hv_mmu_statistics {
+ #define HV_FAST_MMUSTAT_INFO		0x103
+ 
+ /* Function numbers for HV_CORE_TRAP.  */
+-#define HV_CORE_VER			0x00
++#define HV_CORE_SET_VER			0x00
+ #define HV_CORE_PUTCHAR			0x01
+ #define HV_CORE_EXIT			0x02
++#define HV_CORE_GET_VER			0x03
++
++/* Hypervisor API groups for use with HV_CORE_SET_VER and
++ * HV_CORE_GET_VER.
++ */
++#define HV_GRP_SUN4V			0x0000
++#define HV_GRP_CORE			0x0001
++#define HV_GRP_INTR			0x0002
++#define HV_GRP_SOFT_STATE		0x0003
++#define HV_GRP_PCI			0x0100
++#define HV_GRP_LDOM			0x0101
++#define HV_GRP_SVC_CHAN			0x0102
++#define HV_GRP_NCS			0x0103
++#define HV_GRP_NIAG_PERF		0x0200
++#define HV_GRP_FIRE_PERF		0x0201
++#define HV_GRP_DIAG			0x0300
++
++#ifndef __ASSEMBLY__
++extern unsigned long sun4v_get_version(unsigned long group,
++				       unsigned long *major,
++				       unsigned long *minor);
++extern unsigned long sun4v_set_version(unsigned long group,
++				       unsigned long major,
++				       unsigned long minor,
++				       unsigned long *actual_minor);
++
++extern int sun4v_hvapi_register(unsigned long group, unsigned long major,
++				unsigned long *minor);
++extern void sun4v_hvapi_unregister(unsigned long group);
++extern int sun4v_hvapi_get(unsigned long group,
++			   unsigned long *major,
++			   unsigned long *minor);
++#endif
+ 
+ #endif /* !(_SPARC64_HYPERVISOR_H) */
