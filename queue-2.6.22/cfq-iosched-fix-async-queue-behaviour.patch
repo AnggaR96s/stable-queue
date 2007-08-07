@@ -1,0 +1,121 @@
+From stable-bounces@linux.kernel.org Tue Jul 10 14:04:56 2007
+From: Jens Axboe <jens.axboe@oracle.com>
+Date: Tue, 10 Jul 2007 22:11:00 +0200
+Subject: cfq-iosched: fix async queue behaviour
+To: stable@kernel.org
+Message-ID: <20070710201059.GB4587@kernel.dk>
+Content-Disposition: inline
+
+From: Jens Axboe <jens.axboe@oracle.com>
+
+With the cfq_queue hash removal, we inadvertently got rid of the
+async queue sharing. This was not intentional, in fact CFQ purposely
+shares the async queue per priority level to get good merging for
+async writes.
+
+So put some logic in cfq_get_queue() to track the shared queues.
+
+Signed-off-by: Jens Axboe <jens.axboe@oracle.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ block/cfq-iosched.c    |   39 ++++++++++++++++++++++++++++++++++++---
+ include/linux/ioprio.h |    6 ++++--
+ 2 files changed, 40 insertions(+), 5 deletions(-)
+
+--- a/block/cfq-iosched.c
++++ b/block/cfq-iosched.c
+@@ -92,6 +92,8 @@ struct cfq_data {
+ 	struct cfq_queue *active_queue;
+ 	struct cfq_io_context *active_cic;
+ 
++	struct cfq_queue *async_cfqq[IOPRIO_BE_NR];
++
+ 	struct timer_list idle_class_timer;
+ 
+ 	sector_t last_position;
+@@ -1351,8 +1353,8 @@ static void cfq_ioc_set_ioprio(struct io
+ }
+ 
+ static struct cfq_queue *
+-cfq_get_queue(struct cfq_data *cfqd, int is_sync, struct task_struct *tsk,
+-	      gfp_t gfp_mask)
++cfq_find_alloc_queue(struct cfq_data *cfqd, int is_sync,
++		     struct task_struct *tsk, gfp_t gfp_mask)
+ {
+ 	struct cfq_queue *cfqq, *new_cfqq = NULL;
+ 	struct cfq_io_context *cic;
+@@ -1405,12 +1407,35 @@ retry:
+ 	if (new_cfqq)
+ 		kmem_cache_free(cfq_pool, new_cfqq);
+ 
+-	atomic_inc(&cfqq->ref);
+ out:
+ 	WARN_ON((gfp_mask & __GFP_WAIT) && !cfqq);
+ 	return cfqq;
+ }
+ 
++static struct cfq_queue *
++cfq_get_queue(struct cfq_data *cfqd, int is_sync, struct task_struct *tsk,
++	      gfp_t gfp_mask)
++{
++	const int ioprio = task_ioprio(tsk);
++	struct cfq_queue *cfqq = NULL;
++
++	if (!is_sync)
++		cfqq = cfqd->async_cfqq[ioprio];
++	if (!cfqq)
++		cfqq = cfq_find_alloc_queue(cfqd, is_sync, tsk, gfp_mask);
++
++	/*
++	 * pin the queue now that it's allocated, scheduler exit will prune it
++	 */
++	if (!is_sync && !cfqd->async_cfqq[ioprio]) {
++		atomic_inc(&cfqq->ref);
++		cfqd->async_cfqq[ioprio] = cfqq;
++	}
++
++	atomic_inc(&cfqq->ref);
++	return cfqq;
++}
++
+ /*
+  * We drop cfq io contexts lazily, so we may find a dead one.
+  */
+@@ -2019,6 +2044,7 @@ static void cfq_exit_queue(elevator_t *e
+ {
+ 	struct cfq_data *cfqd = e->elevator_data;
+ 	request_queue_t *q = cfqd->queue;
++	int i;
+ 
+ 	cfq_shutdown_timer_wq(cfqd);
+ 
+@@ -2035,6 +2061,13 @@ static void cfq_exit_queue(elevator_t *e
+ 		__cfq_exit_single_io_context(cfqd, cic);
+ 	}
+ 
++	/*
++	 * Put the async queues
++	 */
++	for (i = 0; i < IOPRIO_BE_NR; i++)
++		if (cfqd->async_cfqq[i])
++			cfq_put_queue(cfqd->async_cfqq[i]);
++
+ 	spin_unlock_irq(q->queue_lock);
+ 
+ 	cfq_shutdown_timer_wq(cfqd);
+--- a/include/linux/ioprio.h
++++ b/include/linux/ioprio.h
+@@ -47,8 +47,10 @@ enum {
+ #define IOPRIO_NORM	(4)
+ static inline int task_ioprio(struct task_struct *task)
+ {
+-	WARN_ON(!ioprio_valid(task->ioprio));
+-	return IOPRIO_PRIO_DATA(task->ioprio);
++	if (ioprio_valid(task->ioprio))
++		return IOPRIO_PRIO_DATA(task->ioprio);
++
++	return IOPRIO_NORM;
+ }
+ 
+ static inline int task_nice_ioprio(struct task_struct *task)
