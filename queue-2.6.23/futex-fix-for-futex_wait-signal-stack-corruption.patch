@@ -1,0 +1,216 @@
+From ce6bd420f43b28038a2c6e8fbb86ad24014727b6 Mon Sep 17 00:00:00 2001
+From: Steven Rostedt <srostedt@redhat.com>
+Date: Wed, 5 Dec 2007 15:46:09 +0100
+Subject: [PATCH] futex: fix for futex_wait signal stack corruption
+
+From Steven Rostedt <srostedt@redhat.com>
+
+patch ce6bd420f43b28038a2c6e8fbb86ad24014727b6 in mainline.
+
+David Holmes found a bug in the -rt tree with respect to
+pthread_cond_timedwait. After trying his test program on the latest git
+from mainline, I found the bug was there too.  The bug he was seeing
+that his test program showed, was that if one were to do a "Ctrl-Z" on a
+process that was in the pthread_cond_timedwait, and then did a "bg" on
+that process, it would return with a "-ETIMEDOUT" but early. That is,
+the timer would go off early.
+
+Looking into this, I found the source of the problem. And it is a rather
+nasty bug at that.
+
+Here's the relevant code from kernel/futex.c: (not in order in the file)
+
+[...]
+smlinkage long sys_futex(u32 __user *uaddr, int op, u32 val,
+                          struct timespec __user *utime, u32 __user *uaddr2,
+                          u32 val3)
+{
+        struct timespec ts;
+        ktime_t t, *tp = NULL;
+        u32 val2 = 0;
+        int cmd = op & FUTEX_CMD_MASK;
+
+        if (utime && (cmd == FUTEX_WAIT || cmd == FUTEX_LOCK_PI)) {
+                if (copy_from_user(&ts, utime, sizeof(ts)) != 0)
+                        return -EFAULT;
+                if (!timespec_valid(&ts))
+                        return -EINVAL;
+
+                t = timespec_to_ktime(ts);
+                if (cmd == FUTEX_WAIT)
+                        t = ktime_add(ktime_get(), t);
+                tp = &t;
+        }
+[...]
+        return do_futex(uaddr, op, val, tp, uaddr2, val2, val3);
+}
+
+[...]
+
+long do_futex(u32 __user *uaddr, int op, u32 val, ktime_t *timeout,
+                u32 __user *uaddr2, u32 val2, u32 val3)
+{
+        int ret;
+        int cmd = op & FUTEX_CMD_MASK;
+        struct rw_semaphore *fshared = NULL;
+
+        if (!(op & FUTEX_PRIVATE_FLAG))
+                fshared = &current->mm->mmap_sem;
+
+        switch (cmd) {
+        case FUTEX_WAIT:
+                ret = futex_wait(uaddr, fshared, val, timeout);
+
+[...]
+
+static int futex_wait(u32 __user *uaddr, struct rw_semaphore *fshared,
+                      u32 val, ktime_t *abs_time)
+{
+[...]
+               struct restart_block *restart;
+                restart = &current_thread_info()->restart_block;
+                restart->fn = futex_wait_restart;
+                restart->arg0 = (unsigned long)uaddr;
+                restart->arg1 = (unsigned long)val;
+                restart->arg2 = (unsigned long)abs_time;
+                restart->arg3 = 0;
+                if (fshared)
+                        restart->arg3 |= ARG3_SHARED;
+                return -ERESTART_RESTARTBLOCK;
+[...]
+
+static long futex_wait_restart(struct restart_block *restart)
+{
+        u32 __user *uaddr = (u32 __user *)restart->arg0;
+        u32 val = (u32)restart->arg1;
+        ktime_t *abs_time = (ktime_t *)restart->arg2;
+        struct rw_semaphore *fshared = NULL;
+
+        restart->fn = do_no_restart_syscall;
+        if (restart->arg3 & ARG3_SHARED)
+                fshared = &current->mm->mmap_sem;
+        return (long)futex_wait(uaddr, fshared, val, abs_time);
+}
+
+So when the futex_wait is interrupt by a signal we break out of the
+hrtimer code and set up or return from signal. This code does not return
+back to userspace, so we set up a RESTARTBLOCK.  The bug here is that we
+save the "abs_time" which is a pointer to the stack variable "ktime_t t"
+from sys_futex.
+
+This returns and unwinds the stack before we get to call our signal. On
+return from the signal we go to futex_wait_restart, where we update all
+the parameters for futex_wait and call it. But here we have a problem
+where abs_time is no longer valid.
+
+I verified this with print statements, and sure enough, what abs_time
+was set to ends up being garbage when we get to futex_wait_restart.
+
+The solution I did to solve this (with input from Linus Torvalds)
+was to add unions to the restart_block to allow system calls to
+use the restart with specific parameters.  This way the futex code now
+saves the time in a 64bit value in the restart block instead of storing
+it on the stack.
+
+Note: I'm a bit nervious to add "linux/types.h" and use u32 and u64
+in thread_info.h, when there's a #ifdef __KERNEL__ just below that.
+Not sure what that is there for.  If this turns out to be a problem, I've
+tested this with using "unsigned int" for u32 and "unsigned long long" for
+u64 and it worked just the same. I'm using u32 and u64 just to be
+consistent with what the futex code uses.
+
+Signed-off-by: Steven Rostedt <srostedt@redhat.com>
+Signed-off-by: Ingo Molnar <mingo@elte.hu>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Acked-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ include/linux/thread_info.h |   17 +++++++++++++++--
+ kernel/futex.c              |   25 +++++++++++++------------
+ 2 files changed, 28 insertions(+), 14 deletions(-)
+
+--- a/include/linux/thread_info.h
++++ b/include/linux/thread_info.h
+@@ -7,12 +7,25 @@
+ #ifndef _LINUX_THREAD_INFO_H
+ #define _LINUX_THREAD_INFO_H
+ 
++#include <linux/types.h>
++
+ /*
+- * System call restart block. 
++ * System call restart block.
+  */
+ struct restart_block {
+ 	long (*fn)(struct restart_block *);
+-	unsigned long arg0, arg1, arg2, arg3;
++	union {
++		struct {
++			unsigned long arg0, arg1, arg2, arg3;
++		};
++		/* For futex_wait */
++		struct {
++			u32 *uaddr;
++			u32 val;
++			u32 flags;
++			u64 time;
++		} futex;
++	};
+ };
+ 
+ extern long do_no_restart_syscall(struct restart_block *parm);
+--- a/kernel/futex.c
++++ b/kernel/futex.c
+@@ -1149,9 +1149,9 @@ static int fixup_pi_state_owner(u32 __us
+ 
+ /*
+  * In case we must use restart_block to restart a futex_wait,
+- * we encode in the 'arg3' shared capability
++ * we encode in the 'flags' shared capability
+  */
+-#define ARG3_SHARED  1
++#define FLAGS_SHARED  1
+ 
+ static long futex_wait_restart(struct restart_block *restart);
+ 
+@@ -1290,12 +1290,13 @@ static int futex_wait(u32 __user *uaddr,
+ 		struct restart_block *restart;
+ 		restart = &current_thread_info()->restart_block;
+ 		restart->fn = futex_wait_restart;
+-		restart->arg0 = (unsigned long)uaddr;
+-		restart->arg1 = (unsigned long)val;
+-		restart->arg2 = (unsigned long)abs_time;
+-		restart->arg3 = 0;
++		restart->futex.uaddr = (u32 *)uaddr;
++		restart->futex.val = val;
++		restart->futex.time = abs_time->tv64;
++		restart->futex.flags = 0;
++
+ 		if (fshared)
+-			restart->arg3 |= ARG3_SHARED;
++			restart->futex.flags |= FLAGS_SHARED;
+ 		return -ERESTART_RESTARTBLOCK;
+ 	}
+ 
+@@ -1310,15 +1311,15 @@ static int futex_wait(u32 __user *uaddr,
+ 
+ static long futex_wait_restart(struct restart_block *restart)
+ {
+-	u32 __user *uaddr = (u32 __user *)restart->arg0;
+-	u32 val = (u32)restart->arg1;
+-	ktime_t *abs_time = (ktime_t *)restart->arg2;
++	u32 __user *uaddr = (u32 __user *)restart->futex.uaddr;
+ 	struct rw_semaphore *fshared = NULL;
++	ktime_t t;
+ 
++	t.tv64 = restart->futex.time;
+ 	restart->fn = do_no_restart_syscall;
+-	if (restart->arg3 & ARG3_SHARED)
++	if (restart->futex.flags & FLAGS_SHARED)
+ 		fshared = &current->mm->mmap_sem;
+-	return (long)futex_wait(uaddr, fshared, val, abs_time);
++	return (long)futex_wait(uaddr, fshared, restart->futex.val, &t);
+ }
+ 
+ 
