@@ -1,0 +1,154 @@
+From stable-bounces@linux.kernel.org Tue Feb 19 16:03:26 2008
+From: Thomas Gleixner <tglx@linutronix.de>
+Date: Wed, 20 Feb 2008 01:03:00 +0100 (CET)
+Subject: hrtimer: check relative timeouts for overflow
+To: Stable Team <stable@kernel.org>
+Message-ID: <alpine.LFD.1.00.0802200100000.7583@apollo.tec.linutronix.de>
+
+From: Thomas Gleixner <tglx@linutronix.de>
+
+commit: 5a7780e725d1bb4c3094fcc12f1c5c5faea1e988
+
+Various user space callers ask for relative timeouts. While we fixed
+that overflow issue in hrtimer_start(), the sites which convert
+relative user space values to absolute timeouts themself were uncovered.
+
+Instead of putting overflow checks into each place add a function
+which does the sanity checking and convert all affected callers to use
+it.
+
+Thanks to Frans Pop, who reported the problem and tested the fixes.
+
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Acked-by: Ingo Molnar <mingo@elte.hu>
+Tested-by: Frans Pop <elendil@planet.nl>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+
+---
+ include/linux/ktime.h |    2 ++
+ kernel/futex.c        |    2 +-
+ kernel/futex_compat.c |    2 +-
+ kernel/hrtimer.c      |   38 +++++++++++++++++++++-----------------
+ kernel/posix-timers.c |    8 +++++---
+ 5 files changed, 30 insertions(+), 22 deletions(-)
+
+--- a/include/linux/ktime.h
++++ b/include/linux/ktime.h
+@@ -310,6 +310,8 @@ static inline ktime_t ktime_sub_us(const
+ 	return ktime_sub_ns(kt, usec * 1000);
+ }
+ 
++extern ktime_t ktime_add_safe(const ktime_t lhs, const ktime_t rhs);
++
+ /*
+  * The resolution of the clocks. The resolution value is returned in
+  * the clock_getres() system call to give application programmers an
+--- a/kernel/futex.c
++++ b/kernel/futex.c
+@@ -2094,7 +2094,7 @@ asmlinkage long sys_futex(u32 __user *ua
+ 
+ 		t = timespec_to_ktime(ts);
+ 		if (cmd == FUTEX_WAIT)
+-			t = ktime_add(ktime_get(), t);
++			t = ktime_add_safe(ktime_get(), t);
+ 		tp = &t;
+ 	}
+ 	/*
+--- a/kernel/futex_compat.c
++++ b/kernel/futex_compat.c
+@@ -175,7 +175,7 @@ asmlinkage long compat_sys_futex(u32 __u
+ 
+ 		t = timespec_to_ktime(ts);
+ 		if (cmd == FUTEX_WAIT)
+-			t = ktime_add(ktime_get(), t);
++			t = ktime_add_safe(ktime_get(), t);
+ 		tp = &t;
+ 	}
+ 	if (cmd == FUTEX_REQUEUE || cmd == FUTEX_CMP_REQUEUE)
+--- a/kernel/hrtimer.c
++++ b/kernel/hrtimer.c
+@@ -325,6 +325,24 @@ unsigned long ktime_divns(const ktime_t 
+ }
+ #endif /* BITS_PER_LONG >= 64 */
+ 
++/*
++ * Add two ktime values and do a safety check for overflow:
++ */
++
++ktime_t ktime_add_safe(const ktime_t lhs, const ktime_t rhs)
++{
++	ktime_t res = ktime_add(lhs, rhs);
++
++	/*
++	 * We use KTIME_SEC_MAX here, the maximum timeout which we can
++	 * return to user space in a timespec:
++	 */
++	if (res.tv64 < 0 || res.tv64 < lhs.tv64 || res.tv64 < rhs.tv64)
++		res = ktime_set(KTIME_SEC_MAX, 0);
++
++	return res;
++}
++
+ /* High resolution timer related functions */
+ #ifdef CONFIG_HIGH_RES_TIMERS
+ 
+@@ -682,13 +700,7 @@ hrtimer_forward(struct hrtimer *timer, k
+ 		 */
+ 		orun++;
+ 	}
+-	timer->expires = ktime_add(timer->expires, interval);
+-	/*
+-	 * Make sure, that the result did not wrap with a very large
+-	 * interval.
+-	 */
+-	if (timer->expires.tv64 < 0)
+-		timer->expires = ktime_set(KTIME_SEC_MAX, 0);
++	timer->expires = ktime_add_safe(timer->expires, interval);
+ 
+ 	return orun;
+ }
+@@ -839,7 +851,7 @@ hrtimer_start(struct hrtimer *timer, kti
+ 	new_base = switch_hrtimer_base(timer, base);
+ 
+ 	if (mode == HRTIMER_MODE_REL) {
+-		tim = ktime_add(tim, new_base->get_time());
++		tim = ktime_add_safe(tim, new_base->get_time());
+ 		/*
+ 		 * CONFIG_TIME_LOW_RES is a temporary way for architectures
+ 		 * to signal that they simply return xtime in
+@@ -848,16 +860,8 @@ hrtimer_start(struct hrtimer *timer, kti
+ 		 * timeouts. This will go away with the GTOD framework.
+ 		 */
+ #ifdef CONFIG_TIME_LOW_RES
+-		tim = ktime_add(tim, base->resolution);
++		tim = ktime_add_safe(tim, base->resolution);
+ #endif
+-		/*
+-		 * Careful here: User space might have asked for a
+-		 * very long sleep, so the add above might result in a
+-		 * negative number, which enqueues the timer in front
+-		 * of the queue.
+-		 */
+-		if (tim.tv64 < 0)
+-			tim.tv64 = KTIME_MAX;
+ 	}
+ 	timer->expires = tim;
+ 
+--- a/kernel/posix-timers.c
++++ b/kernel/posix-timers.c
+@@ -766,9 +766,11 @@ common_timer_set(struct k_itimer *timr, 
+ 	/* SIGEV_NONE timers are not queued ! See common_timer_get */
+ 	if (((timr->it_sigev_notify & ~SIGEV_THREAD_ID) == SIGEV_NONE)) {
+ 		/* Setup correct expiry time for relative timers */
+-		if (mode == HRTIMER_MODE_REL)
+-			timer->expires = ktime_add(timer->expires,
+-						   timer->base->get_time());
++		if (mode == HRTIMER_MODE_REL) {
++			timer->expires =
++				ktime_add_safe(timer->expires,
++					       timer->base->get_time());
++		}
+ 		return 0;
+ 	}
+ 
