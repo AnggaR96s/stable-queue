@@ -1,0 +1,125 @@
+From stable-bounces@linux.kernel.org  Wed Mar 26 11:54:30 2008
+Date: Wed, 26 Mar 2008 18:35:10 GMT
+Message-Id: <200803261835.m2QIZA4F017424@hera.kernel.org>
+From: jejb@kernel.org
+To: jejb@kernel.org, stable@kernel.org
+Subject: NOHZ: reevaluate idle sleep length after add_timer_on()
+
+From: Thomas Gleixner <tglx@linutronix.de>
+
+upstream commit: 06d8308c61e54346585b2691c13ee3f90cb6fb2f
+
+add_timer_on() can add a timer on a CPU which is currently in a long
+idle sleep, but the timer wheel is not reevaluated by the nohz code on
+that CPU. So a timer can be delayed for quite a long time. This
+triggered a false positive in the clocksource watchdog code.
+
+To avoid this we need to wake up the idle CPU and enforce the
+reevaluation of the timer wheel for the next timer event.
+
+Add a function, which checks a given CPU for idle state, marks the
+idle task with NEED_RESCHED and sends a reschedule IPI to notify the
+other CPU of the change in the timer wheel.
+
+Call this function from add_timer_on().
+
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Acked-by: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Acked-by: Ingo Molnar <mingo@elte.hu>
+Signed-off-by: Chris Wright <chrisw@sous-sol.org>
+--
+ include/linux/sched.h |    6 ++++++
+ kernel/sched.c        |   43 +++++++++++++++++++++++++++++++++++++++++++
+ kernel/timer.c        |   10 +++++++++-
+ 3 files changed, 58 insertions(+), 1 deletion(-)
+---
+
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1449,6 +1449,12 @@ static inline void idle_task_exit(void) 
+ 
+ extern void sched_idle_next(void);
+ 
++#if defined(CONFIG_NO_HZ) && defined(CONFIG_SMP)
++extern void wake_up_idle_cpu(int cpu);
++#else
++static inline void wake_up_idle_cpu(int cpu) { }
++#endif
++
+ #ifdef CONFIG_SCHED_DEBUG
+ extern unsigned int sysctl_sched_latency;
+ extern unsigned int sysctl_sched_min_granularity;
+--- a/kernel/sched.c
++++ b/kernel/sched.c
+@@ -727,6 +727,49 @@ static void resched_cpu(int cpu)
+ 	resched_task(cpu_curr(cpu));
+ 	spin_unlock_irqrestore(&rq->lock, flags);
+ }
++
++#ifdef CONFIG_NO_HZ
++/*
++ * When add_timer_on() enqueues a timer into the timer wheel of an
++ * idle CPU then this timer might expire before the next timer event
++ * which is scheduled to wake up that CPU. In case of a completely
++ * idle system the next event might even be infinite time into the
++ * future. wake_up_idle_cpu() ensures that the CPU is woken up and
++ * leaves the inner idle loop so the newly added timer is taken into
++ * account when the CPU goes back to idle and evaluates the timer
++ * wheel for the next timer event.
++ */
++void wake_up_idle_cpu(int cpu)
++{
++	struct rq *rq = cpu_rq(cpu);
++
++	if (cpu == smp_processor_id())
++		return;
++
++	/*
++	 * This is safe, as this function is called with the timer
++	 * wheel base lock of (cpu) held. When the CPU is on the way
++	 * to idle and has not yet set rq->curr to idle then it will
++	 * be serialized on the timer wheel base lock and take the new
++	 * timer into account automatically.
++	 */
++	if (rq->curr != rq->idle)
++		return;
++
++	/*
++	 * We can set TIF_RESCHED on the idle task of the other CPU
++	 * lockless. The worst case is that the other CPU runs the
++	 * idle task through an additional NOOP schedule()
++	 */
++	set_tsk_thread_flag(rq->idle, TIF_NEED_RESCHED);
++
++	/* NEED_RESCHED must be visible before we test polling */
++	smp_mb();
++	if (!tsk_is_polling(rq->idle))
++		smp_send_reschedule(cpu);
++}
++#endif
++
+ #else
+ static inline void resched_task(struct task_struct *p)
+ {
+--- a/kernel/timer.c
++++ b/kernel/timer.c
+@@ -453,10 +453,18 @@ void add_timer_on(struct timer_list *tim
+ 	spin_lock_irqsave(&base->lock, flags);
+ 	timer_set_base(timer, base);
+ 	internal_add_timer(base, timer);
++	/*
++	 * Check whether the other CPU is idle and needs to be
++	 * triggered to reevaluate the timer wheel when nohz is
++	 * active. We are protected against the other CPU fiddling
++	 * with the timer by holding the timer base lock. This also
++	 * makes sure that a CPU on the way to idle can not evaluate
++	 * the timer wheel.
++	 */
++	wake_up_idle_cpu(cpu);
+ 	spin_unlock_irqrestore(&base->lock, flags);
+ }
+ 
+-
+ /**
+  * mod_timer - modify a timer's timeout
+  * @timer: the timer to be modified
