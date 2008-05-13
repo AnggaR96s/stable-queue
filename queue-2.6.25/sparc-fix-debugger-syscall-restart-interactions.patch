@@ -1,0 +1,684 @@
+From da98a7f13a001b4f7c7617107a5a044092770d55 Mon Sep 17 00:00:00 2001
+From: David S. Miller <davem@davemloft.net>
+Date: Sun, 11 May 2008 19:35:21 -0700
+Subject: [PATCH] sparc: Fix debugger syscall restart interactions.
+
+From: David S. Miller <davem@davemloft.net>
+
+[ This is a 2.6.25 backport of upstream changeset
+  28e6103665301ce60634e8a77f0b657c6cc099de with sparc32 build
+  fixes from Robert Reif ]
+
+So, forever, we've had this ptrace_signal_deliver implementation
+which tries to handle all of the nasties that can occur when the
+debugger looks at a process about to take a signal.  It's meant
+to address all of these issues inside of the kernel so that the
+debugger need not be mindful of such things.
+
+Problem is, this doesn't work.
+
+The idea was that we should do the syscall restart business first, so
+that the debugger captures that state.  Otherwise, if the debugger for
+example saves the child's state, makes the child execute something
+else, then restores the saved state, we won't handle the syscall
+restart properly because we lose the "we're in a syscall" state.
+
+The code here worked for most cases, but if the debugger actually
+passes the signal through to the child unaltered, it's possible that
+we would do a syscall restart when we shouldn't have.
+
+In particular this breaks the case of debugging a process under a gdb
+which is being debugged by yet another gdb.  gdb uses sigsuspend
+to wait for SIGCHLD of the inferior, but if gdb itself is being
+debugged by a top-level gdb we get a ptrace_stop().  The top-level gdb
+does a PTRACE_CONT with SIGCHLD to let the inferior gdb see the
+signal.  But ptrace_signal_deliver() assumed the debugger would cancel
+out the signal and therefore did a syscall restart, because the return
+error was ERESTARTNOHAND.
+
+Fix this by simply making ptrace_signal_deliver() a nop, and providing
+a way for the debugger to control system call restarting properly:
+
+1) Report a "in syscall" software bit in regs->{tstate,psr}.
+   It is set early on in trap entry to a system call and is fully
+   visible to the debugger via ptrace() and regsets.
+
+2) Test this bit right before doing a syscall restart.  We have
+   to do a final recheck right after get_signal_to_deliver() in
+   case the debugger cleared the bit during ptrace_stop().
+
+3) Clear the bit in trap return so we don't accidently try to set
+   that bit in the real register.
+
+As a result we also get a ptrace_{is,clear}_syscall() for sparc32 just
+like sparc64 has.
+
+M68K has this same exact bug, and is now the only other user of the
+ptrace_signal_deliver hook.  It needs to be fixed in the same exact
+way as sparc.
+
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ arch/sparc/kernel/entry.S       |    2 +
+ arch/sparc/kernel/ptrace.c      |    4 +-
+ arch/sparc/kernel/rtrap.S       |   11 ++++--
+ arch/sparc/kernel/signal.c      |   64 ++++++++++++++++---------------------
+ arch/sparc64/kernel/etrap.S     |    7 ++--
+ arch/sparc64/kernel/ptrace.c    |   12 ++++--
+ arch/sparc64/kernel/rtrap.S     |    1 
+ arch/sparc64/kernel/signal.c    |   69 +++++++++++++++++-----------------------
+ arch/sparc64/kernel/signal32.c  |   30 +++++++++++------
+ include/asm-sparc/psr.h         |    1 
+ include/asm-sparc/ptrace.h      |   12 ++++++
+ include/asm-sparc/signal.h      |    8 ----
+ include/asm-sparc64/psrcompat.h |    2 +
+ include/asm-sparc64/pstate.h    |    1 
+ include/asm-sparc64/ptrace.h    |   12 ++++++
+ include/asm-sparc64/signal.h    |    8 ----
+ include/asm-sparc64/ttable.h    |    7 ++--
+ 17 files changed, 136 insertions(+), 115 deletions(-)
+
+--- a/arch/sparc64/kernel/etrap.S
++++ b/arch/sparc64/kernel/etrap.S
+@@ -27,11 +27,12 @@
+ 
+ 		.text		
+ 		.align	64
+-		.globl	etrap, etrap_irq, etraptl1
++		.globl	etrap_syscall, etrap, etrap_irq, etraptl1
+ etrap:		rdpr	%pil, %g2
+-etrap_irq:
+-		TRAP_LOAD_THREAD_REG(%g6, %g1)
++etrap_irq:	clr	%g3
++etrap_syscall:	TRAP_LOAD_THREAD_REG(%g6, %g1)
+ 		rdpr	%tstate, %g1
++		or	%g1, %g3, %g1
+ 		sllx	%g2, 20, %g3
+ 		andcc	%g1, TSTATE_PRIV, %g0
+ 		or	%g1, %g3, %g1
+--- a/arch/sparc64/kernel/ptrace.c
++++ b/arch/sparc64/kernel/ptrace.c
+@@ -287,11 +287,11 @@ static int genregs64_set(struct task_str
+ 					 32 * sizeof(u64),
+ 					 33 * sizeof(u64));
+ 		if (!ret) {
+-			/* Only the condition codes can be modified
+-			 * in the %tstate register.
++			/* Only the condition codes and the "in syscall"
++			 * state can be modified in the %tstate register.
+ 			 */
+-			tstate &= (TSTATE_ICC | TSTATE_XCC);
+-			regs->tstate &= ~(TSTATE_ICC | TSTATE_XCC);
++			tstate &= (TSTATE_ICC | TSTATE_XCC | TSTATE_SYSCALL);
++			regs->tstate &= ~(TSTATE_ICC | TSTATE_XCC | TSTATE_SYSCALL);
+ 			regs->tstate |= tstate;
+ 		}
+ 	}
+@@ -657,8 +657,10 @@ static int genregs32_set(struct task_str
+ 		switch (pos) {
+ 		case 32: /* PSR */
+ 			tstate = regs->tstate;
+-			tstate &= ~(TSTATE_ICC | TSTATE_XCC);
++			tstate &= ~(TSTATE_ICC | TSTATE_XCC | TSTATE_SYSCALL);
+ 			tstate |= psr_to_tstate_icc(reg);
++			if (reg & PSR_SYSCALL)
++				tstate |= TSTATE_SYSCALL;
+ 			regs->tstate = tstate;
+ 			break;
+ 		case 33: /* PC */
+--- a/arch/sparc64/kernel/rtrap.S
++++ b/arch/sparc64/kernel/rtrap.S
+@@ -270,6 +270,7 @@ rt_continue:	ldx			[%sp + PTREGS_OFF + P
+ 		wr			%o3, %g0, %y
+ 		wrpr			%l4, 0x0, %pil
+ 		wrpr			%g0, 0x1, %tl
++		andn			%l1, TSTATE_SYSCALL, %l1
+ 		wrpr			%l1, %g0, %tstate
+ 		wrpr			%l2, %g0, %tpc
+ 		wrpr			%o2, %g0, %tnpc
+--- a/arch/sparc64/kernel/signal32.c
++++ b/arch/sparc64/kernel/signal32.c
+@@ -295,6 +295,9 @@ void do_new_sigreturn32(struct pt_regs *
+ 	regs->tstate &= ~(TSTATE_ICC|TSTATE_XCC);
+ 	regs->tstate |= psr_to_tstate_icc(psr);
+ 
++ 	/* Prevent syscall restart.  */
++ 	pt_regs_clear_syscall(regs);
++
+ 	err |= __get_user(fpu_save, &sf->fpu_save);
+ 	if (fpu_save)
+ 		err |= restore_fpu_state32(regs, &sf->fpu_state);
+@@ -448,6 +451,9 @@ asmlinkage void do_rt_sigreturn32(struct
+ 	regs->tstate &= ~(TSTATE_ICC|TSTATE_XCC);
+ 	regs->tstate |= psr_to_tstate_icc(psr);
+ 
++ 	/* Prevent syscall restart.  */
++ 	pt_regs_clear_syscall(regs);
++
+ 	err |= __get_user(fpu_save, &sf->fpu_save);
+ 	if (fpu_save)
+ 		err |= restore_fpu_state32(regs, &sf->fpu_state);
+@@ -1280,20 +1286,24 @@ static inline void syscall_restart32(uns
+  * mistake.
+  */
+ void do_signal32(sigset_t *oldset, struct pt_regs * regs,
+-		 unsigned long orig_i0, int restart_syscall)
++		 int restart_syscall, unsigned long orig_i0)
+ {
+-	siginfo_t info;
+-	struct signal_deliver_cookie cookie;
+ 	struct k_sigaction ka;
++	siginfo_t info;
+ 	int signr;
+ 	int svr4_signal = current->personality == PER_SVR4;
+ 	
+-	cookie.restart_syscall = restart_syscall;
+-	cookie.orig_i0 = orig_i0;
++	signr = get_signal_to_deliver(&info, &ka, regs, NULL);
++
++	/* If the debugger messes with the program counter, it clears
++	 * the "in syscall" bit, directing us to not perform a syscall
++	 * restart.
++	 */
++	if (restart_syscall && !pt_regs_is_syscall(regs))
++		restart_syscall = 0;
+ 
+-	signr = get_signal_to_deliver(&info, &ka, regs, &cookie);
+ 	if (signr > 0) {
+-		if (cookie.restart_syscall)
++		if (restart_syscall)
+ 			syscall_restart32(orig_i0, regs, &ka.sa);
+ 		handle_signal32(signr, &ka, &info, oldset,
+ 				regs, svr4_signal);
+@@ -1307,16 +1317,16 @@ void do_signal32(sigset_t *oldset, struc
+ 			clear_thread_flag(TIF_RESTORE_SIGMASK);
+ 		return;
+ 	}
+-	if (cookie.restart_syscall &&
++	if (restart_syscall &&
+ 	    (regs->u_regs[UREG_I0] == ERESTARTNOHAND ||
+ 	     regs->u_regs[UREG_I0] == ERESTARTSYS ||
+ 	     regs->u_regs[UREG_I0] == ERESTARTNOINTR)) {
+ 		/* replay the system call when we are done */
+-		regs->u_regs[UREG_I0] = cookie.orig_i0;
++		regs->u_regs[UREG_I0] = orig_i0;
+ 		regs->tpc -= 4;
+ 		regs->tnpc -= 4;
+ 	}
+-	if (cookie.restart_syscall &&
++	if (restart_syscall &&
+ 	    regs->u_regs[UREG_I0] == ERESTART_RESTARTBLOCK) {
+ 		regs->u_regs[UREG_G1] = __NR_restart_syscall;
+ 		regs->tpc -= 4;
+--- a/arch/sparc64/kernel/signal.c
++++ b/arch/sparc64/kernel/signal.c
+@@ -336,6 +336,9 @@ void do_rt_sigreturn(struct pt_regs *reg
+ 	regs->tpc = tpc;
+ 	regs->tnpc = tnpc;
+ 
++	/* Prevent syscall restart.  */
++	pt_regs_clear_syscall(regs);
++
+ 	sigdelsetmask(&set, ~_BLOCKABLE);
+ 	spin_lock_irq(&current->sighand->siglock);
+ 	current->blocked = set;
+@@ -500,7 +503,7 @@ static inline void handle_signal(unsigne
+ }
+ 
+ static inline void syscall_restart(unsigned long orig_i0, struct pt_regs *regs,
+-				     struct sigaction *sa)
++				   struct sigaction *sa)
+ {
+ 	switch (regs->u_regs[UREG_I0]) {
+ 	case ERESTART_RESTARTBLOCK:
+@@ -524,17 +527,20 @@ static inline void syscall_restart(unsig
+  * want to handle. Thus you cannot kill init even with a SIGKILL even by
+  * mistake.
+  */
+-static void do_signal(struct pt_regs *regs, unsigned long orig_i0, int restart_syscall)
++static void do_signal(struct pt_regs *regs, unsigned long orig_i0, int __ignored)
+ {
+-	siginfo_t info;
+-	struct signal_deliver_cookie cookie;
+ 	struct k_sigaction ka;
+-	int signr;
++	int restart_syscall;
+ 	sigset_t *oldset;
++	siginfo_t info;
++	int signr;
+ 	
+-	cookie.restart_syscall = restart_syscall;
+-	cookie.orig_i0 = orig_i0;
+-
++ 	if (pt_regs_is_syscall(regs) &&
++ 	    (regs->tstate & (TSTATE_XCARRY | TSTATE_ICARRY))) {
++ 		restart_syscall = 1;
++ 	} else
++ 		restart_syscall = 0;
++
+ 	if (test_thread_flag(TIF_RESTORE_SIGMASK))
+ 		oldset = &current->saved_sigmask;
+ 	else
+@@ -543,16 +549,24 @@ static void do_signal(struct pt_regs *re
+ #ifdef CONFIG_SPARC32_COMPAT
+ 	if (test_thread_flag(TIF_32BIT)) {
+ 		extern void do_signal32(sigset_t *, struct pt_regs *,
+-					unsigned long, int);
+-		do_signal32(oldset, regs, orig_i0,
+-			    cookie.restart_syscall);
++					int restart_syscall,
++					unsigned long orig_i0);
++		do_signal32(oldset, regs, restart_syscall, orig_i0);
+ 		return;
+ 	}
+ #endif	
+ 
+-	signr = get_signal_to_deliver(&info, &ka, regs, &cookie);
++	signr = get_signal_to_deliver(&info, &ka, regs, NULL);
++
++	/* If the debugger messes with the program counter, it clears
++	 * the software "in syscall" bit, directing us to not perform
++	 * a syscall restart.
++	 */
++	if (restart_syscall && !pt_regs_is_syscall(regs))
++		restart_syscall = 0;
++
+ 	if (signr > 0) {
+-		if (cookie.restart_syscall)
++		if (restart_syscall)
+ 			syscall_restart(orig_i0, regs, &ka.sa);
+ 		handle_signal(signr, &ka, &info, oldset, regs);
+ 
+@@ -565,16 +579,16 @@ static void do_signal(struct pt_regs *re
+ 			clear_thread_flag(TIF_RESTORE_SIGMASK);
+ 		return;
+ 	}
+-	if (cookie.restart_syscall &&
++	if (restart_syscall &&
+ 	    (regs->u_regs[UREG_I0] == ERESTARTNOHAND ||
+ 	     regs->u_regs[UREG_I0] == ERESTARTSYS ||
+ 	     regs->u_regs[UREG_I0] == ERESTARTNOINTR)) {
+ 		/* replay the system call when we are done */
+-		regs->u_regs[UREG_I0] = cookie.orig_i0;
++		regs->u_regs[UREG_I0] = orig_i0;
+ 		regs->tpc -= 4;
+ 		regs->tnpc -= 4;
+ 	}
+-	if (cookie.restart_syscall &&
++	if (restart_syscall &&
+ 	    regs->u_regs[UREG_I0] == ERESTART_RESTARTBLOCK) {
+ 		regs->u_regs[UREG_G1] = __NR_restart_syscall;
+ 		regs->tpc -= 4;
+@@ -596,26 +610,3 @@ void do_notify_resume(struct pt_regs *re
+ 	if (thread_info_flags & (_TIF_SIGPENDING | _TIF_RESTORE_SIGMASK))
+ 		do_signal(regs, orig_i0, restart_syscall);
+ }
+-
+-void ptrace_signal_deliver(struct pt_regs *regs, void *cookie)
+-{
+-	struct signal_deliver_cookie *cp = cookie;
+-
+-	if (cp->restart_syscall &&
+-	    (regs->u_regs[UREG_I0] == ERESTARTNOHAND ||
+-	     regs->u_regs[UREG_I0] == ERESTARTSYS ||
+-	     regs->u_regs[UREG_I0] == ERESTARTNOINTR)) {
+-		/* replay the system call when we are done */
+-		regs->u_regs[UREG_I0] = cp->orig_i0;
+-		regs->tpc -= 4;
+-		regs->tnpc -= 4;
+-		cp->restart_syscall = 0;
+-	}
+-	if (cp->restart_syscall &&
+-	    regs->u_regs[UREG_I0] == ERESTART_RESTARTBLOCK) {
+-		regs->u_regs[UREG_G1] = __NR_restart_syscall;
+-		regs->tpc -= 4;
+-		regs->tnpc -= 4;
+-		cp->restart_syscall = 0;
+-	}
+-}
+--- a/arch/sparc/kernel/entry.S
++++ b/arch/sparc/kernel/entry.S
+@@ -1398,6 +1398,8 @@ ret_from_fork:
+ 	.align	4
+ 	.globl	linux_sparc_syscall
+ linux_sparc_syscall:
++	sethi	%hi(PSR_SYSCALL), %l4
++	or	%l0, %l4, %l0
+ 	/* Direct access to user regs, must faster. */
+ 	cmp	%g1, NR_SYSCALLS
+ 	bgeu	linux_sparc_ni_syscall
+--- a/arch/sparc/kernel/ptrace.c
++++ b/arch/sparc/kernel/ptrace.c
+@@ -170,8 +170,8 @@ static int genregs32_set(struct task_str
+ 		switch (pos) {
+ 		case 32: /* PSR */
+ 			psr = regs->psr;
+-			psr &= ~PSR_ICC;
+-			psr |= (reg & PSR_ICC);
++			psr &= ~(PSR_ICC | PSR_SYSCALL);
++			psr |= (reg & (PSR_ICC | PSR_SYSCALL));
+ 			regs->psr = psr;
+ 			break;
+ 		case 33: /* PC */
+--- a/arch/sparc/kernel/rtrap.S
++++ b/arch/sparc/kernel/rtrap.S
+@@ -50,8 +50,9 @@ rtrap_7win_patch5:	and	%g1, 0x7f, %g1
+ ret_trap_entry:
+ ret_trap_lockless_ipi:
+ 	andcc	%t_psr, PSR_PS, %g0
++	sethi	%hi(PSR_SYSCALL), %g1
+ 	be	1f
+-	 nop
++	 andn	%t_psr, %g1, %t_psr
+ 
+ 	wr	%t_psr, 0x0, %psr
+ 	b	ret_trap_kernel
+@@ -73,7 +74,6 @@ signal_p:
+ 	 ld	[%sp + STACKFRAME_SZ + PT_PSR], %t_psr
+ 
+ 	mov	%l5, %o1
+-	mov	%l6, %o2
+ 	call	do_signal
+ 	 add	%sp, STACKFRAME_SZ, %o0	! pt_regs ptr
+ 
+@@ -81,6 +81,8 @@ signal_p:
+ 	ld	[%sp + STACKFRAME_SZ + PT_PSR], %t_psr
+ 	clr	%l6
+ ret_trap_continue:
++	sethi	%hi(PSR_SYSCALL), %g1
++	andn	%t_psr, %g1, %t_psr
+ 	wr	%t_psr, 0x0, %psr
+ 	WRITE_PAUSE
+ 
+@@ -137,8 +139,9 @@ ret_trap_userwins_ok:
+ 	LOAD_PT_PRIV(sp, t_psr, t_pc, t_npc)
+ 	or	%t_pc, %t_npc, %g2
+ 	andcc	%g2, 0x3, %g0
++	sethi	%hi(PSR_SYSCALL), %g2
+ 	be	1f
+-	 nop
++	 andn	%t_psr, %g2, %t_psr
+ 
+ 	b	ret_trap_unaligned_pc
+ 	 add	%sp, STACKFRAME_SZ, %o0
+@@ -201,6 +204,8 @@ rtrap_patch5:	and	%g1, 0xff, %g1
+ 1:
+ 	LOAD_PT_ALL(sp, t_psr, t_pc, t_npc, g1)
+ 2:
++	sethi	%hi(PSR_SYSCALL), %twin_tmp1
++	andn	%t_psr, %twin_tmp1, %t_psr
+ 	wr	%t_psr, 0x0, %psr
+ 	WRITE_PAUSE
+ 
+--- a/arch/sparc/kernel/signal.c
++++ b/arch/sparc/kernel/signal.c
+@@ -178,6 +178,9 @@ static inline void do_new_sigreturn (str
+ 	regs->psr = (up_psr & ~(PSR_ICC | PSR_EF))
+ 		  | (regs->psr & (PSR_ICC | PSR_EF));
+ 
++	/* Prevent syscall restart.  */
++	pt_regs_clear_syscall(regs);
++
+ 	err |= __get_user(fpu_save, &sf->fpu_save);
+ 
+ 	if (fpu_save)
+@@ -299,6 +302,9 @@ asmlinkage void do_rt_sigreturn(struct p
+ 
+ 	regs->psr = (regs->psr & ~PSR_ICC) | (psr & PSR_ICC);
+ 
++	/* Prevent syscall restart.  */
++	pt_regs_clear_syscall(regs);
++
+ 	err |= __get_user(fpu_save, &sf->fpu_save);
+ 
+ 	if (fpu_save)
+@@ -1008,13 +1014,13 @@ static inline void syscall_restart(unsig
+  * want to handle. Thus you cannot kill init even with a SIGKILL even by
+  * mistake.
+  */
+-asmlinkage void do_signal(struct pt_regs * regs, unsigned long orig_i0, int restart_syscall)
++asmlinkage void do_signal(struct pt_regs * regs, unsigned long orig_i0)
+ {
+-	siginfo_t info;
+-	struct sparc_deliver_cookie cookie;
+ 	struct k_sigaction ka;
+-	int signr;
++	int restart_syscall;
+ 	sigset_t *oldset;
++	siginfo_t info;
++	int signr;
+ 
+ 	/*
+ 	 * XXX Disable svr4 signal handling until solaris emulation works.
+@@ -1027,18 +1033,28 @@ asmlinkage void do_signal(struct pt_regs
+ 	int svr4_signal = current->personality == PER_SVR4;
+ #endif
+ 
+-	cookie.restart_syscall = restart_syscall;
+-	cookie.orig_i0 = orig_i0;
++ 	if (pt_regs_is_syscall(regs) && (regs->psr & PSR_C))
++ 		restart_syscall = 1;
++ 	else
++ 		restart_syscall = 0;
+ 
+ 	if (test_thread_flag(TIF_RESTORE_SIGMASK))
+ 		oldset = &current->saved_sigmask;
+ 	else
+ 		oldset = &current->blocked;
+ 
+-	signr = get_signal_to_deliver(&info, &ka, regs, &cookie);
++ 	signr = get_signal_to_deliver(&info, &ka, regs, NULL);
++
++ 	/* If the debugger messes with the program counter, it clears
++ 	 * the software "in syscall" bit, directing us to not perform
++ 	 * a syscall restart.
++ 	 */
++ 	if (restart_syscall && !pt_regs_is_syscall(regs))
++ 		restart_syscall = 0;
++
+ 	if (signr > 0) {
+-		if (cookie.restart_syscall)
+-			syscall_restart(cookie.orig_i0, regs, &ka.sa);
++		if (restart_syscall)
++			syscall_restart(orig_i0, regs, &ka.sa);
+ 		handle_signal(signr, &ka, &info, oldset,
+ 			      regs, svr4_signal);
+ 		/* a signal was successfully delivered; the saved
+@@ -1050,16 +1066,16 @@ asmlinkage void do_signal(struct pt_regs
+ 			clear_thread_flag(TIF_RESTORE_SIGMASK);
+ 		return;
+ 	}
+-	if (cookie.restart_syscall &&
++	if (restart_syscall &&
+ 	    (regs->u_regs[UREG_I0] == ERESTARTNOHAND ||
+ 	     regs->u_regs[UREG_I0] == ERESTARTSYS ||
+ 	     regs->u_regs[UREG_I0] == ERESTARTNOINTR)) {
+ 		/* replay the system call when we are done */
+-		regs->u_regs[UREG_I0] = cookie.orig_i0;
++		regs->u_regs[UREG_I0] = orig_i0;
+ 		regs->pc -= 4;
+ 		regs->npc -= 4;
+ 	}
+-	if (cookie.restart_syscall &&
++	if (restart_syscall &&
+ 	    regs->u_regs[UREG_I0] == ERESTART_RESTARTBLOCK) {
+ 		regs->u_regs[UREG_G1] = __NR_restart_syscall;
+ 		regs->pc -= 4;
+@@ -1111,27 +1127,3 @@ do_sys_sigstack(struct sigstack __user *
+ out:
+ 	return ret;
+ }
+-
+-void ptrace_signal_deliver(struct pt_regs *regs, void *cookie)
+-{
+-	struct sparc_deliver_cookie *cp = cookie;
+-
+-	if (cp->restart_syscall &&
+-	    (regs->u_regs[UREG_I0] == ERESTARTNOHAND ||
+-	     regs->u_regs[UREG_I0] == ERESTARTSYS ||
+-	     regs->u_regs[UREG_I0] == ERESTARTNOINTR)) {
+-		/* replay the system call when we are done */
+-		regs->u_regs[UREG_I0] = cp->orig_i0;
+-		regs->pc -= 4;
+-		regs->npc -= 4;
+-		cp->restart_syscall = 0;
+-	}
+-
+-	if (cp->restart_syscall &&
+-	    regs->u_regs[UREG_I0] == ERESTART_RESTARTBLOCK) {
+-		regs->u_regs[UREG_G1] = __NR_restart_syscall;
+-		regs->pc -= 4;
+-		regs->npc -= 4;
+-		cp->restart_syscall = 0;
+-	}
+-}
+--- a/include/asm-sparc64/psrcompat.h
++++ b/include/asm-sparc64/psrcompat.h
+@@ -12,6 +12,7 @@
+ #define PSR_PIL     0x00000f00         /* processor interrupt level  */
+ #define PSR_EF      0x00001000         /* enable floating point      */
+ #define PSR_EC      0x00002000         /* enable co-processor        */
++#define PSR_SYSCALL 0x00004000         /* inside of a syscall        */
+ #define PSR_LE      0x00008000         /* SuperSparcII little-endian */
+ #define PSR_ICC     0x00f00000         /* integer condition codes    */
+ #define PSR_C       0x00100000         /* carry bit                  */
+@@ -30,6 +31,7 @@ static inline unsigned int tstate_to_psr
+ 		PSR_S					|
+ 		((tstate & TSTATE_ICC) >> 12)		|
+ 		((tstate & TSTATE_XCC) >> 20)		|
++		((tstate & TSTATE_SYSCALL) ? PSR_SYSCALL : 0) |
+ 		PSR_V8PLUS);
+ }
+ 
+--- a/include/asm-sparc64/pstate.h
++++ b/include/asm-sparc64/pstate.h
+@@ -62,6 +62,7 @@
+ #define TSTATE_PRIV	_AC(0x0000000000000400,UL) /* Privilege.	*/
+ #define TSTATE_IE	_AC(0x0000000000000200,UL) /* Interrupt Enable.	*/
+ #define TSTATE_AG	_AC(0x0000000000000100,UL) /* Alternate Globals.*/
++#define TSTATE_SYSCALL	_AC(0x0000000000000020,UL) /* in syscall trap   */
+ #define TSTATE_CWP	_AC(0x000000000000001f,UL) /* Curr Win-Pointer.	*/
+ 
+ /* Floating-Point Registers State Register.
+--- a/include/asm-sparc64/ptrace.h
++++ b/include/asm-sparc64/ptrace.h
+@@ -10,6 +10,8 @@
+ 
+ #ifndef __ASSEMBLY__
+ 
++#include <linux/types.h>
++
+ struct pt_regs {
+ 	unsigned long u_regs[16]; /* globals and ins */
+ 	unsigned long tstate;
+@@ -27,6 +29,16 @@ struct pt_regs32 {
+ 	unsigned int u_regs[16]; /* globals and ins */
+ };
+ 
++static inline bool pt_regs_is_syscall(struct pt_regs *regs)
++{
++	return (regs->tstate & TSTATE_SYSCALL);
++}
++
++static inline bool pt_regs_clear_syscall(struct pt_regs *regs)
++{
++	return (regs->tstate &= ~TSTATE_SYSCALL);
++}
++
+ #define UREG_G0        0
+ #define UREG_G1        1
+ #define UREG_G2        2
+--- a/include/asm-sparc64/signal.h
++++ b/include/asm-sparc64/signal.h
+@@ -186,13 +186,7 @@ struct k_sigaction {
+ 	void __user		*ka_restorer;
+ };
+ 
+-struct signal_deliver_cookie {
+-	int restart_syscall;
+-	unsigned long orig_i0;
+-};
+-
+-struct pt_regs;
+-extern void ptrace_signal_deliver(struct pt_regs *regs, void *cookie);
++#define ptrace_signal_deliver(regs, cookie) do { } while (0)
+ 
+ #endif /* !(__KERNEL__) */
+ 
+--- a/include/asm-sparc64/ttable.h
++++ b/include/asm-sparc64/ttable.h
+@@ -91,13 +91,14 @@
+ 	 clr	%l6;
+ 	
+ #define SYSCALL_TRAP(routine, systbl)			\
++	rdpr	%pil, %g2;				\
++	mov	TSTATE_SYSCALL, %g3;			\
+ 	sethi	%hi(109f), %g7;				\
+-	ba,pt	%xcc, etrap;				\
++	ba,pt	%xcc, etrap_syscall;			\
+ 109:	 or	%g7, %lo(109b), %g7;			\
+ 	sethi	%hi(systbl), %l7;			\
+ 	ba,pt	%xcc, routine;				\
+-	 or	%l7, %lo(systbl), %l7;			\
+-	nop; nop;
++	 or	%l7, %lo(systbl), %l7;
+ 	
+ #define INDIRECT_SOLARIS_SYSCALL(num)			\
+ 	sethi	%hi(109f), %g7;				\
+--- a/include/asm-sparc/psr.h
++++ b/include/asm-sparc/psr.h
+@@ -25,6 +25,7 @@
+ #define PSR_PIL     0x00000f00         /* processor interrupt level  */
+ #define PSR_EF      0x00001000         /* enable floating point      */
+ #define PSR_EC      0x00002000         /* enable co-processor        */
++#define PSR_SYSCALL 0x00004000         /* inside of a syscall        */
+ #define PSR_LE      0x00008000         /* SuperSparcII little-endian */
+ #define PSR_ICC     0x00f00000         /* integer condition codes    */
+ #define PSR_C       0x00100000         /* carry bit                  */
+--- a/include/asm-sparc/ptrace.h
++++ b/include/asm-sparc/ptrace.h
+@@ -10,6 +10,8 @@
+ 
+ #ifndef __ASSEMBLY__
+ 
++#include <linux/types.h>
++
+ struct pt_regs {
+ 	unsigned long psr;
+ 	unsigned long pc;
+@@ -39,6 +41,16 @@ struct pt_regs {
+ #define UREG_FP        UREG_I6
+ #define UREG_RETPC     UREG_I7
+ 
++static inline bool pt_regs_is_syscall(struct pt_regs *regs)
++{
++	return (regs->psr & PSR_SYSCALL);
++}
++
++static inline bool pt_regs_clear_syscall(struct pt_regs *regs)
++{
++	return (regs->psr &= ~PSR_SYSCALL);
++}
++
+ /* A register window */
+ struct reg_window {
+ 	unsigned long locals[8];
+--- a/include/asm-sparc/signal.h
++++ b/include/asm-sparc/signal.h
+@@ -199,13 +199,7 @@ typedef struct sigaltstack {
+ 	size_t		ss_size;
+ } stack_t;
+ 
+-struct sparc_deliver_cookie {
+-	int restart_syscall;
+-	unsigned long orig_i0;
+-};
+-
+-struct pt_regs;
+-extern void ptrace_signal_deliver(struct pt_regs *regs, void *cookie);
++#define ptrace_signal_deliver(regs, cookie) do { } while (0)
+ 
+ #endif /* !(__KERNEL__) */
+ 
