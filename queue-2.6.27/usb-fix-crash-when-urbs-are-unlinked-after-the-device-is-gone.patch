@@ -1,0 +1,162 @@
+From jejb@kernel.org  Tue Nov  4 11:35:41 2008
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Thu, 30 Oct 2008 19:10:11 GMT
+Subject: USB: fix crash when URBs are unlinked after the device is gone
+To: jejb@kernel.org, stable@kernel.org
+Message-ID: <200810301910.m9UJAB0k013078@hera.kernel.org>
+
+From: Alan Stern <stern@rowland.harvard.edu>
+
+commit cde217a556ec552d28ac9e136c5a94684a69ae94 upstream
+
+This patch (as1151) protects usbcore against drivers that try to
+unlink an URB after the URB's device or bus have been removed.  The
+core does not currently check for this, and certain drivers can cause
+a crash if they are running while an HCD is unloaded.
+
+Certainly it would be best to fix the guilty drivers.  But a little
+defensive programming doesn't hurt, especially since it appears that
+quite a few drivers need to be fixed.
+
+The patch prevents the problem by grabbing a reference to the device
+while an unlink is in progress and using a new spinlock to synchronize
+unlinks with device removal.  (There's no need to acquire a reference
+to the bus as well, since the device structure itself keeps a
+reference to the bus.)  In addition, the kerneldoc is updated to
+indicate that URBs should not be unlinked after the disconnect method
+returns.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/hcd.c |   35 ++++++++++++++++++++++++++++++++---
+ drivers/usb/core/hcd.h |    1 +
+ drivers/usb/core/hub.c |    1 +
+ drivers/usb/core/urb.c |   15 +++++++++++++++
+ 4 files changed, 49 insertions(+), 3 deletions(-)
+
+--- a/drivers/usb/core/hcd.c
++++ b/drivers/usb/core/hcd.c
+@@ -106,6 +106,9 @@ static DEFINE_SPINLOCK(hcd_root_hub_lock
+ /* used when updating an endpoint's URB list */
+ static DEFINE_SPINLOCK(hcd_urb_list_lock);
+ 
++/* used to protect against unlinking URBs after the device is gone */
++static DEFINE_SPINLOCK(hcd_urb_unlink_lock);
++
+ /* wait queue for synchronous unlinks */
+ DECLARE_WAIT_QUEUE_HEAD(usb_kill_urb_queue);
+ 
+@@ -1377,10 +1380,25 @@ static int unlink1(struct usb_hcd *hcd, 
+ int usb_hcd_unlink_urb (struct urb *urb, int status)
+ {
+ 	struct usb_hcd		*hcd;
+-	int			retval;
++	int			retval = -EIDRM;
++	unsigned long		flags;
+ 
+-	hcd = bus_to_hcd(urb->dev->bus);
+-	retval = unlink1(hcd, urb, status);
++	/* Prevent the device and bus from going away while
++	 * the unlink is carried out.  If they are already gone
++	 * then urb->use_count must be 0, since disconnected
++	 * devices can't have any active URBs.
++	 */
++	spin_lock_irqsave(&hcd_urb_unlink_lock, flags);
++	if (atomic_read(&urb->use_count) > 0) {
++		retval = 0;
++		usb_get_dev(urb->dev);
++	}
++	spin_unlock_irqrestore(&hcd_urb_unlink_lock, flags);
++	if (retval == 0) {
++		hcd = bus_to_hcd(urb->dev->bus);
++		retval = unlink1(hcd, urb, status);
++		usb_put_dev(urb->dev);
++	}
+ 
+ 	if (retval == 0)
+ 		retval = -EINPROGRESS;
+@@ -1529,6 +1547,17 @@ void usb_hcd_disable_endpoint(struct usb
+ 		hcd->driver->endpoint_disable(hcd, ep);
+ }
+ 
++/* Protect against drivers that try to unlink URBs after the device
++ * is gone, by waiting until all unlinks for @udev are finished.
++ * Since we don't currently track URBs by device, simply wait until
++ * nothing is running in the locked region of usb_hcd_unlink_urb().
++ */
++void usb_hcd_synchronize_unlinks(struct usb_device *udev)
++{
++	spin_lock_irq(&hcd_urb_unlink_lock);
++	spin_unlock_irq(&hcd_urb_unlink_lock);
++}
++
+ /*-------------------------------------------------------------------------*/
+ 
+ /* called in any context */
+--- a/drivers/usb/core/hcd.h
++++ b/drivers/usb/core/hcd.h
+@@ -232,6 +232,7 @@ extern void usb_hcd_flush_endpoint(struc
+ 		struct usb_host_endpoint *ep);
+ extern void usb_hcd_disable_endpoint(struct usb_device *udev,
+ 		struct usb_host_endpoint *ep);
++extern void usb_hcd_synchronize_unlinks(struct usb_device *udev);
+ extern int usb_hcd_get_frame_number(struct usb_device *udev);
+ 
+ extern struct usb_hcd *usb_create_hcd(const struct hc_driver *driver,
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -1349,6 +1349,7 @@ void usb_disconnect(struct usb_device **
+ 	 */
+ 	dev_dbg (&udev->dev, "unregistering device\n");
+ 	usb_disable_device(udev, 0);
++	usb_hcd_synchronize_unlinks(udev);
+ 
+ 	usb_unlock_device(udev);
+ 
+--- a/drivers/usb/core/urb.c
++++ b/drivers/usb/core/urb.c
+@@ -465,6 +465,12 @@ EXPORT_SYMBOL_GPL(usb_submit_urb);
+  * indicating that the request has been canceled (rather than any other
+  * code).
+  *
++ * Drivers should not call this routine or related routines, such as
++ * usb_kill_urb() or usb_unlink_anchored_urbs(), after their disconnect
++ * method has returned.  The disconnect function should synchronize with
++ * a driver's I/O routines to insure that all URB-related activity has
++ * completed before it returns.
++ *
+  * This request is always asynchronous.  Success is indicated by
+  * returning -EINPROGRESS, at which time the URB will probably not yet
+  * have been given back to the device driver.  When it is eventually
+@@ -541,6 +547,9 @@ EXPORT_SYMBOL_GPL(usb_unlink_urb);
+  * This routine may not be used in an interrupt context (such as a bottom
+  * half or a completion handler), or when holding a spinlock, or in other
+  * situations where the caller can't schedule().
++ *
++ * This routine should not be called by a driver after its disconnect
++ * method has returned.
+  */
+ void usb_kill_urb(struct urb *urb)
+ {
+@@ -568,6 +577,9 @@ EXPORT_SYMBOL_GPL(usb_kill_urb);
+  *
+  * this allows all outstanding URBs to be killed starting
+  * from the back of the queue
++ *
++ * This routine should not be called by a driver after its disconnect
++ * method has returned.
+  */
+ void usb_kill_anchored_urbs(struct usb_anchor *anchor)
+ {
+@@ -597,6 +609,9 @@ EXPORT_SYMBOL_GPL(usb_kill_anchored_urbs
+  * from the back of the queue. This function is asynchronous.
+  * The unlinking is just tiggered. It may happen after this
+  * function has returned.
++ *
++ * This routine should not be called by a driver after its disconnect
++ * method has returned.
+  */
+ void usb_unlink_anchored_urbs(struct usb_anchor *anchor)
+ {
