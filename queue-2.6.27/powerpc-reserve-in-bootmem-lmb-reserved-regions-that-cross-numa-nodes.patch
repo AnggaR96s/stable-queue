@@ -1,0 +1,189 @@
+From 8f64e1f2d1e09267ac926e15090fd505c1c0cbcb Mon Sep 17 00:00:00 2001
+From: Jon Tollefson <kniht@linux.vnet.ibm.com>
+Date: Thu, 9 Oct 2008 10:18:40 +0000
+Subject: powerpc: Reserve in bootmem lmb reserved regions that cross NUMA nodes
+
+From: Jon Tollefson <kniht@linux.vnet.ibm.com>
+
+commit 8f64e1f2d1e09267ac926e15090fd505c1c0cbcb upstream
+
+If there are multiple reserved memory blocks via lmb_reserve() that are
+contiguous addresses and on different NUMA nodes we are losing track of which
+address ranges to reserve in bootmem on which node.  I discovered this
+when I recently got to try 16GB huge pages on a system with more then 2 nodes.
+
+When scanning the device tree in early boot we call lmb_reserve() with
+the addresses of the 16G pages that we find so that the memory doesn't
+get used for something else.  For example the addresses for the pages
+could be 4000000000, 4400000000, 4800000000, 4C00000000, etc - 8 pages,
+one on each of eight nodes.  In the lmb after all the pages have been
+reserved it will look something like the following:
+
+lmb_dump_all:
+    memory.cnt            = 0x2
+    memory.size           = 0x3e80000000
+    memory.region[0x0].base       = 0x0
+                      .size     = 0x1e80000000
+    memory.region[0x1].base       = 0x4000000000
+                      .size     = 0x2000000000
+    reserved.cnt          = 0x5
+    reserved.size         = 0x3e80000000
+    reserved.region[0x0].base       = 0x0
+                      .size     = 0x7b5000
+    reserved.region[0x1].base       = 0x2a00000
+                      .size     = 0x78c000
+    reserved.region[0x2].base       = 0x328c000
+                      .size     = 0x43000
+    reserved.region[0x3].base       = 0xf4e8000
+                      .size     = 0xb18000
+    reserved.region[0x4].base       = 0x4000000000
+                      .size     = 0x2000000000
+
+The reserved.region[0x4] contains the 16G pages.  In
+arch/powerpc/mm/num.c: do_init_bootmem() we loop through each of the
+node numbers looking for the reserved regions that belong to the
+particular node.  It is not able to identify region 0x4 as being a part
+of each of the 8 nodes.  It is assuming that a reserved region is only
+on a single node.
+
+This patch takes out the reserved region loop from inside
+the loop that goes over each node.  It looks up the active region containing
+the start of the reserved region.  If it extends past that active region then
+it adjusts the size and gets the next active region containing it.
+
+Signed-off-by: Jon Tollefson <kniht@linux.vnet.ibm.com>
+Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ arch/powerpc/mm/numa.c |  108 ++++++++++++++++++++++++++++++++++++-------------
+ 1 file changed, 80 insertions(+), 28 deletions(-)
+
+--- a/arch/powerpc/mm/numa.c
++++ b/arch/powerpc/mm/numa.c
+@@ -89,6 +89,46 @@ static int __cpuinit fake_numa_create_ne
+ 	return 0;
+ }
+ 
++/*
++ * get_active_region_work_fn - A helper function for get_node_active_region
++ *	Returns datax set to the start_pfn and end_pfn if they contain
++ *	the initial value of datax->start_pfn between them
++ * @start_pfn: start page(inclusive) of region to check
++ * @end_pfn: end page(exclusive) of region to check
++ * @datax: comes in with ->start_pfn set to value to search for and
++ *	goes out with active range if it contains it
++ * Returns 1 if search value is in range else 0
++ */
++static int __init get_active_region_work_fn(unsigned long start_pfn,
++					unsigned long end_pfn, void *datax)
++{
++	struct node_active_region *data;
++	data = (struct node_active_region *)datax;
++
++	if (start_pfn <= data->start_pfn && end_pfn > data->start_pfn) {
++		data->start_pfn = start_pfn;
++		data->end_pfn = end_pfn;
++		return 1;
++	}
++	return 0;
++
++}
++
++/*
++ * get_node_active_region - Return active region containing start_pfn
++ * @start_pfn: The page to return the region for.
++ * @node_ar: Returned set to the active region containing start_pfn
++ */
++static void __init get_node_active_region(unsigned long start_pfn,
++		       struct node_active_region *node_ar)
++{
++	int nid = early_pfn_to_nid(start_pfn);
++
++	node_ar->nid = nid;
++	node_ar->start_pfn = start_pfn;
++	work_with_active_regions(nid, get_active_region_work_fn, node_ar);
++}
++
+ static void __cpuinit map_cpu_to_node(int cpu, int node)
+ {
+ 	numa_cpu_lookup_table[cpu] = node;
+@@ -837,38 +877,50 @@ void __init do_init_bootmem(void)
+ 				  start_pfn, end_pfn);
+ 
+ 		free_bootmem_with_active_regions(nid, end_pfn);
++	}
+ 
+-		/* Mark reserved regions on this node */
+-		for (i = 0; i < lmb.reserved.cnt; i++) {
+-			unsigned long physbase = lmb.reserved.region[i].base;
+-			unsigned long size = lmb.reserved.region[i].size;
+-			unsigned long start_paddr = start_pfn << PAGE_SHIFT;
+-			unsigned long end_paddr = end_pfn << PAGE_SHIFT;
+-
+-			if (early_pfn_to_nid(physbase >> PAGE_SHIFT) != nid &&
+-			    early_pfn_to_nid((physbase+size-1) >> PAGE_SHIFT) != nid)
+-				continue;
+-
+-			if (physbase < end_paddr &&
+-			    (physbase+size) > start_paddr) {
+-				/* overlaps */
+-				if (physbase < start_paddr) {
+-					size -= start_paddr - physbase;
+-					physbase = start_paddr;
+-				}
+-
+-				if (size > end_paddr - physbase)
+-					size = end_paddr - physbase;
+-
+-				dbg("reserve_bootmem %lx %lx\n", physbase,
+-				    size);
+-				reserve_bootmem_node(NODE_DATA(nid), physbase,
+-						     size, BOOTMEM_DEFAULT);
+-			}
++	/* Mark reserved regions */
++	for (i = 0; i < lmb.reserved.cnt; i++) {
++		unsigned long physbase = lmb.reserved.region[i].base;
++		unsigned long size = lmb.reserved.region[i].size;
++		unsigned long start_pfn = physbase >> PAGE_SHIFT;
++		unsigned long end_pfn = ((physbase + size) >> PAGE_SHIFT);
++		struct node_active_region node_ar;
++
++		get_node_active_region(start_pfn, &node_ar);
++		while (start_pfn < end_pfn) {
++			/*
++			 * if reserved region extends past active region
++			 * then trim size to active region
++			 */
++			if (end_pfn > node_ar.end_pfn)
++				size = (node_ar.end_pfn << PAGE_SHIFT)
++					- (start_pfn << PAGE_SHIFT);
++			dbg("reserve_bootmem %lx %lx nid=%d\n", physbase, size,
++				node_ar.nid);
++			reserve_bootmem_node(NODE_DATA(node_ar.nid), physbase,
++						size, BOOTMEM_DEFAULT);
++			/*
++			 * if reserved region is contained in the active region
++			 * then done.
++			 */
++			if (end_pfn <= node_ar.end_pfn)
++				break;
++
++			/*
++			 * reserved region extends past the active region
++			 *   get next active region that contains this
++			 *   reserved region
++			 */
++			start_pfn = node_ar.end_pfn;
++			physbase = start_pfn << PAGE_SHIFT;
++			get_node_active_region(start_pfn, &node_ar);
+ 		}
+ 
+-		sparse_memory_present_with_active_regions(nid);
+ 	}
++
++	for_each_online_node(nid)
++		sparse_memory_present_with_active_regions(nid);
+ }
+ 
+ void __init paging_init(void)
