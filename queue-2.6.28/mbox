@@ -1,0 +1,3523 @@
+From gregkh@mini.kroah.org Wed Feb  4 10:31:11 2009
+Message-Id: <20090204183111.575207308@mini.kroah.org>
+User-Agent: quilt/0.47-1
+Date: Wed, 04 Feb 2009 10:28:24 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: Justin Forbes <jmforbes@linuxtx.org>,
+ Zwane Mwaikambo <zwane@arm.linux.org.uk>,
+ Theodore Ts'o <tytso@mit.edu>,
+ Randy Dunlap <rdunlap@xenotime.net>,
+ Dave Jones <davej@redhat.com>,
+ Chuck Wolber <chuckw@quantumlinux.com>,
+ Chris Wedgwood <reviews@ml.cw.f00f.org>,
+ Michael Krufky <mkrufky@linuxtv.org>,
+ Chuck Ebbert <cebbert@redhat.com>,
+ Domenico Andreoli <cavokz@gmail.com>,
+ Willy Tarreau <w@1wt.eu>,
+ Rodrigo Rubira Branco <rbranco@la.checkpoint.com>,
+ Jake Edge <jake@lwn.net>,
+ Eugene Teo <eteo@redhat.com>,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Lee Schermerhorn <lee.schermerhorn@hp.com>,
+ Rik van Riel <riel@redhat.com>
+Subject: [patch 01/33] Manually revert "mlock: downgrade mmap sem while populating mlocked regions"
+References: <20090204182823.831027530@mini.kroah.org>
+Content-Disposition: inline; filename=manually-revert-mlock-downgrade-mmap-sem-while-populating-mlocked-regions.patch
+Content-Length: 4788
+Lines: 133
+
+2.6.28-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Linus Torvalds <torvalds@linux-foundation.org>
+
+commit 27421e211a39784694b597dbf35848b88363c248 upstream.
+
+This essentially reverts commit 8edb08caf68184fb170f4f69c7445929e199eaea.
+
+It downgraded our mmap semaphore to a read-lock while mlocking pages, in
+order to allow other threads (and external accesses like "ps" et al) to
+walk the vma lists and take page faults etc.  Which is a nice idea, but
+the implementation does not work.
+
+Because we cannot upgrade the lock back to a write lock without
+releasing the mmap semaphore, the code had to release the lock entirely
+and then re-take it as a writelock.  However, that meant that the caller
+possibly lost the vma chain that it was following, since now another
+thread could come in and mmap/munmap the range.
+
+The code tried to work around that by just looking up the vma again and
+erroring out if that happened, but quite frankly, that was just a buggy
+hack that doesn't actually protect against anything (the other thread
+could just have replaced the vma with another one instead of totally
+unmapping it).
+
+The only way to downgrade to a read map _reliably_ is to do it at the
+end, which is likely the right thing to do: do all the 'vma' operations
+with the write-lock held, then downgrade to a read after completing them
+all, and then do the "populate the newly mlocked regions" while holding
+just the read lock.  And then just drop the read-lock and return to user
+space.
+
+The (perhaps somewhat simpler) alternative is to just make all the
+callers of mlock_vma_pages_range() know that the mmap lock got dropped,
+and just re-grab the mmap semaphore if it needs to mlock more than one
+vma region.
+
+So we can do this "downgrade mmap sem while populating mlocked regions"
+thing right, but the way it was done here was absolutely not correct.
+Thus the revert, in the expectation that we will do it all correctly
+some day.
+
+Cc: Lee Schermerhorn <lee.schermerhorn@hp.com>
+Cc: Rik van Riel <riel@redhat.com>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ mm/mlock.c |   47 ++---------------------------------------------
+ 1 file changed, 2 insertions(+), 45 deletions(-)
+
+--- a/mm/mlock.c
++++ b/mm/mlock.c
+@@ -293,14 +293,10 @@ static inline int __mlock_posix_error_re
+  *
+  * return number of pages [> 0] to be removed from locked_vm on success
+  * of "special" vmas.
+- *
+- * return negative error if vma spanning @start-@range disappears while
+- * mmap semaphore is dropped.  Unlikely?
+  */
+ long mlock_vma_pages_range(struct vm_area_struct *vma,
+ 			unsigned long start, unsigned long end)
+ {
+-	struct mm_struct *mm = vma->vm_mm;
+ 	int nr_pages = (end - start) / PAGE_SIZE;
+ 	BUG_ON(!(vma->vm_flags & VM_LOCKED));
+ 
+@@ -313,20 +309,8 @@ long mlock_vma_pages_range(struct vm_are
+ 	if (!((vma->vm_flags & (VM_DONTEXPAND | VM_RESERVED)) ||
+ 			is_vm_hugetlb_page(vma) ||
+ 			vma == get_gate_vma(current))) {
+-		long error;
+-		downgrade_write(&mm->mmap_sem);
+-
+-		error = __mlock_vma_pages_range(vma, start, end, 1);
+ 
+-		up_read(&mm->mmap_sem);
+-		/* vma can change or disappear */
+-		down_write(&mm->mmap_sem);
+-		vma = find_vma(mm, start);
+-		/* non-NULL vma must contain @start, but need to check @end */
+-		if (!vma ||  end > vma->vm_end)
+-			return -ENOMEM;
+-
+-		return 0;	/* hide other errors from mmap(), et al */
++		return __mlock_vma_pages_range(vma, start, end, 1);
+ 	}
+ 
+ 	/*
+@@ -437,41 +421,14 @@ success:
+ 	vma->vm_flags = newflags;
+ 
+ 	if (lock) {
+-		/*
+-		 * mmap_sem is currently held for write.  Downgrade the write
+-		 * lock to a read lock so that other faults, mmap scans, ...
+-		 * while we fault in all pages.
+-		 */
+-		downgrade_write(&mm->mmap_sem);
+-
+ 		ret = __mlock_vma_pages_range(vma, start, end, 1);
+ 
+-		/*
+-		 * Need to reacquire mmap sem in write mode, as our callers
+-		 * expect this.  We have no support for atomically upgrading
+-		 * a sem to write, so we need to check for ranges while sem
+-		 * is unlocked.
+-		 */
+-		up_read(&mm->mmap_sem);
+-		/* vma can change or disappear */
+-		down_write(&mm->mmap_sem);
+-		*prev = find_vma(mm, start);
+-		/* non-NULL *prev must contain @start, but need to check @end */
+-		if (!(*prev) || end > (*prev)->vm_end)
+-			ret = -ENOMEM;
+-		else if (ret > 0) {
++		if (ret > 0) {
+ 			mm->locked_vm -= ret;
+ 			ret = 0;
+ 		} else
+ 			ret = __mlock_posix_error_return(ret); /* translate if needed */
+ 	} else {
+-		/*
+-		 * TODO:  for unlocking, pages will already be resident, so
+-		 * we don't need to wait for allocations/reclaim/pagein, ...
+-		 * However, unlocking a very large region can still take a
+-		 * while.  Should we downgrade the semaphore for both lock
+-		 * AND unlock ?
+-		 */
+ 		__mlock_vma_pages_range(vma, start, end, 0);
+ 	}
+ 
+
+
+From gregkh@mini.kroah.org Wed Feb  4 10:31:11 2009
+Message-Id: <20090204183111.704688289@mini.kroah.org>
+User-Agent: quilt/0.47-1
+Date: Wed, 04 Feb 2009 10:28:25 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: Justin Forbes <jmforbes@linuxtx.org>,
+ Zwane Mwaikambo <zwane@arm.linux.org.uk>,
+ Theodore Ts'o <tytso@mit.edu>,
+ Randy Dunlap <rdunlap@xenotime.net>,
+ Dave Jones <davej@redhat.com>,
+ Chuck Wolber <chuckw@quantumlinux.com>,
+ Chris Wedgwood <reviews@ml.cw.f00f.org>,
+ Michael Krufky <mkrufky@linuxtv.org>,
+ Chuck Ebbert <cebbert@redhat.com>,
+ Domenico Andreoli <cavokz@gmail.com>,
+ Willy Tarreau <w@1wt.eu>,
+ Rodrigo Rubira Branco <rbranco@la.checkpoint.com>,
+ Jake Edge <jake@lwn.net>,
+ Eugene Teo <eteo@redhat.com>,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Jeremy Fitzhardinge <jeremy.fitzhardinge@citrix.com>,
+ "dan.magenheimer@oracle.com" <dan.magenheimer@oracle.com>,
+ Ingo Molnar <mingo@elte.hu>
+Subject: [patch 02/33] xen: make sysfs files behave as their names suggest
+References: <20090204182823.831027530@mini.kroah.org>
+Content-Disposition: inline; filename=xen-make-sysfs-files-behave-as-their-names-suggest.patch
+Content-Length: 2093
+Lines: 73
+
+2.6.28-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Jeremy Fitzhardinge <jeremy@goop.org>
+
+commit 618b2c8db24522ae273d8299c6a936ea13793c4d upstream.
+
+1: make "target_kb" only accept and produce a memory size in kilobytes.
+2: add a second "target" file which produces output in bytes, and will accept
+   memparse input (scaled bytes)
+
+This fixes the rather irritating problem that writing the same value
+read back into target_kb would end up shrinking the domain by a factor
+of 1024, with generally bad results.
+
+Signed-off-by: Jeremy Fitzhardinge <jeremy.fitzhardinge@citrix.com>
+Cc: "dan.magenheimer@oracle.com" <dan.magenheimer@oracle.com>
+Signed-off-by: Ingo Molnar <mingo@elte.hu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/xen/balloon.c |   33 ++++++++++++++++++++++++++++++++-
+ 1 file changed, 32 insertions(+), 1 deletion(-)
+
+--- a/drivers/xen/balloon.c
++++ b/drivers/xen/balloon.c
+@@ -488,7 +488,7 @@ static ssize_t store_target_kb(struct sy
+ 	if (!capable(CAP_SYS_ADMIN))
+ 		return -EPERM;
+ 
+-	target_bytes = memparse(buf, &endchar);
++	target_bytes = simple_strtoull(buf, &endchar, 0) * 1024;
+ 
+ 	balloon_set_new_target(target_bytes >> PAGE_SHIFT);
+ 
+@@ -498,8 +498,39 @@ static ssize_t store_target_kb(struct sy
+ static SYSDEV_ATTR(target_kb, S_IRUGO | S_IWUSR,
+ 		   show_target_kb, store_target_kb);
+ 
++
++static ssize_t show_target(struct sys_device *dev, struct sysdev_attribute *attr,
++			      char *buf)
++{
++	return sprintf(buf, "%llu\n",
++		       (u64)balloon_stats.target_pages << PAGE_SHIFT);
++}
++
++static ssize_t store_target(struct sys_device *dev,
++			    struct sysdev_attribute *attr,
++			    const char *buf,
++			    size_t count)
++{
++	char *endchar;
++	unsigned long long target_bytes;
++
++	if (!capable(CAP_SYS_ADMIN))
++		return -EPERM;
++
++	target_bytes = memparse(buf, &endchar);
++
++	balloon_set_new_target(target_bytes >> PAGE_SHIFT);
++
++	return count;
++}
++
++static SYSDEV_ATTR(target, S_IRUGO | S_IWUSR,
++		   show_target, store_target);
++
++
+ static struct sysdev_attribute *balloon_attrs[] = {
+ 	&attr_target_kb,
++	&attr_target,
+ };
+ 
+ static struct attribute *balloon_info_attrs[] = {
+
+
+From gregkh@mini.kroah.org Wed Feb  4 10:31:11 2009
+Message-Id: <20090204183111.831173429@mini.kroah.org>
+User-Agent: quilt/0.47-1
+Date: Wed, 04 Feb 2009 10:28:26 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: Justin Forbes <jmforbes@linuxtx.org>,
+ Zwane Mwaikambo <zwane@arm.linux.org.uk>,
+ Theodore Ts'o <tytso@mit.edu>,
+ Randy Dunlap <rdunlap@xenotime.net>,
+ Dave Jones <davej@redhat.com>,
+ Chuck Wolber <chuckw@quantumlinux.com>,
+ Chris Wedgwood <reviews@ml.cw.f00f.org>,
+ Michael Krufky <mkrufky@linuxtv.org>,
+ Chuck Ebbert <cebbert@redhat.com>,
+ Domenico Andreoli <cavokz@gmail.com>,
+ Willy Tarreau <w@1wt.eu>,
+ Rodrigo Rubira Branco <rbranco@la.checkpoint.com>,
+ Jake Edge <jake@lwn.net>,
+ Eugene Teo <eteo@redhat.com>,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Mark Lord <mlord@pobox.com>,
+ Jeff Garzik <jgarzik@redhat.com>
+Subject: [patch 03/33] sata_mv: fix 8-port timeouts on 508x/6081 chips
+References: <20090204182823.831027530@mini.kroah.org>
+Content-Disposition: inline; filename=sata_mv-fix-8-port-timeouts-on-508x-6081-chips.patch
+Content-Length: 1032
+Lines: 29
+
+2.6.28-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Mark Lord <liml@rtr.ca>
+
+commit b0bccb18bc523d1d5060d25958f12438062829a9 upstream.
+
+Fix a longstanding bug for the 8-port Marvell Sata controllers (508x/6081),
+where accesses to the upper 4 ports would cause lost-interrupts / timeouts
+for the lower 4-ports.  With this patch, the 6081 boards should finally be
+reliable enough for mainstream use with Linux.
+
+Signed-off-by: Mark Lord <mlord@pobox.com>
+Signed-off-by: Jeff Garzik <jgarzik@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/ata/sata_mv.c |    2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+--- a/drivers/ata/sata_mv.c
++++ b/drivers/ata/sata_mv.c
+@@ -883,7 +883,7 @@ static void mv_start_dma(struct ata_port
+ 		struct mv_host_priv *hpriv = ap->host->private_data;
+ 		int hardport = mv_hardport_from_port(ap->port_no);
+ 		void __iomem *hc_mmio = mv_hc_base_from_port(
+-					mv_host_base(ap->host), hardport);
++					mv_host_base(ap->host), ap->port_no);
+ 		u32 hc_irq_cause, ipending;
+ 
+ 		/* clear EDMA event indicators, if any */
+
+
+From gregkh@mini.kroah.org Wed Feb  4 10:31:12 2009
+Message-Id: <20090204183111.956963089@mini.kroah.org>
+User-Agent: quilt/0.47-1
+Date: Wed, 04 Feb 2009 10:28:27 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: Justin Forbes <jmforbes@linuxtx.org>,
+ Zwane Mwaikambo <zwane@arm.linux.org.uk>,
+ Theodore Ts'o <tytso@mit.edu>,
+ Randy Dunlap <rdunlap@xenotime.net>,
+ Dave Jones <davej@redhat.com>,
+ Chuck Wolber <chuckw@quantumlinux.com>,
+ Chris Wedgwood <reviews@ml.cw.f00f.org>,
+ Michael Krufky <mkrufky@linuxtv.org>,
+ Chuck Ebbert <cebbert@redhat.com>,
+ Domenico Andreoli <cavokz@gmail.com>,
+ Willy Tarreau <w@1wt.eu>,
+ Rodrigo Rubira Branco <rbranco@la.checkpoint.com>,
+ Jake Edge <jake@lwn.net>,
+ Eugene Teo <eteo@redhat.com>,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Adrian Bunk <bunk@kernel.org>,
+ Greg Ungerer <gerg@uclinux.org>
+Subject: [patch 04/33] m68knommu: set NO_DMA
+References: <20090204182823.831027530@mini.kroah.org>
+Content-Disposition: inline; filename=m68knommu-set-no_dma.patch
+Content-Length: 1527
+Lines: 53
+
+2.6.28-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Adrian Bunk <bunk@kernel.org>
+
+commit e0212e72186e855027dd35b37e9d7a99a078448c upstream.
+
+m68knommu does not set the Kconfig NO_DMA variable, but also does
+not provide the required functions, resulting in the following
+build error triggered by commit a40c24a13366e324bc0ff8c3bb107db89312c984
+(net: Add SKB DMA mapping helper functions.):
+
+<--  snip  -->
+
+..
+  LD      vmlinux
+net/built-in.o: In function `skb_dma_unmap':
+(.text+0xac5e): undefined reference to `dma_unmap_single'
+net/built-in.o: In function `skb_dma_unmap':
+(.text+0xac7a): undefined reference to `dma_unmap_page'
+net/built-in.o: In function `skb_dma_map':
+(.text+0xacdc): undefined reference to `dma_map_single'
+net/built-in.o: In function `skb_dma_map':
+(.text+0xace8): undefined reference to `dma_mapping_error'
+net/built-in.o: In function `skb_dma_map':
+(.text+0xad10): undefined reference to `dma_map_page'
+net/built-in.o: In function `skb_dma_map':
+(.text+0xad82): undefined reference to `dma_unmap_page'
+net/built-in.o: In function `skb_dma_map':
+(.text+0xadc6): undefined reference to `dma_unmap_single'
+make[1]: *** [vmlinux] Error 1
+
+<--  snip  -->
+
+Signed-off-by: Adrian Bunk <bunk@kernel.org>
+Signed-off-by: Greg Ungerer <gerg@uclinux.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ arch/m68knommu/Kconfig |    4 ++++
+ 1 file changed, 4 insertions(+)
+
+--- a/arch/m68knommu/Kconfig
++++ b/arch/m68knommu/Kconfig
+@@ -14,6 +14,10 @@ config MMU
+ 	bool
+ 	default n
+ 
++config NO_DMA
++	bool
++	default y
++
+ config FPU
+ 	bool
+ 	default n
+
+
+From gregkh@mini.kroah.org Wed Feb  4 10:31:12 2009
+Message-Id: <20090204183112.096109475@mini.kroah.org>
+User-Agent: quilt/0.47-1
+Date: Wed, 04 Feb 2009 10:28:28 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: Justin Forbes <jmforbes@linuxtx.org>,
+ Zwane Mwaikambo <zwane@arm.linux.org.uk>,
+ Theodore Ts'o <tytso@mit.edu>,
+ Randy Dunlap <rdunlap@xenotime.net>,
+ Dave Jones <davej@redhat.com>,
+ Chuck Wolber <chuckw@quantumlinux.com>,
+ Chris Wedgwood <reviews@ml.cw.f00f.org>,
+ Michael Krufky <mkrufky@linuxtv.org>,
+ Chuck Ebbert <cebbert@redhat.com>,
+ Domenico Andreoli <cavokz@gmail.com>,
+ Willy Tarreau <w@1wt.eu>,
+ Rodrigo Rubira Branco <rbranco@la.checkpoint.com>,
+ Jake Edge <jake@lwn.net>,
+ Eugene Teo <eteo@redhat.com>,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Hidetoshi Seto <seto.hidetoshi@jp.fujitsu.com>,
+ "Jike Song" <albcamus@gmail.com>,
+ Jesse Barnes <jbarnes@virtuousgeek.org>
+Subject: [patch 05/33] PCI/MSI: bugfix/utilize for msi_capability_init()
+References: <20090204182823.831027530@mini.kroah.org>
+Content-Disposition: inline; filename=pci-msi-bugfix-utilize-for-msi_capability_init.patch
+Content-Length: 2012
+Lines: 59
+
+2.6.28-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Hidetoshi Seto <seto.hidetoshi@jp.fujitsu.com>
+
+commit 0db29af1e767464d71b89410d61a1e5b668d0370 upstream.
+
+This patch fix a following bug and does a cleanup.
+
+bug:
+	commit 5993760f7fc75b77e4701f1e56dc84c0d6cf18d5
+	had a wrong change (since is_64 is boolean[0|1]):
+
+-               pci_write_config_dword(dev,
+-                       msi_mask_bits_reg(pos, is_64bit_address(control)),
+-                       maskbits);
++               pci_write_config_dword(dev, entry->msi_attrib.is_64, maskbits);
+
+utilize:
+	Unify separated if (entry->msi_attrib.maskbit) statements.
+
+Signed-off-by: Hidetoshi Seto <seto.hidetoshi@jp.fujitsu.com>
+Acked-by: "Jike Song" <albcamus@gmail.com>
+Signed-off-by: Jesse Barnes <jbarnes@virtuousgeek.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/pci/msi.c |   16 +++++++---------
+ 1 file changed, 7 insertions(+), 9 deletions(-)
+
+--- a/drivers/pci/msi.c
++++ b/drivers/pci/msi.c
+@@ -378,21 +378,19 @@ static int msi_capability_init(struct pc
+ 	entry->msi_attrib.masked = 1;
+ 	entry->msi_attrib.default_irq = dev->irq;	/* Save IOAPIC IRQ */
+ 	entry->msi_attrib.pos = pos;
+-	if (entry->msi_attrib.maskbit) {
+-		entry->mask_base = (void __iomem *)(long)msi_mask_bits_reg(pos,
+-				entry->msi_attrib.is_64);
+-	}
+ 	entry->dev = dev;
+ 	if (entry->msi_attrib.maskbit) {
+-		unsigned int maskbits, temp;
++		unsigned int base, maskbits, temp;
++
++		base = msi_mask_bits_reg(pos, entry->msi_attrib.is_64);
++		entry->mask_base = (void __iomem *)(long)base;
++
+ 		/* All MSIs are unmasked by default, Mask them all */
+-		pci_read_config_dword(dev,
+-			msi_mask_bits_reg(pos, entry->msi_attrib.is_64),
+-			&maskbits);
++		pci_read_config_dword(dev, base, &maskbits);
+ 		temp = (1 << multi_msi_capable(control));
+ 		temp = ((temp - 1) & ~temp);
+ 		maskbits |= temp;
+-		pci_write_config_dword(dev, entry->msi_attrib.is_64, maskbits);
++		pci_write_config_dword(dev, base, maskbits);
+ 		entry->msi_attrib.maskbits_mask = temp;
+ 	}
+ 	list_add_tail(&entry->list, &dev->msi_list);
+
+
+From gregkh@mini.kroah.org Wed Feb  4 10:31:12 2009
+Message-Id: <20090204183112.222464012@mini.kroah.org>
+User-Agent: quilt/0.47-1
+Date: Wed, 04 Feb 2009 10:28:29 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: Justin Forbes <jmforbes@linuxtx.org>,
+ Zwane Mwaikambo <zwane@arm.linux.org.uk>,
+ Theodore Ts'o <tytso@mit.edu>,
+ Randy Dunlap <rdunlap@xenotime.net>,
+ Dave Jones <davej@redhat.com>,
+ Chuck Wolber <chuckw@quantumlinux.com>,
+ Chris Wedgwood <reviews@ml.cw.f00f.org>,
+ Michael Krufky <mkrufky@linuxtv.org>,
+ Chuck Ebbert <cebbert@redhat.com>,
+ Domenico Andreoli <cavokz@gmail.com>,
+ Willy Tarreau <w@1wt.eu>,
+ Rodrigo Rubira Branco <rbranco@la.checkpoint.com>,
+ Jake Edge <jake@lwn.net>,
+ Eugene Teo <eteo@redhat.com>,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Andi Kleen <ak@linux.intel.com>,
+ "H. Peter Anvin" <hpa@zytor.com>,
+ Ingo Molnar <mingo@elte.hu>
+Subject: [patch 06/33] x86: use early clobbers in usercopy*.c
+References: <20090204182823.831027530@mini.kroah.org>
+Content-Disposition: inline; filename=x86-use-early-clobbers-in-usercopy-.c.patch
+Content-Length: 3890
+Lines: 100
+
+2.6.28-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Andi Kleen <andi@firstfloor.org>
+
+commit e0a96129db574d6365e3439d16d88517c437ab33 upstream.
+
+Impact: fix rare (but currently harmless) miscompile with certain configs and gcc versions
+
+Hugh Dickins noticed that strncpy_from_user() was miscompiled
+in some circumstances with gcc 4.3.
+
+Thanks to Hugh's excellent analysis it was easy to track down.
+
+Hugh writes:
+
+> Try building an x86_64 defconfig 2.6.29-rc1 kernel tree,
+> except not quite defconfig, switch CONFIG_PREEMPT_NONE=y
+> and CONFIG_PREEMPT_VOLUNTARY off (because it expands a
+> might_fault() there, which hides the issue): using a
+> gcc 4.3.2 (I've checked both openSUSE 11.1 and Fedora 10).
+>
+> It generates the following:
+>
+> 0000000000000000 <__strncpy_from_user>:
+>    0:   48 89 d1                mov    %rdx,%rcx
+>    3:   48 85 c9                test   %rcx,%rcx
+>    6:   74 0e                   je     16 <__strncpy_from_user+0x16>
+>    8:   ac                      lods   %ds:(%rsi),%al
+>    9:   aa                      stos   %al,%es:(%rdi)
+>    a:   84 c0                   test   %al,%al
+>    c:   74 05                   je     13 <__strncpy_from_user+0x13>
+>    e:   48 ff c9                dec    %rcx
+>   11:   75 f5                   jne    8 <__strncpy_from_user+0x8>
+>   13:   48 29 c9                sub    %rcx,%rcx
+>   16:   48 89 c8                mov    %rcx,%rax
+>   19:   c3                      retq
+>
+> Observe that "sub %rcx,%rcx; mov %rcx,%rax", whereas gcc 4.2.1
+> (and many other configs) say "sub %rcx,%rdx; mov %rdx,%rax".
+> Isn't it returning 0 when it ought to be returning strlen?
+
+The asm constraints for the strncpy_from_user() result were missing an
+early clobber, which tells gcc that the last output arguments
+are written before all input arguments are read.
+
+Also add more early clobbers in the rest of the file and fix 32-bit
+usercopy.c in the same way.
+
+Signed-off-by: Andi Kleen <ak@linux.intel.com>
+Signed-off-by: H. Peter Anvin <hpa@zytor.com>
+[ since this API is rarely used and no in-kernel user relies on a 'len'
+  return value (they only rely on negative return values) this miscompile
+  was never noticed in the field. But it's worth fixing it nevertheless. ]
+Signed-off-by: Ingo Molnar <mingo@elte.hu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ arch/x86/lib/usercopy_32.c |    4 ++--
+ arch/x86/lib/usercopy_64.c |    4 ++--
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
+--- a/arch/x86/lib/usercopy_32.c
++++ b/arch/x86/lib/usercopy_32.c
+@@ -56,7 +56,7 @@ do {									   \
+ 		"	jmp 2b\n"					   \
+ 		".previous\n"						   \
+ 		_ASM_EXTABLE(0b,3b)					   \
+-		: "=d"(res), "=c"(count), "=&a" (__d0), "=&S" (__d1),	   \
++		: "=&d"(res), "=&c"(count), "=&a" (__d0), "=&S" (__d1),	   \
+ 		  "=&D" (__d2)						   \
+ 		: "i"(-EFAULT), "0"(count), "1"(count), "3"(src), "4"(dst) \
+ 		: "memory");						   \
+@@ -218,7 +218,7 @@ long strnlen_user(const char __user *s, 
+ 		"	.align 4\n"
+ 		"	.long 0b,2b\n"
+ 		".previous"
+-		:"=r" (n), "=D" (s), "=a" (res), "=c" (tmp)
++		:"=&r" (n), "=&D" (s), "=&a" (res), "=&c" (tmp)
+ 		:"0" (n), "1" (s), "2" (0), "3" (mask)
+ 		:"cc");
+ 	return res & mask;
+--- a/arch/x86/lib/usercopy_64.c
++++ b/arch/x86/lib/usercopy_64.c
+@@ -32,7 +32,7 @@ do {									   \
+ 		"	jmp 2b\n"					   \
+ 		".previous\n"						   \
+ 		_ASM_EXTABLE(0b,3b)					   \
+-		: "=r"(res), "=c"(count), "=&a" (__d0), "=&S" (__d1),	   \
++		: "=&r"(res), "=&c"(count), "=&a" (__d0), "=&S" (__d1),	   \
+ 		  "=&D" (__d2)						   \
+ 		: "i"(-EFAULT), "0"(count), "1"(count), "3"(src), "4"(dst) \
+ 		: "memory");						   \
+@@ -86,7 +86,7 @@ unsigned long __clear_user(void __user *
+ 		".previous\n"
+ 		_ASM_EXTABLE(0b,3b)
+ 		_ASM_EXTABLE(1b,2b)
+-		: [size8] "=c"(size), [dst] "=&D" (__d0)
++		: [size8] "=&c"(size), [dst] "=&D" (__d0)
+ 		: [size1] "r"(size & 7), "[size8]" (size / 8), "[dst]"(addr),
+ 		  [zero] "r" (0UL), [eight] "r" (8UL));
+ 	return size;
+
+
+From gregkh@mini.kroah.org Wed Feb  4 10:31:12 2009
+Message-Id: <20090204183112.363626577@mini.kroah.org>
+User-Agent: quilt/0.47-1
+Date: Wed, 04 Feb 2009 10:28:30 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: Justin Forbes <jmforbes@linuxtx.org>,
+ Zwane Mwaikambo <zwane@arm.linux.org.uk>,
+ Theodore Ts'o <tytso@mit.edu>,
+ Randy Dunlap <rdunlap@xenotime.net>,
+ Dave Jones <davej@redhat.com>,
+ Chuck Wolber <chuckw@quantumlinux.com>,
+ Chris Wedgwood <reviews@ml.cw.f00f.org>,
+ Michael Krufky <mkrufky@linuxtv.org>,
+ Chuck Ebbert <cebbert@redhat.com>,
+ Domenico Andreoli <cavokz@gmail.com>,
+ Willy Tarreau <w@1wt.eu>,
+ Rodrigo Rubira Branco <rbranco@la.checkpoint.com>,
+ Jake Edge <jake@lwn.net>,
+ Eugene Teo <eteo@redhat.com>,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Jeff Layton <jlayton@redhat.com>,
+ Steve French <sfrench@us.ibm.com>
+Subject: [patch 07/33] cifs: make sure we allocate enough storage for socket address
+References: <20090204182823.831027530@mini.kroah.org>
+Content-Disposition: inline; filename=cifs-make-sure-we-allocate-enough-storage-for-socket-address.patch
+Content-Length: 3297
+Lines: 95
+
+2.6.28-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Jeff Layton <jlayton@redhat.com>
+
+commit a9ac49d303f967be0dabd97cb722c4a13109c6c2 upstream.
+
+cifs_mount declares a struct sockaddr on the stack and then casts it
+to the proper address type. The storage allocated is fine for ipv4,
+but is too small for ipv6 addresses. Declare it as
+"struct sockaddr_storage" instead of struct sockaddr".
+
+This bug was manifesting itself as oopses and address corruption when
+mounting IPv6 addresses.
+
+Signed-off-by: Jeff Layton <jlayton@redhat.com>
+Tested-by: Stefan Bader <stefan.bader@canonical.com>
+Signed-off-by: Steve French <sfrench@us.ibm.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ fs/cifs/connect.c |   18 +++++++++---------
+ 1 file changed, 9 insertions(+), 9 deletions(-)
+
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@ -1356,7 +1356,7 @@ cifs_parse_mount_options(char *options, 
+ }
+ 
+ static struct TCP_Server_Info *
+-cifs_find_tcp_session(struct sockaddr *addr)
++cifs_find_tcp_session(struct sockaddr_storage *addr)
+ {
+ 	struct list_head *tmp;
+ 	struct TCP_Server_Info *server;
+@@ -1376,11 +1376,11 @@ cifs_find_tcp_session(struct sockaddr *a
+ 		if (server->tcpStatus == CifsNew)
+ 			continue;
+ 
+-		if (addr->sa_family == AF_INET &&
++		if (addr->ss_family == AF_INET &&
+ 		    (addr4->sin_addr.s_addr !=
+ 		     server->addr.sockAddr.sin_addr.s_addr))
+ 			continue;
+-		else if (addr->sa_family == AF_INET6 &&
++		else if (addr->ss_family == AF_INET6 &&
+ 			 memcmp(&server->addr.sockAddr6.sin6_addr,
+ 				&addr6->sin6_addr, sizeof(addr6->sin6_addr)))
+ 			continue;
+@@ -2036,7 +2036,7 @@ cifs_mount(struct super_block *sb, struc
+ 	int rc = 0;
+ 	int xid;
+ 	struct socket *csocket = NULL;
+-	struct sockaddr addr;
++	struct sockaddr_storage addr;
+ 	struct sockaddr_in *sin_server = (struct sockaddr_in *) &addr;
+ 	struct sockaddr_in6 *sin_server6 = (struct sockaddr_in6 *) &addr;
+ 	struct smb_vol volume_info;
+@@ -2048,7 +2048,7 @@ cifs_mount(struct super_block *sb, struc
+ 
+ /* cFYI(1, ("Entering cifs_mount. Xid: %d with: %s", xid, mount_data)); */
+ 
+-	memset(&addr, 0, sizeof(struct sockaddr));
++	memset(&addr, 0, sizeof(struct sockaddr_storage));
+ 	memset(&volume_info, 0, sizeof(struct smb_vol));
+ 	if (cifs_parse_mount_options(mount_data, devname, &volume_info)) {
+ 		rc = -EINVAL;
+@@ -2078,9 +2078,9 @@ cifs_mount(struct super_block *sb, struc
+ 			rc = cifs_inet_pton(AF_INET6, volume_info.UNCip,
+ 					    &sin_server6->sin6_addr.in6_u);
+ 			if (rc > 0)
+-				addr.sa_family = AF_INET6;
++				addr.ss_family = AF_INET6;
+ 		} else {
+-			addr.sa_family = AF_INET;
++			addr.ss_family = AF_INET;
+ 		}
+ 
+ 		if (rc <= 0) {
+@@ -2122,7 +2122,7 @@ cifs_mount(struct super_block *sb, struc
+ 
+ 	srvTcp = cifs_find_tcp_session(&addr);
+ 	if (!srvTcp) { /* create socket */
+-		if (addr.sa_family == AF_INET6) {
++		if (addr.ss_family == AF_INET6) {
+ 			cFYI(1, ("attempting ipv6 connect"));
+ 			/* BB should we allow ipv6 on port 139? */
+ 			/* other OS never observed in Wild doing 139 with v6 */
+@@ -2153,7 +2153,7 @@ cifs_mount(struct super_block *sb, struc
+ 		} else {
+ 			srvTcp->noblocksnd = volume_info.noblocksnd;
+ 			srvTcp->noautotune = volume_info.noautotune;
+-			if (addr.sa_family == AF_INET6)
++			if (addr.ss_family == AF_INET6)
+ 				memcpy(&srvTcp->addr.sockAddr6, sin_server6,
+ 					sizeof(struct sockaddr_in6));
+ 			else
+
+
+From gregkh@mini.kroah.org Wed Feb  4 10:31:12 2009
+Message-Id: <20090204183112.493750167@mini.kroah.org>
+User-Agent: quilt/0.47-1
+Date: Wed, 04 Feb 2009 10:28:31 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: Justin Forbes <jmforbes@linuxtx.org>,
+ Zwane Mwaikambo <zwane@arm.linux.org.uk>,
+ Theodore Ts'o <tytso@mit.edu>,
+ Randy Dunlap <rdunlap@xenotime.net>,
+ Dave Jones <davej@redhat.com>,
+ Chuck Wolber <chuckw@quantumlinux.com>,
+ Chris Wedgwood <reviews@ml.cw.f00f.org>,
+ Michael Krufky <mkrufky@linuxtv.org>,
+ Chuck Ebbert <cebbert@redhat.com>,
+ Domenico Andreoli <cavokz@gmail.com>,
+ Willy Tarreau <w@1wt.eu>,
+ Rodrigo Rubira Branco <rbranco@la.checkpoint.com>,
+ Jake Edge <jake@lwn.net>,
+ Eugene Teo <eteo@redhat.com>,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Patrick McHardy <kaber@trash.net>,
+ "David S. Miller" <davem@davemloft.net>
+Subject: [patch 08/33] netfilter: ctnetlink: fix scheduling while atomic
+References: <20090204182823.831027530@mini.kroah.org>
+Content-Disposition: inline; filename=netfilter-ctnetlink-fix-scheduling-while-atomic.patch
+Content-Length: 1029
+Lines: 35
+
+2.6.28-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Patrick McHardy <kaber@trash.net>
+
+commit 748085fcbedbf7b0f38d95e178265d7b13360b44 upstream.
+
+Caused by call to request_module() while holding nf_conntrack_lock.
+
+Reported-and-tested-by: Kövesdi György <kgy@teledigit.hu>
+Signed-off-by: Patrick McHardy <kaber@trash.net>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ net/netfilter/nf_conntrack_netlink.c |    3 +++
+ 1 file changed, 3 insertions(+)
+
+--- a/net/netfilter/nf_conntrack_netlink.c
++++ b/net/netfilter/nf_conntrack_netlink.c
+@@ -825,13 +825,16 @@ ctnetlink_parse_nat_setup(struct nf_conn
+ 	if (!parse_nat_setup) {
+ #ifdef CONFIG_MODULES
+ 		rcu_read_unlock();
++		spin_unlock_bh(&nf_conntrack_lock);
+ 		nfnl_unlock();
+ 		if (request_module("nf-nat-ipv4") < 0) {
+ 			nfnl_lock();
++			spin_lock_bh(&nf_conntrack_lock);
+ 			rcu_read_lock();
+ 			return -EOPNOTSUPP;
+ 		}
+ 		nfnl_lock();
++		spin_lock_bh(&nf_conntrack_lock);
+ 		rcu_read_lock();
+ 		if (nfnetlink_parse_nat_setup_hook)
+ 			return -EAGAIN;
+
+
+From gregkh@mini.kroah.org Wed Feb  4 10:31:12 2009
+Message-Id: <20090204183112.648117622@mini.kroah.org>
+User-Agent: quilt/0.47-1
+Date: Wed, 04 Feb 2009 10:28:32 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org,
+ Greg KH <greg@kroah.com>
+Cc: Justin Forbes <jmforbes@linuxtx.org>,
+ Zwane Mwaikambo <zwane@arm.linux.org.uk>,
+ Theodore Ts'o <tytso@mit.edu>,
+ Randy Dunlap <rdunlap@xenotime.net>,
+ Dave Jones <davej@redhat.com>,
+ Chuck Wolber <chuckw@quantumlinux.com>,
+ Chris Wedgwood <reviews@ml.cw.f00f.org>,
+ Michael Krufky <mkrufky@linuxtv.org>,
+ Chuck Ebbert <cebbert@redhat.com>,
+ Domenico Andreoli <cavokz@gmail.com>,
+ Willy Tarreau <w@1wt.eu>,
+ Rodrigo Rubira Branco <rbranco@la.checkpoint.com>,
+ Jake Edge <jake@lwn.net>,
+ Eugene Teo <eteo@redhat.com>,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ "John W. Linville" <linville@tuxdriver.com>,
+ Andrey Borzenkov <arvidjaar@mail.ru>
+Subject: [patch 09/33] orinoco: move kmalloc(..., GFP_KERNEL) outside spinlock in orinoco_ioctl_set_genie
+References: <20090204182823.831027530@mini.kroah.org>
+Content-Disposition: inline; filename=orinoco-move-kmalloc-outside-spinlock-in-orinoco_ioctl_set_genie.patch
+Content-Length: 4138
+Lines: 112
+
+
+2.6.28-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Andrey Borzenkov <arvidjaar@mail.ru>
+
+commit 7fe99c4e28ab54eada8aa456b417114e6ef21587 upstream
+
+orinoco: move kmalloc(..., GFP_KERNEL) outside spinlock in orinoco_ioctl_set_genie
+
+[   56.923623] BUG: sleeping function called from invalid context at /home/bor/src/linux-git/mm/slub.c:1599
+[   56.923644] in_atomic(): 0, irqs_disabled(): 1, pid: 3031, name: wpa_supplicant
+[   56.923656] 2 locks held by wpa_supplicant/3031:
+[   56.923662]  #0:  (rtnl_mutex){--..}, at: [<c02abd1f>] rtnl_lock+0xf/0x20
+[   56.923703]  #1:  (&priv->lock){++..}, at: [<dfc840c2>] orinoco_ioctl_set_genie+0x52/0x130 [orinoco]
+[   56.923782] irq event stamp: 910
+[   56.923788] hardirqs last  enabled at (909): [<c01957db>] __kmalloc+0x7b/0x140
+[   56.923820] hardirqs last disabled at (910): [<c0309419>] _spin_lock_irqsave+0x19/0x80
+[   56.923847] softirqs last  enabled at (880): [<c0124f54>] __do_softirq+0xc4/0x110
+[   56.923865] softirqs last disabled at (871): [<c01049ae>] do_softirq+0x8e/0xe0
+[   56.923895] Pid: 3031, comm: wpa_supplicant Not tainted 2.6.29-rc2-1avb #1
+[   56.923905] Call Trace:
+[   56.923919]  [<c01049ae>] ? do_softirq+0x8e/0xe0
+[   56.923941]  [<c011ad12>] __might_sleep+0xd2/0x100
+[   56.923952]  [<c0195837>] __kmalloc+0xd7/0x140
+[   56.923963]  [<c030946a>] ? _spin_lock_irqsave+0x6a/0x80
+[   56.923981]  [<dfc840e9>] ? orinoco_ioctl_set_genie+0x79/0x130 [orinoco]
+[   56.923999]  [<dfc840c2>] ? orinoco_ioctl_set_genie+0x52/0x130 [orinoco]
+[   56.924017]  [<dfc840e9>] orinoco_ioctl_set_genie+0x79/0x130 [orinoco]
+[   56.924036]  [<c0209325>] ? copy_from_user+0x35/0x130
+[   56.924061]  [<c02ffd96>] ioctl_standard_call+0x196/0x380
+[   56.924085]  [<c029f945>] ? __dev_get_by_name+0x85/0xb0
+[   56.924096]  [<c02ff88f>] wext_handle_ioctl+0x14f/0x230
+[   56.924113]  [<dfc84070>] ? orinoco_ioctl_set_genie+0x0/0x130 [orinoco]
+[   56.924132]  [<c02a3da5>] dev_ioctl+0x495/0x570
+[   56.924155]  [<c0293e05>] ? sys_sendto+0xa5/0xd0
+[   56.924171]  [<c0142fe8>] ? mark_held_locks+0x48/0x90
+[   56.924183]  [<c0292880>] ? sock_ioctl+0x0/0x280
+[   56.924193]  [<c029297d>] sock_ioctl+0xfd/0x280
+[   56.924203]  [<c0292880>] ? sock_ioctl+0x0/0x280
+[   56.924235]  [<c01a51d0>] vfs_ioctl+0x20/0x80
+[   56.924246]  [<c01a53e2>] do_vfs_ioctl+0x72/0x570
+[   56.924257]  [<c0293e62>] ? sys_send+0x32/0x40
+[   56.924268]  [<c02947c0>] ? sys_socketcall+0x1d0/0x2a0
+[   56.924280]  [<c010339f>] ? sysenter_exit+0xf/0x16
+[   56.924292]  [<c01a5919>] sys_ioctl+0x39/0x70
+[   56.924302]  [<c0103371>] sysenter_do_call+0x12/0x31
+
+Signed-off-by: Andrey Borzenkov <arvidjaar@mail.ru>
+Signed-off-by: John W. Linville <linville@tuxdriver.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/net/wireless/orinoco.c |   30 +++++++++++++-----------------
+ 1 file changed, 13 insertions(+), 17 deletions(-)
+
+--- a/drivers/net/wireless/orinoco.c
++++ b/drivers/net/wireless/orinoco.c
+@@ -4938,32 +4938,29 @@ static int orinoco_ioctl_set_genie(struc
+ 	struct orinoco_private *priv = netdev_priv(dev);
+ 	u8 *buf;
+ 	unsigned long flags;
+-	int err = 0;
+ 
+ 	if ((wrqu->data.length > MAX_WPA_IE_LEN) ||
+ 	    (wrqu->data.length && (extra == NULL)))
+ 		return -EINVAL;
+ 
+-	if (orinoco_lock(priv, &flags) != 0)
+-		return -EBUSY;
+-
+ 	if (wrqu->data.length) {
+ 		buf = kmalloc(wrqu->data.length, GFP_KERNEL);
+-		if (buf == NULL) {
+-			err = -ENOMEM;
+-			goto out;
+-		}
++		if (buf == NULL)
++			return -ENOMEM;
+ 
+ 		memcpy(buf, extra, wrqu->data.length);
+-		kfree(priv->wpa_ie);
+-		priv->wpa_ie = buf;
+-		priv->wpa_ie_len = wrqu->data.length;
+-	} else {
+-		kfree(priv->wpa_ie);
+-		priv->wpa_ie = NULL;
+-		priv->wpa_ie_len = 0;
++	} else
++		buf = NULL;
++
++	if (orinoco_lock(priv, &flags) != 0) {
++		kfree(buf);
++		return -EBUSY;
+ 	}
+ 
++	kfree(priv->wpa_ie);
++	priv->wpa_ie = buf;
++	priv->wpa_ie_len = wrqu->data.length;
++
+ 	if (priv->wpa_ie) {
+ 		/* Looks like wl_lkm wants to check the auth alg, and
+ 		 * somehow pass it to the firmware.
+@@ -4972,9 +4969,8 @@ static int orinoco_ioctl_set_genie(struc
+ 		 */
+ 	}
+ 
+-out:
+ 	orinoco_unlock(priv, &flags);
+-	return err;
++	return 0;
+ }
+ 
+ static int orinoco_ioctl_get_genie(struct net_device *dev,
+
+
+From gregkh@mini.kroah.org Wed Feb  4 10:31:12 2009
+Message-Id: <20090204183112.776600361@mini.kroah.org>
+User-Agent: quilt/0.47-1
+Date: Wed, 04 Feb 2009 10:28:33 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: Justin Forbes <jmforbes@linuxtx.org>,
+ Zwane Mwaikambo <zwane@arm.linux.org.uk>,
+ Theodore Ts'o <tytso@mit.edu>,
+ Randy Dunlap <rdunlap@xenotime.net>,
+ Dave Jones <davej@redhat.com>,
+ Chuck Wolber <chuckw@quantumlinux.com>,
+ Chris Wedgwood <reviews@ml.cw.f00f.org>,
+ Michael Krufky <mkrufky@linuxtv.org>,
+ Chuck Ebbert <cebbert@redhat.com>,
+ Domenico Andreoli <cavokz@gmail.com>,
+ Willy Tarreau <w@1wt.eu>,
+ Rodrigo Rubira Branco <rbranco@la.checkpoint.com>,
+ Jake Edge <jake@lwn.net>,
+ Eugene Teo <eteo@redhat.com>,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Risto Suominen <Risto.Suominen@gmail.com>,
+ Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Subject: [patch 10/33] fbdev/atyfb: Fix DSP config on some PowerMacs & PowerBooks
+References: <20090204182823.831027530@mini.kroah.org>
+Content-Disposition: inline; filename=fbdev-atyfb-fix-dsp-config-on-some-powermacs-powerbooks.patch
+Content-Length: 1771
+Lines: 52
+
+2.6.28-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Risto Suominen <Risto.Suominen@gmail.com>
+
+commit 7fbb7cadd062baf299fd8b26a80ea99da0c3fe01 upstream.
+
+Since the complete re-write in 2.6.10, some PowerMacs (At least PowerMac 5500
+and PowerMac G3 Beige rev A) with ATI Mach64 chip have suffered from unstable
+columns in their framebuffer image. This seems to depend on a value (4) read
+from PLL_EXT_CNTL register, which leads to incorrect DSP config parameters to
+be written to the chip. This patch uses a value calculated by aty_init_pll_ct
+instead, as a starting point.
+
+There are questions as to whether this should be extended to other platforms
+or maybe made dependent on specific chip types, but in the meantime, this has
+been tested on various powermacs and works for them so let's commit it.
+
+Signed-off-by: Risto Suominen <Risto.Suominen@gmail.com>
+Tested-by: Michael Pettersson <mike@it.uu.se>
+Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/video/aty/mach64_ct.c |   11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+--- a/drivers/video/aty/mach64_ct.c
++++ b/drivers/video/aty/mach64_ct.c
+@@ -8,6 +8,9 @@
+ #include <asm/io.h>
+ #include <video/mach64.h>
+ #include "atyfb.h"
++#ifdef CONFIG_PPC
++#include <asm/machdep.h>
++#endif
+ 
+ #undef DEBUG
+ 
+@@ -536,6 +539,14 @@ static int __devinit aty_init_pll_ct(con
+ 	pll->ct.xclk_post_div_real = postdividers[xpost_div];
+ 	pll->ct.mclk_fb_div = q * pll->ct.xclk_post_div_real / 8;
+ 
++#ifdef CONFIG_PPC
++	if (machine_is(powermac)) {
++		/* Override PLL_EXT_CNTL & 0x07. */
++		pll->ct.xclk_post_div = xpost_div;
++		pll->ct.xclk_ref_div = 1;
++	}
++#endif
++
+ #ifdef DEBUG
+ 	pllmclk = (1000000 * pll->ct.mclk_fb_mult * pll->ct.mclk_fb_div) /
+ 			(par->ref_clk_per * pll->ct.pll_ref_div);
+
+
+From gregkh@mini.kroah.org Wed Feb  4 10:31:13 2009
+Message-Id: <20090204183112.903696124@mini.kroah.org>
+User-Agent: quilt/0.47-1
+Date: Wed, 04 Feb 2009 10:28:34 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: Justin Forbes <jmforbes@linuxtx.org>,
+ Zwane Mwaikambo <zwane@arm.linux.org.uk>,
+ Theodore Ts'o <tytso@mit.edu>,
+ Randy Dunlap <rdunlap@xenotime.net>,
+ Dave Jones <davej@redhat.com>,
+ Chuck Wolber <chuckw@quantumlinux.com>,
+ Chris Wedgwood <reviews@ml.cw.f00f.org>,
+ Michael Krufky <mkrufky@linuxtv.org>,
+ Chuck Ebbert <cebbert@redhat.com>,
+ Domenico Andreoli <cavokz@gmail.com>,
+ Willy Tarreau <w@1wt.eu>,
+ Rodrigo Rubira Branco <rbranco@la.checkpoint.com>,
+ Jake Edge <jake@lwn.net>,
+ Eugene Teo <eteo@redhat.com>,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Jeff Mahoney <jeffm@suse.com>,
+ Martin Schwidefsky <schwidefsky@de.ibm.com>,
+ Heiko Carstens <heiko.carstens@de.ibm.com>,
+ Christoph Lameter <cl@linux-foundation.org>,
+ Pekka Enberg <penberg@cs.helsinki.fi>,
+ Matt Mackall <mpm@selenic.com>,
+ Nick Piggin <nickpiggin@yahoo.com.au>
+Subject: [patch 11/33] kmalloc: return NULL instead of link failure
+References: <20090204182823.831027530@mini.kroah.org>
+Content-Disposition: inline; filename=kmalloc-return-null-instead-of-link-failure.patch
+Content-Length: 2083
+Lines: 63
+
+2.6.28-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Jeff Mahoney <jeffm@suse.com>
+
+commit 1cf3eb2ff6b0844c678f2f48d0053b9d12b7da67 upstream.
+
+The SLAB kmalloc with a constant value isn't consistent with the other
+implementations because it bails out with __you_cannot_kmalloc_that_much
+rather than returning NULL and properly allowing the caller to fall back
+to vmalloc or take other action.  This doesn't happen with a non-constant
+value or with SLOB or SLUB.
+
+Starting with 2.6.28, I've been seeing build failures on s390x.  This is
+due to init_section_page_cgroup trying to allocate 2.5MB when the max size
+for a kmalloc on s390x is 2MB.
+
+It's failing because the value is constant.  The workarounds at the call
+size are ugly and the caller shouldn't have to change behavior depending
+on what the backend of the API is.
+
+So, this patch eliminates the link failure and returns NULL like the other
+implementations.
+
+Signed-off-by: Jeff Mahoney <jeffm@suse.com>
+Cc: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Cc: Heiko Carstens <heiko.carstens@de.ibm.com>
+Cc: Christoph Lameter <cl@linux-foundation.org>
+Cc: Pekka Enberg <penberg@cs.helsinki.fi>
+Cc: Matt Mackall <mpm@selenic.com>
+Cc: Nick Piggin <nickpiggin@yahoo.com.au>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Pekka Enberg <penberg@cs.helsinki.fi>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ include/linux/slab_def.h |   10 ++--------
+ 1 file changed, 2 insertions(+), 8 deletions(-)
+
+--- a/include/linux/slab_def.h
++++ b/include/linux/slab_def.h
+@@ -43,10 +43,7 @@ static inline void *kmalloc(size_t size,
+ 			i++;
+ #include <linux/kmalloc_sizes.h>
+ #undef CACHE
+-		{
+-			extern void __you_cannot_kmalloc_that_much(void);
+-			__you_cannot_kmalloc_that_much();
+-		}
++		return NULL;
+ found:
+ #ifdef CONFIG_ZONE_DMA
+ 		if (flags & GFP_DMA)
+@@ -77,10 +74,7 @@ static inline void *kmalloc_node(size_t 
+ 			i++;
+ #include <linux/kmalloc_sizes.h>
+ #undef CACHE
+-		{
+-			extern void __you_cannot_kmalloc_that_much(void);
+-			__you_cannot_kmalloc_that_much();
+-		}
++		return NULL;
+ found:
+ #ifdef CONFIG_ZONE_DMA
+ 		if (flags & GFP_DMA)
+
+
+From gregkh@mini.kroah.org Wed Feb  4 10:31:13 2009
+Message-Id: <20090204183113.031718610@mini.kroah.org>
+User-Agent: quilt/0.47-1
+Date: Wed, 04 Feb 2009 10:28:35 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: Justin Forbes <jmforbes@linuxtx.org>,
+ Zwane Mwaikambo <zwane@arm.linux.org.uk>,
+ Theodore Ts'o <tytso@mit.edu>,
+ Randy Dunlap <rdunlap@xenotime.net>,
+ Dave Jones <davej@redhat.com>,
+ Chuck Wolber <chuckw@quantumlinux.com>,
+ Chris Wedgwood <reviews@ml.cw.f00f.org>,
+ Michael Krufky <mkrufky@linuxtv.org>,
+ Chuck Ebbert <cebbert@redhat.com>,
+ Domenico Andreoli <cavokz@gmail.com>,
+ Willy Tarreau <w@1wt.eu>,
+ Rodrigo Rubira Branco <rbranco@la.checkpoint.com>,
+ Jake Edge <jake@lwn.net>,
+ Eugene Teo <eteo@redhat.com>,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Tejun Heo <tj@kernel.org>,
+ Jeff Garzik <jgarzik@redhat.com>
+Subject: [patch 12/33] sata_nv: rename nv_nf2_hardreset()
+References: <20090204182823.831027530@mini.kroah.org>
+Content-Disposition: inline; filename=sata_nv-rename-nv_nf2_hardreset.patch
+Content-Length: 2419
+Lines: 76
+
+2.6.28-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Tejun Heo <tj@kernel.org>
+
+commit e8caa3c70e94d867ca2efe9e53fd388b52d6d0c8 upstream.
+
+nv_nf2_hardreset() will be used by other flavors too.  Rename it to
+nv_noclassify_hardreset().
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Signed-off-by: Jeff Garzik <jgarzik@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/ata/sata_nv.c |   28 ++++++++++++++--------------
+ 1 file changed, 14 insertions(+), 14 deletions(-)
+
+--- a/drivers/ata/sata_nv.c
++++ b/drivers/ata/sata_nv.c
+@@ -305,10 +305,10 @@ static irqreturn_t nv_ck804_interrupt(in
+ static int nv_scr_read(struct ata_link *link, unsigned int sc_reg, u32 *val);
+ static int nv_scr_write(struct ata_link *link, unsigned int sc_reg, u32 val);
+ 
++static int nv_noclassify_hardreset(struct ata_link *link, unsigned int *class,
++				   unsigned long deadline);
+ static void nv_nf2_freeze(struct ata_port *ap);
+ static void nv_nf2_thaw(struct ata_port *ap);
+-static int nv_nf2_hardreset(struct ata_link *link, unsigned int *class,
+-			    unsigned long deadline);
+ static void nv_ck804_freeze(struct ata_port *ap);
+ static void nv_ck804_thaw(struct ata_port *ap);
+ static int nv_adma_slave_config(struct scsi_device *sdev);
+@@ -432,7 +432,7 @@ static struct ata_port_operations nv_nf2
+ 	.inherits		= &nv_common_ops,
+ 	.freeze			= nv_nf2_freeze,
+ 	.thaw			= nv_nf2_thaw,
+-	.hardreset		= nv_nf2_hardreset,
++	.hardreset		= nv_noclassify_hardreset,
+ };
+ 
+ /* CK804 finally gets hardreset right */
+@@ -1530,6 +1530,17 @@ static int nv_scr_write(struct ata_link 
+ 	return 0;
+ }
+ 
++static int nv_noclassify_hardreset(struct ata_link *link, unsigned int *class,
++				   unsigned long deadline)
++{
++	bool online;
++	int rc;
++
++	rc = sata_link_hardreset(link, sata_deb_timing_hotplug, deadline,
++				 &online, NULL);
++	return online ? -EAGAIN : rc;
++}
++
+ static void nv_nf2_freeze(struct ata_port *ap)
+ {
+ 	void __iomem *scr_addr = ap->host->ports[0]->ioaddr.scr_addr;
+@@ -1554,17 +1565,6 @@ static void nv_nf2_thaw(struct ata_port 
+ 	iowrite8(mask, scr_addr + NV_INT_ENABLE);
+ }
+ 
+-static int nv_nf2_hardreset(struct ata_link *link, unsigned int *class,
+-			    unsigned long deadline)
+-{
+-	bool online;
+-	int rc;
+-
+-	rc = sata_link_hardreset(link, sata_deb_timing_hotplug, deadline,
+-				 &online, NULL);
+-	return online ? -EAGAIN : rc;
+-}
+-
+ static void nv_ck804_freeze(struct ata_port *ap)
+ {
+ 	void __iomem *mmio_base = ap->host->iomap[NV_MMIO_BAR];
+
+
+From gregkh@mini.kroah.org Wed Feb  4 10:31:13 2009
+Message-Id: <20090204183113.162149643@mini.kroah.org>
+User-Agent: quilt/0.47-1
+Date: Wed, 04 Feb 2009 10:28:36 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: Justin Forbes <jmforbes@linuxtx.org>,
+ Zwane Mwaikambo <zwane@arm.linux.org.uk>,
+ Theodore Ts'o <tytso@mit.edu>,
+ Randy Dunlap <rdunlap@xenotime.net>,
+ Dave Jones <davej@redhat.com>,
+ Chuck Wolber <chuckw@quantumlinux.com>,
+ Chris Wedgwood <reviews@ml.cw.f00f.org>,
+ Michael Krufky <mkrufky@linuxtv.org>,
+ Chuck Ebbert <cebbert@redhat.com>,
+ Domenico Andreoli <cavokz@gmail.com>,
+ Willy Tarreau <w@1wt.eu>,
+ Rodrigo Rubira Branco <rbranco@la.checkpoint.com>,
+ Jake Edge <jake@lwn.net>,
+ Eugene Teo <eteo@redhat.com>,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Tejun Heo <tj@kernel.org>,
+ Jeff Garzik <jgarzik@redhat.com>
+Subject: [patch 13/33] sata_nv: fix MCP5x reset
+References: <20090204182823.831027530@mini.kroah.org>
+Content-Disposition: inline; filename=sata_nv-fix-mcp5x-reset.patch
+Content-Length: 3772
+Lines: 101
+
+2.6.28-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Tejun Heo <tj@kernel.org>
+
+commit 2d775708bc6613f1be47f1e720781343341ecc94 upstream.
+
+MCP5x family of controllers seem to share much more with nf2's as far
+as reset protocol is concerned.  It requires heardreset to get the PHY
+going and classfication code report after hardreset is unreliable.
+Create a new board type MCP5x and use noclassify hardreset.  SWNCQ is
+modified to inherit from this new type.
+
+This fixes hotplug regression reported in kernel bz#12351.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Signed-off-by: Jeff Garzik <jgarzik@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/ata/sata_nv.c |   42 +++++++++++++++++++++++++++++-------------
+ 1 file changed, 29 insertions(+), 13 deletions(-)
+
+--- a/drivers/ata/sata_nv.c
++++ b/drivers/ata/sata_nv.c
+@@ -352,6 +352,7 @@ enum nv_host_type
+ 	NFORCE3 = NFORCE2,	/* NF2 == NF3 as far as sata_nv is concerned */
+ 	CK804,
+ 	ADMA,
++	MCP5x,
+ 	SWNCQ,
+ };
+ 
+@@ -363,10 +364,10 @@ static const struct pci_device_id nv_pci
+ 	{ PCI_VDEVICE(NVIDIA, PCI_DEVICE_ID_NVIDIA_NFORCE_CK804_SATA2), CK804 },
+ 	{ PCI_VDEVICE(NVIDIA, PCI_DEVICE_ID_NVIDIA_NFORCE_MCP04_SATA), CK804 },
+ 	{ PCI_VDEVICE(NVIDIA, PCI_DEVICE_ID_NVIDIA_NFORCE_MCP04_SATA2), CK804 },
+-	{ PCI_VDEVICE(NVIDIA, PCI_DEVICE_ID_NVIDIA_NFORCE_MCP51_SATA), SWNCQ },
+-	{ PCI_VDEVICE(NVIDIA, PCI_DEVICE_ID_NVIDIA_NFORCE_MCP51_SATA2), SWNCQ },
+-	{ PCI_VDEVICE(NVIDIA, PCI_DEVICE_ID_NVIDIA_NFORCE_MCP55_SATA), SWNCQ },
+-	{ PCI_VDEVICE(NVIDIA, PCI_DEVICE_ID_NVIDIA_NFORCE_MCP55_SATA2), SWNCQ },
++	{ PCI_VDEVICE(NVIDIA, PCI_DEVICE_ID_NVIDIA_NFORCE_MCP51_SATA), MCP5x },
++	{ PCI_VDEVICE(NVIDIA, PCI_DEVICE_ID_NVIDIA_NFORCE_MCP51_SATA2), MCP5x },
++	{ PCI_VDEVICE(NVIDIA, PCI_DEVICE_ID_NVIDIA_NFORCE_MCP55_SATA), MCP5x },
++	{ PCI_VDEVICE(NVIDIA, PCI_DEVICE_ID_NVIDIA_NFORCE_MCP55_SATA2), MCP5x },
+ 	{ PCI_VDEVICE(NVIDIA, PCI_DEVICE_ID_NVIDIA_NFORCE_MCP61_SATA), GENERIC },
+ 	{ PCI_VDEVICE(NVIDIA, PCI_DEVICE_ID_NVIDIA_NFORCE_MCP61_SATA2), GENERIC },
+ 	{ PCI_VDEVICE(NVIDIA, PCI_DEVICE_ID_NVIDIA_NFORCE_MCP61_SATA3), GENERIC },
+@@ -467,8 +468,19 @@ static struct ata_port_operations nv_adm
+ 	.host_stop		= nv_adma_host_stop,
+ };
+ 
++/* Kernel bz#12351 reports that when SWNCQ is enabled, for hotplug to
++ * work, hardreset should be used and hardreset can't report proper
++ * signature, which suggests that mcp5x is closer to nf2 as long as
++ * reset quirkiness is concerned.  Define separate ops for mcp5x with
++ * nv_noclassify_hardreset().
++ */
++static struct ata_port_operations nv_mcp5x_ops = {
++	.inherits		= &nv_common_ops,
++	.hardreset		= nv_noclassify_hardreset,
++};
++
+ static struct ata_port_operations nv_swncq_ops = {
+-	.inherits		= &nv_generic_ops,
++	.inherits		= &nv_mcp5x_ops,
+ 
+ 	.qc_defer		= ata_std_qc_defer,
+ 	.qc_prep		= nv_swncq_qc_prep,
+@@ -531,6 +543,15 @@ static const struct ata_port_info nv_por
+ 		.port_ops	= &nv_adma_ops,
+ 		.private_data	= NV_PI_PRIV(nv_adma_interrupt, &nv_adma_sht),
+ 	},
++	/* MCP5x */
++	{
++		.flags		= ATA_FLAG_SATA | ATA_FLAG_NO_LEGACY,
++		.pio_mask	= NV_PIO_MASK,
++		.mwdma_mask	= NV_MWDMA_MASK,
++		.udma_mask	= NV_UDMA_MASK,
++		.port_ops	= &nv_mcp5x_ops,
++		.private_data	= NV_PI_PRIV(nv_generic_interrupt, &nv_sht),
++	},
+ 	/* SWNCQ */
+ 	{
+ 		.flags	        = ATA_FLAG_SATA | ATA_FLAG_NO_LEGACY |
+@@ -2355,14 +2376,9 @@ static int nv_init_one(struct pci_dev *p
+ 	if (type == CK804 && adma_enabled) {
+ 		dev_printk(KERN_NOTICE, &pdev->dev, "Using ADMA mode\n");
+ 		type = ADMA;
+-	}
+-
+-	if (type == SWNCQ) {
+-		if (swncq_enabled)
+-			dev_printk(KERN_NOTICE, &pdev->dev,
+-				   "Using SWNCQ mode\n");
+-		else
+-			type = GENERIC;
++	} else if (type == MCP5x && swncq_enabled) {
++		dev_printk(KERN_NOTICE, &pdev->dev, "Using SWNCQ mode\n");
++		type = SWNCQ;
+ 	}
+ 
+ 	ppi[0] = &nv_port_info[type];
+
+
+From gregkh@mini.kroah.org Wed Feb  4 10:31:13 2009
+Message-Id: <20090204183113.290390453@mini.kroah.org>
+User-Agent: quilt/0.47-1
+Date: Wed, 04 Feb 2009 10:28:37 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: Justin Forbes <jmforbes@linuxtx.org>,
+ Zwane Mwaikambo <zwane@arm.linux.org.uk>,
+ Theodore Ts'o <tytso@mit.edu>,
+ Randy Dunlap <rdunlap@xenotime.net>,
+ Dave Jones <davej@redhat.com>,
+ Chuck Wolber <chuckw@quantumlinux.com>,
+ Chris Wedgwood <reviews@ml.cw.f00f.org>,
+ Michael Krufky <mkrufky@linuxtv.org>,
+ Chuck Ebbert <cebbert@redhat.com>,
+ Domenico Andreoli <cavokz@gmail.com>,
+ Willy Tarreau <w@1wt.eu>,
+ Rodrigo Rubira Branco <rbranco@la.checkpoint.com>,
+ Jake Edge <jake@lwn.net>,
+ Eugene Teo <eteo@redhat.com>,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Tejun Heo <tj@kernel.org>,
+ Jeff Garzik <jgarzik@redhat.com>
+Subject: [patch 14/33] sata_nv: ck804 has borked hardreset too
+References: <20090204182823.831027530@mini.kroah.org>
+Content-Disposition: inline; filename=sata_nv-ck804-has-borked-hardreset-too.patch
+Content-Length: 1303
+Lines: 38
+
+2.6.28-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Tejun Heo <tj@kernel.org>
+
+commit 8d993eaa9c3c61b8a5929a7f695078a1fcfb4869 upstream.
+
+While playing with nvraid, I found out that rmmoding and insmoding
+often trigger hardreset failure on the first port (the second one was
+always okay).  Seriously, how diverse can you get with hardreset
+behaviors?  Anyways, make ck804 use noclassify variant too.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Signed-off-by: Jeff Garzik <jgarzik@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/ata/sata_nv.c |    7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+--- a/drivers/ata/sata_nv.c
++++ b/drivers/ata/sata_nv.c
+@@ -436,11 +436,16 @@ static struct ata_port_operations nv_nf2
+ 	.hardreset		= nv_noclassify_hardreset,
+ };
+ 
+-/* CK804 finally gets hardreset right */
++/* For initial probing after boot and hot plugging, hardreset mostly
++ * works fine on CK804 but curiously, reprobing on the initial port by
++ * rescanning or rmmod/insmod fails to acquire the initial D2H Reg FIS
++ * in somewhat undeterministic way.  Use noclassify hardreset.
++ */
+ static struct ata_port_operations nv_ck804_ops = {
+ 	.inherits		= &nv_common_ops,
+ 	.freeze			= nv_ck804_freeze,
+ 	.thaw			= nv_ck804_thaw,
++	.hardreset		= nv_noclassify_hardreset,
+ 	.host_stop		= nv_ck804_host_stop,
+ };
+ 
+
+
+From gregkh@mini.kroah.org Wed Feb  4 10:31:13 2009
+Message-Id: <20090204183113.427940895@mini.kroah.org>
+User-Agent: quilt/0.47-1
+Date: Wed, 04 Feb 2009 10:28:38 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: Justin Forbes <jmforbes@linuxtx.org>,
+ Zwane Mwaikambo <zwane@arm.linux.org.uk>,
+ Theodore Ts'o <tytso@mit.edu>,
+ Randy Dunlap <rdunlap@xenotime.net>,
+ Dave Jones <davej@redhat.com>,
+ Chuck Wolber <chuckw@quantumlinux.com>,
+ Chris Wedgwood <reviews@ml.cw.f00f.org>,
+ Michael Krufky <mkrufky@linuxtv.org>,
+ Chuck Ebbert <cebbert@redhat.com>,
+ Domenico Andreoli <cavokz@gmail.com>,
+ Willy Tarreau <w@1wt.eu>,
+ Rodrigo Rubira Branco <rbranco@la.checkpoint.com>,
+ Jake Edge <jake@lwn.net>,
+ Eugene Teo <eteo@redhat.com>,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Mikulas Patocka <mpatocka@redhat.com>
+Subject: [patch 15/33] Fix memory corruption in console selection
+References: <20090204182823.831027530@mini.kroah.org>
+Content-Disposition: inline; filename=fix-memory-corruption-in-console-selection.patch
+Content-Length: 1390
+Lines: 37
+
+2.6.28-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Mikulas Patocka <mpatocka@redhat.com>
+
+commit 878b8619f711280fd05845e21956434b5e588cc4 upstream.
+
+Fix an off-by-two memory error in console selection.
+
+The loop below goes from sel_start to sel_end (inclusive), so it writes
+one more character.  This one more character was added to the allocated
+size (+1), but it was not multiplied by an UTF-8 multiplier.
+
+This patch fixes a memory corruption when UTF-8 console is used and the
+user selects a few characters, all of them 3-byte in UTF-8 (for example
+a frame line).
+
+When memory redzones are enabled, a redzone corruption is reported.
+When they are not enabled, trashing of random memory occurs.
+
+Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/char/selection.c |    2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+--- a/drivers/char/selection.c
++++ b/drivers/char/selection.c
+@@ -268,7 +268,7 @@ int set_selection(const struct tiocl_sel
+ 
+ 	/* Allocate a new buffer before freeing the old one ... */
+ 	multiplier = use_unicode ? 3 : 1;  /* chars can take up to 3 bytes */
+-	bp = kmalloc((sel_end-sel_start)/2*multiplier+1, GFP_KERNEL);
++	bp = kmalloc(((sel_end-sel_start)/2+1)*multiplier, GFP_KERNEL);
+ 	if (!bp) {
+ 		printk(KERN_WARNING "selection: kmalloc() failed\n");
+ 		clear_selection();
+
+
+From gregkh@mini.kroah.org Wed Feb  4 10:31:13 2009
+Message-Id: <20090204183113.585588236@mini.kroah.org>
+User-Agent: quilt/0.47-1
+Date: Wed, 04 Feb 2009 10:28:39 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: Justin Forbes <jmforbes@linuxtx.org>,
+ Zwane Mwaikambo <zwane@arm.linux.org.uk>,
+ Theodore Ts'o <tytso@mit.edu>,
+ Randy Dunlap <rdunlap@xenotime.net>,
+ Dave Jones <davej@redhat.com>,
+ Chuck Wolber <chuckw@quantumlinux.com>,
+ Chris Wedgwood <reviews@ml.cw.f00f.org>,
+ Michael Krufky <mkrufky@linuxtv.org>,
+ Chuck Ebbert <cebbert@redhat.com>,
+ Domenico Andreoli <cavokz@gmail.com>,
+ Willy Tarreau <w@1wt.eu>,
+ Rodrigo Rubira Branco <rbranco@la.checkpoint.com>,
+ Jake Edge <jake@lwn.net>,
+ Eugene Teo <eteo@redhat.com>,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Scott Kilau <Scott.Kilau@digi.com>,
+ Paul Larson <pl@linux.vnet.ibm.com>
+Subject: [patch 16/33] Add enable_ms to jsm driver
+References: <20090204182823.831027530@mini.kroah.org>
+Content-Disposition: inline; filename=add-enable_ms-to-jsm-driver.patch
+Content-Length: 1140
+Lines: 39
+
+2.6.28-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Paul Larson <pl@linux.vnet.ibm.com>
+
+commit 0461ec5bc7745b89a8ab67ba0ea497abd58a6301 upstream.
+
+This fixes a crash observed when non-existant enable_ms function is
+called for jsm driver.
+
+Signed-off-by: Scott Kilau <Scott.Kilau@digi.com>
+Signed-off-by: Paul Larson <pl@linux.vnet.ibm.com>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/serial/jsm/jsm_tty.c |    6 ++++++
+ 1 file changed, 6 insertions(+)
+
+--- a/drivers/serial/jsm/jsm_tty.c
++++ b/drivers/serial/jsm/jsm_tty.c
+@@ -161,6 +161,11 @@ static void jsm_tty_stop_rx(struct uart_
+ 	channel->ch_bd->bd_ops->disable_receiver(channel);
+ }
+ 
++static void jsm_tty_enable_ms(struct uart_port *port)
++{
++	/* Nothing needed */
++}
++
+ static void jsm_tty_break(struct uart_port *port, int break_state)
+ {
+ 	unsigned long lock_flags;
+@@ -345,6 +350,7 @@ static struct uart_ops jsm_ops = {
+ 	.start_tx	= jsm_tty_start_tx,
+ 	.send_xchar	= jsm_tty_send_xchar,
+ 	.stop_rx	= jsm_tty_stop_rx,
++	.enable_ms	= jsm_tty_enable_ms,
+ 	.break_ctl	= jsm_tty_break,
+ 	.startup	= jsm_tty_open,
+ 	.shutdown	= jsm_tty_close,
+
+
+From gregkh@mini.kroah.org Wed Feb  4 10:31:13 2009
+Message-Id: <20090204183113.714236221@mini.kroah.org>
+User-Agent: quilt/0.47-1
+Date: Wed, 04 Feb 2009 10:28:40 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: Justin Forbes <jmforbes@linuxtx.org>,
+ Zwane Mwaikambo <zwane@arm.linux.org.uk>,
+ Theodore Ts'o <tytso@mit.edu>,
+ Randy Dunlap <rdunlap@xenotime.net>,
+ Dave Jones <davej@redhat.com>,
+ Chuck Wolber <chuckw@quantumlinux.com>,
+ Chris Wedgwood <reviews@ml.cw.f00f.org>,
+ Michael Krufky <mkrufky@linuxtv.org>,
+ Chuck Ebbert <cebbert@redhat.com>,
+ Domenico Andreoli <cavokz@gmail.com>,
+ Willy Tarreau <w@1wt.eu>,
+ Rodrigo Rubira Branco <rbranco@la.checkpoint.com>,
+ Jake Edge <jake@lwn.net>,
+ Eugene Teo <eteo@redhat.com>,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Stuart Hopkins <stuart@dodgy-geeza.com>,
+ Dmitry Torokhov <dtor@mail.ru>
+Subject: [patch 17/33] Input: atkbd - Samsung NC10 key repeat fix
+References: <20090204182823.831027530@mini.kroah.org>
+Content-Disposition: inline; filename=input-atkbd-samsung-nc10-key-repeat-fix.patch
+Content-Length: 1738
+Lines: 61
+
+2.6.28-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Stuart Hopkins <stuart@dodgy-geeza.com>
+
+commit 4200844bd9dc511088258437d564a187f0ffc94e upstream.
+
+This patch fixes the key repeat issue with the Fn+F? keys on the new
+Samsung NC10 Netbook, so that the keys can be defined and used within
+ACPID correctly, otherwise the keys repeat indefinately.
+
+This solves part of http://bugzilla.kernel.org/show_bug.cgi?id=12021
+
+Signed-off-by: Stuart Hopkins <stuart@dodgy-geeza.com>
+Signed-off-by: Dmitry Torokhov <dtor@mail.ru>
+Cc: Chuck Ebbert <cebbert@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/input/keyboard/atkbd.c |   25 +++++++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+--- a/drivers/input/keyboard/atkbd.c
++++ b/drivers/input/keyboard/atkbd.c
+@@ -884,6 +884,22 @@ static void atkbd_inventec_keymap_fixup(
+ }
+ 
+ /*
++ * Samsung NC10 with Fn+F? key release not working
++ */
++static void atkbd_samsung_keymap_fixup(struct atkbd *atkbd)
++{
++	const unsigned int forced_release_keys[] = {
++		0x82, 0x83, 0x84, 0x86, 0x88, 0x89, 0xb3, 0xf7, 0xf9,
++	};
++	int i;
++
++	if (atkbd->set == 2)
++		for (i = 0; i < ARRAY_SIZE(forced_release_keys); i++)
++			__set_bit(forced_release_keys[i],
++				  atkbd->force_release_mask);
++}
++
++/*
+  * atkbd_set_keycode_table() initializes keyboard's keycode table
+  * according to the selected scancode set
+  */
+@@ -1493,6 +1509,15 @@ static struct dmi_system_id atkbd_dmi_qu
+ 		.callback = atkbd_setup_fixup,
+ 		.driver_data = atkbd_inventec_keymap_fixup,
+ 	},
++	{
++		.ident = "Samsung NC10",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "SAMSUNG ELECTRONICS CO., LTD."),
++			DMI_MATCH(DMI_PRODUCT_NAME, "NC10"),
++		},
++		.callback = atkbd_setup_fixup,
++		.driver_data = atkbd_samsung_keymap_fixup,
++	},
+ 	{ }
+ };
+ 
+
+
+From gregkh@mini.kroah.org Wed Feb  4 10:31:13 2009
+Message-Id: <20090204183113.844776136@mini.kroah.org>
+User-Agent: quilt/0.47-1
+Date: Wed, 04 Feb 2009 10:28:41 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: Justin Forbes <jmforbes@linuxtx.org>,
+ Zwane Mwaikambo <zwane@arm.linux.org.uk>,
+ Theodore Ts'o <tytso@mit.edu>,
+ Randy Dunlap <rdunlap@xenotime.net>,
+ Dave Jones <davej@redhat.com>,
+ Chuck Wolber <chuckw@quantumlinux.com>,
+ Chris Wedgwood <reviews@ml.cw.f00f.org>,
+ Michael Krufky <mkrufky@linuxtv.org>,
+ Chuck Ebbert <cebbert@redhat.com>,
+ Domenico Andreoli <cavokz@gmail.com>,
+ Willy Tarreau <w@1wt.eu>,
+ Rodrigo Rubira Branco <rbranco@la.checkpoint.com>,
+ Jake Edge <jake@lwn.net>,
+ Eugene Teo <eteo@redhat.com>,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Jeff Layton <jlayton@redhat.com>,
+ "J. Bruce Fields" <bfields@pig.fieldses.org>
+Subject: [patch 18/33] nfsd: only set file_lock.fl_lmops in nfsd4_lockt if a stateowner is found
+References: <20090204182823.831027530@mini.kroah.org>
+Content-Disposition: inline; filename=nfsd-only-set-file_lock.fl_lmops-in-nfsd4_lockt-if-a-stateowner-is-found.patch
+Content-Length: 1387
+Lines: 35
+
+2.6.28-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Jeff Layton <jlayton@redhat.com>
+
+commit fa82a491275a613b15489aab4b99acecb00958d3 upstream.
+
+nfsd4_lockt does a search for a lockstateowner when building the lock
+struct to test. If one is found, it'll set fl_owner to it. Regardless of
+whether that happens, it'll also set fl_lmops. Given that this lock is
+basically a "lightweight" lock that's just used for checking conflicts,
+setting fl_lmops is probably not appropriate for it.
+
+This behavior exposed a bug in DLM's GETLK implementation where it
+wasn't clearing out the fields in the file_lock before filling in
+conflicting lock info. While we were able to fix this in DLM, it
+still seems pointless and dangerous to set the fl_lmops this way
+when we may have a NULL lockstateowner.
+
+Signed-off-by: Jeff Layton <jlayton@redhat.com>
+Signed-off-by: J. Bruce Fields <bfields@pig.fieldses.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ fs/nfsd/nfs4state.c |    1 -
+ 1 file changed, 1 deletion(-)
+
+--- a/fs/nfsd/nfs4state.c
++++ b/fs/nfsd/nfs4state.c
+@@ -2824,7 +2824,6 @@ nfsd4_lockt(struct svc_rqst *rqstp, stru
+ 		file_lock.fl_owner = (fl_owner_t)lockt->lt_stateowner;
+ 	file_lock.fl_pid = current->tgid;
+ 	file_lock.fl_flags = FL_POSIX;
+-	file_lock.fl_lmops = &nfsd_posix_mng_ops;
+ 
+ 	file_lock.fl_start = lockt->lt_offset;
+ 	if ((lockt->lt_length == ~(u64)0) || LOFF_OVERFLOW(lockt->lt_offset, lockt->lt_length))
+
+
+From gregkh@mini.kroah.org Wed Feb  4 10:31:14 2009
+Message-Id: <20090204183113.991394002@mini.kroah.org>
+User-Agent: quilt/0.47-1
+Date: Wed, 04 Feb 2009 10:28:42 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: Justin Forbes <jmforbes@linuxtx.org>,
+ Zwane Mwaikambo <zwane@arm.linux.org.uk>,
+ Theodore Ts'o <tytso@mit.edu>,
+ Randy Dunlap <rdunlap@xenotime.net>,
+ Dave Jones <davej@redhat.com>,
+ Chuck Wolber <chuckw@quantumlinux.com>,
+ Chris Wedgwood <reviews@ml.cw.f00f.org>,
+ Michael Krufky <mkrufky@linuxtv.org>,
+ Chuck Ebbert <cebbert@redhat.com>,
+ Domenico Andreoli <cavokz@gmail.com>,
+ Willy Tarreau <w@1wt.eu>,
+ Rodrigo Rubira Branco <rbranco@la.checkpoint.com>,
+ Jake Edge <jake@lwn.net>,
+ Eugene Teo <eteo@redhat.com>,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ "J. Bruce Fields" <bfields@citi.umich.edu>
+Subject: [patch 19/33] nfsd: Ensure nfsv4 calls the underlying filesystem on LOCKT
+References: <20090204182823.831027530@mini.kroah.org>
+Content-Disposition: inline; filename=nfsd-ensure-nfsv4-calls-the-underlying-filesystem-on-lockt.patch
+Content-Length: 2573
+Lines: 82
+
+2.6.28-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: J. Bruce Fields <bfields@citi.umich.edu>
+
+commit 55ef1274dddd4de387c54d110e354ffbb6cdc706 upstream.
+
+Since nfsv4 allows LOCKT without an open, but the ->lock() method is a
+file method, we fake up a struct file in the nfsv4 code with just the
+fields we need initialized.  But we forgot to initialize the file
+operations, with the result that LOCKT never results in a call to the
+filesystem's ->lock() method (if it exists).
+
+We could just add that one more initialization.  But this hack of faking
+up a struct file with only some fields initialized seems the kind of
+thing that might cause more problems in the future.  We should either do
+an open and get a real struct file, or make lock-testing an inode (not a
+file) method.
+
+This patch does the former.
+
+Reported-by: Marc Eshel <eshel@almaden.ibm.com>
+Tested-by: Marc Eshel <eshel@almaden.ibm.com>
+Signed-off-by: J. Bruce Fields <bfields@citi.umich.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ fs/nfsd/nfs4state.c |   30 ++++++++++++++++++++----------
+ 1 file changed, 20 insertions(+), 10 deletions(-)
+
+--- a/fs/nfsd/nfs4state.c
++++ b/fs/nfsd/nfs4state.c
+@@ -2769,6 +2769,25 @@ out:
+ }
+ 
+ /*
++ * The NFSv4 spec allows a client to do a LOCKT without holding an OPEN,
++ * so we do a temporary open here just to get an open file to pass to
++ * vfs_test_lock.  (Arguably perhaps test_lock should be done with an
++ * inode operation.)
++ */
++static int nfsd_test_lock(struct svc_rqst *rqstp, struct svc_fh *fhp, struct file_lock *lock)
++{
++	struct file *file;
++	int err;
++
++	err = nfsd_open(rqstp, fhp, S_IFREG, NFSD_MAY_READ, &file);
++	if (err)
++		return err;
++	err = vfs_test_lock(file, lock);
++	nfsd_close(file);
++	return err;
++}
++
++/*
+  * LOCKT operation
+  */
+ __be32
+@@ -2776,7 +2795,6 @@ nfsd4_lockt(struct svc_rqst *rqstp, stru
+ 	    struct nfsd4_lockt *lockt)
+ {
+ 	struct inode *inode;
+-	struct file file;
+ 	struct file_lock file_lock;
+ 	int error;
+ 	__be32 status;
+@@ -2833,16 +2851,8 @@ nfsd4_lockt(struct svc_rqst *rqstp, stru
+ 
+ 	nfs4_transform_lock_offset(&file_lock);
+ 
+-	/* vfs_test_lock uses the struct file _only_ to resolve the inode.
+-	 * since LOCKT doesn't require an OPEN, and therefore a struct
+-	 * file may not exist, pass vfs_test_lock a struct file with
+-	 * only the dentry:inode set.
+-	 */
+-	memset(&file, 0, sizeof (struct file));
+-	file.f_path.dentry = cstate->current_fh.fh_dentry;
+-
+ 	status = nfs_ok;
+-	error = vfs_test_lock(&file, &file_lock);
++	error = nfsd_test_lock(rqstp, &cstate->current_fh, &file_lock);
+ 	if (error) {
+ 		status = nfserrno(error);
+ 		goto out;
+
+
+From gregkh@mini.kroah.org Wed Feb  4 10:31:14 2009
+Message-Id: <20090204183114.116589313@mini.kroah.org>
+User-Agent: quilt/0.47-1
+Date: Wed, 04 Feb 2009 10:28:43 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: Justin Forbes <jmforbes@linuxtx.org>,
+ Zwane Mwaikambo <zwane@arm.linux.org.uk>,
+ Theodore Ts'o <tytso@mit.edu>,
+ Randy Dunlap <rdunlap@xenotime.net>,
+ Dave Jones <davej@redhat.com>,
+ Chuck Wolber <chuckw@quantumlinux.com>,
+ Chris Wedgwood <reviews@ml.cw.f00f.org>,
+ Michael Krufky <mkrufky@linuxtv.org>,
+ Chuck Ebbert <cebbert@redhat.com>,
+ Domenico Andreoli <cavokz@gmail.com>,
+ Willy Tarreau <w@1wt.eu>,
+ Rodrigo Rubira Branco <rbranco@la.checkpoint.com>,
+ Jake Edge <jake@lwn.net>,
+ Eugene Teo <eteo@redhat.com>,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ mohamed abbas <mohamed.abbas@intel.com>,
+ Reinette Chatre <reinette.chatre@intel.com>,
+ "John W. Linville" <linville@tuxdriver.com>
+Subject: [patch 20/33] iwlwifi: fix rs_get_rate WARN_ON()
+References: <20090204182823.831027530@mini.kroah.org>
+Content-Disposition: inline; filename=iwlwifi-fix-rs_get_rate-warn_on.patch
+Content-Length: 3518
+Lines: 101
+
+2.6.28-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Abbas, Mohamed <mohamed.abbas@intel.com>
+
+commit c338ba3ca5bef2df2082d9e8d336ff7b2880c326 upstream.
+
+In ieee80211_sta structure there is u64 supp_rates[IEEE80211_NUM_BANDS]
+this is filled with all support rate from assoc_resp.  If we associate
+with G-band AP only supp_rates of G-band will be set the other band
+supp_rates will be set to 0. If the user type this command
+this will cause mac80211 to set to new channel, mac80211
+does not disassociate in setting new channel, so the active
+band is now A-band. then in handling the new essid mac80211 will
+kick in the assoc steps which involve sending disassociation frame.
+in this mac80211 will WARN_ON sta->supp_rates[A_BAND] == 0.
+
+This fixes:
+http://www.intellinuxwireless.org/bugzilla/show_bug.cgi?id=1822
+http://www.kerneloops.org/searchweek.php?search=rs_get_rate
+
+Signed-off-by: mohamed abbas <mohamed.abbas@intel.com>
+Signed-off-by: Reinette Chatre <reinette.chatre@intel.com>
+Signed-off-by: John W. Linville <linville@tuxdriver.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/net/wireless/iwlwifi/iwl-3945-rs.c |   12 +++++++++---
+ drivers/net/wireless/iwlwifi/iwl-agn-rs.c  |   12 ++++++++++--
+ 2 files changed, 19 insertions(+), 5 deletions(-)
+
+--- a/drivers/net/wireless/iwlwifi/iwl-3945-rs.c
++++ b/drivers/net/wireless/iwlwifi/iwl-3945-rs.c
+@@ -647,12 +647,16 @@ static void rs_get_rate(void *priv_r, st
+ 	s8 scale_action = 0;
+ 	unsigned long flags;
+ 	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
+-	u16 fc, rate_mask;
++	u16 fc;
++	u16 rate_mask = 0;
+ 	struct iwl3945_priv *priv = (struct iwl3945_priv *)priv_r;
+ 	DECLARE_MAC_BUF(mac);
+ 
+ 	IWL_DEBUG_RATE("enter\n");
+ 
++	if (sta)
++		rate_mask = sta->supp_rates[sband->band];
++
+ 	/* Send management frames and broadcast/multicast data using lowest
+ 	 * rate. */
+ 	fc = le16_to_cpu(hdr->frame_control);
+@@ -660,11 +664,13 @@ static void rs_get_rate(void *priv_r, st
+ 	    is_multicast_ether_addr(hdr->addr1) ||
+ 	    !sta || !priv_sta) {
+ 		IWL_DEBUG_RATE("leave: No STA priv data to update!\n");
+-		sel->rate_idx = rate_lowest_index(sband, sta);
++		if (!rate_mask)
++			sel->rate_idx = rate_lowest_index(sband, NULL);
++		else
++			sel->rate_idx = rate_lowest_index(sband, sta);
+ 		return;
+ 	}
+ 
+-	rate_mask = sta->supp_rates[sband->band];
+ 	index = min(rs_sta->last_txrate_idx & 0xffff, IWL_RATE_COUNT - 1);
+ 
+ 	if (sband->band == IEEE80211_BAND_5GHZ)
+--- a/drivers/net/wireless/iwlwifi/iwl-agn-rs.c
++++ b/drivers/net/wireless/iwlwifi/iwl-agn-rs.c
+@@ -951,7 +951,8 @@ static void rs_tx_status(void *priv_r, s
+ 	}
+ 
+ 	/* See if there's a better rate or modulation mode to try. */
+-	rs_rate_scale_perform(priv, hdr, sta, lq_sta);
++	if (sta && sta->supp_rates[sband->band])
++		rs_rate_scale_perform(priv, hdr, sta, lq_sta);
+ out:
+ 	return;
+ }
+@@ -2114,15 +2115,22 @@ static void rs_get_rate(void *priv_r, st
+ 	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
+ 	__le16 fc;
+ 	struct iwl_lq_sta *lq_sta;
++	u64 mask_bit = 0;
+ 
+ 	IWL_DEBUG_RATE_LIMIT("rate scale calculate new rate for skb\n");
+ 
++	if (sta)
++		mask_bit = sta->supp_rates[sband->band];
++
+ 	/* Send management frames and broadcast/multicast data using lowest
+ 	 * rate. */
+ 	fc = hdr->frame_control;
+ 	if (!ieee80211_is_data(fc) || is_multicast_ether_addr(hdr->addr1) ||
+ 	    !sta || !priv_sta) {
+-		sel->rate_idx = rate_lowest_index(sband, sta);
++		if (!mask_bit)
++			sel->rate_idx = rate_lowest_index(sband, NULL);
++		else
++			sel->rate_idx = rate_lowest_index(sband, sta);
+ 		return;
+ 	}
+ 
+
+
+From gregkh@mini.kroah.org Wed Feb  4 10:31:14 2009
+Message-Id: <20090204183114.243549094@mini.kroah.org>
+User-Agent: quilt/0.47-1
+Date: Wed, 04 Feb 2009 10:28:44 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org,
+ Greg KH <greg@kroah.com>
+Cc: Justin Forbes <jmforbes@linuxtx.org>,
+ Zwane Mwaikambo <zwane@arm.linux.org.uk>,
+ Theodore Ts'o <tytso@mit.edu>,
+ Randy Dunlap <rdunlap@xenotime.net>,
+ Dave Jones <davej@redhat.com>,
+ Chuck Wolber <chuckw@quantumlinux.com>,
+ Chris Wedgwood <reviews@ml.cw.f00f.org>,
+ Michael Krufky <mkrufky@linuxtv.org>,
+ Chuck Ebbert <cebbert@redhat.com>,
+ Domenico Andreoli <cavokz@gmail.com>,
+ Willy Tarreau <w@1wt.eu>,
+ Rodrigo Rubira Branco <rbranco@la.checkpoint.com>,
+ Jake Edge <jake@lwn.net>,
+ Eugene Teo <eteo@redhat.com>,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Johannes Berg <johannes@sipsolutions.net>,
+ linville@tuxdriver.com,
+ Larry.Finger@lwfinger.net,
+ Christian Lamparter <chunkeey@web.de>
+Subject: [patch 21/33] p54: fix lm87 checksum endianness
+References: <20090204182823.831027530@mini.kroah.org>
+Content-Disposition: inline; filename=p54-fix-lm87-checksum-endianness.patch
+Content-Length: 1311
+Lines: 46
+
+
+2.6.28-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Johannes Berg <johannes@sipsolutions.net>
+
+commit c91276592695e13d1b52eab572551017cbf96ee7 upstream
+
+This fixes the checksum calculation for lm87 firmwares
+on big endian platforms, the device treats the data as
+an array of 32-bit little endian values so the driver
+needs to do that as well.
+
+Signed-off-by: Johannes Berg <johannes@sipsolutions.net>
+Acked-by: Christian Lamparter <chunkeey@web.de>
+Signed-off-by: John W. Linville <linville@tuxdriver.com>
+
+---
+ drivers/net/wireless/p54/p54usb.c |    6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+--- a/drivers/net/wireless/p54/p54usb.c
++++ b/drivers/net/wireless/p54/p54usb.c
+@@ -222,13 +222,13 @@ static void p54u_tx_3887(struct ieee8021
+ 	usb_submit_urb(data_urb, GFP_ATOMIC);
+ }
+ 
+-static __le32 p54u_lm87_chksum(const u32 *data, size_t length)
++static __le32 p54u_lm87_chksum(const __le32 *data, size_t length)
+ {
+ 	u32 chk = 0;
+ 
+ 	length >>= 2;
+ 	while (length--) {
+-		chk ^= *data++;
++		chk ^= le32_to_cpu(*data++);
+ 		chk = (chk >> 5) ^ (chk << 3);
+ 	}
+ 
+@@ -247,7 +247,7 @@ static void p54u_tx_lm87(struct ieee8021
+ 	if (!data_urb)
+ 		return;
+ 
+-	hdr->chksum = p54u_lm87_chksum((u32 *)data, len);
++	hdr->chksum = p54u_lm87_chksum((__le32 *) data, len);
+ 	hdr->device_addr = data->req_id;
+ 
+ 	usb_fill_bulk_urb(data_urb, priv->udev,
+
+
+From gregkh@mini.kroah.org Wed Feb  4 10:31:14 2009
+Message-Id: <20090204183114.370232862@mini.kroah.org>
+User-Agent: quilt/0.47-1
+Date: Wed, 04 Feb 2009 10:28:45 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org,
+ Greg KH <greg@kroah.com>
+Cc: Justin Forbes <jmforbes@linuxtx.org>,
+ Zwane Mwaikambo <zwane@arm.linux.org.uk>,
+ Theodore Ts'o <tytso@mit.edu>,
+ Randy Dunlap <rdunlap@xenotime.net>,
+ Dave Jones <davej@redhat.com>,
+ Chuck Wolber <chuckw@quantumlinux.com>,
+ Chris Wedgwood <reviews@ml.cw.f00f.org>,
+ Michael Krufky <mkrufky@linuxtv.org>,
+ Chuck Ebbert <cebbert@redhat.com>,
+ Domenico Andreoli <cavokz@gmail.com>,
+ Willy Tarreau <w@1wt.eu>,
+ Rodrigo Rubira Branco <rbranco@la.checkpoint.com>,
+ Jake Edge <jake@lwn.net>,
+ Eugene Teo <eteo@redhat.com>,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Larry.Finger@lwfinger.net,
+ linville@tuxdriver.com,
+ Christian Lamparter <chunkeey@web.de>
+Subject: [patch 22/33] p54: fix p54_read_eeprom to cope with tx_hdr_len
+References: <20090204182823.831027530@mini.kroah.org>
+Content-Disposition: inline; filename=p54-fix-p54_read_eeprom-to-cope-with-tx_hdr_len.patch
+Content-Length: 1619
+Lines: 53
+
+2.6.28-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Christian Lamparter <chunkeey@web.de>
+
+commit b92f30d65aeb0502e2ed8beb80c8465578b40002 upstream
+
+This patch fixes a regression in "p54: move eeprom code into common library"
+7cb770729ba895f73253dfcd46c3fcba45d896f9
+
+Some of p54usb's devices need a little headroom for the transportation and
+this was forgotten in the eeprom change.
+
+Signed-off-by: Christian Lamparter <chunkeey@web.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/net/wireless/p54/p54common.c |   12 +++++++-----
+ 1 file changed, 7 insertions(+), 5 deletions(-)
+
+--- a/drivers/net/wireless/p54/p54common.c
++++ b/drivers/net/wireless/p54/p54common.c
+@@ -741,17 +741,19 @@ static void p54_assign_address(struct ie
+ int p54_read_eeprom(struct ieee80211_hw *dev)
+ {
+ 	struct p54_common *priv = dev->priv;
+-	struct p54_control_hdr *hdr = NULL;
++	struct p54_control_hdr *hdr = NULL, *org_hdr;
+ 	struct p54_eeprom_lm86 *eeprom_hdr;
+ 	size_t eeprom_size = 0x2020, offset = 0, blocksize;
+ 	int ret = -ENOMEM;
+ 	void *eeprom = NULL;
+ 
+-	hdr = (struct p54_control_hdr *)kzalloc(sizeof(*hdr) +
+-		sizeof(*eeprom_hdr) + EEPROM_READBACK_LEN, GFP_KERNEL);
+-	if (!hdr)
++	org_hdr = kzalloc(priv->tx_hdr_len + sizeof(*hdr) +
++			  sizeof(*eeprom_hdr) + EEPROM_READBACK_LEN,
++			  GFP_KERNEL);
++	if (!org_hdr)
+ 		goto free;
+ 
++	hdr = (void *) org_hdr + priv->tx_hdr_len;
+ 	priv->eeprom = kzalloc(EEPROM_READBACK_LEN, GFP_KERNEL);
+ 	if (!priv->eeprom)
+ 		goto free;
+@@ -790,7 +792,7 @@ int p54_read_eeprom(struct ieee80211_hw 
+ free:
+ 	kfree(priv->eeprom);
+ 	priv->eeprom = NULL;
+-	kfree(hdr);
++	kfree(org_hdr);
+ 	kfree(eeprom);
+ 
+ 	return ret;
+
+
+From gregkh@mini.kroah.org Wed Feb  4 10:31:14 2009
+Message-Id: <20090204183114.509157852@mini.kroah.org>
+User-Agent: quilt/0.47-1
+Date: Wed, 04 Feb 2009 10:28:46 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org,
+ Greg KH <greg@kroah.com>
+Cc: Justin Forbes <jmforbes@linuxtx.org>,
+ Zwane Mwaikambo <zwane@arm.linux.org.uk>,
+ Theodore Ts'o <tytso@mit.edu>,
+ Randy Dunlap <rdunlap@xenotime.net>,
+ Dave Jones <davej@redhat.com>,
+ Chuck Wolber <chuckw@quantumlinux.com>,
+ Chris Wedgwood <reviews@ml.cw.f00f.org>,
+ Michael Krufky <mkrufky@linuxtv.org>,
+ Chuck Ebbert <cebbert@redhat.com>,
+ Domenico Andreoli <cavokz@gmail.com>,
+ Willy Tarreau <w@1wt.eu>,
+ Rodrigo Rubira Branco <rbranco@la.checkpoint.com>,
+ Jake Edge <jake@lwn.net>,
+ Eugene Teo <eteo@redhat.com>,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ linville@tuxdriver.com,
+ Larry.Finger@lwfinger.net,
+ Christian Lamparter <chunkeey@web.de>
+Subject: [patch 23/33] p54usb: rewriting rx/tx routines to make use of usb_anchors facilities
+References: <20090204182823.831027530@mini.kroah.org>
+Content-Disposition: inline; filename=p54usb-rewriting-rx-tx-routines-to-make-use-of-usb_anchor-s-facilities.patch
+Content-Length: 8135
+Lines: 274
+
+2.6.28-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Christian Lamparter <chunkeey@web.de>
+
+commit dd397dc9dddfa2149a1bbc9e52ac7d5630737cec upstream
+
+Alan Stern found several flaws in p54usb's implementation and annotated:
+"usb_kill_urb() and similar routines do not expect an URB's completion
+routine to deallocate it.  This is almost obvious -- if the URB is deallocated
+before the completion routine returns then there's no way for usb_kill_urb
+to detect when the URB actually is complete."
+
+This patch addresses all known limitations in the old implementation and fixes
+khub's "use-after-freed" hang, when SLUB debug's poisoning option is enabled.
+
+Signed-off-by: Christian Lamparter <chunkeey@web.de>
+Tested-by: Larry Finger <Larry.Finger@lwfinger.net>
+Signed-off-by: John W. Linville <linville@tuxdriver.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/net/wireless/p54/p54usb.c |  143 +++++++++++++++++++++++---------------
+ drivers/net/wireless/p54/p54usb.h |    1 
+ 2 files changed, 89 insertions(+), 55 deletions(-)
+
+--- a/drivers/net/wireless/p54/p54usb.c
++++ b/drivers/net/wireless/p54/p54usb.c
+@@ -85,13 +85,13 @@ static void p54u_rx_cb(struct urb *urb)
+ 	struct ieee80211_hw *dev = info->dev;
+ 	struct p54u_priv *priv = dev->priv;
+ 
++	skb_unlink(skb, &priv->rx_queue);
++
+ 	if (unlikely(urb->status)) {
+-		info->urb = NULL;
+-		usb_free_urb(urb);
++		dev_kfree_skb_irq(skb);
+ 		return;
+ 	}
+ 
+-	skb_unlink(skb, &priv->rx_queue);
+ 	skb_put(skb, urb->actual_length);
+ 
+ 	if (priv->hw_type == P54U_NET2280)
+@@ -104,7 +104,6 @@ static void p54u_rx_cb(struct urb *urb)
+ 	if (p54_rx(dev, skb)) {
+ 		skb = dev_alloc_skb(priv->common.rx_mtu + 32);
+ 		if (unlikely(!skb)) {
+-			usb_free_urb(urb);
+ 			/* TODO check rx queue length and refill *somewhere* */
+ 			return;
+ 		}
+@@ -114,7 +113,6 @@ static void p54u_rx_cb(struct urb *urb)
+ 		info->dev = dev;
+ 		urb->transfer_buffer = skb_tail_pointer(skb);
+ 		urb->context = skb;
+-		skb_queue_tail(&priv->rx_queue, skb);
+ 	} else {
+ 		if (priv->hw_type == P54U_NET2280)
+ 			skb_push(skb, priv->common.tx_hdr_len);
+@@ -129,22 +127,23 @@ static void p54u_rx_cb(struct urb *urb)
+ 			WARN_ON(1);
+ 			urb->transfer_buffer = skb_tail_pointer(skb);
+ 		}
+-
+-		skb_queue_tail(&priv->rx_queue, skb);
+ 	}
+ 
+-	usb_submit_urb(urb, GFP_ATOMIC);
++	usb_anchor_urb(urb, &priv->submitted);
++	if (usb_submit_urb(urb, GFP_ATOMIC)) {
++		usb_unanchor_urb(urb);
++		dev_kfree_skb_irq(skb);
++	} else
++		skb_queue_tail(&priv->rx_queue, skb);
+ }
+ 
+-static void p54u_tx_cb(struct urb *urb)
+-{
+-	usb_free_urb(urb);
+-}
++static void p54u_tx_cb(struct urb *urb) { }
+ 
+-static void p54u_tx_free_cb(struct urb *urb)
++static void p54u_free_urbs(struct ieee80211_hw *dev)
+ {
+-	kfree(urb->transfer_buffer);
+-	usb_free_urb(urb);
++	struct p54u_priv *priv = dev->priv;
++
++	usb_kill_anchored_urbs(&priv->submitted);
+ }
+ 
+ static int p54u_init_urbs(struct ieee80211_hw *dev)
+@@ -153,15 +152,18 @@ static int p54u_init_urbs(struct ieee802
+ 	struct urb *entry;
+ 	struct sk_buff *skb;
+ 	struct p54u_rx_info *info;
++	int ret = 0;
+ 
+ 	while (skb_queue_len(&priv->rx_queue) < 32) {
+ 		skb = __dev_alloc_skb(priv->common.rx_mtu + 32, GFP_KERNEL);
+-		if (!skb)
+-			break;
++		if (!skb) {
++			ret = -ENOMEM;
++			goto err;
++		}
+ 		entry = usb_alloc_urb(0, GFP_KERNEL);
+ 		if (!entry) {
+-			kfree_skb(skb);
+-			break;
++			ret = -ENOMEM;
++			goto err;
+ 		}
+ 		usb_fill_bulk_urb(entry, priv->udev,
+ 				  usb_rcvbulkpipe(priv->udev, P54U_PIPE_DATA),
+@@ -171,26 +173,25 @@ static int p54u_init_urbs(struct ieee802
+ 		info->urb = entry;
+ 		info->dev = dev;
+ 		skb_queue_tail(&priv->rx_queue, skb);
+-		usb_submit_urb(entry, GFP_KERNEL);
++
++		usb_anchor_urb(entry, &priv->submitted);
++		ret = usb_submit_urb(entry, GFP_KERNEL);
++		if (ret) {
++			skb_unlink(skb, &priv->rx_queue);
++			usb_unanchor_urb(entry);
++			goto err;
++		}
++		usb_free_urb(entry);
++		entry = NULL;
+ 	}
+ 
+ 	return 0;
+-}
+-
+-static void p54u_free_urbs(struct ieee80211_hw *dev)
+-{
+-	struct p54u_priv *priv = dev->priv;
+-	struct p54u_rx_info *info;
+-	struct sk_buff *skb;
+ 
+-	while ((skb = skb_dequeue(&priv->rx_queue))) {
+-		info = (struct p54u_rx_info *) skb->cb;
+-		if (!info->urb)
+-			continue;
+-
+-		usb_kill_urb(info->urb);
+-		kfree_skb(skb);
+-	}
++err:
++	usb_free_urb(entry);
++	kfree_skb(skb);
++	p54u_free_urbs(dev);
++	return ret;
+ }
+ 
+ static void p54u_tx_3887(struct ieee80211_hw *dev, struct p54_control_hdr *data,
+@@ -210,16 +211,29 @@ static void p54u_tx_3887(struct ieee8021
+ 	}
+ 
+ 	usb_fill_bulk_urb(addr_urb, priv->udev,
+-		usb_sndbulkpipe(priv->udev, P54U_PIPE_DATA), &data->req_id,
+-		sizeof(data->req_id), p54u_tx_cb, dev);
++			  usb_sndbulkpipe(priv->udev, P54U_PIPE_DATA),
++			  &data->req_id, sizeof(data->req_id), p54u_tx_cb,
++			  dev);
+ 	usb_fill_bulk_urb(data_urb, priv->udev,
+-		usb_sndbulkpipe(priv->udev, P54U_PIPE_DATA), data, len,
+-		free_on_tx ? p54u_tx_free_cb : p54u_tx_cb, dev);
++			  usb_sndbulkpipe(priv->udev, P54U_PIPE_DATA),
++			  data, len, p54u_tx_cb, dev);
+ 	addr_urb->transfer_flags |= URB_ZERO_PACKET;
+-	data_urb->transfer_flags |= URB_ZERO_PACKET;
++	data_urb->transfer_flags |= URB_ZERO_PACKET |
++				    (free_on_tx ? URB_FREE_BUFFER : 0);
+ 
+-	usb_submit_urb(addr_urb, GFP_ATOMIC);
+-	usb_submit_urb(data_urb, GFP_ATOMIC);
++	usb_anchor_urb(addr_urb, &priv->submitted);
++	if (usb_submit_urb(addr_urb, GFP_ATOMIC)) {
++		usb_unanchor_urb(addr_urb);
++		goto out;
++	}
++
++	usb_anchor_urb(data_urb, &priv->submitted);
++	if (usb_submit_urb(data_urb, GFP_ATOMIC))
++		usb_unanchor_urb(data_urb);
++
++out:
++	usb_free_urb(addr_urb);
++	usb_free_urb(data_urb);
+ }
+ 
+ static __le32 p54u_lm87_chksum(const __le32 *data, size_t length)
+@@ -251,12 +265,16 @@ static void p54u_tx_lm87(struct ieee8021
+ 	hdr->device_addr = data->req_id;
+ 
+ 	usb_fill_bulk_urb(data_urb, priv->udev,
+-		usb_sndbulkpipe(priv->udev, P54U_PIPE_DATA), hdr,
+-		len + sizeof(*hdr), free_on_tx ? p54u_tx_free_cb : p54u_tx_cb,
+-		dev);
+-	data_urb->transfer_flags |= URB_ZERO_PACKET;
++			  usb_sndbulkpipe(priv->udev, P54U_PIPE_DATA), hdr,
++			  len + sizeof(*hdr), p54u_tx_cb, dev);
++	data_urb->transfer_flags |= URB_ZERO_PACKET |
++				    (free_on_tx ? URB_FREE_BUFFER : 0);
++
++	usb_anchor_urb(data_urb, &priv->submitted);
++	if (usb_submit_urb(data_urb, GFP_ATOMIC))
++		usb_unanchor_urb(data_urb);
+ 
+-	usb_submit_urb(data_urb, GFP_ATOMIC);
++	usb_free_urb(data_urb);
+ }
+ 
+ static void p54u_tx_net2280(struct ieee80211_hw *dev, struct p54_control_hdr *data,
+@@ -295,16 +313,30 @@ static void p54u_tx_net2280(struct ieee8
+ 	hdr->len = cpu_to_le16(len);
+ 
+ 	usb_fill_bulk_urb(int_urb, priv->udev,
+-		usb_sndbulkpipe(priv->udev, P54U_PIPE_DEV), reg, sizeof(*reg),
+-		p54u_tx_free_cb, dev);
+-	int_urb->transfer_flags |= URB_ZERO_PACKET;
+-	usb_submit_urb(int_urb, GFP_ATOMIC);
++			  usb_sndbulkpipe(priv->udev, P54U_PIPE_DEV),
++			  reg, sizeof(*reg), p54u_tx_cb, dev);
++	int_urb->transfer_flags |= URB_ZERO_PACKET | URB_FREE_BUFFER;
++	usb_anchor_urb(int_urb, &priv->submitted);
++	if (usb_submit_urb(int_urb, GFP_ATOMIC)) {
++		usb_unanchor_urb(int_urb);
++		goto out;
++	}
+ 
+ 	usb_fill_bulk_urb(data_urb, priv->udev,
+-		usb_sndbulkpipe(priv->udev, P54U_PIPE_DATA), hdr, len + sizeof(*hdr),
+-		free_on_tx ? p54u_tx_free_cb : p54u_tx_cb, dev);
+-	data_urb->transfer_flags |= URB_ZERO_PACKET;
+-	usb_submit_urb(data_urb, GFP_ATOMIC);
++			  usb_sndbulkpipe(priv->udev, P54U_PIPE_DATA), hdr,
++			  len + sizeof(*hdr), p54u_tx_cb, dev);
++	data_urb->transfer_flags |= URB_ZERO_PACKET |
++				    (free_on_tx ? URB_FREE_BUFFER : 0);
++
++	usb_anchor_urb(int_urb, &priv->submitted);
++	if (usb_submit_urb(data_urb, GFP_ATOMIC)) {
++		usb_unanchor_urb(data_urb);
++		goto out;
++	}
++
++out:
++	usb_free_urb(int_urb);
++	usb_free_urb(data_urb);
+ }
+ 
+ static int p54u_write(struct p54u_priv *priv,
+@@ -805,6 +837,7 @@ static int __devinit p54u_probe(struct u
+ 	SET_IEEE80211_DEV(dev, &intf->dev);
+ 	usb_set_intfdata(intf, dev);
+ 	priv->udev = udev;
++	init_usb_anchor(&priv->submitted);
+ 
+ 	usb_get_dev(udev);
+ 
+--- a/drivers/net/wireless/p54/p54usb.h
++++ b/drivers/net/wireless/p54/p54usb.h
+@@ -133,6 +133,7 @@ struct p54u_priv {
+ 
+ 	spinlock_t lock;
+ 	struct sk_buff_head rx_queue;
++	struct usb_anchor submitted;
+ };
+ 
+ #endif /* P54USB_H */
+
+
+From gregkh@mini.kroah.org Wed Feb  4 10:31:14 2009
+Message-Id: <20090204183114.648425482@mini.kroah.org>
+User-Agent: quilt/0.47-1
+Date: Wed, 04 Feb 2009 10:28:47 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org,
+ Greg KH <greg@kroah.com>
+Cc: Justin Forbes <jmforbes@linuxtx.org>,
+ Zwane Mwaikambo <zwane@arm.linux.org.uk>,
+ Theodore Ts'o <tytso@mit.edu>,
+ Randy Dunlap <rdunlap@xenotime.net>,
+ Dave Jones <davej@redhat.com>,
+ Chuck Wolber <chuckw@quantumlinux.com>,
+ Chris Wedgwood <reviews@ml.cw.f00f.org>,
+ Michael Krufky <mkrufky@linuxtv.org>,
+ Chuck Ebbert <cebbert@redhat.com>,
+ Domenico Andreoli <cavokz@gmail.com>,
+ Willy Tarreau <w@1wt.eu>,
+ Rodrigo Rubira Branco <rbranco@la.checkpoint.com>,
+ Jake Edge <jake@lwn.net>,
+ Eugene Teo <eteo@redhat.com>,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Larry.Finger@lwfinger.net,
+ linville@tuxdriver.com,
+ nbd@openwrt.org,
+ Christian Lamparter <chunkeey@web.de>
+Subject: [patch 24/33] minstrel: fix warning if lowest supported rate index is not 0
+References: <20090204182823.831027530@mini.kroah.org>
+Content-Disposition: inline; filename=minstrel-fix-warning-if-lowest-supported-rate-index-is-not-0.patch
+Content-Length: 2279
+Lines: 62
+
+2.6.28-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Christian Lamparter <chunkeey@web.de>
+
+commit d57854bb1d78ba89ffbfdfd1c3e95b52ed7478ff upstream
+
+This patch fixes the following WARNING (caused by rix_to_ndx): "
+>WARNING: at net/mac80211/rc80211_minstrel.c:69 minstrel_rate_init+0xd2/0x33a [mac80211]()
+>[...]
+>Call Trace:
+> warn_on_slowpath+0x51/0x75
+> _format_mac_addr+0x4c/0x88
+> minstrel_rate_init+0xd2/0x33a [mac80211]
+> print_mac+0x16/0x1b
+> schedule_hrtimeout_range+0xdc/0x107
+> ieee80211_add_station+0x158/0x1bd [mac80211]
+> nl80211_new_station+0x1b3/0x20b [cfg80211]
+
+The reason is that I'm experimenting with "g" only mode on a 802.11 b/g card.
+
+Therefore rate_lowest_index returns 4 (= 6Mbit, instead of usual 0 = 1Mbit).
+Since mi->r array is initialized with zeros in minstrel_alloc_sta,
+rix_to_ndx has a hard time to find the 6Mbit entry and will trigged the WARNING.
+
+Signed-off-by: Christian Lamparter <chunkeey@web.de>
+Acked-by: Felix Fietkau <nbd@openwrt.org>
+Signed-off-by: John W. Linville <linville@tuxdriver.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ net/mac80211/rc80211_minstrel.c |   10 ++++++----
+ 1 file changed, 6 insertions(+), 4 deletions(-)
+
+--- a/net/mac80211/rc80211_minstrel.c
++++ b/net/mac80211/rc80211_minstrel.c
+@@ -389,13 +389,15 @@ minstrel_rate_init(void *priv, struct ie
+ {
+ 	struct minstrel_sta_info *mi = priv_sta;
+ 	struct minstrel_priv *mp = priv;
+-	struct minstrel_rate *mr_ctl;
++	struct ieee80211_local *local = hw_to_local(mp->hw);
++	struct ieee80211_rate *ctl_rate;
+ 	unsigned int i, n = 0;
+ 	unsigned int t_slot = 9; /* FIXME: get real slot time */
+ 
+ 	mi->lowest_rix = rate_lowest_index(sband, sta);
+-	mr_ctl = &mi->r[rix_to_ndx(mi, mi->lowest_rix)];
+-	mi->sp_ack_dur = mr_ctl->ack_time;
++	ctl_rate = &sband->bitrates[mi->lowest_rix];
++	mi->sp_ack_dur = ieee80211_frame_duration(local, 10, ctl_rate->bitrate,
++				!!(ctl_rate->flags & IEEE80211_RATE_ERP_G), 1);
+ 
+ 	for (i = 0; i < sband->n_bitrates; i++) {
+ 		struct minstrel_rate *mr = &mi->r[n];
+@@ -410,7 +412,7 @@ minstrel_rate_init(void *priv, struct ie
+ 
+ 		mr->rix = i;
+ 		mr->bitrate = sband->bitrates[i].bitrate / 5;
+-		calc_rate_durations(mi, hw_to_local(mp->hw), mr,
++		calc_rate_durations(mi, local, mr,
+ 				&sband->bitrates[i]);
+ 
+ 		/* calculate maximum number of retransmissions before
+
+
+From gregkh@mini.kroah.org Wed Feb  4 10:31:14 2009
+Message-Id: <20090204183114.778586788@mini.kroah.org>
+User-Agent: quilt/0.47-1
+Date: Wed, 04 Feb 2009 10:28:48 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: Justin Forbes <jmforbes@linuxtx.org>,
+ Zwane Mwaikambo <zwane@arm.linux.org.uk>,
+ Theodore Ts'o <tytso@mit.edu>,
+ Randy Dunlap <rdunlap@xenotime.net>,
+ Dave Jones <davej@redhat.com>,
+ Chuck Wolber <chuckw@quantumlinux.com>,
+ Chris Wedgwood <reviews@ml.cw.f00f.org>,
+ Michael Krufky <mkrufky@linuxtv.org>,
+ Chuck Ebbert <cebbert@redhat.com>,
+ Domenico Andreoli <cavokz@gmail.com>,
+ Willy Tarreau <w@1wt.eu>,
+ Rodrigo Rubira Branco <rbranco@la.checkpoint.com>,
+ Jake Edge <jake@lwn.net>,
+ Eugene Teo <eteo@redhat.com>,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Seth Heasley <seth.heasley@intel.com>,
+ Jesse Barnes <jbarnes@virtuousgeek.org>
+Subject: [patch 25/33] PCI: irq and pci_ids patch for Intel Tigerpoint DeviceIDs
+References: <20090204182823.831027530@mini.kroah.org>
+Content-Disposition: inline; filename=pci-irq-and-pci_ids-patch-for-intel-tigerpoint-deviceids.patch
+Content-Length: 1183
+Lines: 36
+
+2.6.28-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Seth Heasley <seth.heasley@intel.com>
+
+commit 57064d213d2e44654d4f13c66df135b5e7389a26 upstream.
+
+This patch adds the Intel Tigerpoint LPC Controller DeviceIDs.
+
+Signed-off-by: Seth Heasley <seth.heasley@intel.com>
+Signed-off-by: Jesse Barnes <jbarnes@virtuousgeek.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ arch/x86/pci/irq.c      |    1 +
+ include/linux/pci_ids.h |    1 +
+ 2 files changed, 2 insertions(+)
+
+--- a/arch/x86/pci/irq.c
++++ b/arch/x86/pci/irq.c
+@@ -573,6 +573,7 @@ static __init int intel_router_probe(str
+ 	case PCI_DEVICE_ID_INTEL_ICH7_1:
+ 	case PCI_DEVICE_ID_INTEL_ICH7_30:
+ 	case PCI_DEVICE_ID_INTEL_ICH7_31:
++	case PCI_DEVICE_ID_INTEL_TGP_LPC:
+ 	case PCI_DEVICE_ID_INTEL_ESB2_0:
+ 	case PCI_DEVICE_ID_INTEL_ICH8_0:
+ 	case PCI_DEVICE_ID_INTEL_ICH8_1:
+--- a/include/linux/pci_ids.h
++++ b/include/linux/pci_ids.h
+@@ -2418,6 +2418,7 @@
+ #define PCI_DEVICE_ID_INTEL_ICH7_0	0x27b8
+ #define PCI_DEVICE_ID_INTEL_ICH7_1	0x27b9
+ #define PCI_DEVICE_ID_INTEL_ICH7_30	0x27b0
++#define PCI_DEVICE_ID_INTEL_TGP_LPC	0x27bc
+ #define PCI_DEVICE_ID_INTEL_ICH7_31	0x27bd
+ #define PCI_DEVICE_ID_INTEL_ICH7_17	0x27da
+ #define PCI_DEVICE_ID_INTEL_ICH7_19	0x27dd
+
+
+From gregkh@mini.kroah.org Wed Feb  4 10:31:15 2009
+Message-Id: <20090204183114.918688253@mini.kroah.org>
+User-Agent: quilt/0.47-1
+Date: Wed, 04 Feb 2009 10:28:49 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: Justin Forbes <jmforbes@linuxtx.org>,
+ Zwane Mwaikambo <zwane@arm.linux.org.uk>,
+ Theodore Ts'o <tytso@mit.edu>,
+ Randy Dunlap <rdunlap@xenotime.net>,
+ Dave Jones <davej@redhat.com>,
+ Chuck Wolber <chuckw@quantumlinux.com>,
+ Chris Wedgwood <reviews@ml.cw.f00f.org>,
+ Michael Krufky <mkrufky@linuxtv.org>,
+ Chuck Ebbert <cebbert@redhat.com>,
+ Domenico Andreoli <cavokz@gmail.com>,
+ Willy Tarreau <w@1wt.eu>,
+ Rodrigo Rubira Branco <rbranco@la.checkpoint.com>,
+ Jake Edge <jake@lwn.net>,
+ Eugene Teo <eteo@redhat.com>,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Len Brown <len.brown@intel.com>,
+  <venkatesh.pallipadi@intel.com>,
+ Thomas Renninger <trenn@suse.de>
+Subject: [patch 26/33] cpuidle: Add decaying history logic to menu idle predictor
+References: <20090204182823.831027530@mini.kroah.org>
+Content-Disposition: inline; filename=cpuidle-add-decaying-history-logic-to-menu-idle-predictor.patch
+Content-Length: 2100
+Lines: 62
+
+
+2.6.28-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Venkatesh Pallipadi <venkatesh.pallipadi@intel.com>
+
+commit 816bb611e41be29b476dc16f6297eb551bf4d747 upstream
+
+Add decaying history of predicted idle time, instead of using the last early
+wakeup. This logic helps menu governor do better job of predicting idle time.
+
+With this change, we also measured noticable (~8%) power savings on
+a DP server system with CPUs supporting deep C states, when system
+was lightly loaded. There was no change to power or perf on other load
+conditions.
+
+Signed-off-by: Venkatesh Pallipadi <venkatesh.pallipadi@intel.com>
+Signed-off-by: Len Brown <len.brown@intel.com>
+Cc: Thomas Renninger <trenn@suse.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/cpuidle/governors/menu.c |   10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+--- a/drivers/cpuidle/governors/menu.c
++++ b/drivers/cpuidle/governors/menu.c
+@@ -15,12 +15,14 @@
+ #include <linux/tick.h>
+ 
+ #define BREAK_FUZZ	4	/* 4 us */
++#define PRED_HISTORY_PCT	50
+ 
+ struct menu_device {
+ 	int		last_state_idx;
+ 
+ 	unsigned int	expected_us;
+ 	unsigned int	predicted_us;
++	unsigned int    current_predicted_us;
+ 	unsigned int	last_measured_us;
+ 	unsigned int	elapsed_us;
+ };
+@@ -47,6 +49,12 @@ static int menu_select(struct cpuidle_de
+ 	data->expected_us =
+ 		(u32) ktime_to_ns(tick_nohz_get_sleep_length()) / 1000;
+ 
++	/* Recalculate predicted_us based on prediction_history_pct */
++	data->predicted_us *= PRED_HISTORY_PCT;
++	data->predicted_us += (100 - PRED_HISTORY_PCT) *
++				data->current_predicted_us;
++	data->predicted_us /= 100;
++
+ 	/* find the deepest idle state that satisfies our constraints */
+ 	for (i = CPUIDLE_DRIVER_STATE_START + 1; i < dev->state_count; i++) {
+ 		struct cpuidle_state *s = &dev->states[i];
+@@ -97,7 +105,7 @@ static void menu_reflect(struct cpuidle_
+ 		measured_us = -1;
+ 
+ 	/* Predict time until next break event */
+-	data->predicted_us = max(measured_us, data->last_measured_us);
++	data->current_predicted_us = max(measured_us, data->last_measured_us);
+ 
+ 	if (last_idle_us + BREAK_FUZZ <
+ 	    data->expected_us - target->exit_latency) {
+
+
+From gregkh@mini.kroah.org Wed Feb  4 10:31:15 2009
+Message-Id: <20090204183115.058873737@mini.kroah.org>
+User-Agent: quilt/0.47-1
+Date: Wed, 04 Feb 2009 10:28:50 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: Justin Forbes <jmforbes@linuxtx.org>,
+ Zwane Mwaikambo <zwane@arm.linux.org.uk>,
+ Theodore Ts'o <tytso@mit.edu>,
+ Randy Dunlap <rdunlap@xenotime.net>,
+ Dave Jones <davej@redhat.com>,
+ Chuck Wolber <chuckw@quantumlinux.com>,
+ Chris Wedgwood <reviews@ml.cw.f00f.org>,
+ Michael Krufky <mkrufky@linuxtv.org>,
+ Chuck Ebbert <cebbert@redhat.com>,
+ Domenico Andreoli <cavokz@gmail.com>,
+ Willy Tarreau <w@1wt.eu>,
+ Rodrigo Rubira Branco <rbranco@la.checkpoint.com>,
+ Jake Edge <jake@lwn.net>,
+ Eugene Teo <eteo@redhat.com>,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Zhao Yakui <yakui.zhao@intel.com>,
+ Venki Pallipadi <venkatesh.pallipadi@intel.com>,
+ Len Brown <len.brown@intel.com>,
+ Thomas Renninger <trenn@suse.de>
+Subject: [patch 27/33] ACPI: Avoid array address overflow when _CST MWAIT hint bits are set
+References: <20090204182823.831027530@mini.kroah.org>
+Content-Disposition: inline; filename=acpi-avoid-array-address-overflow-when-_cst-mwait-hint-bits-are-set.patch
+Content-Length: 2017
+Lines: 59
+
+2.6.28-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Zhao Yakui <yakui.zhao@intel.com>
+
+commit 13b40a1a065824d2d4e55c8b48ea9f3f9d162929 upstream.
+
+The Cx Register address obtained from the _CST object is used as the MWAIT
+hints if the register type is FFixedHW. And it is used to check whether
+the Cx type is supported or not.
+
+On some boxes the following Cx state package is obtained from _CST object:
+    >{
+                ResourceTemplate ()
+                {
+                    Register (FFixedHW,
+                        0x01,               // Bit Width
+                        0x02,               // Bit Offset
+                        0x0000000000889759, // Address
+                        0x03,               // Access Size
+                        )
+                },
+
+                0x03,
+                0xF5,
+                0x015E }
+
+   In such case we should use the bit[7:4] of Cx address to check whether
+the Cx type is supported or not.
+
+mask the MWAIT hint to avoid array address overflow
+
+Signed-off-by: Zhao Yakui <yakui.zhao@intel.com>
+Acked-by:Venki Pallipadi <venkatesh.pallipadi@intel.com>
+Signed-off-by: Len Brown <len.brown@intel.com>
+Cc: Thomas Renninger <trenn@suse.de>
+
+---
+ arch/x86/kernel/acpi/cstate.c |    4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+--- a/arch/x86/kernel/acpi/cstate.c
++++ b/arch/x86/kernel/acpi/cstate.c
+@@ -56,6 +56,7 @@ static struct cstate_entry *cpu_cstate_e
+ static short mwait_supported[ACPI_PROCESSOR_MAX_POWER];
+ 
+ #define MWAIT_SUBSTATE_MASK	(0xf)
++#define MWAIT_CSTATE_MASK	(0xf)
+ #define MWAIT_SUBSTATE_SIZE	(4)
+ 
+ #define CPUID_MWAIT_LEAF (5)
+@@ -98,7 +99,8 @@ int acpi_processor_ffh_cstate_probe(unsi
+ 	cpuid(CPUID_MWAIT_LEAF, &eax, &ebx, &ecx, &edx);
+ 
+ 	/* Check whether this particular cx_type (in CST) is supported or not */
+-	cstate_type = (cx->address >> MWAIT_SUBSTATE_SIZE) + 1;
++	cstate_type = ((cx->address >> MWAIT_SUBSTATE_SIZE) &
++			MWAIT_CSTATE_MASK) + 1;
+ 	edx_part = edx >> (cstate_type * MWAIT_SUBSTATE_SIZE);
+ 	num_cstate_subtype = edx_part & MWAIT_SUBSTATE_MASK;
+ 
+
+
+From gregkh@mini.kroah.org Wed Feb  4 10:31:15 2009
+Message-Id: <20090204183115.183745963@mini.kroah.org>
+User-Agent: quilt/0.47-1
+Date: Wed, 04 Feb 2009 10:28:51 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: Justin Forbes <jmforbes@linuxtx.org>,
+ Zwane Mwaikambo <zwane@arm.linux.org.uk>,
+ Theodore Ts'o <tytso@mit.edu>,
+ Randy Dunlap <rdunlap@xenotime.net>,
+ Dave Jones <davej@redhat.com>,
+ Chuck Wolber <chuckw@quantumlinux.com>,
+ Chris Wedgwood <reviews@ml.cw.f00f.org>,
+ Michael Krufky <mkrufky@linuxtv.org>,
+ Chuck Ebbert <cebbert@redhat.com>,
+ Domenico Andreoli <cavokz@gmail.com>,
+ Willy Tarreau <w@1wt.eu>,
+ Rodrigo Rubira Branco <rbranco@la.checkpoint.com>,
+ Jake Edge <jake@lwn.net>,
+ Eugene Teo <eteo@redhat.com>,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Matthew Garrett <mjg59@srcf.ucam.org>,
+ Len Brown <len.brown@intel.com>,
+ Thomas Renninger <trenn@suse.de>
+Subject: [patch 28/33] video: always update the brightness when poking "brightness"
+References: <20090204182823.831027530@mini.kroah.org>
+Content-Disposition: inline; filename=video-always-update-the-brightness-when-poking-brightness.patch
+Content-Length: 1157
+Lines: 39
+
+2.6.28-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Zhang Rui <rui.zhang@intel.com>
+
+commit 9e6dada9d255497127251c03aaa59296d186f959 upstream.
+
+always update props.brightness no matter the backlight is changed
+via procfs, hotkeys or sysfs.
+
+Sighed-off-by: Zhang Rui <rui.zhang@intel.com>
+Acked-by: Matthew Garrett <mjg59@srcf.ucam.org>
+Signed-off-by: Len Brown <len.brown@intel.com>
+Cc: Thomas Renninger <trenn@suse.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/acpi/video.c |    5 +++++
+ 1 file changed, 5 insertions(+)
+
+--- a/drivers/acpi/video.c
++++ b/drivers/acpi/video.c
+@@ -481,6 +481,7 @@ acpi_video_device_lcd_set_level(struct a
+ 	int status = AE_OK;
+ 	union acpi_object arg0 = { ACPI_TYPE_INTEGER };
+ 	struct acpi_object_list args = { 1, &arg0 };
++	int state;
+ 
+ 
+ 	arg0.integer.value = level;
+@@ -489,6 +490,10 @@ acpi_video_device_lcd_set_level(struct a
+ 		status = acpi_evaluate_object(device->dev->handle, "_BCM",
+ 					      &args, NULL);
+ 	device->brightness->curr = level;
++	for (state = 2; state < device->brightness->count; state++)
++		if (level == device->brightness->levels[state])
++			device->backlight->props.brightness = state - 2;
++
+ 	return status;
+ }
+ 
+
+
+From gregkh@mini.kroah.org Wed Feb  4 10:31:15 2009
+Message-Id: <20090204183115.372884248@mini.kroah.org>
+User-Agent: quilt/0.47-1
+Date: Wed, 04 Feb 2009 10:28:52 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: Justin Forbes <jmforbes@linuxtx.org>,
+ Zwane Mwaikambo <zwane@arm.linux.org.uk>,
+ Theodore Ts'o <tytso@mit.edu>,
+ Randy Dunlap <rdunlap@xenotime.net>,
+ Dave Jones <davej@redhat.com>,
+ Chuck Wolber <chuckw@quantumlinux.com>,
+ Chris Wedgwood <reviews@ml.cw.f00f.org>,
+ Michael Krufky <mkrufky@linuxtv.org>,
+ Chuck Ebbert <cebbert@redhat.com>,
+ Domenico Andreoli <cavokz@gmail.com>,
+ Willy Tarreau <w@1wt.eu>,
+ Rodrigo Rubira Branco <rbranco@la.checkpoint.com>,
+ Jake Edge <jake@lwn.net>,
+ Eugene Teo <eteo@redhat.com>,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Alexey Starikovskiy <astarikovskiy@suse.de>,
+ Andy Neitzke <neitzke@ias.edu>,
+ Len Brown <len.brown@intel.com>,
+ Thomas Renninger <trenn@suse.de>
+Subject: [patch 29/33] Newly inserted battery might differ from one just removed, so
+References: <20090204182823.831027530@mini.kroah.org>
+Content-Disposition: inline; filename=newly-inserted-battery-might-differ-from-one-just-removed-so.patch
+ update of battery info fields is required.
+Content-Length: 1114
+Lines: 38
+
+2.6.28-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Alexey Starikovskiy <astarikovskiy@suse.de>
+
+commit 50b178512b7d6e7724f87459f6bd06504c9c2da1 upstream.
+
+Signed-off-by: Alexey Starikovskiy <astarikovskiy@suse.de>
+Acked-by: Andy Neitzke <neitzke@ias.edu>
+
+Signed-off-by: Alexey Starikovskiy <astarikovskiy@suse.de>
+Signed-off-by: Len Brown <len.brown@intel.com>
+Cc: Thomas Renninger <trenn@suse.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/acpi/battery.c |    5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+--- a/drivers/acpi/battery.c
++++ b/drivers/acpi/battery.c
+@@ -471,7 +471,7 @@ static void sysfs_remove_battery(struct 
+ 
+ static int acpi_battery_update(struct acpi_battery *battery)
+ {
+-	int result;
++	int result, old_present = acpi_battery_present(battery);
+ 	result = acpi_battery_get_status(battery);
+ 	if (result)
+ 		return result;
+@@ -482,7 +482,8 @@ static int acpi_battery_update(struct ac
+ 		return 0;
+ 	}
+ #endif
+-	if (!battery->update_time) {
++	if (!battery->update_time ||
++	    old_present != acpi_battery_present(battery)) {
+ 		result = acpi_battery_get_info(battery);
+ 		if (result)
+ 			return result;
+
+
+From gregkh@mini.kroah.org Wed Feb  4 10:31:15 2009
+Message-Id: <20090204183115.499087647@mini.kroah.org>
+User-Agent: quilt/0.47-1
+Date: Wed, 04 Feb 2009 10:28:53 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: Justin Forbes <jmforbes@linuxtx.org>,
+ Zwane Mwaikambo <zwane@arm.linux.org.uk>,
+ Theodore Ts'o <tytso@mit.edu>,
+ Randy Dunlap <rdunlap@xenotime.net>,
+ Dave Jones <davej@redhat.com>,
+ Chuck Wolber <chuckw@quantumlinux.com>,
+ Chris Wedgwood <reviews@ml.cw.f00f.org>,
+ Michael Krufky <mkrufky@linuxtv.org>,
+ Chuck Ebbert <cebbert@redhat.com>,
+ Domenico Andreoli <cavokz@gmail.com>,
+ Willy Tarreau <w@1wt.eu>,
+ Rodrigo Rubira Branco <rbranco@la.checkpoint.com>,
+ Jake Edge <jake@lwn.net>,
+ Eugene Teo <eteo@redhat.com>,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ "Rafael J. Wysocki" <rjw@sisk.pl>,
+ Len Brown <len.brown@intel.com>,
+ Thomas Renninger <trenn@suse.de>
+Subject: [patch 30/33] ACPI: Do not modify SCI_EN directly
+References: <20090204182823.831027530@mini.kroah.org>
+Content-Disposition: inline; filename=acpi-do-not-modify-sci_en-directly.patch
+Content-Length: 1234
+Lines: 35
+
+2.6.28-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Rafael J. Wysocki <rjw@sisk.pl>
+
+commit 11e93130c7ce5228d484fd5e86f3984835d4256b upstream.
+
+According to the ACPI specification the SCI_EN flag is controlled by
+the hardware, which sets this flag to inform the kernel that ACPI is
+enabled.  For this reason, we shouldn't try to modify SCI_EN
+directly.  Also, we don't need to do it in irqrouter_resume(), since
+lower-level resume code takes care of enabling ACPI in case it hasn't
+been enabled by the BIOS before passing control to the kernel (which
+by the way is against the ACPI specification).
+
+Signed-off-by: Rafael J. Wysocki <rjw@sisk.pl>
+Signed-off-by: Len Brown <len.brown@intel.com>
+Cc: Thomas Renninger <trenn@suse.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/acpi/pci_link.c |    4 ----
+ 1 file changed, 4 deletions(-)
+
+--- a/drivers/acpi/pci_link.c
++++ b/drivers/acpi/pci_link.c
+@@ -796,10 +796,6 @@ static int irqrouter_resume(struct sys_d
+ 	struct list_head *node = NULL;
+ 	struct acpi_pci_link *link = NULL;
+ 
+-
+-	/* Make sure SCI is enabled again (Apple firmware bug?) */
+-	acpi_set_register(ACPI_BITREG_SCI_ENABLE, 1);
+-
+ 	list_for_each(node, &acpi_link.entries) {
+ 		link = list_entry(node, struct acpi_pci_link, node);
+ 		if (!link) {
+
+
+From gregkh@mini.kroah.org Wed Feb  4 10:31:15 2009
+Message-Id: <20090204183115.624956298@mini.kroah.org>
+User-Agent: quilt/0.47-1
+Date: Wed, 04 Feb 2009 10:28:54 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: Justin Forbes <jmforbes@linuxtx.org>,
+ Zwane Mwaikambo <zwane@arm.linux.org.uk>,
+ Theodore Ts'o <tytso@mit.edu>,
+ Randy Dunlap <rdunlap@xenotime.net>,
+ Dave Jones <davej@redhat.com>,
+ Chuck Wolber <chuckw@quantumlinux.com>,
+ Chris Wedgwood <reviews@ml.cw.f00f.org>,
+ Michael Krufky <mkrufky@linuxtv.org>,
+ Chuck Ebbert <cebbert@redhat.com>,
+ Domenico Andreoli <cavokz@gmail.com>,
+ Willy Tarreau <w@1wt.eu>,
+ Rodrigo Rubira Branco <rbranco@la.checkpoint.com>,
+ Jake Edge <jake@lwn.net>,
+ Eugene Teo <eteo@redhat.com>,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Jeff Layton <jlayton@redhat.com>,
+ David Teigland <teigland@redhat.com>
+Subject: [patch 31/33] dlm: initialize file_lock struct in GETLK before copying conflicting lock
+References: <20090204182823.831027530@mini.kroah.org>
+Content-Disposition: inline; filename=dlm-initialize-file_lock-struct-in-getlk-before-copying-conflicting-lock.patch
+Content-Length: 1209
+Lines: 37
+
+2.6.28-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Jeff Layton <jlayton@redhat.com>
+
+commit 20d5a39929232a715f29e6cb7e3f0d0c790f41eb upstream.
+
+dlm_posix_get fills out the relevant fields in the file_lock before
+returning when there is a lock conflict, but doesn't clean out any of
+the other fields in the file_lock.
+
+When nfsd does a NFSv4 lockt call, it sets the fl_lmops to
+nfsd_posix_mng_ops before calling the lower fs. When the lock comes back
+after testing a lock on GFS2, it still has that field set. This confuses
+nfsd into thinking that the file_lock is a nfsd4 lock.
+
+Fix this by making DLM reinitialize the file_lock before copying the
+fields from the conflicting lock.
+
+Signed-off-by: Jeff Layton <jlayton@redhat.com>
+Signed-off-by: David Teigland <teigland@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ fs/dlm/plock.c |    2 ++
+ 1 file changed, 2 insertions(+)
+
+--- a/fs/dlm/plock.c
++++ b/fs/dlm/plock.c
+@@ -304,7 +304,9 @@ int dlm_posix_get(dlm_lockspace_t *locks
+ 	if (rv == -ENOENT)
+ 		rv = 0;
+ 	else if (rv > 0) {
++		locks_init_lock(fl);
+ 		fl->fl_type = (op->info.ex) ? F_WRLCK : F_RDLCK;
++		fl->fl_flags = FL_POSIX;
+ 		fl->fl_pid = op->info.pid;
+ 		fl->fl_start = op->info.start;
+ 		fl->fl_end = op->info.end;
+
+
+From gregkh@mini.kroah.org Wed Feb  4 10:31:15 2009
+Message-Id: <20090204183115.769963903@mini.kroah.org>
+User-Agent: quilt/0.47-1
+Date: Wed, 04 Feb 2009 10:28:55 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: Justin Forbes <jmforbes@linuxtx.org>,
+ Zwane Mwaikambo <zwane@arm.linux.org.uk>,
+ Theodore Ts'o <tytso@mit.edu>,
+ Randy Dunlap <rdunlap@xenotime.net>,
+ Dave Jones <davej@redhat.com>,
+ Chuck Wolber <chuckw@quantumlinux.com>,
+ Chris Wedgwood <reviews@ml.cw.f00f.org>,
+ Michael Krufky <mkrufky@linuxtv.org>,
+ Chuck Ebbert <cebbert@redhat.com>,
+ Domenico Andreoli <cavokz@gmail.com>,
+ Willy Tarreau <w@1wt.eu>,
+ Rodrigo Rubira Branco <rbranco@la.checkpoint.com>,
+ Jake Edge <jake@lwn.net>,
+ Eugene Teo <eteo@redhat.com>,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Mark Lord <mlord@pobox.com>,
+ Jeff Garzik <jgarzik@redhat.com>
+Subject: [patch 32/33] sata_mv: Fix chip type for Hightpoint RocketRaid 1740/1742
+References: <20090204182823.831027530@mini.kroah.org>
+Content-Disposition: inline; filename=sata_mv-fix-chip-type-for-hightpoint-rocketraid-1740-1742.patch
+Content-Length: 1118
+Lines: 32
+
+2.6.28-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Mark Lord <liml@rtr.ca>
+
+commit 4462254ac6be9150aae87d54d388fc348d6fcead upstream.
+
+Fix chip type for the Highpoint RocketRAID 1740 and 1742 PCI cards.
+These really do have Marvell 6042 chips on them, rather than the 5081 chip.
+
+Confirmed by multiple (two) users (for the 1740), and by examining
+the product photographs from Highpoint's web site.
+
+Signed-off-by: Mark Lord <mlord@pobox.com>
+Signed-off-by: Jeff Garzik <jgarzik@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/ata/sata_mv.c |    4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+--- a/drivers/ata/sata_mv.c
++++ b/drivers/ata/sata_mv.c
+@@ -669,8 +669,8 @@ static const struct pci_device_id mv_pci
+ 	{ PCI_VDEVICE(MARVELL, 0x5081), chip_508x },
+ 	/* RocketRAID 1720/174x have different identifiers */
+ 	{ PCI_VDEVICE(TTI, 0x1720), chip_6042 },
+-	{ PCI_VDEVICE(TTI, 0x1740), chip_508x },
+-	{ PCI_VDEVICE(TTI, 0x1742), chip_508x },
++	{ PCI_VDEVICE(TTI, 0x1740), chip_6042 },
++	{ PCI_VDEVICE(TTI, 0x1742), chip_6042 },
+ 
+ 	{ PCI_VDEVICE(MARVELL, 0x6040), chip_604x },
+ 	{ PCI_VDEVICE(MARVELL, 0x6041), chip_604x },
+
+
+From gregkh@mini.kroah.org Wed Feb  4 10:31:16 2009
+Message-Id: <20090204183115.899736263@mini.kroah.org>
+User-Agent: quilt/0.47-1
+Date: Wed, 04 Feb 2009 10:28:56 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: Justin Forbes <jmforbes@linuxtx.org>,
+ Zwane Mwaikambo <zwane@arm.linux.org.uk>,
+ Theodore Ts'o <tytso@mit.edu>,
+ Randy Dunlap <rdunlap@xenotime.net>,
+ Dave Jones <davej@redhat.com>,
+ Chuck Wolber <chuckw@quantumlinux.com>,
+ Chris Wedgwood <reviews@ml.cw.f00f.org>,
+ Michael Krufky <mkrufky@linuxtv.org>,
+ Chuck Ebbert <cebbert@redhat.com>,
+ Domenico Andreoli <cavokz@gmail.com>,
+ Willy Tarreau <w@1wt.eu>,
+ Rodrigo Rubira Branco <rbranco@la.checkpoint.com>,
+ Jake Edge <jake@lwn.net>,
+ Eugene Teo <eteo@redhat.com>,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Lin Ming <ming.m.lin@intel.com>,
+ Bob Moore <robert.moore@intel.com>,
+ Len Brown <len.brown@intel.com>,
+ Thomas Renninger <trenn@suse.de>
+Subject: [patch 33/33] ACPICA: Allow multiple backslash prefix in namepaths
+References: <20090204182823.831027530@mini.kroah.org>
+Content-Disposition: inline; filename=acpica-allow-multiple-backslash-prefix-in-namepaths.patch
+Content-Length: 1305
+Lines: 41
+
+2.6.28-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Lin Ming <ming.m.lin@intel.com>
+
+commit d037c5fd7367548191eab2b376a1d08c4ffaf7ff upstream.
+
+In a fully qualified namepath, allow multiple backslash prefixes.
+This can happen because of the use of a double-backslash in strings
+(since backslash is the escape character) causing confusion.
+ACPICA BZ 739 Lin Ming.
+
+http://www.acpica.org/bugzilla/show_bug.cgi?id=739
+
+Signed-off-by: Lin Ming <ming.m.lin@intel.com>
+Signed-off-by: Bob Moore <robert.moore@intel.com>
+Signed-off-by: Len Brown <len.brown@intel.com>
+Cc: Thomas Renninger <trenn@suse.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/acpi/namespace/nsutils.c |    8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+--- a/drivers/acpi/namespace/nsutils.c
++++ b/drivers/acpi/namespace/nsutils.c
+@@ -314,9 +314,15 @@ void acpi_ns_get_internal_name_length(st
+ 	 *
+ 	 * strlen() + 1 covers the first name_seg, which has no path separator
+ 	 */
+-	if (acpi_ns_valid_root_prefix(next_external_char[0])) {
++	if (acpi_ns_valid_root_prefix(*next_external_char)) {
+ 		info->fully_qualified = TRUE;
+ 		next_external_char++;
++
++		/* Skip redundant root_prefix, like \\_SB.PCI0.SBRG.EC0 */
++
++		while (acpi_ns_valid_root_prefix(*next_external_char)) {
++			next_external_char++;
++		}
+ 	} else {
+ 		/*
+ 		 * Handle Carat prefixes
+
+
+From gregkh@mini.kroah.org Wed Feb  4 10:31:11 2009
+Message-Id: <20090204182823.831027530@mini.kroah.org>
+User-Agent: quilt/0.47-1
+Date: Wed, 04 Feb 2009 10:28:23 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: Justin Forbes <jmforbes@linuxtx.org>,
+ Zwane Mwaikambo <zwane@arm.linux.org.uk>,
+ Theodore Ts'o <tytso@mit.edu>,
+ Randy Dunlap <rdunlap@xenotime.net>,
+ Dave Jones <davej@redhat.com>,
+ Chuck Wolber <chuckw@quantumlinux.com>,
+ Chris Wedgwood <reviews@ml.cw.f00f.org>,
+ Michael Krufky <mkrufky@linuxtv.org>,
+ Chuck Ebbert <cebbert@redhat.com>,
+ Domenico Andreoli <cavokz@gmail.com>,
+ Willy Tarreau <w@1wt.eu>,
+ Rodrigo Rubira Branco <rbranco@la.checkpoint.com>,
+ Jake Edge <jake@lwn.net>,
+ Eugene Teo <eteo@redhat.com>,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk
+Subject: [patch 00/33] 2.6.28-stable review
+Content-Length: 2782
+Lines: 57
+
+This is the start of the stable review cycle for the 2.6.28.4 release.
+There are 33 patches in this series, all will be posted as a response to
+this one.  If anyone has any issues with these being applied, please let
+us know.  If anyone is a maintainer of the proper subsystem, and wants
+to add a Signed-off-by: line to the patch, please respond with it.
+
+These patches are sent out with a number of different people on the Cc:
+line.  If you wish to be a reviewer, please email stable@kernel.org to
+add your name to the list.  If you want to be off the reviewer list,
+also email us.
+
+Responses should be made by Friday, February 6, 19:00:00 UTC.  Anything
+received after that time might be too late.
+
+The whole patch series can be found in one patch at:
+	kernel.org/pub/linux/kernel/v2.6/stable-review/patch-2.6.28.4-rc1.gz
+and the diffstat can be found below.
+
+
+thanks,
+
+greg k-h
+
+ Makefile                                   |    2 +-
+ arch/m68knommu/Kconfig                     |    4 +
+ arch/x86/kernel/acpi/cstate.c              |    4 +-
+ arch/x86/lib/usercopy_32.c                 |    4 +-
+ arch/x86/lib/usercopy_64.c                 |    4 +-
+ arch/x86/pci/irq.c                         |    1 +
+ drivers/acpi/battery.c                     |    5 +-
+ drivers/acpi/namespace/nsutils.c           |    8 ++-
+ drivers/acpi/pci_link.c                    |    4 -
+ drivers/acpi/video.c                       |    5 +
+ drivers/ata/sata_mv.c                      |    6 +-
+ drivers/ata/sata_nv.c                      |   77 +++++++++-----
+ drivers/char/selection.c                   |    2 +-
+ drivers/cpuidle/governors/menu.c           |   10 ++-
+ drivers/input/keyboard/atkbd.c             |   25 +++++
+ drivers/net/wireless/iwlwifi/iwl-3945-rs.c |   12 ++-
+ drivers/net/wireless/iwlwifi/iwl-agn-rs.c  |   12 ++-
+ drivers/net/wireless/orinoco.c             |   30 +++---
+ drivers/net/wireless/p54/p54common.c       |   12 ++-
+ drivers/net/wireless/p54/p54usb.c          |  149 +++++++++++++++++-----------
+ drivers/net/wireless/p54/p54usb.h          |    1 +
+ drivers/pci/msi.c                          |   16 ++--
+ drivers/serial/jsm/jsm_tty.c               |    6 +
+ drivers/video/aty/mach64_ct.c              |   11 ++
+ drivers/xen/balloon.c                      |   33 ++++++-
+ fs/cifs/connect.c                          |   18 ++--
+ fs/dlm/plock.c                             |    2 +
+ fs/nfsd/nfs4state.c                        |   31 ++++--
+ include/linux/pci_ids.h                    |    1 +
+ include/linux/slab_def.h                   |   10 +--
+ mm/mlock.c                                 |   47 +---------
+ net/mac80211/rc80211_minstrel.c            |   10 +-
+ net/netfilter/nf_conntrack_netlink.c       |    3 +
+ 33 files changed, 347 insertions(+), 218 deletions(-)
+
