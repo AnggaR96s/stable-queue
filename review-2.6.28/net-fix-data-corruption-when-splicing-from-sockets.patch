@@ -1,0 +1,202 @@
+From 8b9d3728977760f6bd1317c4420890f73695354e Mon Sep 17 00:00:00 2001
+From: Jarek Poplawski <jarkao2@gmail.com>
+Date: Mon, 19 Jan 2009 17:03:56 -0800
+Subject: net: Fix data corruption when splicing from sockets.
+
+From: Jarek Poplawski <jarkao2@gmail.com>
+
+[ Upstream commit 8b9d3728977760f6bd1317c4420890f73695354e ]
+
+The trick in socket splicing where we try to convert the skb->data
+into a page based reference using virt_to_page() does not work so
+well.
+
+The idea is to pass the virt_to_page() reference via the pipe
+buffer, and refcount the buffer using a SKB reference.
+
+But if we are splicing from a socket to a socket (via sendpage)
+this doesn't work.
+
+The from side processing will grab the page (and SKB) references.
+The sendpage() calls will grab page references only, return, and
+then the from side processing completes and drops the SKB ref.
+
+The page based reference to skb->data is not enough to keep the
+kmalloc() buffer backing it from being reused.  Yet, that is
+all that the socket send side has at this point.
+
+This leads to data corruption if the skb->data buffer is reused
+by SLAB before the send side socket actually gets the TX packet
+out to the device.
+
+The fix employed here is to simply allocate a page and copy the
+skb->data bytes into that page.
+
+This will hurt performance, but there is no clear way to fix this
+properly without a copy at the present time, and it is important
+to get rid of the data corruption.
+
+With fixes from Herbert Xu.
+
+Tested-by: Willy Tarreau <w@1wt.eu>
+Foreseen-by: Changli Gao <xiaosuo@gmail.com>
+Diagnosed-by: Willy Tarreau <w@1wt.eu>
+Reported-by: Willy Tarreau <w@1wt.eu>
+Fixed-by: Jens Axboe <jens.axboe@oracle.com>
+Signed-off-by: Jarek Poplawski <jarkao2@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ net/core/skbuff.c |   61 +++++++++++++++++++++++++-----------------------------
+ 1 file changed, 29 insertions(+), 32 deletions(-)
+
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -73,17 +73,13 @@ static struct kmem_cache *skbuff_fclone_
+ static void sock_pipe_buf_release(struct pipe_inode_info *pipe,
+ 				  struct pipe_buffer *buf)
+ {
+-	struct sk_buff *skb = (struct sk_buff *) buf->private;
+-
+-	kfree_skb(skb);
++	put_page(buf->page);
+ }
+ 
+ static void sock_pipe_buf_get(struct pipe_inode_info *pipe,
+ 				struct pipe_buffer *buf)
+ {
+-	struct sk_buff *skb = (struct sk_buff *) buf->private;
+-
+-	skb_get(skb);
++	get_page(buf->page);
+ }
+ 
+ static int sock_pipe_buf_steal(struct pipe_inode_info *pipe,
+@@ -1333,9 +1329,19 @@ fault:
+  */
+ static void sock_spd_release(struct splice_pipe_desc *spd, unsigned int i)
+ {
+-	struct sk_buff *skb = (struct sk_buff *) spd->partial[i].private;
++	put_page(spd->pages[i]);
++}
+ 
+-	kfree_skb(skb);
++static inline struct page *linear_to_page(struct page *page, unsigned int len,
++					  unsigned int offset)
++{
++	struct page *p = alloc_pages(GFP_KERNEL, 0);
++
++	if (!p)
++		return NULL;
++	memcpy(page_address(p) + offset, page_address(page) + offset, len);
++
++	return p;
+ }
+ 
+ /*
+@@ -1343,16 +1349,23 @@ static void sock_spd_release(struct spli
+  */
+ static inline int spd_fill_page(struct splice_pipe_desc *spd, struct page *page,
+ 				unsigned int len, unsigned int offset,
+-				struct sk_buff *skb)
++				struct sk_buff *skb, int linear)
+ {
+ 	if (unlikely(spd->nr_pages == PIPE_BUFFERS))
+ 		return 1;
+ 
++	if (linear) {
++		page = linear_to_page(page, len, offset);
++		if (!page)
++			return 1;
++	} else
++		get_page(page);
++
+ 	spd->pages[spd->nr_pages] = page;
+ 	spd->partial[spd->nr_pages].len = len;
+ 	spd->partial[spd->nr_pages].offset = offset;
+-	spd->partial[spd->nr_pages].private = (unsigned long) skb_get(skb);
+ 	spd->nr_pages++;
++
+ 	return 0;
+ }
+ 
+@@ -1368,7 +1381,7 @@ static inline void __segment_seek(struct
+ static inline int __splice_segment(struct page *page, unsigned int poff,
+ 				   unsigned int plen, unsigned int *off,
+ 				   unsigned int *len, struct sk_buff *skb,
+-				   struct splice_pipe_desc *spd)
++				   struct splice_pipe_desc *spd, int linear)
+ {
+ 	if (!*len)
+ 		return 1;
+@@ -1391,7 +1404,7 @@ static inline int __splice_segment(struc
+ 		/* the linear region may spread across several pages  */
+ 		flen = min_t(unsigned int, flen, PAGE_SIZE - poff);
+ 
+-		if (spd_fill_page(spd, page, flen, poff, skb))
++		if (spd_fill_page(spd, page, flen, poff, skb, linear))
+ 			return 1;
+ 
+ 		__segment_seek(&page, &poff, &plen, flen);
+@@ -1418,7 +1431,7 @@ static int __skb_splice_bits(struct sk_b
+ 	if (__splice_segment(virt_to_page(skb->data),
+ 			     (unsigned long) skb->data & (PAGE_SIZE - 1),
+ 			     skb_headlen(skb),
+-			     offset, len, skb, spd))
++			     offset, len, skb, spd, 1))
+ 		return 1;
+ 
+ 	/*
+@@ -1428,7 +1441,7 @@ static int __skb_splice_bits(struct sk_b
+ 		const skb_frag_t *f = &skb_shinfo(skb)->frags[seg];
+ 
+ 		if (__splice_segment(f->page, f->page_offset, f->size,
+-				     offset, len, skb, spd))
++				     offset, len, skb, spd, 0))
+ 			return 1;
+ 	}
+ 
+@@ -1441,7 +1454,7 @@ static int __skb_splice_bits(struct sk_b
+  * the frag list, if such a thing exists. We'd probably need to recurse to
+  * handle that cleanly.
+  */
+-int skb_splice_bits(struct sk_buff *__skb, unsigned int offset,
++int skb_splice_bits(struct sk_buff *skb, unsigned int offset,
+ 		    struct pipe_inode_info *pipe, unsigned int tlen,
+ 		    unsigned int flags)
+ {
+@@ -1454,16 +1467,6 @@ int skb_splice_bits(struct sk_buff *__sk
+ 		.ops = &sock_pipe_buf_ops,
+ 		.spd_release = sock_spd_release,
+ 	};
+-	struct sk_buff *skb;
+-
+-	/*
+-	 * I'd love to avoid the clone here, but tcp_read_sock()
+-	 * ignores reference counts and unconditonally kills the sk_buff
+-	 * on return from the actor.
+-	 */
+-	skb = skb_clone(__skb, GFP_KERNEL);
+-	if (unlikely(!skb))
+-		return -ENOMEM;
+ 
+ 	/*
+ 	 * __skb_splice_bits() only fails if the output has no room left,
+@@ -1487,15 +1490,9 @@ int skb_splice_bits(struct sk_buff *__sk
+ 	}
+ 
+ done:
+-	/*
+-	 * drop our reference to the clone, the pipe consumption will
+-	 * drop the rest.
+-	 */
+-	kfree_skb(skb);
+-
+ 	if (spd.nr_pages) {
++		struct sock *sk = skb->sk;
+ 		int ret;
+-		struct sock *sk = __skb->sk;
+ 
+ 		/*
+ 		 * Drop the socket lock, otherwise we have reverse
