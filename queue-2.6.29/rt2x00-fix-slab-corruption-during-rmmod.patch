@@ -1,0 +1,205 @@
+From stable-bounces@linux.kernel.org  Wed Apr  1 19:26:08 2009
+From: Ivo van Doorn <ivdoorn@gmail.com>
+To: stable@kernel.org
+Date: Wed, 1 Apr 2009 21:18:11 +0200
+Cc: Arnaud Patard <apatard@mandriva.com>, linux-wireless@vger.kernel.org, "John W. Linville" <linville@tuxdriver.com>, Gertjan van Wingerde <gwingerde@gmail.com>
+Subject: rt2x00: Fix SLAB corruption during rmmod
+
+From: Gertjan van Wingerde <gwingerde@gmail.com>
+
+At rmmod stage, the code path is the following one :
+
+rt2x00lib_remove_dev
+  ->  rt2x00lib_uninitialize()
+        -> rt2x00rfkill_unregister()
+             -> rfkill_unregister()
+        -> rt2x00rfkill_free()
+             -> rfkill_free()
+
+The problem is that rfkill_free should not be called after rfkill_register
+otherwise put_device(&rfkill->dev) will be called 2 times. This patch
+fixes this by only calling rt2x00rfkill_free() when rt2x00rfkill_register()
+hasn't been called or has failed.
+
+This patch is for 2.6.29 only. The code in question has completely disappeared
+in 2.6.30 and does not contain this bug.
+
+Signed-off-by: Gertjan van Wingerde <gwingerde@gmail.com>
+Tested-by: Arnaud Patard <apatard@mandriva.com>
+Signed-off-by: Ivo van Doorn <IvDoorn@gmail.com>
+Signed-off-by: Chris Wright <chrisw@sous-sol.org>
+---
+ drivers/net/wireless/rt2x00/rt2x00.h       |    3 -
+ drivers/net/wireless/rt2x00/rt2x00dev.c    |    2 
+ drivers/net/wireless/rt2x00/rt2x00lib.h    |   10 ---
+ drivers/net/wireless/rt2x00/rt2x00rfkill.c |   86 +++++++++++++----------------
+ 4 files changed, 40 insertions(+), 61 deletions(-)
+
+--- a/drivers/net/wireless/rt2x00/rt2x00.h
++++ b/drivers/net/wireless/rt2x00/rt2x00.h
+@@ -687,8 +687,7 @@ struct rt2x00_dev {
+ 	 */
+ #ifdef CONFIG_RT2X00_LIB_RFKILL
+ 	unsigned long rfkill_state;
+-#define RFKILL_STATE_ALLOCATED		1
+-#define RFKILL_STATE_REGISTERED		2
++#define RFKILL_STATE_REGISTERED		1
+ 	struct rfkill *rfkill;
+ 	struct delayed_work rfkill_work;
+ #endif /* CONFIG_RT2X00_LIB_RFKILL */
+--- a/drivers/net/wireless/rt2x00/rt2x00dev.c
++++ b/drivers/net/wireless/rt2x00/rt2x00dev.c
+@@ -1105,7 +1105,6 @@ int rt2x00lib_probe_dev(struct rt2x00_de
+ 	 * Register extra components.
+ 	 */
+ 	rt2x00leds_register(rt2x00dev);
+-	rt2x00rfkill_allocate(rt2x00dev);
+ 	rt2x00debug_register(rt2x00dev);
+ 
+ 	set_bit(DEVICE_STATE_PRESENT, &rt2x00dev->flags);
+@@ -1137,7 +1136,6 @@ void rt2x00lib_remove_dev(struct rt2x00_
+ 	 * Free extra components
+ 	 */
+ 	rt2x00debug_deregister(rt2x00dev);
+-	rt2x00rfkill_free(rt2x00dev);
+ 	rt2x00leds_unregister(rt2x00dev);
+ 
+ 	/*
+--- a/drivers/net/wireless/rt2x00/rt2x00lib.h
++++ b/drivers/net/wireless/rt2x00/rt2x00lib.h
+@@ -260,8 +260,6 @@ static inline void rt2x00crypto_rx_inser
+ #ifdef CONFIG_RT2X00_LIB_RFKILL
+ void rt2x00rfkill_register(struct rt2x00_dev *rt2x00dev);
+ void rt2x00rfkill_unregister(struct rt2x00_dev *rt2x00dev);
+-void rt2x00rfkill_allocate(struct rt2x00_dev *rt2x00dev);
+-void rt2x00rfkill_free(struct rt2x00_dev *rt2x00dev);
+ #else
+ static inline void rt2x00rfkill_register(struct rt2x00_dev *rt2x00dev)
+ {
+@@ -270,14 +268,6 @@ static inline void rt2x00rfkill_register
+ static inline void rt2x00rfkill_unregister(struct rt2x00_dev *rt2x00dev)
+ {
+ }
+-
+-static inline void rt2x00rfkill_allocate(struct rt2x00_dev *rt2x00dev)
+-{
+-}
+-
+-static inline void rt2x00rfkill_free(struct rt2x00_dev *rt2x00dev)
+-{
+-}
+ #endif /* CONFIG_RT2X00_LIB_RFKILL */
+ 
+ /*
+--- a/drivers/net/wireless/rt2x00/rt2x00rfkill.c
++++ b/drivers/net/wireless/rt2x00/rt2x00rfkill.c
+@@ -94,14 +94,50 @@ static void rt2x00rfkill_poll(struct wor
+ 			   &rt2x00dev->rfkill_work, RFKILL_POLL_INTERVAL);
+ }
+ 
++static int rt2x00rfkill_allocate(struct rt2x00_dev *rt2x00dev)
++{
++	struct device *dev = wiphy_dev(rt2x00dev->hw->wiphy);
++
++	rt2x00dev->rfkill = rfkill_allocate(dev, RFKILL_TYPE_WLAN);
++	if (!rt2x00dev->rfkill)
++		return -ENOMEM;
++
++	rt2x00dev->rfkill->name = rt2x00dev->ops->name;
++	rt2x00dev->rfkill->data = rt2x00dev;
++	rt2x00dev->rfkill->toggle_radio = rt2x00rfkill_toggle_radio;
++	if (test_bit(CONFIG_SUPPORT_HW_BUTTON, &rt2x00dev->flags)) {
++		rt2x00dev->rfkill->get_state = rt2x00rfkill_get_state;
++		rt2x00dev->rfkill->state =
++			rt2x00dev->ops->lib->rfkill_poll(rt2x00dev) ?
++			    RFKILL_STATE_SOFT_BLOCKED : RFKILL_STATE_UNBLOCKED;
++	} else {
++		rt2x00dev->rfkill->state = RFKILL_STATE_UNBLOCKED;
++	}
++
++	INIT_DELAYED_WORK(&rt2x00dev->rfkill_work, rt2x00rfkill_poll);
++
++	return 0;
++}
++
++static void rt2x00rfkill_free(struct rt2x00_dev *rt2x00dev)
++{
++	rfkill_free(rt2x00dev->rfkill);
++	rt2x00dev->rfkill = NULL;
++}
++
+ void rt2x00rfkill_register(struct rt2x00_dev *rt2x00dev)
+ {
+-	if (!test_bit(RFKILL_STATE_ALLOCATED, &rt2x00dev->rfkill_state) ||
+-	    test_bit(RFKILL_STATE_REGISTERED, &rt2x00dev->rfkill_state))
++	if (test_bit(RFKILL_STATE_REGISTERED, &rt2x00dev->rfkill_state))
++		return;
++
++	if (rt2x00rfkill_allocate(rt2x00dev)) {
++		ERROR(rt2x00dev, "Failed to allocate rfkill handler.\n");
+ 		return;
++	}
+ 
+ 	if (rfkill_register(rt2x00dev->rfkill)) {
+ 		ERROR(rt2x00dev, "Failed to register rfkill handler.\n");
++		rt2x00rfkill_free(rt2x00dev);
+ 		return;
+ 	}
+ 
+@@ -117,8 +153,7 @@ void rt2x00rfkill_register(struct rt2x00
+ 
+ void rt2x00rfkill_unregister(struct rt2x00_dev *rt2x00dev)
+ {
+-	if (!test_bit(RFKILL_STATE_ALLOCATED, &rt2x00dev->rfkill_state) ||
+-	    !test_bit(RFKILL_STATE_REGISTERED, &rt2x00dev->rfkill_state))
++	if (!test_bit(RFKILL_STATE_REGISTERED, &rt2x00dev->rfkill_state))
+ 		return;
+ 
+ 	cancel_delayed_work_sync(&rt2x00dev->rfkill_work);
+@@ -127,46 +162,3 @@ void rt2x00rfkill_unregister(struct rt2x
+ 
+ 	__clear_bit(RFKILL_STATE_REGISTERED, &rt2x00dev->rfkill_state);
+ }
+-
+-void rt2x00rfkill_allocate(struct rt2x00_dev *rt2x00dev)
+-{
+-	struct device *dev = wiphy_dev(rt2x00dev->hw->wiphy);
+-
+-	if (test_bit(RFKILL_STATE_ALLOCATED, &rt2x00dev->rfkill_state))
+-		return;
+-
+-	rt2x00dev->rfkill = rfkill_allocate(dev, RFKILL_TYPE_WLAN);
+-	if (!rt2x00dev->rfkill) {
+-		ERROR(rt2x00dev, "Failed to allocate rfkill handler.\n");
+-		return;
+-	}
+-
+-	__set_bit(RFKILL_STATE_ALLOCATED, &rt2x00dev->rfkill_state);
+-
+-	rt2x00dev->rfkill->name = rt2x00dev->ops->name;
+-	rt2x00dev->rfkill->data = rt2x00dev;
+-	rt2x00dev->rfkill->toggle_radio = rt2x00rfkill_toggle_radio;
+-	if (test_bit(CONFIG_SUPPORT_HW_BUTTON, &rt2x00dev->flags)) {
+-		rt2x00dev->rfkill->get_state = rt2x00rfkill_get_state;
+-		rt2x00dev->rfkill->state =
+-			rt2x00dev->ops->lib->rfkill_poll(rt2x00dev) ?
+-			    RFKILL_STATE_SOFT_BLOCKED : RFKILL_STATE_UNBLOCKED;
+-	} else {
+-		rt2x00dev->rfkill->state = RFKILL_STATE_UNBLOCKED;
+-	}
+-
+-	INIT_DELAYED_WORK(&rt2x00dev->rfkill_work, rt2x00rfkill_poll);
+-
+-	return;
+-}
+-
+-void rt2x00rfkill_free(struct rt2x00_dev *rt2x00dev)
+-{
+-	if (!test_bit(RFKILL_STATE_ALLOCATED, &rt2x00dev->rfkill_state))
+-		return;
+-
+-	cancel_delayed_work_sync(&rt2x00dev->rfkill_work);
+-
+-	rfkill_free(rt2x00dev->rfkill);
+-	rt2x00dev->rfkill = NULL;
+-}
