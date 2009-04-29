@@ -1,0 +1,210 @@
+From hugh@veritas.com  Wed Apr 29 12:45:48 2009
+From: Hugh Dickins <hugh@veritas.com>
+Date: Sat, 25 Apr 2009 17:52:56 +0100 (BST)
+Subject: fs core fixes
+To: Chris Wright <chrisw@sous-sol.org>
+Cc: Greg Kroah-Hartman <gregkh@suse.de>, Oleg Nesterov <oleg@redhat.com>, Joe Malicki <jmalicki@metatcarta.com>, stable@kernel.org, David Howells <dhowells@redhat.com>, Al Viro <viro@zeniv.linux.org.uk>, Andrew Morton <akpm@linux-foundation.org>, Linus Torvalds <torvalds@linux-foundation.org>, Alexey Dobriyan <adobriyan@gmail.com>, Roland McGrath <roland@redhat.com>
+Message-ID: <Pine.LNX.4.64.0904251751200.2298@blonde.anvils>
+
+From: Hugh Dickins <hugh@veritas.com>
+
+Please add the following 4 commits to 2.6.27-stable and 2.6.28-stable.
+However, there has been a lot of change here between 2.6.28 and 2.6.29:
+in particular, fs/exec.c's unsafe_exec() grew into the more complicated
+check_unsafe_exec().  So applying the original patches gives too many
+rejects: at the bottom is the diffstat and the combined patch required.
+
+1
+Commit: 53e9309e01277ec99c38e84e0ca16921287cf470
+Author: Hugh Dickins <hugh@veritas.com>
+Date: Sat, 28 Mar 2009 23:16:03 +0000 (+0000)
+Subject: compat_do_execve should unshare_files
+
+2
+Commit: e426b64c412aaa3e9eb3e4b261dc5be0d5a83e78
+Author: Hugh Dickins <hugh@veritas.com>
+Date: Sat, 28 Mar 2009 23:20:19 +0000 (+0000)
+Subject: fix setuid sometimes doesn't
+
+3
+Commit: 7c2c7d993044cddc5010f6f429b100c63bc7dffb
+Author: Hugh Dickins <hugh@veritas.com>
+Date: Sat, 28 Mar 2009 23:21:27 +0000 (+0000)
+Subject: fix setuid sometimes wouldn't
+
+4
+Commit: f1191b50ec11c8e2ca766d6d99eb5bb9d2c084a3
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date: Mon, 30 Mar 2009 11:35:18 +0000 (-0400)
+Subject: check_unsafe_exec() doesn't care about signal handlers sharing
+
+Signed-off-by: Hugh Dickins <hugh@veritas.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ fs/compat.c    |   12 +++++++++++-
+ fs/exec.c      |    4 +---
+ fs/proc/base.c |   50 ++++++++++++++++----------------------------------
+ 3 files changed, 28 insertions(+), 38 deletions(-)
+
+--- a/fs/compat.c
++++ b/fs/compat.c
+@@ -1353,12 +1353,17 @@ int compat_do_execve(char * filename,
+ {
+ 	struct linux_binprm *bprm;
+ 	struct file *file;
++	struct files_struct *displaced;
+ 	int retval;
+ 
++	retval = unshare_files(&displaced);
++	if (retval)
++		goto out_ret;
++
+ 	retval = -ENOMEM;
+ 	bprm = kzalloc(sizeof(*bprm), GFP_KERNEL);
+ 	if (!bprm)
+-		goto out_ret;
++		goto out_files;
+ 
+ 	file = open_exec(filename);
+ 	retval = PTR_ERR(file);
+@@ -1410,6 +1415,8 @@ int compat_do_execve(char * filename,
+ 		security_bprm_free(bprm);
+ 		acct_update_integrals(current);
+ 		free_bprm(bprm);
++		if (displaced)
++			put_files_struct(displaced);
+ 		return retval;
+ 	}
+ 
+@@ -1430,6 +1437,9 @@ out_file:
+ out_kfree:
+ 	free_bprm(bprm);
+ 
++out_files:
++	if (displaced)
++		reset_files_struct(displaced);
+ out_ret:
+ 	return retval;
+ }
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@ -1089,9 +1089,7 @@ static int unsafe_exec(struct task_struc
+ {
+ 	int unsafe = tracehook_unsafe_exec(p);
+ 
+-	if (atomic_read(&p->fs->count) > 1 ||
+-	    atomic_read(&p->files->count) > 1 ||
+-	    atomic_read(&p->sighand->count) > 1)
++	if (atomic_read(&p->fs->count) > 1)
+ 		unsafe |= LSM_UNSAFE_SHARE;
+ 
+ 	return unsafe;
+--- a/fs/proc/base.c
++++ b/fs/proc/base.c
+@@ -151,15 +151,22 @@ static unsigned int pid_entry_count_dirs
+ int maps_protect;
+ EXPORT_SYMBOL(maps_protect);
+ 
+-static struct fs_struct *get_fs_struct(struct task_struct *task)
++static int get_fs_path(struct task_struct *task, struct path *path, bool root)
+ {
+ 	struct fs_struct *fs;
++	int result = -ENOENT;
++
+ 	task_lock(task);
+ 	fs = task->fs;
+-	if(fs)
+-		atomic_inc(&fs->count);
++	if (fs) {
++		read_lock(&fs->lock);
++		*path = root ? fs->root : fs->pwd;
++		path_get(path);
++		read_unlock(&fs->lock);
++		result = 0;
++	}
+ 	task_unlock(task);
+-	return fs;
++	return result;
+ }
+ 
+ static int get_nr_threads(struct task_struct *tsk)
+@@ -178,42 +185,24 @@ static int get_nr_threads(struct task_st
+ static int proc_cwd_link(struct inode *inode, struct path *path)
+ {
+ 	struct task_struct *task = get_proc_task(inode);
+-	struct fs_struct *fs = NULL;
+ 	int result = -ENOENT;
+ 
+ 	if (task) {
+-		fs = get_fs_struct(task);
++		result = get_fs_path(task, path, 0);
+ 		put_task_struct(task);
+ 	}
+-	if (fs) {
+-		read_lock(&fs->lock);
+-		*path = fs->pwd;
+-		path_get(&fs->pwd);
+-		read_unlock(&fs->lock);
+-		result = 0;
+-		put_fs_struct(fs);
+-	}
+ 	return result;
+ }
+ 
+ static int proc_root_link(struct inode *inode, struct path *path)
+ {
+ 	struct task_struct *task = get_proc_task(inode);
+-	struct fs_struct *fs = NULL;
+ 	int result = -ENOENT;
+ 
+ 	if (task) {
+-		fs = get_fs_struct(task);
++		result = get_fs_path(task, path, 1);
+ 		put_task_struct(task);
+ 	}
+-	if (fs) {
+-		read_lock(&fs->lock);
+-		*path = fs->root;
+-		path_get(&fs->root);
+-		read_unlock(&fs->lock);
+-		result = 0;
+-		put_fs_struct(fs);
+-	}
+ 	return result;
+ }
+ 
+@@ -575,7 +564,6 @@ static int mounts_open_common(struct ino
+ 	struct task_struct *task = get_proc_task(inode);
+ 	struct nsproxy *nsp;
+ 	struct mnt_namespace *ns = NULL;
+-	struct fs_struct *fs = NULL;
+ 	struct path root;
+ 	struct proc_mounts *p;
+ 	int ret = -EINVAL;
+@@ -589,22 +577,16 @@ static int mounts_open_common(struct ino
+ 				get_mnt_ns(ns);
+ 		}
+ 		rcu_read_unlock();
+-		if (ns)
+-			fs = get_fs_struct(task);
++		if (ns && get_fs_path(task, &root, 1) == 0)
++			ret = 0;
+ 		put_task_struct(task);
+ 	}
+ 
+ 	if (!ns)
+ 		goto err;
+-	if (!fs)
++	if (ret)
+ 		goto err_put_ns;
+ 
+-	read_lock(&fs->lock);
+-	root = fs->root;
+-	path_get(&root);
+-	read_unlock(&fs->lock);
+-	put_fs_struct(fs);
+-
+ 	ret = -ENOMEM;
+ 	p = kmalloc(sizeof(struct proc_mounts), GFP_KERNEL);
+ 	if (!p)
