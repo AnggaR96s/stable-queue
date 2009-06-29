@@ -1,0 +1,94 @@
+From 83c97c9fbcefcc759abf935de7d4b9ce99675b68 Mon Sep 17 00:00:00 2001
+From: Neil Horman <nhorman@tuxdriver.com>
+Date: Fri, 26 Jun 2009 11:41:16 -0700
+Subject: ipv4 routing: Ensure that route cache entries are usable and reclaimable with caching is off
+
+From: Neil Horman <nhorman@tuxdriver.com>
+
+[ Upstream commit b6280b47a7a42970d098a3059f4ebe7e55e90d8d ]
+
+When route caching is disabled (rt_caching returns false), We still use route
+cache entries that are created and passed into rt_intern_hash once.  These
+routes need to be made usable for the one call path that holds a reference to
+them, and they need to be reclaimed when they're finished with their use.  To be
+made usable, they need to be associated with a neighbor table entry (which they
+currently are not), otherwise iproute_finish2 just discards the packet, since we
+don't know which L2 peer to send the packet to.  To do this binding, we need to
+follow the path a bit higher up in rt_intern_hash, which calls
+arp_bind_neighbour, but not assign the route entry to the hash table.
+Currently, if caching is off, we simply assign the route to the rp pointer and
+are reutrn success.  This patch associates us with a neighbor entry first.
+
+Secondly, we need to make sure that any single use routes like this are known to
+the garbage collector when caching is off.  If caching is off, and we try to
+hash in a route, it will leak when its refcount reaches zero.  To avoid this,
+this patch calls rt_free on the route cache entry passed into rt_intern_hash.
+This places us on the gc list for the route cache garbage collector, so that
+when its refcount reaches zero, it will be reclaimed (Thanks to Alexey for this
+suggestion).
+
+I've tested this on a local system here, and with these patches in place, I'm
+able to maintain routed connectivity to remote systems, even if I set
+/proc/sys/net/ipv4/rt_cache_rebuild_count to -1, which forces rt_caching to
+return false.
+
+Signed-off-by: Neil Horman <nhorman@redhat.com>
+Reported-by: Jarek Poplawski <jarkao2@gmail.com>
+Reported-by: Maxime Bizon <mbizon@freebox.fr>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ net/ipv4/route.c |   26 +++++++++++++++++++++++---
+ 1 file changed, 23 insertions(+), 3 deletions(-)
+
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@ -1089,8 +1089,27 @@ restart:
+ 		 * If we drop it here, the callers have no way to resolve routes
+ 		 * when we're not caching.  Instead, just point *rp at rt, so
+ 		 * the caller gets a single use out of the route
++		 * Note that we do rt_free on this new route entry, so that
++		 * once its refcount hits zero, we are still able to reap it
++		 * (Thanks Alexey)
++		 * Note also the rt_free uses call_rcu.  We don't actually
++		 * need rcu protection here, this is just our path to get
++		 * on the route gc list.
+ 		 */
+-		goto report_and_exit;
++
++		if (rt->rt_type == RTN_UNICAST || rt->fl.iif == 0) {
++			int err = arp_bind_neighbour(&rt->u.dst);
++			if (err) {
++				if (net_ratelimit())
++					printk(KERN_WARNING
++					    "Neighbour table failure & not caching routes.\n");
++				rt_drop(rt);
++				return err;
++			}
++		}
++
++		rt_free(rt);
++		goto skip_hashing;
+ 	}
+ 
+ 	rthp = &rt_hash_table[hash].chain;
+@@ -1204,7 +1223,8 @@ restart:
+ #if RT_CACHE_DEBUG >= 2
+ 	if (rt->u.dst.rt_next) {
+ 		struct rtable *trt;
+-		printk(KERN_DEBUG "rt_cache @%02x: %pI4", hash, &rt->rt_dst);
++		printk(KERN_DEBUG "rt_cache @%02x: %pI4",
++		       hash, &rt->rt_dst);
+ 		for (trt = rt->u.dst.rt_next; trt; trt = trt->u.dst.rt_next)
+ 			printk(" . %pI4", &trt->rt_dst);
+ 		printk("\n");
+@@ -1219,7 +1239,7 @@ restart:
+ 
+ 	spin_unlock_bh(rt_hash_lock_addr(hash));
+ 
+-report_and_exit:
++skip_hashing:
+ 	*rp = rt;
+ 	return 0;
+ }
