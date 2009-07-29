@@ -1,0 +1,153 @@
+From 89b8dcb97369f49e1d44535d34a797457325018a Mon Sep 17 00:00:00 2001
+From: Eric Dumazet <eric.dumazet@gmail.com>
+Date: Tue, 28 Jul 2009 18:59:07 -0700
+Subject: net: sock_copy() fixes
+
+From: Eric Dumazet <eric.dumazet@gmail.com>
+
+[ Upstream commit 4dc6dc7162c08b9965163c9ab3f9375d4adff2c7 ]
+
+Commit e912b1142be8f1e2c71c71001dc992c6e5eb2ec1
+(net: sk_prot_alloc() should not blindly overwrite memory)
+took care of not zeroing whole new socket at allocation time.
+
+sock_copy() is another spot where we should be very careful.
+We should not set refcnt to a non null value, until
+we are sure other fields are correctly setup, or
+a lockless reader could catch this socket by mistake,
+while not fully (re)initialized.
+
+This patch puts sk_node & sk_refcnt to the very beginning
+of struct sock to ease sock_copy() & sk_prot_alloc() job.
+
+We add appropriate smp_wmb() before sk_refcnt initializations
+to match our RCU requirements (changes to sock keys should
+be committed to memory before sk_refcnt setting)
+
+Signed-off-by: Eric Dumazet <eric.dumazet@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+---
+ include/net/sock.h |   32 +++++++++++++++++++-------------
+ net/core/sock.c    |   20 ++++++++++++++++++--
+ 2 files changed, 37 insertions(+), 15 deletions(-)
+
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@ -103,15 +103,15 @@ struct net;
+ 
+ /**
+  *	struct sock_common - minimal network layer representation of sockets
++ *	@skc_node: main hash linkage for various protocol lookup tables
++ *	@skc_nulls_node: main hash linkage for UDP/UDP-Lite protocol
++ *	@skc_refcnt: reference count
++ *	@skc_hash: hash value used with various protocol lookup tables
+  *	@skc_family: network address family
+  *	@skc_state: Connection state
+  *	@skc_reuse: %SO_REUSEADDR setting
+  *	@skc_bound_dev_if: bound device index if != 0
+- *	@skc_node: main hash linkage for various protocol lookup tables
+- *	@skc_nulls_node: main hash linkage for UDP/UDP-Lite protocol
+  *	@skc_bind_node: bind hash linkage for various protocol lookup tables
+- *	@skc_refcnt: reference count
+- *	@skc_hash: hash value used with various protocol lookup tables
+  *	@skc_prot: protocol handlers inside a network family
+  *	@skc_net: reference to the network namespace of this socket
+  *
+@@ -119,17 +119,21 @@ struct net;
+  *	for struct sock and struct inet_timewait_sock.
+  */
+ struct sock_common {
+-	unsigned short		skc_family;
+-	volatile unsigned char	skc_state;
+-	unsigned char		skc_reuse;
+-	int			skc_bound_dev_if;
++	/*
++	 * first fields are not copied in sock_copy()
++	 */
+ 	union {
+ 		struct hlist_node	skc_node;
+ 		struct hlist_nulls_node skc_nulls_node;
+ 	};
+-	struct hlist_node	skc_bind_node;
+ 	atomic_t		skc_refcnt;
++
+ 	unsigned int		skc_hash;
++	unsigned short		skc_family;
++	volatile unsigned char	skc_state;
++	unsigned char		skc_reuse;
++	int			skc_bound_dev_if;
++	struct hlist_node	skc_bind_node;
+ 	struct proto		*skc_prot;
+ #ifdef CONFIG_NET_NS
+ 	struct net	 	*skc_net;
+@@ -207,15 +211,17 @@ struct sock {
+ 	 * don't add nothing before this first member (__sk_common) --acme
+ 	 */
+ 	struct sock_common	__sk_common;
++#define sk_node			__sk_common.skc_node
++#define sk_nulls_node		__sk_common.skc_nulls_node
++#define sk_refcnt		__sk_common.skc_refcnt
++
++#define sk_copy_start		__sk_common.skc_hash
++#define sk_hash			__sk_common.skc_hash
+ #define sk_family		__sk_common.skc_family
+ #define sk_state		__sk_common.skc_state
+ #define sk_reuse		__sk_common.skc_reuse
+ #define sk_bound_dev_if		__sk_common.skc_bound_dev_if
+-#define sk_node			__sk_common.skc_node
+-#define sk_nulls_node		__sk_common.skc_nulls_node
+ #define sk_bind_node		__sk_common.skc_bind_node
+-#define sk_refcnt		__sk_common.skc_refcnt
+-#define sk_hash			__sk_common.skc_hash
+ #define sk_prot			__sk_common.skc_prot
+ #define sk_net			__sk_common.skc_net
+ 	unsigned char		sk_shutdown : 2,
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@ -915,13 +915,19 @@ static inline void sock_lock_init(struct
+ 			af_family_keys + sk->sk_family);
+ }
+ 
++/*
++ * Copy all fields from osk to nsk but nsk->sk_refcnt must not change yet,
++ * even temporarly, because of RCU lookups. sk_node should also be left as is.
++ */
+ static void sock_copy(struct sock *nsk, const struct sock *osk)
+ {
+ #ifdef CONFIG_SECURITY_NETWORK
+ 	void *sptr = nsk->sk_security;
+ #endif
+-
+-	memcpy(nsk, osk, osk->sk_prot->obj_size);
++	BUILD_BUG_ON(offsetof(struct sock, sk_copy_start) !=
++		     sizeof(osk->sk_node) + sizeof(osk->sk_refcnt));
++	memcpy(&nsk->sk_copy_start, &osk->sk_copy_start,
++	       osk->sk_prot->obj_size - offsetof(struct sock, sk_copy_start));
+ #ifdef CONFIG_SECURITY_NETWORK
+ 	nsk->sk_security = sptr;
+ 	security_sk_clone(osk, nsk);
+@@ -1118,6 +1124,11 @@ struct sock *sk_clone(const struct sock 
+ 
+ 		newsk->sk_err	   = 0;
+ 		newsk->sk_priority = 0;
++		/*
++		 * Before updating sk_refcnt, we must commit prior changes to memory
++		 * (Documentation/RCU/rculist_nulls.txt for details)
++		 */
++		smp_wmb();
+ 		atomic_set(&newsk->sk_refcnt, 2);
+ 
+ 		/*
+@@ -1809,6 +1820,11 @@ void sock_init_data(struct socket *sock,
+ 
+ 	sk->sk_stamp = ktime_set(-1L, 0);
+ 
++	/*
++	 * Before updating sk_refcnt, we must commit prior changes to memory
++	 * (Documentation/RCU/rculist_nulls.txt for details)
++	 */
++	smp_wmb();
+ 	atomic_set(&sk->sk_refcnt, 1);
+ 	atomic_set(&sk->sk_drops, 0);
+ }
