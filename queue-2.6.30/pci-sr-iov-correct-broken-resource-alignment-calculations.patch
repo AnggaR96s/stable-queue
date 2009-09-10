@@ -1,0 +1,159 @@
+From 6faf17f6f1ffc586d16efc2f9fa2083a7785ee74 Mon Sep 17 00:00:00 2001
+From: Chris Wright <chrisw@sous-sol.org>
+Date: Fri, 28 Aug 2009 13:00:06 -0700
+Subject: PCI SR-IOV: correct broken resource alignment calculations
+
+From: Chris Wright <chrisw@sous-sol.org>
+
+commit 6faf17f6f1ffc586d16efc2f9fa2083a7785ee74 upstream.
+
+An SR-IOV capable device includes an SR-IOV PCIe capability which
+describes the Virtual Function (VF) BAR requirements.  A typical SR-IOV
+device can support multiple VFs whose BARs must be in a contiguous region,
+effectively an array of VF BARs.  The BAR reports the size requirement
+for a single VF.  We calculate the full range needed by simply multiplying
+the VF BAR size with the number of possible VFs and create a resource
+spanning the full range.
+
+This all seems sane enough except it artificially inflates the alignment
+requirement for the VF BAR.  The VF BAR need only be aligned to the size
+of a single BAR not the contiguous range of VF BARs.  This can cause us
+to fail to allocate resources for the BAR despite the fact that we
+actually have enough space.
+
+This patch adds a thin PCI specific layer over the generic
+resource_alignment() function which is aware of the special nature of
+VF BARs and does sorting and allocation based on the smaller alignment
+requirement.
+
+I recognize that while resource_alignment is generic, it's basically a
+PCI helper.  An alternative to this patch is to add PCI VF BAR specific
+information to struct resource.  I opted for the extra layer rather than
+adding such PCI specific information to struct resource.  This does
+have the slight downside that we don't cache the BAR size and re-read
+for each alignment query (happens a small handful of times during boot
+for each VF BAR).
+
+Signed-off-by: Chris Wright <chrisw@sous-sol.org>
+Cc: Ivan Kokshaysky <ink@jurassic.park.msu.ru>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Matthew Wilcox <matthew@wil.cx>
+Cc: Yu Zhao <yu.zhao@intel.com>
+Signed-off-by: Jesse Barnes <jbarnes@virtuousgeek.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/pci/iov.c       |   23 +++++++++++++++++++++++
+ drivers/pci/pci.h       |   13 +++++++++++++
+ drivers/pci/setup-bus.c |    4 ++--
+ drivers/pci/setup-res.c |    6 +++---
+ 4 files changed, 41 insertions(+), 5 deletions(-)
+
+--- a/drivers/pci/iov.c
++++ b/drivers/pci/iov.c
+@@ -595,6 +595,29 @@ int pci_iov_resource_bar(struct pci_dev 
+ }
+ 
+ /**
++ * pci_sriov_resource_alignment - get resource alignment for VF BAR
++ * @dev: the PCI device
++ * @resno: the resource number
++ *
++ * Returns the alignment of the VF BAR found in the SR-IOV capability.
++ * This is not the same as the resource size which is defined as
++ * the VF BAR size multiplied by the number of VFs.  The alignment
++ * is just the VF BAR size.
++ */
++int pci_sriov_resource_alignment(struct pci_dev *dev, int resno)
++{
++	struct resource tmp;
++	enum pci_bar_type type;
++	int reg = pci_iov_resource_bar(dev, resno, &type);
++
++	if (!reg)
++		return 0;
++
++	 __pci_read_base(dev, type, &tmp, reg);
++	return resource_alignment(&tmp);
++}
++
++/**
+  * pci_restore_iov_state - restore the state of the IOV capability
+  * @dev: the PCI device
+  */
+--- a/drivers/pci/pci.h
++++ b/drivers/pci/pci.h
+@@ -234,6 +234,7 @@ extern int pci_iov_init(struct pci_dev *
+ extern void pci_iov_release(struct pci_dev *dev);
+ extern int pci_iov_resource_bar(struct pci_dev *dev, int resno,
+ 				enum pci_bar_type *type);
++extern int pci_sriov_resource_alignment(struct pci_dev *dev, int resno);
+ extern void pci_restore_iov_state(struct pci_dev *dev);
+ extern int pci_iov_bus_range(struct pci_bus *bus);
+ #else
+@@ -259,4 +260,16 @@ static inline int pci_iov_bus_range(stru
+ }
+ #endif /* CONFIG_PCI_IOV */
+ 
++static inline int pci_resource_alignment(struct pci_dev *dev,
++					 struct resource *res)
++{
++#ifdef CONFIG_PCI_IOV
++	int resno = res - dev->resource;
++
++	if (resno >= PCI_IOV_RESOURCES && resno <= PCI_IOV_RESOURCE_END)
++		return pci_sriov_resource_alignment(dev, resno);
++#endif
++	return resource_alignment(res);
++}
++
+ #endif /* DRIVERS_PCI_H */
+--- a/drivers/pci/setup-bus.c
++++ b/drivers/pci/setup-bus.c
+@@ -25,7 +25,7 @@
+ #include <linux/ioport.h>
+ #include <linux/cache.h>
+ #include <linux/slab.h>
+-
++#include "pci.h"
+ 
+ static void pbus_assign_resources_sorted(const struct pci_bus *bus)
+ {
+@@ -355,7 +355,7 @@ static int pbus_size_mem(struct pci_bus 
+ 				continue;
+ 			r_size = resource_size(r);
+ 			/* For bridges size != alignment */
+-			align = resource_alignment(r);
++			align = pci_resource_alignment(dev, r);
+ 			order = __ffs(align) - 20;
+ 			if (order > 11) {
+ 				dev_warn(&dev->dev, "BAR %d bad alignment %llx: "
+--- a/drivers/pci/setup-res.c
++++ b/drivers/pci/setup-res.c
+@@ -145,7 +145,7 @@ int pci_assign_resource(struct pci_dev *
+ 	size = resource_size(res);
+ 	min = (res->flags & IORESOURCE_IO) ? PCIBIOS_MIN_IO : PCIBIOS_MIN_MEM;
+ 
+-	align = resource_alignment(res);
++	align = pci_resource_alignment(dev, res);
+ 	if (!align) {
+ 		dev_info(&dev->dev, "BAR %d: can't allocate resource (bogus "
+ 			"alignment) %pR flags %#lx\n",
+@@ -236,7 +236,7 @@ void pdev_sort_resources(struct pci_dev 
+ 		if (!(r->flags) || r->parent)
+ 			continue;
+ 
+-		r_align = resource_alignment(r);
++		r_align = pci_resource_alignment(dev, r);
+ 		if (!r_align) {
+ 			dev_warn(&dev->dev, "BAR %d: bogus alignment "
+ 				"%pR flags %#lx\n",
+@@ -248,7 +248,7 @@ void pdev_sort_resources(struct pci_dev 
+ 			struct resource_list *ln = list->next;
+ 
+ 			if (ln)
+-				align = resource_alignment(ln->res);
++				align = pci_resource_alignment(ln->dev, ln->res);
+ 
+ 			if (r_align > align) {
+ 				tmp = kmalloc(sizeof(*tmp), GFP_KERNEL);

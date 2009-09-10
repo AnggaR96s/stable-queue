@@ -1,0 +1,143 @@
+From 61578dcd3fafe6babd72e8db32110cc0b630a432 Mon Sep 17 00:00:00 2001
+From: Mikulas Patocka <mpatocka@redhat.com>
+Date: Fri, 4 Sep 2009 20:40:39 +0100
+Subject: dm snapshot: fix header corruption race on invalidation
+
+From: Mikulas Patocka <mpatocka@redhat.com>
+
+commit 61578dcd3fafe6babd72e8db32110cc0b630a432 upstream.
+
+If a persistent snapshot fills up, a race can corrupt the on-disk header
+which causes a crash on any future attempt to activate the snapshot
+(typically while booting).  This patch fixes the race.
+
+When the snapshot overflows, __invalidate_snapshot is called, which calls
+snapshot store method drop_snapshot. It goes to persistent_drop_snapshot that
+calls write_header. write_header constructs the new header in the "area"
+location.
+
+Concurrently, an existing kcopyd job may finish, call copy_callback
+and commit_exception method, that goes to persistent_commit_exception.
+persistent_commit_exception doesn't do locking, relying on the fact that
+callbacks are single-threaded, but it can race with snapshot invalidation and
+overwrite the header that is just being written while the snapshot is being
+invalidated.
+
+The result of this race is a corrupted header being written that can
+lead to a crash on further reactivation (if chunk_size is zero in the
+corrupted header).
+
+The fix is to use separate memory areas for each.
+
+See the bug: https://bugzilla.redhat.com/show_bug.cgi?id=461506
+
+Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+Signed-off-by: Alasdair G Kergon <agk@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/md/dm-snap-persistent.c |   44 ++++++++++++++++++++++++++++++----------
+ 1 file changed, 34 insertions(+), 10 deletions(-)
+
+--- a/drivers/md/dm-snap-persistent.c
++++ b/drivers/md/dm-snap-persistent.c
+@@ -106,6 +106,13 @@ struct pstore {
+ 	void *zero_area;
+ 
+ 	/*
++	 * An area used for header. The header can be written
++	 * concurrently with metadata (when invalidating the snapshot),
++	 * so it needs a separate buffer.
++	 */
++	void *header_area;
++
++	/*
+ 	 * Used to keep track of which metadata area the data in
+ 	 * 'chunk' refers to.
+ 	 */
+@@ -148,16 +155,27 @@ static int alloc_area(struct pstore *ps)
+ 	 */
+ 	ps->area = vmalloc(len);
+ 	if (!ps->area)
+-		return r;
++		goto err_area;
+ 
+ 	ps->zero_area = vmalloc(len);
+-	if (!ps->zero_area) {
+-		vfree(ps->area);
+-		return r;
+-	}
++	if (!ps->zero_area)
++		goto err_zero_area;
+ 	memset(ps->zero_area, 0, len);
+ 
++	ps->header_area = vmalloc(len);
++	if (!ps->header_area)
++		goto err_header_area;
++
+ 	return 0;
++
++err_header_area:
++	vfree(ps->zero_area);
++
++err_zero_area:
++	vfree(ps->area);
++
++err_area:
++	return r;
+ }
+ 
+ static void free_area(struct pstore *ps)
+@@ -169,6 +187,10 @@ static void free_area(struct pstore *ps)
+ 	if (ps->zero_area)
+ 		vfree(ps->zero_area);
+ 	ps->zero_area = NULL;
++
++	if (ps->header_area)
++		vfree(ps->header_area);
++	ps->header_area = NULL;
+ }
+ 
+ struct mdata_req {
+@@ -285,11 +307,11 @@ static int read_header(struct pstore *ps
+ 	if (r)
+ 		return r;
+ 
+-	r = chunk_io(ps, ps->area, 0, READ, 1);
++	r = chunk_io(ps, ps->header_area, 0, READ, 1);
+ 	if (r)
+ 		goto bad;
+ 
+-	dh = (struct disk_header *) ps->area;
++	dh = ps->header_area;
+ 
+ 	if (le32_to_cpu(dh->magic) == 0) {
+ 		*new_snapshot = 1;
+@@ -339,15 +361,15 @@ static int write_header(struct pstore *p
+ {
+ 	struct disk_header *dh;
+ 
+-	memset(ps->area, 0, ps->store->chunk_size << SECTOR_SHIFT);
++	memset(ps->header_area, 0, ps->store->chunk_size << SECTOR_SHIFT);
+ 
+-	dh = (struct disk_header *) ps->area;
++	dh = ps->header_area;
+ 	dh->magic = cpu_to_le32(SNAP_MAGIC);
+ 	dh->valid = cpu_to_le32(ps->valid);
+ 	dh->version = cpu_to_le32(ps->version);
+ 	dh->chunk_size = cpu_to_le32(ps->store->chunk_size);
+ 
+-	return chunk_io(ps, ps->area, 0, WRITE, 1);
++	return chunk_io(ps, ps->header_area, 0, WRITE, 1);
+ }
+ 
+ /*
+@@ -667,6 +689,8 @@ static int persistent_ctr(struct dm_exce
+ 	ps->valid = 1;
+ 	ps->version = SNAPSHOT_DISK_VERSION;
+ 	ps->area = NULL;
++	ps->zero_area = NULL;
++	ps->header_area = NULL;
+ 	ps->next_free = 2;	/* skipping the header and first area */
+ 	ps->current_committed = 0;
+ 
