@@ -1,0 +1,303 @@
+From f2217e8edd95b0428d8123d426e0097a5e955f9f Mon Sep 17 00:00:00 2001
+From: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Date: Fri, 7 Aug 2009 14:04:43 -0700
+Subject: USB: xhci: Configure endpoint code refactoring.
+
+From: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+
+commit f2217e8edd95b0428d8123d426e0097a5e955f9f upstream.
+
+Refactor out the code issue, wait for, and parse the event completion code
+for a configure endpoint command.  Modify it to support the evaluate
+context command, which has a very similar submission process.  Add
+functions to copy parts of the output context into the input context
+(which will be used in the evaluate context command).
+
+Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/xhci-hcd.c  |  169 +++++++++++++++++++++++++++++--------------
+ drivers/usb/host/xhci-mem.c  |   38 +++++++++
+ drivers/usb/host/xhci-ring.c |    9 ++
+ drivers/usb/host/xhci.h      |    5 +
+ 4 files changed, 169 insertions(+), 52 deletions(-)
+
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@ -1168,6 +1168,9 @@ int xhci_setup_addressable_virt_dev(stru
+ unsigned int xhci_get_endpoint_index(struct usb_endpoint_descriptor *desc);
+ unsigned int xhci_get_endpoint_flag(struct usb_endpoint_descriptor *desc);
+ void xhci_endpoint_zero(struct xhci_hcd *xhci, struct xhci_virt_device *virt_dev, struct usb_host_endpoint *ep);
++void xhci_endpoint_copy(struct xhci_hcd *xhci,
++		struct xhci_virt_device *vdev, unsigned int ep_index);
++void xhci_slot_copy(struct xhci_hcd *xhci, struct xhci_virt_device *vdev);
+ int xhci_endpoint_init(struct xhci_hcd *xhci, struct xhci_virt_device *virt_dev,
+ 		struct usb_device *udev, struct usb_host_endpoint *ep,
+ 		gfp_t mem_flags);
+@@ -1216,6 +1219,8 @@ int xhci_queue_bulk_tx(struct xhci_hcd *
+ 		int slot_id, unsigned int ep_index);
+ int xhci_queue_configure_endpoint(struct xhci_hcd *xhci, dma_addr_t in_ctx_ptr,
+ 		u32 slot_id);
++int xhci_queue_evaluate_context(struct xhci_hcd *xhci, dma_addr_t in_ctx_ptr,
++		u32 slot_id);
+ int xhci_queue_reset_ep(struct xhci_hcd *xhci, int slot_id,
+ 		unsigned int ep_index);
+ void xhci_find_new_dequeue_state(struct xhci_hcd *xhci,
+--- a/drivers/usb/host/xhci-hcd.c
++++ b/drivers/usb/host/xhci-hcd.c
+@@ -942,6 +942,122 @@ static void xhci_zero_in_ctx(struct xhci
+ 	}
+ }
+ 
++static int xhci_configure_endpoint_result(struct xhci_hcd *xhci,
++		struct usb_device *udev, struct xhci_virt_device *virt_dev)
++{
++	int ret;
++
++	switch (virt_dev->cmd_status) {
++	case COMP_ENOMEM:
++		dev_warn(&udev->dev, "Not enough host controller resources "
++				"for new device state.\n");
++		ret = -ENOMEM;
++		/* FIXME: can we allocate more resources for the HC? */
++		break;
++	case COMP_BW_ERR:
++		dev_warn(&udev->dev, "Not enough bandwidth "
++				"for new device state.\n");
++		ret = -ENOSPC;
++		/* FIXME: can we go back to the old state? */
++		break;
++	case COMP_TRB_ERR:
++		/* the HCD set up something wrong */
++		dev_warn(&udev->dev, "ERROR: Endpoint drop flag = 0, "
++				"add flag = 1, "
++				"and endpoint is not disabled.\n");
++		ret = -EINVAL;
++		break;
++	case COMP_SUCCESS:
++		dev_dbg(&udev->dev, "Successful Endpoint Configure command\n");
++		ret = 0;
++		break;
++	default:
++		xhci_err(xhci, "ERROR: unexpected command completion "
++				"code 0x%x.\n", virt_dev->cmd_status);
++		ret = -EINVAL;
++		break;
++	}
++	return ret;
++}
++
++static int xhci_evaluate_context_result(struct xhci_hcd *xhci,
++		struct usb_device *udev, struct xhci_virt_device *virt_dev)
++{
++	int ret;
++
++	switch (virt_dev->cmd_status) {
++	case COMP_EINVAL:
++		dev_warn(&udev->dev, "WARN: xHCI driver setup invalid evaluate "
++				"context command.\n");
++		ret = -EINVAL;
++		break;
++	case COMP_EBADSLT:
++		dev_warn(&udev->dev, "WARN: slot not enabled for"
++				"evaluate context command.\n");
++	case COMP_CTX_STATE:
++		dev_warn(&udev->dev, "WARN: invalid context state for "
++				"evaluate context command.\n");
++		xhci_dbg_ctx(xhci, virt_dev->out_ctx, 1);
++		ret = -EINVAL;
++		break;
++	case COMP_SUCCESS:
++		dev_dbg(&udev->dev, "Successful evaluate context command\n");
++		ret = 0;
++		break;
++	default:
++		xhci_err(xhci, "ERROR: unexpected command completion "
++				"code 0x%x.\n", virt_dev->cmd_status);
++		ret = -EINVAL;
++		break;
++	}
++	return ret;
++}
++
++/* Issue a configure endpoint command or evaluate context command
++ * and wait for it to finish.
++ */
++static int xhci_configure_endpoint(struct xhci_hcd *xhci,
++		struct usb_device *udev, struct xhci_virt_device *virt_dev,
++		bool ctx_change)
++{
++	int ret;
++	int timeleft;
++	unsigned long flags;
++
++	spin_lock_irqsave(&xhci->lock, flags);
++	if (!ctx_change)
++		ret = xhci_queue_configure_endpoint(xhci, virt_dev->in_ctx->dma,
++				udev->slot_id);
++	else
++		ret = xhci_queue_evaluate_context(xhci, virt_dev->in_ctx->dma,
++				udev->slot_id);
++	if (ret < 0) {
++		spin_unlock_irqrestore(&xhci->lock, flags);
++		xhci_dbg(xhci, "FIXME allocate a new ring segment\n");
++		return -ENOMEM;
++	}
++	xhci_ring_cmd_db(xhci);
++	spin_unlock_irqrestore(&xhci->lock, flags);
++
++	/* Wait for the configure endpoint command to complete */
++	timeleft = wait_for_completion_interruptible_timeout(
++			&virt_dev->cmd_completion,
++			USB_CTRL_SET_TIMEOUT);
++	if (timeleft <= 0) {
++		xhci_warn(xhci, "%s while waiting for %s command\n",
++				timeleft == 0 ? "Timeout" : "Signal",
++				ctx_change == 0 ?
++					"configure endpoint" :
++					"evaluate context");
++		/* FIXME cancel the configure endpoint command */
++		return -ETIME;
++	}
++
++	if (!ctx_change)
++		return xhci_configure_endpoint_result(xhci, udev, virt_dev);
++	return xhci_evaluate_context_result(xhci, udev, virt_dev);
++}
++
+ /* Called after one or more calls to xhci_add_endpoint() or
+  * xhci_drop_endpoint().  If this call fails, the USB core is expected
+  * to call xhci_reset_bandwidth().
+@@ -956,8 +1072,6 @@ int xhci_check_bandwidth(struct usb_hcd 
+ {
+ 	int i;
+ 	int ret = 0;
+-	int timeleft;
+-	unsigned long flags;
+ 	struct xhci_hcd *xhci;
+ 	struct xhci_virt_device	*virt_dev;
+ 	struct xhci_input_control_ctx *ctrl_ctx;
+@@ -987,56 +1101,7 @@ int xhci_check_bandwidth(struct usb_hcd 
+ 	xhci_dbg_ctx(xhci, virt_dev->in_ctx,
+ 			LAST_CTX_TO_EP_NUM(slot_ctx->dev_info));
+ 
+-	spin_lock_irqsave(&xhci->lock, flags);
+-	ret = xhci_queue_configure_endpoint(xhci, virt_dev->in_ctx->dma,
+-			udev->slot_id);
+-	if (ret < 0) {
+-		spin_unlock_irqrestore(&xhci->lock, flags);
+-		xhci_dbg(xhci, "FIXME allocate a new ring segment\n");
+-		return -ENOMEM;
+-	}
+-	xhci_ring_cmd_db(xhci);
+-	spin_unlock_irqrestore(&xhci->lock, flags);
+-
+-	/* Wait for the configure endpoint command to complete */
+-	timeleft = wait_for_completion_interruptible_timeout(
+-			&virt_dev->cmd_completion,
+-			USB_CTRL_SET_TIMEOUT);
+-	if (timeleft <= 0) {
+-		xhci_warn(xhci, "%s while waiting for configure endpoint command\n",
+-				timeleft == 0 ? "Timeout" : "Signal");
+-		/* FIXME cancel the configure endpoint command */
+-		return -ETIME;
+-	}
+-
+-	switch (virt_dev->cmd_status) {
+-	case COMP_ENOMEM:
+-		dev_warn(&udev->dev, "Not enough host controller resources "
+-				"for new device state.\n");
+-		ret = -ENOMEM;
+-		/* FIXME: can we allocate more resources for the HC? */
+-		break;
+-	case COMP_BW_ERR:
+-		dev_warn(&udev->dev, "Not enough bandwidth "
+-				"for new device state.\n");
+-		ret = -ENOSPC;
+-		/* FIXME: can we go back to the old state? */
+-		break;
+-	case COMP_TRB_ERR:
+-		/* the HCD set up something wrong */
+-		dev_warn(&udev->dev, "ERROR: Endpoint drop flag = 0, add flag = 1, "
+-				"and endpoint is not disabled.\n");
+-		ret = -EINVAL;
+-		break;
+-	case COMP_SUCCESS:
+-		dev_dbg(&udev->dev, "Successful Endpoint Configure command\n");
+-		break;
+-	default:
+-		xhci_err(xhci, "ERROR: unexpected command completion "
+-				"code 0x%x.\n", virt_dev->cmd_status);
+-		ret = -EINVAL;
+-		break;
+-	}
++	ret = xhci_configure_endpoint(xhci, udev, virt_dev, false);
+ 	if (ret) {
+ 		/* Callee should call reset_bandwidth() */
+ 		return ret;
+--- a/drivers/usb/host/xhci-mem.c
++++ b/drivers/usb/host/xhci-mem.c
+@@ -601,6 +601,44 @@ void xhci_endpoint_zero(struct xhci_hcd 
+ 	 */
+ }
+ 
++/* Copy output xhci_ep_ctx to the input xhci_ep_ctx copy.
++ * Useful when you want to change one particular aspect of the endpoint and then
++ * issue a configure endpoint command.
++ */
++void xhci_endpoint_copy(struct xhci_hcd *xhci,
++		struct xhci_virt_device *vdev, unsigned int ep_index)
++{
++	struct xhci_ep_ctx *out_ep_ctx;
++	struct xhci_ep_ctx *in_ep_ctx;
++
++	out_ep_ctx = xhci_get_ep_ctx(xhci, vdev->out_ctx, ep_index);
++	in_ep_ctx = xhci_get_ep_ctx(xhci, vdev->in_ctx, ep_index);
++
++	in_ep_ctx->ep_info = out_ep_ctx->ep_info;
++	in_ep_ctx->ep_info2 = out_ep_ctx->ep_info2;
++	in_ep_ctx->deq = out_ep_ctx->deq;
++	in_ep_ctx->tx_info = out_ep_ctx->tx_info;
++}
++
++/* Copy output xhci_slot_ctx to the input xhci_slot_ctx.
++ * Useful when you want to change one particular aspect of the endpoint and then
++ * issue a configure endpoint command.  Only the context entries field matters,
++ * but we'll copy the whole thing anyway.
++ */
++void xhci_slot_copy(struct xhci_hcd *xhci, struct xhci_virt_device *vdev)
++{
++	struct xhci_slot_ctx *in_slot_ctx;
++	struct xhci_slot_ctx *out_slot_ctx;
++
++	in_slot_ctx = xhci_get_slot_ctx(xhci, vdev->in_ctx);
++	out_slot_ctx = xhci_get_slot_ctx(xhci, vdev->out_ctx);
++
++	in_slot_ctx->dev_info = out_slot_ctx->dev_info;
++	in_slot_ctx->dev_info2 = out_slot_ctx->dev_info2;
++	in_slot_ctx->tt_info = out_slot_ctx->tt_info;
++	in_slot_ctx->dev_state = out_slot_ctx->dev_state;
++}
++
+ /* Set up the scratchpad buffer array and scratchpad buffers, if needed. */
+ static int scratchpad_alloc(struct xhci_hcd *xhci, gfp_t flags)
+ {
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@ -1740,6 +1740,15 @@ int xhci_queue_configure_endpoint(struct
+ 			TRB_TYPE(TRB_CONFIG_EP) | SLOT_ID_FOR_TRB(slot_id));
+ }
+ 
++/* Queue an evaluate context command TRB */
++int xhci_queue_evaluate_context(struct xhci_hcd *xhci, dma_addr_t in_ctx_ptr,
++		u32 slot_id)
++{
++	return queue_command(xhci, lower_32_bits(in_ctx_ptr),
++			upper_32_bits(in_ctx_ptr), 0,
++			TRB_TYPE(TRB_EVAL_CONTEXT) | SLOT_ID_FOR_TRB(slot_id));
++}
++
+ int xhci_queue_stop_endpoint(struct xhci_hcd *xhci, int slot_id,
+ 		unsigned int ep_index)
+ {
