@@ -1,0 +1,124 @@
+From c8e33141911bf8fe87dc6c92793b9a59b2be0130 Mon Sep 17 00:00:00 2001
+From: Linus Torvalds <torvalds@linux-foundation.org>
+Date: Wed, 14 Oct 2009 08:59:49 -0700
+Subject: tty: Make flush_to_ldisc() locking more robust
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+From: Linus Torvalds <torvalds@linux-foundation.org>
+
+commit c8e33141911bf8fe87dc6c92793b9a59b2be0130 upstream.
+
+The locking logic in this function is extremely subtle, and it broke
+when we started doing potentially concurrent 'flush_to_ldisc()' calls in
+commit e043e42bdb66885b3ac10d27a01ccb9972e2b0a3 ("pty: avoid forcing
+'low_latency' tty flag").
+
+The code in flush_to_ldisc() used to set 'tty->buf.head' to NULL, with
+the intention that this would then cause any other concurrent calls to
+not do anything (locking note: we have to drop the buf.lock over the
+call to ->receive_buf that can block, which is why we can have
+concurrency here at all in the first place).
+
+It also used to set the TTY_FLUSHING bit, which would then cause any
+concurrent 'tty_buffer_flush()' to not free all the tty buffers and
+clear 'tty->buf.tail'.  And with 'buf.head' being NULL, and 'buf.tail'
+being non-NULL, new data would never touch 'buf.head'.
+
+Does that sound a bit too subtle? It was.  If another concurrent call to
+'flush_to_ldisc()' were to come in, the NULL buf.head would indeed cause
+it to not process the buffer list, but it would still clear TTY_FLUSHING
+afterwards, making the buffer protection against 'tty_buffer_flush()' no
+longer work.
+
+So this clears it all up.  We depend purely on TTY_FLUSHING for handling
+re-entrancy, and stop playing games with the buffer list entirely.  In
+fact, the buffer list handling is now robust enough that we could
+probably stop doing the whole "protect against 'tty_buffer_flush()'"
+thing entirely.
+
+However, Alan also points out that we would probably be better off
+simplifying the locking even further, and just take the tty ldisc_mutex
+around all the buffer flushing calls.  That seems like a good idea, but
+in the meantime this is a conceptually minimal fix (with the patch
+itself being bigger than required just to clean the code up and make it
+readable).
+
+This fixes keyboard trouble under X:
+
+	http://bugzilla.kernel.org/show_bug.cgi?id=14388
+
+Reported-and-tested-by: Frédéric Meunier <fredlwm@gmail.com>
+Reported-and-tested-by: Boyan <btanastasov@yahoo.co.uk>
+Cc: Alan Cox <alan@lxorguk.ukuu.org.uk>
+Cc: Paul Fulghum <paulkf@microgate.com>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/char/tty_buffer.c |   29 +++++++++++++----------------
+ 1 file changed, 13 insertions(+), 16 deletions(-)
+
+--- a/drivers/char/tty_buffer.c
++++ b/drivers/char/tty_buffer.c
+@@ -402,28 +402,26 @@ static void flush_to_ldisc(struct work_s
+ 		container_of(work, struct tty_struct, buf.work.work);
+ 	unsigned long 	flags;
+ 	struct tty_ldisc *disc;
+-	struct tty_buffer *tbuf, *head;
+-	char *char_buf;
+-	unsigned char *flag_buf;
+ 
+ 	disc = tty_ldisc_ref(tty);
+ 	if (disc == NULL)	/*  !TTY_LDISC */
+ 		return;
+ 
+ 	spin_lock_irqsave(&tty->buf.lock, flags);
+-	/* So we know a flush is running */
+-	set_bit(TTY_FLUSHING, &tty->flags);
+-	head = tty->buf.head;
+-	if (head != NULL) {
+-		tty->buf.head = NULL;
+-		for (;;) {
+-			int count = head->commit - head->read;
++
++	if (!test_and_set_bit(TTY_FLUSHING, &tty->flags)) {
++		struct tty_buffer *head;
++		while ((head = tty->buf.head) != NULL) {
++			int count;
++			char *char_buf;
++			unsigned char *flag_buf;
++
++			count = head->commit - head->read;
+ 			if (!count) {
+ 				if (head->next == NULL)
+ 					break;
+-				tbuf = head;
+-				head = head->next;
+-				tty_buffer_free(tty, tbuf);
++				tty->buf.head = head->next;
++				tty_buffer_free(tty, head);
+ 				continue;
+ 			}
+ 			/* Ldisc or user is trying to flush the buffers
+@@ -445,9 +443,9 @@ static void flush_to_ldisc(struct work_s
+ 							flag_buf, count);
+ 			spin_lock_irqsave(&tty->buf.lock, flags);
+ 		}
+-		/* Restore the queue head */
+-		tty->buf.head = head;
++		clear_bit(TTY_FLUSHING, &tty->flags);
+ 	}
++
+ 	/* We may have a deferred request to flush the input buffer,
+ 	   if so pull the chain under the lock and empty the queue */
+ 	if (test_bit(TTY_FLUSHPENDING, &tty->flags)) {
+@@ -455,7 +453,6 @@ static void flush_to_ldisc(struct work_s
+ 		clear_bit(TTY_FLUSHPENDING, &tty->flags);
+ 		wake_up(&tty->read_wait);
+ 	}
+-	clear_bit(TTY_FLUSHING, &tty->flags);
+ 	spin_unlock_irqrestore(&tty->buf.lock, flags);
+ 
+ 	tty_ldisc_deref(disc);
