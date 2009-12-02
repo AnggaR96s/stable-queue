@@ -1,0 +1,149 @@
+From a1f17a872bc7b1cb7efdd5486a2963e88a536e61 Mon Sep 17 00:00:00 2001
+From: Libin Yang <libin.yang@amd.com>
+Date: Wed, 4 Nov 2009 14:55:18 +0800
+Subject: USB: ohci: quirk AMD prefetch for USB 1.1 ISO transfer
+
+From: Libin Yang <libin.yang@amd.com>
+
+commit a1f17a872bc7b1cb7efdd5486a2963e88a536e61 upstream.
+
+The following patch in the driver is required to avoid USB 1.1 device
+failures that may occur due to requests from USB OHCI controllers may
+be overwritten if the latency for any pending request by the USB
+controller is very long (in the range of milliseconds).
+
+Signed-off-by: Libin Yang <libin.yang@amd.com>
+Cc: David Brownell <dbrownell@users.sourceforge.net>
+Cc: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/ohci-hcd.c |    5 +++++
+ drivers/usb/host/ohci-pci.c |   20 ++++++++++++++++++++
+ drivers/usb/host/ohci-q.c   |   18 ++++++++++++------
+ drivers/usb/host/ohci.h     |    9 +++++++++
+ 4 files changed, 46 insertions(+), 6 deletions(-)
+
+--- a/drivers/usb/host/ohci.h
++++ b/drivers/usb/host/ohci.h
+@@ -402,6 +402,7 @@ struct ohci_hcd {
+ #define	OHCI_QUIRK_FRAME_NO	0x80			/* no big endian frame_no shift */
+ #define	OHCI_QUIRK_HUB_POWER	0x100			/* distrust firmware power/oc setup */
+ #define	OHCI_QUIRK_AMD_ISO	0x200			/* ISO transfers*/
++#define	OHCI_QUIRK_AMD_PREFETCH	0x400			/* pre-fetch for ISO transfer */
+ 	// there are also chip quirks/bugs in init logic
+ 
+ 	struct work_struct	nec_work;	/* Worker for NEC quirk */
+@@ -433,6 +434,10 @@ static inline int quirk_amdiso(struct oh
+ {
+ 	return ohci->flags & OHCI_QUIRK_AMD_ISO;
+ }
++static inline int quirk_amdprefetch(struct ohci_hcd *ohci)
++{
++	return ohci->flags & OHCI_QUIRK_AMD_PREFETCH;
++}
+ #else
+ static inline int quirk_nec(struct ohci_hcd *ohci)
+ {
+@@ -446,6 +451,10 @@ static inline int quirk_amdiso(struct oh
+ {
+ 	return 0;
+ }
++static inline int quirk_amdprefetch(struct ohci_hcd *ohci)
++{
++	return 0;
++}
+ #endif
+ 
+ /* convert between an hcd pointer and the corresponding ohci_hcd */
+--- a/drivers/usb/host/ohci-hcd.c
++++ b/drivers/usb/host/ohci-hcd.c
+@@ -88,6 +88,7 @@ static int ohci_restart (struct ohci_hcd
+ #ifdef CONFIG_PCI
+ static void quirk_amd_pll(int state);
+ static void amd_iso_dev_put(void);
++static void sb800_prefetch(struct ohci_hcd *ohci, int on);
+ #else
+ static inline void quirk_amd_pll(int state)
+ {
+@@ -97,6 +98,10 @@ static inline void amd_iso_dev_put(void)
+ {
+ 	return;
+ }
++static inline void sb800_prefetch(struct ohci_hcd *ohci, int on)
++{
++	return;
++}
+ #endif
+ 
+ 
+--- a/drivers/usb/host/ohci-pci.c
++++ b/drivers/usb/host/ohci-pci.c
+@@ -177,6 +177,13 @@ static int ohci_quirk_amd700(struct usb_
+ 		return 0;
+ 
+ 	pci_read_config_byte(amd_smbus_dev, PCI_REVISION_ID, &rev);
++
++	/* SB800 needs pre-fetch fix */
++	if ((rev >= 0x40) && (rev <= 0x4f)) {
++		ohci->flags |= OHCI_QUIRK_AMD_PREFETCH;
++		ohci_dbg(ohci, "enabled AMD prefetch quirk\n");
++	}
++
+ 	if ((rev > 0x3b) || (rev < 0x30)) {
+ 		pci_dev_put(amd_smbus_dev);
+ 		amd_smbus_dev = NULL;
+@@ -262,6 +269,19 @@ static void amd_iso_dev_put(void)
+ 
+ }
+ 
++static void sb800_prefetch(struct ohci_hcd *ohci, int on)
++{
++	struct pci_dev *pdev;
++	u16 misc;
++
++	pdev = to_pci_dev(ohci_to_hcd(ohci)->self.controller);
++	pci_read_config_word(pdev, 0x50, &misc);
++	if (on == 0)
++		pci_write_config_word(pdev, 0x50, misc & 0xfcff);
++	else
++		pci_write_config_word(pdev, 0x50, misc | 0x0300);
++}
++
+ /* List of quirks for OHCI */
+ static const struct pci_device_id ohci_pci_quirks[] = {
+ 	{
+--- a/drivers/usb/host/ohci-q.c
++++ b/drivers/usb/host/ohci-q.c
+@@ -49,9 +49,12 @@ __acquires(ohci->lock)
+ 	switch (usb_pipetype (urb->pipe)) {
+ 	case PIPE_ISOCHRONOUS:
+ 		ohci_to_hcd(ohci)->self.bandwidth_isoc_reqs--;
+-		if (ohci_to_hcd(ohci)->self.bandwidth_isoc_reqs == 0
+-				&& quirk_amdiso(ohci))
+-			quirk_amd_pll(1);
++		if (ohci_to_hcd(ohci)->self.bandwidth_isoc_reqs == 0) {
++			if (quirk_amdiso(ohci))
++				quirk_amd_pll(1);
++			if (quirk_amdprefetch(ohci))
++				sb800_prefetch(ohci, 0);
++		}
+ 		break;
+ 	case PIPE_INTERRUPT:
+ 		ohci_to_hcd(ohci)->self.bandwidth_int_reqs--;
+@@ -680,9 +683,12 @@ static void td_submit_urb (
+ 				data + urb->iso_frame_desc [cnt].offset,
+ 				urb->iso_frame_desc [cnt].length, urb, cnt);
+ 		}
+-		if (ohci_to_hcd(ohci)->self.bandwidth_isoc_reqs == 0
+-				&& quirk_amdiso(ohci))
+-			quirk_amd_pll(0);
++		if (ohci_to_hcd(ohci)->self.bandwidth_isoc_reqs == 0) {
++			if (quirk_amdiso(ohci))
++				quirk_amd_pll(0);
++			if (quirk_amdprefetch(ohci))
++				sb800_prefetch(ohci, 1);
++		}
+ 		periodic = ohci_to_hcd(ohci)->self.bandwidth_isoc_reqs++ == 0
+ 			&& ohci_to_hcd(ohci)->self.bandwidth_int_reqs == 0;
+ 		break;
