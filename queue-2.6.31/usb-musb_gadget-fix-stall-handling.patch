@@ -1,0 +1,223 @@
+From cea83241b3a84499c4f9b12f8288f787e7aa6383 Mon Sep 17 00:00:00 2001
+From: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+Date: Wed, 18 Nov 2009 22:51:18 +0300
+Subject: USB: musb_gadget: fix STALL handling
+
+From: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+
+commit cea83241b3a84499c4f9b12f8288f787e7aa6383 upstream.
+
+The driver incorrectly cancels the mass-storage device CSW request
+(which leads to device reset) due to giving back URB at the head of
+endpoint's queue after sending each STALL handshake; stop doing that
+and start checking for the queue being non-empty before stalling an
+endpoint and disallowing stall in such case in musb_gadget_set_halt()
+like the other gadget drivers do.
+
+Moreover, the driver starts Rx request despite of the endpoint being
+halted -- fix this by moving the SendStall bit check from musb_g_rx()
+to rxstate().  And we also sometimes get into rxstate() with DMA still
+active after clearing an endpoint's halt (not clear why), so bail out
+in this case, similarly to what txstate() does...
+
+While at it, also do the following changes :
+
+- in musb_gadget_set_halt(), remove pointless Tx FIFO flushing (the
+  driver does not allow stalling with non-empty Tx FIFO anyway);
+
+- in rxstate(), stop pointlessly zeroing the 'csr' variable;
+
+- in musb_gadget_set_halt(), move the 'done' label to a more proper
+  place;
+
+- in musb_g_rx(), eliminate the 'done' label completely...
+
+Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/musb/musb_gadget.c |   79 +++++++++++++++++------------------------
+ 1 file changed, 34 insertions(+), 45 deletions(-)
+
+--- a/drivers/usb/musb/musb_gadget.c
++++ b/drivers/usb/musb/musb_gadget.c
+@@ -4,6 +4,7 @@
+  * Copyright 2005 Mentor Graphics Corporation
+  * Copyright (C) 2005-2006 by Texas Instruments
+  * Copyright (C) 2006-2007 Nokia Corporation
++ * Copyright (C) 2009 MontaVista Software, Inc. <source@mvista.com>
+  *
+  * This program is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU General Public License
+@@ -436,14 +437,6 @@ void musb_g_tx(struct musb *musb, u8 epn
+ 			csr |= MUSB_TXCSR_P_WZC_BITS;
+ 			csr &= ~MUSB_TXCSR_P_SENTSTALL;
+ 			musb_writew(epio, MUSB_TXCSR, csr);
+-			if (dma_channel_status(dma) == MUSB_DMA_STATUS_BUSY) {
+-				dma->status = MUSB_DMA_STATUS_CORE_ABORT;
+-				musb->dma_controller->channel_abort(dma);
+-			}
+-
+-			if (request)
+-				musb_g_giveback(musb_ep, request, -EPIPE);
+-
+ 			break;
+ 		}
+ 
+@@ -582,15 +575,25 @@ void musb_g_tx(struct musb *musb, u8 epn
+  */
+ static void rxstate(struct musb *musb, struct musb_request *req)
+ {
+-	u16			csr = 0;
+ 	const u8		epnum = req->epnum;
+ 	struct usb_request	*request = &req->request;
+ 	struct musb_ep		*musb_ep = &musb->endpoints[epnum].ep_out;
+ 	void __iomem		*epio = musb->endpoints[epnum].regs;
+ 	unsigned		fifo_count = 0;
+ 	u16			len = musb_ep->packet_sz;
++	u16			csr = musb_readw(epio, MUSB_RXCSR);
+ 
+-	csr = musb_readw(epio, MUSB_RXCSR);
++	/* We shouldn't get here while DMA is active, but we do... */
++	if (dma_channel_status(musb_ep->dma) == MUSB_DMA_STATUS_BUSY) {
++		DBG(4, "DMA pending...\n");
++		return;
++	}
++
++	if (csr & MUSB_RXCSR_P_SENDSTALL) {
++		DBG(5, "%s stalling, RXCSR %04x\n",
++		    musb_ep->end_point.name, csr);
++		return;
++	}
+ 
+ 	if (is_cppi_enabled() && musb_ep->dma) {
+ 		struct dma_controller	*c = musb->dma_controller;
+@@ -761,19 +764,10 @@ void musb_g_rx(struct musb *musb, u8 epn
+ 			csr, dma ? " (dma)" : "", request);
+ 
+ 	if (csr & MUSB_RXCSR_P_SENTSTALL) {
+-		if (dma_channel_status(dma) == MUSB_DMA_STATUS_BUSY) {
+-			dma->status = MUSB_DMA_STATUS_CORE_ABORT;
+-			(void) musb->dma_controller->channel_abort(dma);
+-			request->actual += musb_ep->dma->actual_len;
+-		}
+-
+ 		csr |= MUSB_RXCSR_P_WZC_BITS;
+ 		csr &= ~MUSB_RXCSR_P_SENTSTALL;
+ 		musb_writew(epio, MUSB_RXCSR, csr);
+-
+-		if (request)
+-			musb_g_giveback(musb_ep, request, -EPIPE);
+-		goto done;
++		return;
+ 	}
+ 
+ 	if (csr & MUSB_RXCSR_P_OVERRUN) {
+@@ -795,7 +789,7 @@ void musb_g_rx(struct musb *musb, u8 epn
+ 		DBG((csr & MUSB_RXCSR_DMAENAB) ? 4 : 1,
+ 			"%s busy, csr %04x\n",
+ 			musb_ep->end_point.name, csr);
+-		goto done;
++		return;
+ 	}
+ 
+ 	if (dma && (csr & MUSB_RXCSR_DMAENAB)) {
+@@ -826,22 +820,15 @@ void musb_g_rx(struct musb *musb, u8 epn
+ 		if ((request->actual < request->length)
+ 				&& (musb_ep->dma->actual_len
+ 					== musb_ep->packet_sz))
+-			goto done;
++			return;
+ #endif
+ 		musb_g_giveback(musb_ep, request, 0);
+ 
+ 		request = next_request(musb_ep);
+ 		if (!request)
+-			goto done;
+-
+-		/* don't start more i/o till the stall clears */
+-		musb_ep_select(mbase, epnum);
+-		csr = musb_readw(epio, MUSB_RXCSR);
+-		if (csr & MUSB_RXCSR_P_SENDSTALL)
+-			goto done;
++			return;
+ 	}
+ 
+-
+ 	/* analyze request if the ep is hot */
+ 	if (request)
+ 		rxstate(musb, to_musb_request(request));
+@@ -849,8 +836,6 @@ void musb_g_rx(struct musb *musb, u8 epn
+ 		DBG(3, "packet waiting for %s%s request\n",
+ 				musb_ep->desc ? "" : "inactive ",
+ 				musb_ep->end_point.name);
+-
+-done:
+ 	return;
+ }
+ 
+@@ -1244,7 +1229,7 @@ int musb_gadget_set_halt(struct usb_ep *
+ 	void __iomem		*mbase;
+ 	unsigned long		flags;
+ 	u16			csr;
+-	struct musb_request	*request = NULL;
++	struct musb_request	*request;
+ 	int			status = 0;
+ 
+ 	if (!ep)
+@@ -1260,24 +1245,29 @@ int musb_gadget_set_halt(struct usb_ep *
+ 
+ 	musb_ep_select(mbase, epnum);
+ 
+-	/* cannot portably stall with non-empty FIFO */
+ 	request = to_musb_request(next_request(musb_ep));
+-	if (value && musb_ep->is_in) {
+-		csr = musb_readw(epio, MUSB_TXCSR);
+-		if (csr & MUSB_TXCSR_FIFONOTEMPTY) {
+-			DBG(3, "%s fifo busy, cannot halt\n", ep->name);
+-			spin_unlock_irqrestore(&musb->lock, flags);
+-			return -EAGAIN;
++	if (value) {
++		if (request) {
++			DBG(3, "request in progress, cannot halt %s\n",
++			    ep->name);
++			status = -EAGAIN;
++			goto done;
++		}
++		/* Cannot portably stall with non-empty FIFO */
++		if (musb_ep->is_in) {
++			csr = musb_readw(epio, MUSB_TXCSR);
++			if (csr & MUSB_TXCSR_FIFONOTEMPTY) {
++				DBG(3, "FIFO busy, cannot halt %s\n", ep->name);
++				status = -EAGAIN;
++				goto done;
++			}
+ 		}
+-
+ 	}
+ 
+ 	/* set/clear the stall and toggle bits */
+ 	DBG(2, "%s: %s stall\n", ep->name, value ? "set" : "clear");
+ 	if (musb_ep->is_in) {
+ 		csr = musb_readw(epio, MUSB_TXCSR);
+-		if (csr & MUSB_TXCSR_FIFONOTEMPTY)
+-			csr |= MUSB_TXCSR_FLUSHFIFO;
+ 		csr |= MUSB_TXCSR_P_WZC_BITS
+ 			| MUSB_TXCSR_CLRDATATOG;
+ 		if (value)
+@@ -1300,14 +1290,13 @@ int musb_gadget_set_halt(struct usb_ep *
+ 		musb_writew(epio, MUSB_RXCSR, csr);
+ 	}
+ 
+-done:
+-
+ 	/* maybe start the first request in the queue */
+ 	if (!musb_ep->busy && !value && request) {
+ 		DBG(3, "restarting the request\n");
+ 		musb_ep_restart(musb, request);
+ 	}
+ 
++done:
+ 	spin_unlock_irqrestore(&musb->lock, flags);
+ 	return status;
+ }
