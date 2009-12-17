@@ -1,0 +1,1553 @@
+From gregkh@mini.kroah.org Wed Dec 16 16:47:07 2009
+Message-Id: <20091217004707.069265221@mini.kroah.org>
+User-Agent: quilt/0.48-1
+Date: Wed, 16 Dec 2009 16:45:52 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: stable-review@kernel.org,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Sebastian Andrzej Siewior <sebastian@breakpoint.cc>,
+ Oleg Nesterov <oleg@redhat.com>,
+ Roland McGrath <roland@redhat.com>,
+ Kyle McMartin <kyle@mcmartin.ca>,
+ Thomas Gleixner <tglx@linutronix.de>
+Subject: [01/18] signal: Fix alternate signal stack check
+
+2.6.27-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+From: Sebastian Andrzej Siewior <sebastian@breakpoint.cc>
+
+commit 2a855dd01bc1539111adb7233f587c5c468732ac upstream.
+
+All architectures in the kernel increment/decrement the stack pointer
+before storing values on the stack.
+
+On architectures which have the stack grow down sas_ss_sp == sp is not
+on the alternate signal stack while sas_ss_sp + sas_ss_size == sp is
+on the alternate signal stack.
+
+On architectures which have the stack grow up sas_ss_sp == sp is on
+the alternate signal stack while sas_ss_sp + sas_ss_size == sp is not
+on the alternate signal stack.
+
+The current implementation fails for architectures which have the
+stack grow down on the corner case where sas_ss_sp == sp.This was
+reported as Debian bug #544905 on AMD64.
+Simplified test case: http://download.breakpoint.cc/tc-sig-stack.c
+
+The test case creates the following stack scenario:
+   0xn0300	stack top
+   0xn0200	alt stack pointer top (when switching to alt stack)
+   0xn01ff	alt stack end
+   0xn0100	alt stack start == stack pointer
+
+If the signal is sent the stack pointer is pointing to the base
+address of the alt stack and the kernel erroneously decides that it
+has already switched to the alternate stack because of the current
+check for "sp - sas_ss_sp < sas_ss_size"
+
+On parisc (stack grows up) the scenario would be:
+   0xn0200	stack pointer
+   0xn01ff	alt stack end
+   0xn0100	alt stack start = alt stack pointer base
+   		    	  	  (when switching to alt stack)
+   0xn0000	stack base
+
+This is handled correctly by the current implementation.
+
+[ tglx: Modified for archs which have the stack grow up (parisc) which
+  	would fail with the correct implementation for stack grows
+  	down. Added a check for sp >= current->sas_ss_sp which is
+  	strictly not necessary but makes the code symetric for both
+  	variants ]
+
+Signed-off-by: Sebastian Andrzej Siewior <sebastian@breakpoint.cc>
+Cc: Oleg Nesterov <oleg@redhat.com>
+Cc: Roland McGrath <roland@redhat.com>
+Cc: Kyle McMartin <kyle@mcmartin.ca>
+LKML-Reference: <20091025143758.GA6653@Chamillionaire.breakpoint.cc>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ include/linux/sched.h |   13 ++++++++++---
+ 1 file changed, 10 insertions(+), 3 deletions(-)
+
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1803,11 +1803,18 @@ static inline int is_si_special(const st
+ 	return info <= SEND_SIG_FORCED;
+ }
+ 
+-/* True if we are on the alternate signal stack.  */
+-
++/*
++ * True if we are on the alternate signal stack.
++ */
+ static inline int on_sig_stack(unsigned long sp)
+ {
+-	return (sp - current->sas_ss_sp < current->sas_ss_size);
++#ifdef CONFIG_STACK_GROWSUP
++	return sp >= current->sas_ss_sp &&
++		sp - current->sas_ss_sp < current->sas_ss_size;
++#else
++	return sp > current->sas_ss_sp &&
++		sp - current->sas_ss_sp <= current->sas_ss_size;
++#endif
+ }
+ 
+ static inline int sas_ss_flags(unsigned long sp)
+
+
+From gregkh@mini.kroah.org Wed Dec 16 16:47:07 2009
+Message-Id: <20091217004707.207213364@mini.kroah.org>
+User-Agent: quilt/0.48-1
+Date: Wed, 16 Dec 2009 16:45:53 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: stable-review@kernel.org,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Mathieu Desnoyers <mathieu.desnoyers@polymtl.ca>
+Subject: [02/18] debugfs: fix create mutex racy fops and private data
+
+2.6.27-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+From: Mathieu Desnoyers <mathieu.desnoyers@polymtl.ca>
+
+commit d3a3b0adad0865c12e39b712ca89efbd0a3a0dbc upstream.
+
+Setting fops and private data outside of the mutex at debugfs file
+creation introduces a race where the files can be opened with the wrong
+file operations and private data.  It is easy to trigger with a process
+waiting on file creation notification.
+
+Signed-off-by: Mathieu Desnoyers <mathieu.desnoyers@polymtl.ca>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ fs/debugfs/inode.c |   55 ++++++++++++++++++++++++++++++-----------------------
+ 1 file changed, 32 insertions(+), 23 deletions(-)
+
+--- a/fs/debugfs/inode.c
++++ b/fs/debugfs/inode.c
+@@ -32,7 +32,9 @@
+ static struct vfsmount *debugfs_mount;
+ static int debugfs_mount_count;
+ 
+-static struct inode *debugfs_get_inode(struct super_block *sb, int mode, dev_t dev)
++static struct inode *debugfs_get_inode(struct super_block *sb, int mode, dev_t dev,
++				       void *data, const struct file_operations *fops)
++
+ {
+ 	struct inode *inode = new_inode(sb);
+ 
+@@ -47,14 +49,18 @@ static struct inode *debugfs_get_inode(s
+ 			init_special_inode(inode, mode, dev);
+ 			break;
+ 		case S_IFREG:
+-			inode->i_fop = &debugfs_file_operations;
++			inode->i_fop = fops ? fops : &debugfs_file_operations;
++			inode->i_private = data;
+ 			break;
+ 		case S_IFLNK:
+ 			inode->i_op = &debugfs_link_operations;
++			inode->i_fop = fops;
++			inode->i_private = data;
+ 			break;
+ 		case S_IFDIR:
+ 			inode->i_op = &simple_dir_inode_operations;
+-			inode->i_fop = &simple_dir_operations;
++			inode->i_fop = fops ? fops : &simple_dir_operations;
++			inode->i_private = data;
+ 
+ 			/* directory inodes start off with i_nlink == 2
+ 			 * (for "." entry) */
+@@ -67,7 +73,8 @@ static struct inode *debugfs_get_inode(s
+ 
+ /* SMP-safe */
+ static int debugfs_mknod(struct inode *dir, struct dentry *dentry,
+-			 int mode, dev_t dev)
++			 int mode, dev_t dev, void *data,
++			 const struct file_operations *fops)
+ {
+ 	struct inode *inode;
+ 	int error = -EPERM;
+@@ -75,7 +82,7 @@ static int debugfs_mknod(struct inode *d
+ 	if (dentry->d_inode)
+ 		return -EEXIST;
+ 
+-	inode = debugfs_get_inode(dir->i_sb, mode, dev);
++	inode = debugfs_get_inode(dir->i_sb, mode, dev, data, fops);
+ 	if (inode) {
+ 		d_instantiate(dentry, inode);
+ 		dget(dentry);
+@@ -84,12 +91,13 @@ static int debugfs_mknod(struct inode *d
+ 	return error;
+ }
+ 
+-static int debugfs_mkdir(struct inode *dir, struct dentry *dentry, int mode)
++static int debugfs_mkdir(struct inode *dir, struct dentry *dentry, int mode,
++			 void *data, const struct file_operations *fops)
+ {
+ 	int res;
+ 
+ 	mode = (mode & (S_IRWXUGO | S_ISVTX)) | S_IFDIR;
+-	res = debugfs_mknod(dir, dentry, mode, 0);
++	res = debugfs_mknod(dir, dentry, mode, 0, data, fops);
+ 	if (!res) {
+ 		inc_nlink(dir);
+ 		fsnotify_mkdir(dir, dentry);
+@@ -97,18 +105,20 @@ static int debugfs_mkdir(struct inode *d
+ 	return res;
+ }
+ 
+-static int debugfs_link(struct inode *dir, struct dentry *dentry, int mode)
++static int debugfs_link(struct inode *dir, struct dentry *dentry, int mode,
++			void *data, const struct file_operations *fops)
+ {
+ 	mode = (mode & S_IALLUGO) | S_IFLNK;
+-	return debugfs_mknod(dir, dentry, mode, 0);
++	return debugfs_mknod(dir, dentry, mode, 0, data, fops);
+ }
+ 
+-static int debugfs_create(struct inode *dir, struct dentry *dentry, int mode)
++static int debugfs_create(struct inode *dir, struct dentry *dentry, int mode,
++			  void *data, const struct file_operations *fops)
+ {
+ 	int res;
+ 
+ 	mode = (mode & S_IALLUGO) | S_IFREG;
+-	res = debugfs_mknod(dir, dentry, mode, 0);
++	res = debugfs_mknod(dir, dentry, mode, 0, data, fops);
+ 	if (!res)
+ 		fsnotify_create(dir, dentry);
+ 	return res;
+@@ -142,7 +152,9 @@ static struct file_system_type debug_fs_
+ 
+ static int debugfs_create_by_name(const char *name, mode_t mode,
+ 				  struct dentry *parent,
+-				  struct dentry **dentry)
++				  struct dentry **dentry,
++				  void *data,
++				  const struct file_operations *fops)
+ {
+ 	int error = 0;
+ 
+@@ -167,13 +179,16 @@ static int debugfs_create_by_name(const 
+ 	if (!IS_ERR(*dentry)) {
+ 		switch (mode & S_IFMT) {
+ 		case S_IFDIR:
+-			error = debugfs_mkdir(parent->d_inode, *dentry, mode);
++			error = debugfs_mkdir(parent->d_inode, *dentry, mode,
++					      data, fops);
+ 			break;
+ 		case S_IFLNK:
+-			error = debugfs_link(parent->d_inode, *dentry, mode);
++			error = debugfs_link(parent->d_inode, *dentry, mode,
++					     data, fops);
+ 			break;
+ 		default:
+-			error = debugfs_create(parent->d_inode, *dentry, mode);
++			error = debugfs_create(parent->d_inode, *dentry, mode,
++					       data, fops);
+ 			break;
+ 		}
+ 		dput(*dentry);
+@@ -224,19 +239,13 @@ struct dentry *debugfs_create_file(const
+ 	if (error)
+ 		goto exit;
+ 
+-	error = debugfs_create_by_name(name, mode, parent, &dentry);
++	error = debugfs_create_by_name(name, mode, parent, &dentry,
++				       data, fops);
+ 	if (error) {
+ 		dentry = NULL;
+ 		simple_release_fs(&debugfs_mount, &debugfs_mount_count);
+ 		goto exit;
+ 	}
+-
+-	if (dentry->d_inode) {
+-		if (data)
+-			dentry->d_inode->i_private = data;
+-		if (fops)
+-			dentry->d_inode->i_fop = fops;
+-	}
+ exit:
+ 	return dentry;
+ }
+
+
+From gregkh@mini.kroah.org Wed Dec 16 16:47:07 2009
+Message-Id: <20091217004707.341234770@mini.kroah.org>
+User-Agent: quilt/0.48-1
+Date: Wed, 16 Dec 2009 16:45:54 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: stable-review@kernel.org,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Jay Fenlason <fenlason@redhat.com>,
+ Stefan Richter <stefanr@s5r6.in-berlin.de>
+Subject: [03/18] firewire: ohci: handle receive packets with a data length of zero
+
+2.6.27-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+From: Jay Fenlason <fenlason@redhat.com>
+
+commit 8c0c0cc2d9f4c523fde04bdfe41e4380dec8ee54 upstream.
+
+Queueing to receive an ISO packet with a payload length of zero
+silently does nothing in dualbuffer mode, and crashes the kernel in
+packet-per-buffer mode.  Return an error in dualbuffer mode, because
+the DMA controller won't let us do what we want, and work correctly in
+packet-per-buffer mode.
+
+Signed-off-by: Jay Fenlason <fenlason@redhat.com>
+Signed-off-by: Stefan Richter <stefanr@s5r6.in-berlin.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/firewire/fw-ohci.c |   12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+--- a/drivers/firewire/fw-ohci.c
++++ b/drivers/firewire/fw-ohci.c
+@@ -2146,6 +2146,13 @@ ohci_queue_iso_receive_dualbuffer(struct
+ 	page     = payload >> PAGE_SHIFT;
+ 	offset   = payload & ~PAGE_MASK;
+ 	rest     = p->payload_length;
++	/*
++	 * The controllers I've tested have not worked correctly when
++	 * second_req_count is zero.  Rather than do something we know won't
++	 * work, return an error
++	 */
++	if (rest == 0)
++		return -EINVAL;
+ 
+ 	/* FIXME: make packet-per-buffer/dual-buffer a context option */
+ 	while (rest > 0) {
+@@ -2199,7 +2206,7 @@ ohci_queue_iso_receive_packet_per_buffer
+ 					 unsigned long payload)
+ {
+ 	struct iso_context *ctx = container_of(base, struct iso_context, base);
+-	struct descriptor *d = NULL, *pd = NULL;
++	struct descriptor *d, *pd;
+ 	struct fw_iso_packet *p = packet;
+ 	dma_addr_t d_bus, page_bus;
+ 	u32 z, header_z, rest;
+@@ -2237,8 +2244,9 @@ ohci_queue_iso_receive_packet_per_buffer
+ 		d->data_address = cpu_to_le32(d_bus + (z * sizeof(*d)));
+ 
+ 		rest = payload_per_buffer;
++		pd = d;
+ 		for (j = 1; j < z; j++) {
+-			pd = d + j;
++			pd++;
+ 			pd->control = cpu_to_le16(DESCRIPTOR_STATUS |
+ 						  DESCRIPTOR_INPUT_MORE);
+ 
+
+
+From gregkh@mini.kroah.org Wed Dec 16 16:47:07 2009
+Message-Id: <20091217004707.472856791@mini.kroah.org>
+User-Agent: quilt/0.48-1
+Date: Wed, 16 Dec 2009 16:45:55 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: stable-review@kernel.org,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Csaba Henk <csaba@gluster.com>,
+ Miklos Szeredi <mszeredi@suse.cz>,
+ Harshavardhana <harsha@gluster.com>
+Subject: [04/18] fuse: reject O_DIRECT flag also in fuse_create
+
+2.6.27-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+From: Csaba Henk <csaba@gluster.com>
+
+commit 1b7323965a8c6eee9dc4e345a7ae4bff1dc93149 upstream.
+
+The comment in fuse_open about O_DIRECT:
+
+  "VFS checks this, but only _after_ ->open()"
+
+also holds for fuse_create, however, the same kind of check was missing there.
+
+As an impact of this bug, open(newfile, O_RDWR|O_CREAT|O_DIRECT) fails, but a
+stub newfile will remain if the fuse server handled the implied FUSE_CREATE
+request appropriately.
+
+Other impact: in the above situation ima_file_free() will complain to open/free
+imbalance if CONFIG_IMA is set.
+
+Signed-off-by: Csaba Henk <csaba@gluster.com>
+Signed-off-by: Miklos Szeredi <mszeredi@suse.cz>
+Cc: Harshavardhana <harsha@gluster.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ fs/fuse/dir.c |    3 +++
+ 1 file changed, 3 insertions(+)
+
+--- a/fs/fuse/dir.c
++++ b/fs/fuse/dir.c
+@@ -401,6 +401,9 @@ static int fuse_create_open(struct inode
+ 	if (flags & O_DIRECT)
+ 		return -EINVAL;
+ 
++	if (flags & O_DIRECT)
++		return -EINVAL;
++
+ 	forget_req = fuse_get_req(fc);
+ 	if (IS_ERR(forget_req))
+ 		return PTR_ERR(forget_req);
+
+
+From gregkh@mini.kroah.org Wed Dec 16 16:47:07 2009
+Message-Id: <20091217004707.607176768@mini.kroah.org>
+User-Agent: quilt/0.48-1
+Date: Wed, 16 Dec 2009 16:45:56 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: stable-review@kernel.org,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ WANG Cong <amwang@redhat.com>,
+ Eugene Teo <eteo@redhat.com>,
+ Roman Zippel <zippel@linux-m68k.org>,
+ Al Viro <viro@zeniv.linux.org.uk>,
+ Christoph Hellwig <hch@lst.de>,
+ Alexey Dobriyan <adobriyan@gmail.com>,
+ Dave Anderson <anderson@redhat.com>
+Subject: [05/18] hfs: fix a potential buffer overflow
+
+2.6.27-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+From: Amerigo Wang <amwang@redhat.com>
+
+commit ec81aecb29668ad71f699f4e7b96ec46691895b6 upstream.
+
+A specially-crafted Hierarchical File System (HFS) filesystem could cause
+a buffer overflow to occur in a process's kernel stack during a memcpy()
+call within the hfs_bnode_read() function (at fs/hfs/bnode.c:24).  The
+attacker can provide the source buffer and length, and the destination
+buffer is a local variable of a fixed length.  This local variable (passed
+as "&entry" from fs/hfs/dir.c:112 and allocated on line 60) is stored in
+the stack frame of hfs_bnode_read()'s caller, which is hfs_readdir().
+Because the hfs_readdir() function executes upon any attempt to read a
+directory on the filesystem, it gets called whenever a user attempts to
+inspect any filesystem contents.
+
+[amwang@redhat.com: modify this patch and fix coding style problems]
+Signed-off-by: WANG Cong <amwang@redhat.com>
+Cc: Eugene Teo <eteo@redhat.com>
+Cc: Roman Zippel <zippel@linux-m68k.org>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Christoph Hellwig <hch@lst.de>
+Cc: Alexey Dobriyan <adobriyan@gmail.com>
+Cc: Dave Anderson <anderson@redhat.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ fs/hfs/catalog.c |    4 ++++
+ fs/hfs/dir.c     |   11 +++++++++++
+ fs/hfs/super.c   |    7 ++++++-
+ 3 files changed, 21 insertions(+), 1 deletion(-)
+
+--- a/fs/hfs/catalog.c
++++ b/fs/hfs/catalog.c
+@@ -289,6 +289,10 @@ int hfs_cat_move(u32 cnid, struct inode 
+ 	err = hfs_brec_find(&src_fd);
+ 	if (err)
+ 		goto out;
++	if (src_fd.entrylength > sizeof(entry) || src_fd.entrylength < 0) {
++		err = -EIO;
++		goto out;
++	}
+ 
+ 	hfs_bnode_read(src_fd.bnode, &entry, src_fd.entryoffset,
+ 			    src_fd.entrylength);
+--- a/fs/hfs/dir.c
++++ b/fs/hfs/dir.c
+@@ -79,6 +79,11 @@ static int hfs_readdir(struct file *filp
+ 		filp->f_pos++;
+ 		/* fall through */
+ 	case 1:
++		if (fd.entrylength > sizeof(entry) || fd.entrylength < 0) {
++			err = -EIO;
++			goto out;
++		}
++
+ 		hfs_bnode_read(fd.bnode, &entry, fd.entryoffset, fd.entrylength);
+ 		if (entry.type != HFS_CDR_THD) {
+ 			printk(KERN_ERR "hfs: bad catalog folder thread\n");
+@@ -109,6 +114,12 @@ static int hfs_readdir(struct file *filp
+ 			err = -EIO;
+ 			goto out;
+ 		}
++
++		if (fd.entrylength > sizeof(entry) || fd.entrylength < 0) {
++			err = -EIO;
++			goto out;
++		}
++
+ 		hfs_bnode_read(fd.bnode, &entry, fd.entryoffset, fd.entrylength);
+ 		type = entry.type;
+ 		len = hfs_mac2asc(sb, strbuf, &fd.key->cat.CName);
+--- a/fs/hfs/super.c
++++ b/fs/hfs/super.c
+@@ -386,8 +386,13 @@ static int hfs_fill_super(struct super_b
+ 	/* try to get the root inode */
+ 	hfs_find_init(HFS_SB(sb)->cat_tree, &fd);
+ 	res = hfs_cat_find_brec(sb, HFS_ROOT_CNID, &fd);
+-	if (!res)
++	if (!res) {
++		if (fd.entrylength > sizeof(rec) || fd.entrylength < 0) {
++			res =  -EIO;
++			goto bail;
++		}
+ 		hfs_bnode_read(fd.bnode, &rec, fd.entryoffset, fd.entrylength);
++	}
+ 	if (res) {
+ 		hfs_find_exit(&fd);
+ 		goto bail_no_root;
+
+
+From gregkh@mini.kroah.org Wed Dec 16 16:47:07 2009
+Message-Id: <20091217004707.741791752@mini.kroah.org>
+User-Agent: quilt/0.48-1
+Date: Wed, 16 Dec 2009 16:45:57 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: stable-review@kernel.org,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Sergei Shtylyov <sshtylyov@ru.mvista.com>,
+ Jeff Garzik <jgarzik@redhat.com>
+Subject: [06/18] pata_hpt{37x|3x2n}: fix timing register masks (take 2)
+
+2.6.27-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+From: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+
+commit 5600c70e576199a7552e1c0fff43f3fe16f5566e upstream.
+
+These drivers inherited from the older 'hpt366' IDE driver the buggy timing
+register masks in their set_piomode() metods. As a result, too low command
+cycle active time is programmed for slow PIO modes.  Quite fortunately, it's
+later "fixed up" by the set_dmamode() methods which also "helpfully" reprogram
+the command timings, usually to PIO mode 4; unfortunately, setting an UltraDMA
+mode #N also reprograms already set PIO data timings, usually to MWDMA mode #
+max(N, 2) timings...
+
+However, the drivers added some breakage of their own too:  the bit that they
+set/clear to control the FIFO is sometimes wrong -- it's actually the MSB of
+the command cycle setup time; also, setting it in DMA mode is wrong as this
+bit is only for PIO actually and clearing it for PIO modes is not needed as
+no mode in any timing table has it set...
+
+Fix all this, inverting the masks while at it, like in the 'hpt366' and
+'pata_hpt366' drivers; bump the drivers' versions, accounting for recent
+patches that forgot to do it...
+
+Signed-off-by: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+Signed-off-by: Jeff Garzik <jgarzik@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/ata/pata_hpt37x.c  |   32 +++++++++++++++-----------------
+ drivers/ata/pata_hpt3x2n.c |   17 ++++++++---------
+ 2 files changed, 23 insertions(+), 26 deletions(-)
+
+--- a/drivers/ata/pata_hpt37x.c
++++ b/drivers/ata/pata_hpt37x.c
+@@ -24,7 +24,7 @@
+ #include <linux/libata.h>
+ 
+ #define DRV_NAME	"pata_hpt37x"
+-#define DRV_VERSION	"0.6.12"
++#define DRV_VERSION	"0.6.14"
+ 
+ struct hpt_clock {
+ 	u8	xfer_speed;
+@@ -404,9 +404,8 @@ static void hpt370_set_piomode(struct at
+ 
+ 	pci_read_config_dword(pdev, addr1, &reg);
+ 	mode = hpt37x_find_mode(ap, adev->pio_mode);
+-	mode &= ~0x8000000;	/* No FIFO in PIO */
+-	mode &= ~0x30070000;	/* Leave config bits alone */
+-	reg &= 0x30070000;	/* Strip timing bits */
++	mode &= 0xCFC3FFFF;	/* Leave DMA bits alone */
++	reg &= ~0xCFC3FFFF;	/* Strip timing bits */
+ 	pci_write_config_dword(pdev, addr1, reg | mode);
+ }
+ 
+@@ -423,8 +422,7 @@ static void hpt370_set_dmamode(struct at
+ {
+ 	struct pci_dev *pdev = to_pci_dev(ap->host->dev);
+ 	u32 addr1, addr2;
+-	u32 reg;
+-	u32 mode;
++	u32 reg, mode, mask;
+ 	u8 fast;
+ 
+ 	addr1 = 0x40 + 4 * (adev->devno + 2 * ap->port_no);
+@@ -436,11 +434,12 @@ static void hpt370_set_dmamode(struct at
+ 	fast |= 0x01;
+ 	pci_write_config_byte(pdev, addr2, fast);
+ 
++	mask = adev->dma_mode < XFER_UDMA_0 ? 0x31C001FF : 0x303C0000;
++
+ 	pci_read_config_dword(pdev, addr1, &reg);
+ 	mode = hpt37x_find_mode(ap, adev->dma_mode);
+-	mode |= 0x8000000;	/* FIFO in MWDMA or UDMA */
+-	mode &= ~0xC0000000;	/* Leave config bits alone */
+-	reg &= 0xC0000000;	/* Strip timing bits */
++	mode &= mask;
++	reg &= ~mask;
+ 	pci_write_config_dword(pdev, addr1, reg | mode);
+ }
+ 
+@@ -508,9 +507,8 @@ static void hpt372_set_piomode(struct at
+ 	mode = hpt37x_find_mode(ap, adev->pio_mode);
+ 
+ 	printk("Find mode for %d reports %X\n", adev->pio_mode, mode);
+-	mode &= ~0x80000000;	/* No FIFO in PIO */
+-	mode &= ~0x30070000;	/* Leave config bits alone */
+-	reg &= 0x30070000;	/* Strip timing bits */
++	mode &= 0xCFC3FFFF;	/* Leave DMA bits alone */
++	reg &= ~0xCFC3FFFF;	/* Strip timing bits */
+ 	pci_write_config_dword(pdev, addr1, reg | mode);
+ }
+ 
+@@ -527,8 +525,7 @@ static void hpt372_set_dmamode(struct at
+ {
+ 	struct pci_dev *pdev = to_pci_dev(ap->host->dev);
+ 	u32 addr1, addr2;
+-	u32 reg;
+-	u32 mode;
++	u32 reg, mode, mask;
+ 	u8 fast;
+ 
+ 	addr1 = 0x40 + 4 * (adev->devno + 2 * ap->port_no);
+@@ -539,12 +536,13 @@ static void hpt372_set_dmamode(struct at
+ 	fast &= ~0x07;
+ 	pci_write_config_byte(pdev, addr2, fast);
+ 
++	mask = adev->dma_mode < XFER_UDMA_0 ? 0x31C001FF : 0x303C0000;
++
+ 	pci_read_config_dword(pdev, addr1, &reg);
+ 	mode = hpt37x_find_mode(ap, adev->dma_mode);
+ 	printk("Find mode for DMA %d reports %X\n", adev->dma_mode, mode);
+-	mode &= ~0xC0000000;	/* Leave config bits alone */
+-	mode |= 0x80000000;	/* FIFO in MWDMA or UDMA */
+-	reg &= 0xC0000000;	/* Strip timing bits */
++	mode &= mask;
++	reg &= ~mask;
+ 	pci_write_config_dword(pdev, addr1, reg | mode);
+ }
+ 
+--- a/drivers/ata/pata_hpt3x2n.c
++++ b/drivers/ata/pata_hpt3x2n.c
+@@ -25,7 +25,7 @@
+ #include <linux/libata.h>
+ 
+ #define DRV_NAME	"pata_hpt3x2n"
+-#define DRV_VERSION	"0.3.4"
++#define DRV_VERSION	"0.3.7"
+ 
+ enum {
+ 	HPT_PCI_FAST	=	(1 << 31),
+@@ -185,9 +185,8 @@ static void hpt3x2n_set_piomode(struct a
+ 
+ 	pci_read_config_dword(pdev, addr1, &reg);
+ 	mode = hpt3x2n_find_mode(ap, adev->pio_mode);
+-	mode &= ~0x8000000;	/* No FIFO in PIO */
+-	mode &= ~0x30070000;	/* Leave config bits alone */
+-	reg &= 0x30070000;	/* Strip timing bits */
++	mode &= 0xCFC3FFFF;	/* Leave DMA bits alone */
++	reg &= ~0xCFC3FFFF;	/* Strip timing bits */
+ 	pci_write_config_dword(pdev, addr1, reg | mode);
+ }
+ 
+@@ -204,8 +203,7 @@ static void hpt3x2n_set_dmamode(struct a
+ {
+ 	struct pci_dev *pdev = to_pci_dev(ap->host->dev);
+ 	u32 addr1, addr2;
+-	u32 reg;
+-	u32 mode;
++	u32 reg, mode, mask;
+ 	u8 fast;
+ 
+ 	addr1 = 0x40 + 4 * (adev->devno + 2 * ap->port_no);
+@@ -216,11 +214,12 @@ static void hpt3x2n_set_dmamode(struct a
+ 	fast &= ~0x07;
+ 	pci_write_config_byte(pdev, addr2, fast);
+ 
++	mask = adev->dma_mode < XFER_UDMA_0 ? 0x31C001FF : 0x303C0000;
++
+ 	pci_read_config_dword(pdev, addr1, &reg);
+ 	mode = hpt3x2n_find_mode(ap, adev->dma_mode);
+-	mode |= 0x8000000;	/* FIFO in MWDMA or UDMA */
+-	mode &= ~0xC0000000;	/* Leave config bits alone */
+-	reg &= 0xC0000000;	/* Strip timing bits */
++	mode &= mask;
++	reg &= ~mask;
+ 	pci_write_config_dword(pdev, addr1, reg | mode);
+ }
+ 
+
+
+From gregkh@mini.kroah.org Wed Dec 16 16:47:08 2009
+Message-Id: <20091217004707.899625984@mini.kroah.org>
+User-Agent: quilt/0.48-1
+Date: Wed, 16 Dec 2009 16:45:58 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: stable-review@kernel.org,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Michael Buesch <mb@bu3sch.de>,
+ "John W. Linville" <linville@tuxdriver.com>
+Subject: [07/18] ssb: Fix range check in sprom write
+
+2.6.27-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+From: Michael Buesch <mb@bu3sch.de>
+
+commit e33761e6f23881de9f3ee77cc2204ab2e26f3d9a upstream.
+
+The range check in the sprom image parser hex2sprom() is broken.
+One sprom word is 4 hex characters.
+This fixes the check and also adds much better sanity checks to the code.
+We better make sure the image is OK by doing some sanity checks to avoid
+bricking the device by accident.
+
+Signed-off-by: Michael Buesch <mb@bu3sch.de>
+Signed-off-by: John W. Linville <linville@tuxdriver.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/ssb/sprom.c |   20 ++++++++++++++++----
+ 1 file changed, 16 insertions(+), 4 deletions(-)
+
+--- a/drivers/ssb/sprom.c
++++ b/drivers/ssb/sprom.c
+@@ -13,6 +13,8 @@
+ 
+ #include "ssb_private.h"
+ 
++#include <linux/ctype.h>
++
+ 
+ static int sprom2hex(const u16 *sprom, char *buf, size_t buf_len,
+ 		     size_t sprom_size_words)
+@@ -30,17 +32,27 @@ static int sprom2hex(const u16 *sprom, c
+ static int hex2sprom(u16 *sprom, const char *dump, size_t len,
+ 		     size_t sprom_size_words)
+ {
+-	char tmp[5] = { 0 };
+-	int cnt = 0;
++	char c, tmp[5] = { 0 };
++	int err, cnt = 0;
+ 	unsigned long parsed;
+ 
+-	if (len < sprom_size_words * 2)
++	/* Strip whitespace at the end. */
++	while (len) {
++		c = dump[len - 1];
++		if (!isspace(c) && c != '\0')
++			break;
++		len--;
++	}
++	/* Length must match exactly. */
++	if (len != sprom_size_words * 4)
+ 		return -EINVAL;
+ 
+ 	while (cnt < sprom_size_words) {
+ 		memcpy(tmp, dump, 4);
+ 		dump += 4;
+-		parsed = simple_strtoul(tmp, NULL, 16);
++		err = strict_strtoul(tmp, 16, &parsed);
++		if (err)
++			return err;
+ 		sprom[cnt++] = swab16((u16)parsed);
+ 	}
+ 
+
+
+From gregkh@mini.kroah.org Wed Dec 16 16:47:08 2009
+Message-Id: <20091217004708.059914148@mini.kroah.org>
+User-Agent: quilt/0.48-1
+Date: Wed, 16 Dec 2009 16:45:59 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: stable-review@kernel.org,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Roel Kluin <roel.kluin@gmail.com>,
+ Michael Krufky <mkrufky@linuxtv.org>,
+ Mauro Carvalho Chehab <mchehab@redhat.com>
+Subject: [08/18] V4L/DVB: Fix test in copy_reg_bits()
+
+2.6.27-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+From: Roel Kluin <roel.kluin@gmail.com>
+
+commit c95a419a5604ec8a23cd73f61e9bb151e8cbe89b upstream.
+
+The reg_pair2[j].reg was tested twice.
+
+Signed-off-by: Roel Kluin <roel.kluin@gmail.com>
+Acked-by: Michael Krufky <mkrufky@linuxtv.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Mauro Carvalho Chehab <mchehab@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/media/common/tuners/mxl5007t.c |    2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+--- a/drivers/media/common/tuners/mxl5007t.c
++++ b/drivers/media/common/tuners/mxl5007t.c
+@@ -207,7 +207,7 @@ static void copy_reg_bits(struct reg_pai
+ 	i = j = 0;
+ 
+ 	while (reg_pair1[i].reg || reg_pair1[i].val) {
+-		while (reg_pair2[j].reg || reg_pair2[j].reg) {
++		while (reg_pair2[j].reg || reg_pair2[j].val) {
+ 			if (reg_pair1[i].reg != reg_pair2[j].reg) {
+ 				j++;
+ 				continue;
+
+
+From gregkh@mini.kroah.org Wed Dec 16 16:47:08 2009
+Message-Id: <20091217004708.229129590@mini.kroah.org>
+User-Agent: quilt/0.48-1
+Date: Wed, 16 Dec 2009 16:46:00 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: stable-review@kernel.org,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Mikael Pettersson <mikpe@it.uu.se>,
+ Andreas Herrmann <andreas.herrmann3@amd.com>,
+ Joerg Roedel <joerg.roedel@amd.com>,
+ Ingo Molnar <mingo@elte.hu>
+Subject: [09/18] x86, apic: Enable lapic nmi watchdog on AMD Family 11h
+
+2.6.27-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+From: Mikael Pettersson <mikpe@it.uu.se>
+
+commit 7d1849aff6687a135a8da3a75e32a00e3137a5e2 upstream.
+
+The x86 lapic nmi watchdog does not recognize AMD Family 11h,
+resulting in:
+
+  NMI watchdog: CPU not supported
+
+As far as I can see from available documentation (the BKDM),
+family 11h looks identical to family 10h as far as the PMU
+is concerned.
+
+Extending the check to accept family 11h results in:
+
+  Testing NMI watchdog ... OK.
+
+I've been running with this change on a Turion X2 Ultra ZM-82
+laptop for a couple of weeks now without problems.
+
+Signed-off-by: Mikael Pettersson <mikpe@it.uu.se>
+Cc: Andreas Herrmann <andreas.herrmann3@amd.com>
+Cc: Joerg Roedel <joerg.roedel@amd.com>
+LKML-Reference: <19223.53436.931768.278021@pilspetsen.it.uu.se>
+Signed-off-by: Ingo Molnar <mingo@elte.hu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ arch/x86/kernel/cpu/perfctr-watchdog.c |    2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+--- a/arch/x86/kernel/cpu/perfctr-watchdog.c
++++ b/arch/x86/kernel/cpu/perfctr-watchdog.c
+@@ -646,7 +646,7 @@ static void probe_nmi_watchdog(void)
+ 	switch (boot_cpu_data.x86_vendor) {
+ 	case X86_VENDOR_AMD:
+ 		if (boot_cpu_data.x86 != 6 && boot_cpu_data.x86 != 15 &&
+-		    boot_cpu_data.x86 != 16)
++		    boot_cpu_data.x86 != 16 && boot_cpu_data.x86 != 17)
+ 			return;
+ 		wd_ops = &k7_wd_ops;
+ 		break;
+
+
+From gregkh@mini.kroah.org Wed Dec 16 16:47:08 2009
+Message-Id: <20091217004708.398272676@mini.kroah.org>
+User-Agent: quilt/0.48-1
+Date: Wed, 16 Dec 2009 16:46:01 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: stable-review@kernel.org,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Leann Ogasawara <leann.ogasawara@canonical.com>,
+ "H. Peter Anvin" <hpa@zytor.com>
+Subject: [10/18] x86: ASUS P4S800 reboot=bios quirk
+
+2.6.27-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+From: Leann Ogasawara <leann.ogasawara@canonical.com>
+
+commit 4832ddda2ec4df96ea1eed334ae2dbd65fc1f541 upstream.
+
+Bug reporter noted their system with an ASUS P4S800 motherboard would
+hang when rebooting unless reboot=b was specified.  Their dmidecode
+didn't contain descriptive System Information for Manufacturer or
+Product Name, so I used their Base Board Information to create a
+reboot quirk patch.  The bug reporter confirmed this patch resolves
+the reboot hang.
+
+Handle 0x0001, DMI type 1, 25 bytes
+System Information
+       Manufacturer: System Manufacturer
+       Product Name: System Name
+       Version: System Version
+       Serial Number: SYS-1234567890
+       UUID: E0BFCD8B-7948-D911-A953-E486B4EEB67F
+       Wake-up Type: Power Switch
+
+Handle 0x0002, DMI type 2, 8 bytes
+Base Board Information
+     Manufacturer: ASUSTeK Computer INC.
+     Product Name: P4S800
+     Version: REV 1.xx
+     Serial Number: xxxxxxxxxxx
+
+BugLink: http://bugs.launchpad.net/bugs/366682
+
+ASUS P4S800 will hang when rebooting unless reboot=b is specified.
+Add a quirk to reboot through the bios.
+
+Signed-off-by: Leann Ogasawara <leann.ogasawara@canonical.com>
+LKML-Reference: <1259972107.4629.275.camel@emiko>
+Signed-off-by: H. Peter Anvin <hpa@zytor.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ arch/x86/kernel/reboot.c |    8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+--- a/arch/x86/kernel/reboot.c
++++ b/arch/x86/kernel/reboot.c
+@@ -219,6 +219,14 @@ static struct dmi_system_id __initdata r
+ 			DMI_MATCH(DMI_PRODUCT_NAME, "Dell XPS710"),
+ 		},
+ 	},
++	{       /* Handle problems with rebooting on ASUS P4S800 */
++		.callback = set_bios_reboot,
++		.ident = "ASUS P4S800",
++		.matches = {
++			DMI_MATCH(DMI_BOARD_VENDOR, "ASUSTeK Computer INC."),
++			DMI_MATCH(DMI_BOARD_NAME, "P4S800"),
++		},
++	},
+ 	{ }
+ };
+ 
+
+
+From gregkh@mini.kroah.org Wed Dec 16 16:47:08 2009
+Message-Id: <20091217004708.549421595@mini.kroah.org>
+User-Agent: quilt/0.48-1
+Date: Wed, 16 Dec 2009 16:46:02 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: stable-review@kernel.org,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ "Darrick J. Wong" <djwong@us.ibm.com>,
+ Muli Ben-Yehuda <muli@il.ibm.com>,
+ FUJITA Tomonori <fujita.tomonori@lab.ntt.co.jp>,
+ Joerg Roedel <joerg.roedel@amd.com>,
+ Yinghai Lu <yhlu.kernel@gmail.com>,
+ "Jon D. Mason" <jdmason@kudzu.us>,
+ Corinna Schultz <coschult@us.ibm.com>,
+ Ingo Molnar <mingo@elte.hu>
+Subject: [11/18] x86, Calgary IOMMU quirk: Find nearest matching Calgary while walking up the PCI tree
+
+2.6.27-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+From: Darrick J. Wong <djwong@us.ibm.com>
+
+commit 4528752f49c1f4025473d12bc5fa9181085c3f22 upstream.
+
+On a multi-node x3950M2 system, there's a slight oddity in the
+PCI device tree for all secondary nodes:
+
+ 30:1e.0 PCI bridge: Intel Corporation 82801 PCI Bridge (rev e1)
+  \-33:00.0 PCI bridge: IBM CalIOC2 PCI-E Root Port (rev 01)
+     \-34:00.0 RAID bus controller: LSI Logic / Symbios Logic MegaRAID SAS 1078 (rev 04)
+
+...as compared to the primary node:
+
+ 00:1e.0 PCI bridge: Intel Corporation 82801 PCI Bridge (rev e1)
+  \-01:00.0 VGA compatible controller: ATI Technologies Inc ES1000 (rev 02)
+ 03:00.0 PCI bridge: IBM CalIOC2 PCI-E Root Port (rev 01)
+  \-04:00.0 RAID bus controller: LSI Logic / Symbios Logic MegaRAID SAS 1078 (rev 04)
+
+In both nodes, the LSI RAID controller hangs off a CalIOC2
+device, but on the secondary nodes, the BIOS hides the VGA
+device and substitutes the device tree ending with the disk
+controller.
+
+It would seem that Calgary devices don't necessarily appear at
+the top of the PCI tree, which means that the current code to
+find the Calgary IOMMU that goes with a particular device is
+buggy.
+
+Rather than walk all the way to the top of the PCI
+device tree and try to match bus number with Calgary descriptor,
+the code needs to examine each parent of the particular device;
+if it encounters a Calgary with a matching bus number, simply
+use that.
+
+Otherwise, we BUG() when the bus number of the Calgary doesn't
+match the bus number of whatever's at the top of the device tree.
+
+Extra note: This patch appears to work correctly for the x3950
+that came before the x3950 M2.
+
+Signed-off-by: Darrick J. Wong <djwong@us.ibm.com>
+Acked-by: Muli Ben-Yehuda <muli@il.ibm.com>
+Cc: FUJITA Tomonori <fujita.tomonori@lab.ntt.co.jp>
+Cc: Joerg Roedel <joerg.roedel@amd.com>
+Cc: Yinghai Lu <yhlu.kernel@gmail.com>
+Cc: Jon D. Mason <jdmason@kudzu.us>
+Cc: Corinna Schultz <coschult@us.ibm.com>
+LKML-Reference: <20091202230556.GG10295@tux1.beaverton.ibm.com>
+Signed-off-by: Ingo Molnar <mingo@elte.hu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ arch/x86/kernel/pci-calgary_64.c |   12 +++++++-----
+ 1 file changed, 7 insertions(+), 5 deletions(-)
+
+--- a/arch/x86/kernel/pci-calgary_64.c
++++ b/arch/x86/kernel/pci-calgary_64.c
+@@ -377,13 +377,15 @@ static inline struct iommu_table *find_i
+ 
+ 	pdev = to_pci_dev(dev);
+ 
++	/* search up the device tree for an iommu */
+ 	pbus = pdev->bus;
+-
+-	/* is the device behind a bridge? Look for the root bus */
+-	while (pbus->parent)
++	do {
++		tbl = pci_iommu(pbus);
++		if (tbl && tbl->it_busno == pbus->number)
++			break;
++		tbl = NULL;
+ 		pbus = pbus->parent;
+-
+-	tbl = pci_iommu(pbus);
++	} while (pbus);
+ 
+ 	BUG_ON(tbl && (tbl->it_busno != pbus->number));
+ 
+
+
+From gregkh@mini.kroah.org Wed Dec 16 16:47:08 2009
+Message-Id: <20091217004708.677324097@mini.kroah.org>
+User-Agent: quilt/0.48-1
+Date: Wed, 16 Dec 2009 16:46:03 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: stable-review@kernel.org,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Tejun Heo <tj@kernel.org>,
+ FUJITA Tomonori <fujita.tomonori@lab.ntt.co.jp>,
+ Matteo Frigo <athena@fftw.org>,
+ Ingo Molnar <mingo@elte.hu>
+Subject: [12/18] x86: Fix iommu=nodac parameter handling
+
+2.6.27-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+From: Tejun Heo <tj@kernel.org>
+
+commit 2ae8bb75db1f3de422eb5898f2a063c46c36dba8 upstream.
+
+iommu=nodac should forbid dac instead of enabling it. Fix it.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Acked-by: FUJITA Tomonori <fujita.tomonori@lab.ntt.co.jp>
+Cc: Matteo Frigo <athena@fftw.org>
+LKML-Reference: <4AE5B52A.4050408@kernel.org>
+Signed-off-by: Ingo Molnar <mingo@elte.hu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ arch/x86/kernel/pci-dma.c |    2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+--- a/arch/x86/kernel/pci-dma.c
++++ b/arch/x86/kernel/pci-dma.c
+@@ -175,7 +175,7 @@ static __init int iommu_setup(char *p)
+ 		if (!strncmp(p, "allowdac", 8))
+ 			forbid_dac = 0;
+ 		if (!strncmp(p, "nodac", 5))
+-			forbid_dac = -1;
++			forbid_dac = 1;
+ 		if (!strncmp(p, "usedac", 6)) {
+ 			forbid_dac = -1;
+ 			return 1;
+
+
+From gregkh@mini.kroah.org Wed Dec 16 16:47:08 2009
+Message-Id: <20091217004708.835196603@mini.kroah.org>
+User-Agent: quilt/0.48-1
+Date: Wed, 16 Dec 2009 16:46:04 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: stable-review@kernel.org,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Joe Perches <joe@perches.com>,
+ Ingo Molnar <mingo@elte.hu>
+Subject: [13/18] x86: GART: pci-gart_64.c: Use correct length in strncmp
+
+2.6.27-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+From: Joe Perches <joe@perches.com>
+
+commit 41855b77547fa18d90ed6a5d322983d3fdab1959 upstream.
+
+Signed-off-by: Joe Perches <joe@perches.com>
+LKML-Reference: <1257818330.12852.72.camel@Joe-Laptop.home>
+Signed-off-by: Ingo Molnar <mingo@elte.hu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ arch/x86/kernel/pci-gart_64.c |    2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+--- a/arch/x86/kernel/pci-gart_64.c
++++ b/arch/x86/kernel/pci-gart_64.c
+@@ -865,7 +865,7 @@ void __init gart_parse_options(char *p)
+ #endif
+ 	if (isdigit(*p) && get_option(&p, &arg))
+ 		iommu_size = arg;
+-	if (!strncmp(p, "fullflush", 8))
++	if (!strncmp(p, "fullflush", 9))
+ 		iommu_fullflush = 1;
+ 	if (!strncmp(p, "nofullflush", 11))
+ 		iommu_fullflush = 0;
+
+
+From gregkh@mini.kroah.org Wed Dec 16 16:47:09 2009
+Message-Id: <20091217004708.982827493@mini.kroah.org>
+User-Agent: quilt/0.48-1
+Date: Wed, 16 Dec 2009 16:46:05 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: stable-review@kernel.org,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Jiri Bohac <jbohac@suse.cz>,
+ Tony Luck <tony.luck@intel.com>,
+ Dennis Schridde <devurandom@gmx.net>
+Subject: [14/18] [IA64] fix csum_ipv6_magic()
+
+2.6.27-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+From: Jiri Bohac <jbohac@suse.cz>
+
+commit 5afe18d2f58812f3924edbd215464e5e3e8545e7 upstream.
+
+The 32-bit parameters (len and csum) of csum_ipv6_magic() are passed in 64-bit
+registers in2 and in4. The high order 32 bits of the registers were never
+cleared, and garbage was sometimes calculated into the checksum.
+
+Fix this by clearing the high order 32 bits of these registers.
+
+Signed-off-by: Jiri Bohac <jbohac@suse.cz>
+Signed-off-by: Tony Luck <tony.luck@intel.com>
+Cc: Dennis Schridde <devurandom@gmx.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ arch/ia64/lib/ip_fast_csum.S |    8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+--- a/arch/ia64/lib/ip_fast_csum.S
++++ b/arch/ia64/lib/ip_fast_csum.S
+@@ -96,20 +96,22 @@ END(ip_fast_csum)
+ GLOBAL_ENTRY(csum_ipv6_magic)
+ 	ld4	r20=[in0],4
+ 	ld4	r21=[in1],4
+-	dep	r15=in3,in2,32,16
++	zxt4	in2=in2
+ 	;;
+ 	ld4	r22=[in0],4
+ 	ld4	r23=[in1],4
+-	mux1	r15=r15,@rev
++	dep	r15=in3,in2,32,16
+ 	;;
+ 	ld4	r24=[in0],4
+ 	ld4	r25=[in1],4
+-	shr.u	r15=r15,16
++	mux1	r15=r15,@rev
+ 	add	r16=r20,r21
+ 	add	r17=r22,r23
++	zxt4	in4=in4
+ 	;;
+ 	ld4	r26=[in0],4
+ 	ld4	r27=[in1],4
++	shr.u	r15=r15,16
+ 	add	r18=r24,r25
+ 	add	r8=r16,r17
+ 	;;
+
+
+From gregkh@mini.kroah.org Wed Dec 16 16:47:09 2009
+Message-Id: <20091217004709.114459571@mini.kroah.org>
+User-Agent: quilt/0.48-1
+Date: Wed, 16 Dec 2009 16:46:06 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org,
+ Greg KH <greg@kroah.com>
+Cc: stable-review@kernel.org,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Tony Cook <tony-cook@bigpond.com>
+Subject: [15/18] USB: fix mos7840 problem with minor numbers
+
+2.6.27-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+From: Tony Cook <tony-cook@bigpond.com>
+
+commit 37768adf9a1d49aeac0db1ba3dc28b3274b7b789 upstream
+
+This patch fixes a problem with any mos7840 device where the use of the
+field "minor" before it is initialised results in all the devices being
+overlaid in memory (minor = 0 for all instances)
+
+Contributed by: Phillip Branch
+
+Backported to .27 by Christoph Biedl <linux-kernel.bfrz@manchmal.in-ulm.de>
+
+Signed-off-by: Tony Cook <tony-cook@bigpond.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+
+---
+ drivers/usb/serial/mos7840.c |   21 ++++++++++++++-------
+ 1 file changed, 14 insertions(+), 7 deletions(-)
+
+--- a/drivers/usb/serial/mos7840.c
++++ b/drivers/usb/serial/mos7840.c
+@@ -2453,9 +2453,14 @@ static int mos7840_startup(struct usb_se
+ 		mos7840_set_port_private(serial->port[i], mos7840_port);
+ 		spin_lock_init(&mos7840_port->pool_lock);
+ 
+-		mos7840_port->port_num = ((serial->port[i]->number -
+-					   (serial->port[i]->serial->minor)) +
+-					  1);
++		/* minor is not initialised until later by
++		 * usb-serial.c:get_free_serial() and cannot therefore be used
++		 * to index device instances */
++		mos7840_port->port_num = i + 1;
++		dbg ("serial->port[i]->number = %d", serial->port[i]->number);
++		dbg ("serial->port[i]->serial->minor = %d", serial->port[i]->serial->minor);
++		dbg ("mos7840_port->port_num = %d", mos7840_port->port_num);
++		dbg ("serial->minor = %d", serial->minor);
+ 
+ 		if (mos7840_port->port_num == 1) {
+ 			mos7840_port->SpRegOffset = 0x0;
+@@ -2666,10 +2671,12 @@ static void mos7840_disconnect(struct us
+ 
+ 	for (i = 0; i < serial->num_ports; ++i) {
+ 		mos7840_port = mos7840_get_port_private(serial->port[i]);
+-		spin_lock_irqsave(&mos7840_port->pool_lock, flags);
+-		mos7840_port->zombie = 1;
+-		spin_unlock_irqrestore(&mos7840_port->pool_lock, flags);
+-		usb_kill_urb(mos7840_port->control_urb);
++		if (mos7840_port) {
++			spin_lock_irqsave(&mos7840_port->pool_lock, flags);
++			mos7840_port->zombie = 1;
++			spin_unlock_irqrestore(&mos7840_port->pool_lock, flags);
++			usb_kill_urb(mos7840_port->control_urb);
++		}
+ 	}
+ 
+ 	dbg("%s\n", "Thank u ::");
+
+
+From gregkh@mini.kroah.org Wed Dec 16 16:47:09 2009
+Message-Id: <20091217004709.245425227@mini.kroah.org>
+User-Agent: quilt/0.48-1
+Date: Wed, 16 Dec 2009 16:46:07 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: stable-review@kernel.org,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Jean Delvare <khali@linux-fr.org>,
+ Richard Purdie <rpurdie@linux.intel.com>
+Subject: [16/18] backlight: lcd - Fix wrong sizeof
+
+2.6.27-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+From: Jean Delvare <khali@linux-fr.org>
+
+commit 1e0fa6bd8c7468067f2e988c7a416dafd0651c34 upstream.
+
+Which is why I have always preferred sizeof(struct foo) over
+sizeof(var).
+
+Signed-off-by: Jean Delvare <khali@linux-fr.org>
+Signed-off-by: Richard Purdie <rpurdie@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/video/backlight/lcd.c |    2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+--- a/drivers/video/backlight/lcd.c
++++ b/drivers/video/backlight/lcd.c
+@@ -41,7 +41,7 @@ static int fb_notifier_callback(struct n
+ 
+ static int lcd_register_fb(struct lcd_device *ld)
+ {
+-	memset(&ld->fb_notif, 0, sizeof(&ld->fb_notif));
++	memset(&ld->fb_notif, 0, sizeof(ld->fb_notif));
+ 	ld->fb_notif.notifier_call = fb_notifier_callback;
+ 	return fb_register_client(&ld->fb_notif);
+ }
+
+
+From gregkh@mini.kroah.org Wed Dec 16 16:47:09 2009
+Message-Id: <20091217004709.378331483@mini.kroah.org>
+User-Agent: quilt/0.48-1
+Date: Wed, 16 Dec 2009 16:46:08 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: stable-review@kernel.org,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ David Woodhouse <David.Woodhouse@intel.com>
+Subject: [17/18] jffs2: Fix long-standing bug with symlink garbage collection.
+
+2.6.27-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+From: David Woodhouse <David.Woodhouse@intel.com>
+
+commit 2e16cfca6e17ae37ae21feca080a6f2eca9087dc upstream.
+
+Ever since jffs2_garbage_collect_metadata() was first half-written in
+February 2001, it's been broken on architectures where 'char' is signed.
+When garbage collecting a symlink with target length above 127, the payload
+length would end up negative, causing interesting and bad things to happen.
+
+Signed-off-by: David Woodhouse <David.Woodhouse@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ fs/jffs2/gc.c |    3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+--- a/fs/jffs2/gc.c
++++ b/fs/jffs2/gc.c
+@@ -700,7 +700,8 @@ static int jffs2_garbage_collect_metadat
+ 	struct jffs2_raw_inode ri;
+ 	struct jffs2_node_frag *last_frag;
+ 	union jffs2_device_node dev;
+-	char *mdata = NULL, mdatalen = 0;
++	char *mdata = NULL;
++	int mdatalen = 0;
+ 	uint32_t alloclen, ilen;
+ 	int ret;
+ 
+
+
+From gregkh@mini.kroah.org Wed Dec 16 16:47:09 2009
+Message-Id: <20091217004709.508264959@mini.kroah.org>
+User-Agent: quilt/0.48-1
+Date: Wed, 16 Dec 2009 16:46:09 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: stable-review@kernel.org,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Alan Cox <alan@linux.intel.com>,
+ Petr Vandrovec <VANDROVE@vc.cvut.cz>,
+ Pekka Enberg <penberg@cs.helsinki.fi>,
+ "Paul A. Clarke" <pc@us.ibm.com>
+Subject: [18/18] matroxfb: fix problems with display stability
+
+2.6.27-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+From: Alan Cox <alan@linux.intel.com>
+
+commit 8c651311a3a08c1e4815de6933e00a760e498dae upstream.
+
+Regression caused in 2.6.23 and then despite repeated requests never fixed
+or dealt with (Petr promised to sort it in 2008 but seems to have
+forgotten).
+
+Enough is enough - remove the problem line that was added.  If it upsets
+someone they've had two years to deal with it and at the very least it'll
+rattle their cage and wake them up.
+
+Addresses http://bugzilla.kernel.org/show_bug.cgi?id=9709
+
+Signed-off-by: Alan Cox <alan@linux.intel.com>
+Reported-by: Damon <account@bugzilla.kernel.org.juxtaposition.net>
+Tested-by: Ruud van Melick <rvm1974@raketnet.nl>
+Cc: Petr Vandrovec <VANDROVE@vc.cvut.cz>
+Cc: Pekka Enberg <penberg@cs.helsinki.fi>
+Cc: Paul A. Clarke <pc@us.ibm.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/video/matrox/g450_pll.c |    3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+--- a/drivers/video/matrox/g450_pll.c
++++ b/drivers/video/matrox/g450_pll.c
+@@ -341,7 +341,8 @@ static int __g450_setclk(WPMINFO unsigne
+ 					M1064_XDVICLKCTRL_C1DVICLKEN |
+ 					M1064_XDVICLKCTRL_DVILOOPCTL |
+ 					M1064_XDVICLKCTRL_P1LOOPBWDTCTL;
+-				matroxfb_DAC_out(PMINFO M1064_XDVICLKCTRL,tmp);
++				/* Setting this breaks PC systems so don't do it */
++				/* matroxfb_DAC_out(PMINFO M1064_XDVICLKCTRL,tmp); */
+ 				matroxfb_DAC_out(PMINFO M1064_XPWRCTRL,
+ 						 xpwrctrl);
+ 
+
+
+From gregkh@mini.kroah.org Wed Dec 16 16:47:07 2009
+Message-Id: <20091217004551.256916716@mini.kroah.org>
+User-Agent: quilt/0.48-1
+Date: Wed, 16 Dec 2009 16:45:51 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: stable-review@kernel.org,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk
+Subject: [00/18] 2.6.27.42-stable review
+Status: RO
+Content-Length: 1926
+Lines: 43
+
+This is the start of the stable review cycle for the 2.6.27.42 release.
+There are 18 patches in this series, all will be posted as a response to
+this one.  If anyone has any issues with these being applied, please let
+us know.  If anyone is a maintainer of the proper subsystem, and wants
+to add a Signed-off-by: line to the patch, please respond with it.
+
+Responses should be made by Friday, December 19, 00:00:00 UTC.
+Anything received after that time might be too late.
+
+The whole patch series can be found in one patch at:
+	kernel.org/pub/linux/kernel/v2.6/stable-review/patch-2.6.27.42-rc1.gz
+and the diffstat can be found below.
+
+
+thanks,
+
+greg k-h
+
+-------------
+
+ Makefile                               |    2 +-
+ arch/ia64/lib/ip_fast_csum.S           |    8 +++--
+ arch/x86/kernel/cpu/perfctr-watchdog.c |    2 +-
+ arch/x86/kernel/pci-calgary_64.c       |   12 ++++---
+ arch/x86/kernel/pci-dma.c              |    2 +-
+ arch/x86/kernel/pci-gart_64.c          |    2 +-
+ arch/x86/kernel/reboot.c               |    8 +++++
+ drivers/ata/pata_hpt37x.c              |   32 +++++++++----------
+ drivers/ata/pata_hpt3x2n.c             |   17 +++++-----
+ drivers/firewire/fw-ohci.c             |   12 ++++++-
+ drivers/media/common/tuners/mxl5007t.c |    2 +-
+ drivers/ssb/sprom.c                    |   20 +++++++++--
+ drivers/usb/serial/mos7840.c           |   21 ++++++++----
+ drivers/video/backlight/lcd.c          |    2 +-
+ drivers/video/matrox/g450_pll.c        |    3 +-
+ fs/debugfs/inode.c                     |   55 ++++++++++++++++++-------------
+ fs/fuse/dir.c                          |    3 ++
+ fs/hfs/catalog.c                       |    4 ++
+ fs/hfs/dir.c                           |   11 ++++++
+ fs/hfs/super.c                         |    7 +++-
+ fs/jffs2/gc.c                          |    3 +-
+ include/linux/sched.h                  |   13 ++++++--
+ 22 files changed, 159 insertions(+), 82 deletions(-)
+
