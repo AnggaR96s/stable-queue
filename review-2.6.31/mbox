@@ -1,0 +1,719 @@
+From gregkh@mini.kroah.org Thu Jan 14 14:48:06 2010
+Message-Id: <20100114224806.361798368@mini.kroah.org>
+User-Agent: quilt/0.48-1
+Date: Thu, 14 Jan 2010 14:46:37 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: stable-review@kernel.org,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Al Viro <viro@ZenIV.linux.org.uk>,
+ Jeff Dike <jdike@addtoit.com>,
+ Matt Mackall <mpm@selenic.com>
+Subject: [1/9] fasync: split fasync_helper() into separate add/remove functions
+
+2.6.31-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Linus Torvalds <torvalds@linux-foundation.org>
+
+commit 53281b6d34d44308372d16acb7fb5327609f68b6 upstream.
+
+Yes, the add and remove cases do share the same basic loop and the
+locking, but the compiler can inline and then CSE some of the end result
+anyway.  And splitting it up makes the code way easier to follow,
+and makes it clearer exactly what the semantics are.
+
+In particular, we must make sure that the FASYNC flag in file->f_flags
+exactly matches the state of "is this file on any fasync list", since
+not only is that flag visible to user space (F_GETFL), but we also use
+that flag to check whether we need to remove any fasync entries on file
+close.
+
+We got that wrong for the case of a mixed use of file locking (which
+tries to remove any fasync entries for file leases) and fasync.
+
+Splitting the function up also makes it possible to do some future
+optimizations without making the function even messier.  In particular,
+since the FASYNC flag has to match the state of "is this on a list", we
+can do the following future optimizations:
+
+ - on remove, we don't even need to get the locks and traverse the list
+   if FASYNC isn't set, since we can know a priori that there is no
+   point (this is effectively the same optimization that we already do
+   in __fput() wrt removing fasync on file close)
+
+ - on add, we can use the FASYNC flag to decide whether we are changing
+   an existing entry or need to allocate a new one.
+
+but this is just the cleanup + fix for the FASYNC flag.
+
+Acked-by: Al Viro <viro@ZenIV.linux.org.uk>
+Tested-by: Tavis Ormandy <taviso@google.com>
+Cc: Jeff Dike <jdike@addtoit.com>
+Cc: Matt Mackall <mpm@selenic.com>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ fs/fcntl.c |  102 +++++++++++++++++++++++++++++++++++++++----------------------
+ 1 file changed, 66 insertions(+), 36 deletions(-)
+
+--- a/fs/fcntl.c
++++ b/fs/fcntl.c
+@@ -526,60 +526,90 @@ static DEFINE_RWLOCK(fasync_lock);
+ static struct kmem_cache *fasync_cache __read_mostly;
+ 
+ /*
+- * fasync_helper() is used by almost all character device drivers
+- * to set up the fasync queue. It returns negative on error, 0 if it did
+- * no changes and positive if it added/deleted the entry.
++ * Remove a fasync entry. If successfully removed, return
++ * positive and clear the FASYNC flag. If no entry exists,
++ * do nothing and return 0.
++ *
++ * NOTE! It is very important that the FASYNC flag always
++ * match the state "is the filp on a fasync list".
++ *
++ * We always take the 'filp->f_lock', in since fasync_lock
++ * needs to be irq-safe.
+  */
+-int fasync_helper(int fd, struct file * filp, int on, struct fasync_struct **fapp)
++static int fasync_remove_entry(struct file *filp, struct fasync_struct **fapp)
+ {
+ 	struct fasync_struct *fa, **fp;
+-	struct fasync_struct *new = NULL;
+ 	int result = 0;
+ 
+-	if (on) {
+-		new = kmem_cache_alloc(fasync_cache, GFP_KERNEL);
+-		if (!new)
+-			return -ENOMEM;
++	spin_lock(&filp->f_lock);
++	write_lock_irq(&fasync_lock);
++	for (fp = fapp; (fa = *fp) != NULL; fp = &fa->fa_next) {
++		if (fa->fa_file != filp)
++			continue;
++		*fp = fa->fa_next;
++		kmem_cache_free(fasync_cache, fa);
++		filp->f_flags &= ~FASYNC;
++		result = 1;
++		break;
+ 	}
++	write_unlock_irq(&fasync_lock);
++	spin_unlock(&filp->f_lock);
++	return result;
++}
++
++/*
++ * Add a fasync entry. Return negative on error, positive if
++ * added, and zero if did nothing but change an existing one.
++ *
++ * NOTE! It is very important that the FASYNC flag always
++ * match the state "is the filp on a fasync list".
++ */
++static int fasync_add_entry(int fd, struct file *filp, struct fasync_struct **fapp)
++{
++	struct fasync_struct *new, *fa, **fp;
++	int result = 0;
++
++	new = kmem_cache_alloc(fasync_cache, GFP_KERNEL);
++	if (!new)
++		return -ENOMEM;
+ 
+-	/*
+-	 * We need to take f_lock first since it's not an IRQ-safe
+-	 * lock.
+-	 */
+ 	spin_lock(&filp->f_lock);
+ 	write_lock_irq(&fasync_lock);
+ 	for (fp = fapp; (fa = *fp) != NULL; fp = &fa->fa_next) {
+-		if (fa->fa_file == filp) {
+-			if(on) {
+-				fa->fa_fd = fd;
+-				kmem_cache_free(fasync_cache, new);
+-			} else {
+-				*fp = fa->fa_next;
+-				kmem_cache_free(fasync_cache, fa);
+-				result = 1;
+-			}
+-			goto out;
+-		}
++		if (fa->fa_file != filp)
++			continue;
++		fa->fa_fd = fd;
++		kmem_cache_free(fasync_cache, new);
++		goto out;
+ 	}
+ 
+-	if (on) {
+-		new->magic = FASYNC_MAGIC;
+-		new->fa_file = filp;
+-		new->fa_fd = fd;
+-		new->fa_next = *fapp;
+-		*fapp = new;
+-		result = 1;
+-	}
++	new->magic = FASYNC_MAGIC;
++	new->fa_file = filp;
++	new->fa_fd = fd;
++	new->fa_next = *fapp;
++	*fapp = new;
++	result = 1;
++	filp->f_flags |= FASYNC;
++
+ out:
+-	if (on)
+-		filp->f_flags |= FASYNC;
+-	else
+-		filp->f_flags &= ~FASYNC;
+ 	write_unlock_irq(&fasync_lock);
+ 	spin_unlock(&filp->f_lock);
+ 	return result;
+ }
+ 
++/*
++ * fasync_helper() is used by almost all character device drivers
++ * to set up the fasync queue, and for regular files by the file
++ * lease code. It returns negative on error, 0 if it did no changes
++ * and positive if it added/deleted the entry.
++ */
++int fasync_helper(int fd, struct file * filp, int on, struct fasync_struct **fapp)
++{
++	if (!on)
++		return fasync_remove_entry(filp, fapp);
++	return fasync_add_entry(fd, filp, fapp);
++}
++
+ EXPORT_SYMBOL(fasync_helper);
+ 
+ void __kill_fasync(struct fasync_struct *fa, int sig, int band)
+
+
+From gregkh@mini.kroah.org Thu Jan 14 14:48:06 2010
+Message-Id: <20100114224806.492063117@mini.kroah.org>
+User-Agent: quilt/0.48-1
+Date: Thu, 14 Jan 2010 14:46:38 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: stable-review@kernel.org,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Roger Blofeld <blofeldus@yahoo.com>,
+ Jean Delvare <khali@linux-fr.org>
+Subject: [2/9] hwmon: (adt7462) Fix pin 28 monitoring
+
+2.6.31-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Roger Blofeld <blofeldus@yahoo.com>
+
+commit bb595c923bc51dff9cdd112de18deb57ac7945d2 upstream.
+
+The ADT7462_PIN28_VOLT value is a 4-bit field, so the corresponding
+shift must be 4.
+
+Signed-off-by: Roger Blofeld <blofeldus@yahoo.com>
+Signed-off-by: Jean Delvare <khali@linux-fr.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/hwmon/adt7462.c |    2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+--- a/drivers/hwmon/adt7462.c
++++ b/drivers/hwmon/adt7462.c
+@@ -97,7 +97,7 @@ I2C_CLIENT_INSMOD_1(adt7462);
+ #define		ADT7462_PIN24_SHIFT		6
+ #define		ADT7462_PIN26_VOLT_INPUT	0x08
+ #define		ADT7462_PIN25_VOLT_INPUT	0x20
+-#define		ADT7462_PIN28_SHIFT		6	/* cfg3 */
++#define		ADT7462_PIN28_SHIFT		4	/* cfg3 */
+ #define		ADT7462_PIN28_VOLT		0x5
+ 
+ #define ADT7462_REG_ALARM1			0xB8
+
+
+From gregkh@mini.kroah.org Thu Jan 14 14:48:06 2010
+Message-Id: <20100114224806.617287984@mini.kroah.org>
+User-Agent: quilt/0.48-1
+Date: Thu, 14 Jan 2010 14:46:39 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: stable-review@kernel.org,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Andi Kleen <ak@linux.intel.com>,
+ Ingo Molnar <mingo@elte.hu>,
+ Oleg Nesterov <oleg@redhat.com>
+Subject: [3/9] kernel/signal.c: fix kernel information leak with print-fatal-signals=1
+
+2.6.31-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Andi Kleen <andi@firstfloor.org>
+
+commit b45c6e76bc2c72f6426c14bed64fdcbc9bf37cb0 upstream.
+
+When print-fatal-signals is enabled it's possible to dump any memory
+reachable by the kernel to the log by simply jumping to that address from
+user space.
+
+Or crash the system if there's some hardware with read side effects.
+
+The fatal signals handler will dump 16 bytes at the execution address,
+which is fully controlled by ring 3.
+
+In addition when something jumps to a unmapped address there will be up to
+16 additional useless page faults, which might be potentially slow (and at
+least is not very efficient)
+
+Fortunately this option is off by default and only there on i386.
+
+But fix it by checking for kernel addresses and also stopping when there's
+a page fault.
+
+Signed-off-by: Andi Kleen <ak@linux.intel.com>
+Cc: Ingo Molnar <mingo@elte.hu>
+Cc: Oleg Nesterov <oleg@redhat.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ kernel/signal.c |    3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+--- a/kernel/signal.c
++++ b/kernel/signal.c
+@@ -939,7 +939,8 @@ static void print_fatal_signal(struct pt
+ 		for (i = 0; i < 16; i++) {
+ 			unsigned char insn;
+ 
+-			__get_user(insn, (unsigned char *)(regs->ip + i));
++			if (get_user(insn, (unsigned char *)(regs->ip + i)))
++				break;
+ 			printk("%02x ", insn);
+ 		}
+ 	}
+
+
+From gregkh@mini.kroah.org Thu Jan 14 14:48:06 2010
+Message-Id: <20100114224806.743281302@mini.kroah.org>
+User-Agent: quilt/0.48-1
+Date: Thu, 14 Jan 2010 14:46:40 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: stable-review@kernel.org,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Florian Westphal <fwestphal@astaro.com>,
+ Patrick McHardy <kaber@trash.net>
+Subject: [4/9] netfilter: ebtables: enforce CAP_NET_ADMIN
+
+2.6.31-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Florian Westphal <fwestphal@astaro.com>
+
+commit dce766af541f6605fa9889892c0280bab31c66ab upstream.
+
+normal users are currently allowed to set/modify ebtables rules.
+Restrict it to processes with CAP_NET_ADMIN.
+
+Note that this cannot be reproduced with unmodified ebtables binary
+because it uses SOCK_RAW.
+
+Signed-off-by: Florian Westphal <fwestphal@astaro.com>
+Signed-off-by: Patrick McHardy <kaber@trash.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ net/bridge/netfilter/ebtables.c |    6 ++++++
+ 1 file changed, 6 insertions(+)
+
+--- a/net/bridge/netfilter/ebtables.c
++++ b/net/bridge/netfilter/ebtables.c
+@@ -1405,6 +1405,9 @@ static int do_ebt_set_ctl(struct sock *s
+ {
+ 	int ret;
+ 
++	if (!capable(CAP_NET_ADMIN))
++		return -EPERM;
++
+ 	switch(cmd) {
+ 	case EBT_SO_SET_ENTRIES:
+ 		ret = do_replace(sock_net(sk), user, len);
+@@ -1424,6 +1427,9 @@ static int do_ebt_get_ctl(struct sock *s
+ 	struct ebt_replace tmp;
+ 	struct ebt_table *t;
+ 
++	if (!capable(CAP_NET_ADMIN))
++		return -EPERM;
++
+ 	if (copy_from_user(&tmp, user, sizeof(tmp)))
+ 		return -EFAULT;
+ 
+
+
+From gregkh@mini.kroah.org Thu Jan 14 14:48:07 2010
+Message-Id: <20100114224806.913050712@mini.kroah.org>
+User-Agent: quilt/0.48-1
+Date: Thu, 14 Jan 2010 14:46:41 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: stable-review@kernel.org,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Patrick McHardy <kaber@trash.net>
+Subject: [5/9] netfilter: nf_ct_ftp: fix out of bounds read in update_nl_seq()
+
+2.6.31-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Patrick McHardy <kaber@trash.net>
+
+commit aaff23a95aea5f000895f50d90e91f1e2f727002 upstream.
+
+As noticed by Dan Carpenter <error27@gmail.com>, update_nl_seq()
+currently contains an out of bounds read of the seq_aft_nl array
+when looking for the oldest sequence number position.
+
+Fix it to only compare valid positions.
+
+Signed-off-by: Patrick McHardy <kaber@trash.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ net/netfilter/nf_conntrack_ftp.c |   18 +++++++++---------
+ 1 file changed, 9 insertions(+), 9 deletions(-)
+
+--- a/net/netfilter/nf_conntrack_ftp.c
++++ b/net/netfilter/nf_conntrack_ftp.c
+@@ -323,24 +323,24 @@ static void update_nl_seq(struct nf_conn
+ 			  struct nf_ct_ftp_master *info, int dir,
+ 			  struct sk_buff *skb)
+ {
+-	unsigned int i, oldest = NUM_SEQ_TO_REMEMBER;
++	unsigned int i, oldest;
+ 
+ 	/* Look for oldest: if we find exact match, we're done. */
+ 	for (i = 0; i < info->seq_aft_nl_num[dir]; i++) {
+ 		if (info->seq_aft_nl[dir][i] == nl_seq)
+ 			return;
+-
+-		if (oldest == info->seq_aft_nl_num[dir] ||
+-		    before(info->seq_aft_nl[dir][i],
+-			   info->seq_aft_nl[dir][oldest]))
+-			oldest = i;
+ 	}
+ 
+ 	if (info->seq_aft_nl_num[dir] < NUM_SEQ_TO_REMEMBER) {
+ 		info->seq_aft_nl[dir][info->seq_aft_nl_num[dir]++] = nl_seq;
+-	} else if (oldest != NUM_SEQ_TO_REMEMBER &&
+-		   after(nl_seq, info->seq_aft_nl[dir][oldest])) {
+-		info->seq_aft_nl[dir][oldest] = nl_seq;
++	} else {
++		if (before(info->seq_aft_nl[dir][0], info->seq_aft_nl[dir][1]))
++			oldest = 0;
++		else
++			oldest = 1;
++
++		if (after(nl_seq, info->seq_aft_nl[dir][oldest]))
++			info->seq_aft_nl[dir][oldest] = nl_seq;
+ 	}
+ }
+ 
+
+
+From gregkh@mini.kroah.org Thu Jan 14 14:48:07 2010
+Message-Id: <20100114224807.086778669@mini.kroah.org>
+User-Agent: quilt/0.48-1
+Date: Thu, 14 Jan 2010 14:46:42 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: stable-review@kernel.org,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Dmitry Monakhov <dmonakhov@openvz.org>,
+ Jan Kara <jack@suse.cz>
+Subject: [6/9] quota: Fix dquot_transfer for filesystems different from ext4
+
+2.6.31-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Jan Kara <jack@suse.cz>
+
+commit 05b5d898235401c489c68e1f3bc5706a29ad5713 upstream.
+
+Commit fd8fbfc1 modified the way we find amount of reserved space
+belonging to an inode. The amount of reserved space is checked
+from dquot_transfer and thus inode_reserved_space gets called
+even for filesystems that don't provide get_reserved_space callback
+which results in a BUG.
+
+Fix the problem by checking get_reserved_space callback and return 0 if
+the filesystem does not provide it.
+
+CC: Dmitry Monakhov <dmonakhov@openvz.org>
+Signed-off-by: Jan Kara <jack@suse.cz>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ fs/quota/dquot.c |    3 +++
+ 1 file changed, 3 insertions(+)
+
+--- a/fs/quota/dquot.c
++++ b/fs/quota/dquot.c
+@@ -1425,6 +1425,9 @@ static void inode_sub_rsv_space(struct i
+ static qsize_t inode_get_rsv_space(struct inode *inode)
+ {
+ 	qsize_t ret;
++
++	if (!inode->i_sb->dq_op->get_reserved_space)
++		return 0;
+ 	spin_lock(&inode->i_lock);
+ 	ret = *inode_reserved_space(inode);
+ 	spin_unlock(&inode->i_lock);
+
+
+From gregkh@mini.kroah.org Thu Jan 14 14:48:07 2010
+Message-Id: <20100114224807.227254692@mini.kroah.org>
+User-Agent: quilt/0.48-1
+Date: Thu, 14 Jan 2010 14:46:43 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: stable-review@kernel.org,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Al Viro <viro@zeniv.linux.org.uk>
+Subject: [7/9] fix braindamage in audit_tree.c untag_chunk()
+
+2.6.31-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Al Viro <viro@ZenIV.linux.org.uk>
+
+commit 6f5d51148921c242680a7a1d9913384a30ab3cbe upstream.
+
+... aka "Al had badly fscked up when writing that thing and nobody
+noticed until Eric had fixed leaks that used to mask the breakage".
+
+The function essentially creates a copy of old array sans one element
+and replaces the references to elements of original (they are on cyclic
+lists) with those to corresponding elements of new one.  After that the
+old one is fair game for freeing.
+
+First of all, there's a dumb braino: when we get to list_replace_init we
+use indices for wrong arrays - position in new one with the old array
+and vice versa.
+
+Another bug is more subtle - termination condition is wrong if the
+element to be excluded happens to be the last one.  We shouldn't go
+until we fill the new array, we should go until we'd finished the old
+one.  Otherwise the element we are trying to kill will remain on the
+cyclic lists...
+
+That crap used to be masked by several leaks, so it was not quite
+trivial to hit.  Eric had fixed some of those leaks a while ago and the
+shit had hit the fan...
+
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ kernel/audit_tree.c |    4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+--- a/kernel/audit_tree.c
++++ b/kernel/audit_tree.c
+@@ -277,7 +277,7 @@ static void untag_chunk(struct node *p)
+ 		owner->root = NULL;
+ 	}
+ 
+-	for (i = j = 0; i < size; i++, j++) {
++	for (i = j = 0; j <= size; i++, j++) {
+ 		struct audit_tree *s;
+ 		if (&chunk->owners[j] == p) {
+ 			list_del_init(&p->list);
+@@ -290,7 +290,7 @@ static void untag_chunk(struct node *p)
+ 		if (!s) /* result of earlier fallback */
+ 			continue;
+ 		get_tree(s);
+-		list_replace_init(&chunk->owners[i].list, &new->owners[j].list);
++		list_replace_init(&chunk->owners[j].list, &new->owners[i].list);
+ 	}
+ 
+ 	list_replace_rcu(&chunk->hash, &new->hash);
+
+
+From gregkh@mini.kroah.org Thu Jan 14 14:48:07 2010
+Message-Id: <20100114224807.352150724@mini.kroah.org>
+User-Agent: quilt/0.48-1
+Date: Thu, 14 Jan 2010 14:46:44 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: stable-review@kernel.org,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ Al Viro <viro@zeniv.linux.org.uk>
+Subject: [8/9] fix more leaks in audit_tree.c tag_chunk()
+
+2.6.31-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: Al Viro <viro@ZenIV.linux.org.uk>
+
+commit b4c30aad39805902cf5b855aa8a8b22d728ad057 upstream.
+
+Several leaks in audit_tree didn't get caught by commit
+318b6d3d7ddbcad3d6867e630711b8a705d873d7, including the leak on normal
+exit in case of multiple rules refering to the same chunk.
+
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ kernel/audit_tree.c |    9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+--- a/kernel/audit_tree.c
++++ b/kernel/audit_tree.c
+@@ -373,15 +373,17 @@ static int tag_chunk(struct inode *inode
+ 	for (n = 0; n < old->count; n++) {
+ 		if (old->owners[n].owner == tree) {
+ 			spin_unlock(&hash_lock);
+-			put_inotify_watch(watch);
++			put_inotify_watch(&old->watch);
+ 			return 0;
+ 		}
+ 	}
+ 	spin_unlock(&hash_lock);
+ 
+ 	chunk = alloc_chunk(old->count + 1);
+-	if (!chunk)
++	if (!chunk) {
++		put_inotify_watch(&old->watch);
+ 		return -ENOMEM;
++	}
+ 
+ 	mutex_lock(&inode->inotify_mutex);
+ 	if (inotify_clone_watch(&old->watch, &chunk->watch) < 0) {
+@@ -425,7 +427,8 @@ static int tag_chunk(struct inode *inode
+ 	spin_unlock(&hash_lock);
+ 	inotify_evict_watch(&old->watch);
+ 	mutex_unlock(&inode->inotify_mutex);
+-	put_inotify_watch(&old->watch);
++	put_inotify_watch(&old->watch); /* pair to inotify_find_watch */
++	put_inotify_watch(&old->watch); /* and kill it */
+ 	return 0;
+ }
+ 
+
+
+From gregkh@mini.kroah.org Thu Jan 14 14:48:07 2010
+Message-Id: <20100114224807.515390123@mini.kroah.org>
+User-Agent: quilt/0.48-1
+Date: Thu, 14 Jan 2010 14:46:45 -0800
+From: Greg KH <gregkh@suse.de>
+To: linux-kernel@vger.kernel.org,
+ stable@kernel.org
+Cc: stable-review@kernel.org,
+ torvalds@linux-foundation.org,
+ akpm@linux-foundation.org,
+ alan@lxorguk.ukuu.org.uk,
+ "David S. Miller" <davem@davemloft.net>
+Subject: [9/9] ipv6: skb_dst() can be NULL in ipv6_hop_jumbo().
+
+2.6.31-stable review patch.  If anyone has any objections, please let us know.
+
+------------------
+
+From: David S. Miller <davem@davemloft.net>
+
+commit 2570a4f5428bcdb1077622342181755741e7fa60 upstream.
+
+This fixes CERT-FI FICORA #341748
+
+Discovered by Olli Jarva and Tuomo Untinen from the CROSS
+project at Codenomicon Ltd.
+
+Just like in CVE-2007-4567, we can't rely upon skb_dst() being
+non-NULL at this point.  We fixed that in commit
+e76b2b2567b83448c2ee85a896433b96150c92e6 ("[IPV6]: Do no rely on
+skb->dst before it is assigned.")
+
+However commit 483a47d2fe794328d29950fe00ce26dd405d9437 ("ipv6: added
+net argument to IP6_INC_STATS_BH") put a new version of the same bug
+into this function.
+
+Complicating analysis further, this bug can only trigger when network
+namespaces are enabled in the build.  When namespaces are turned off,
+the dev_net() does not evaluate it's argument, so the dereference
+would not occur.
+
+So, for a long time, namespaces couldn't be turned on unless SYSFS was
+disabled.  Therefore, this code has largely been disabled except by
+people turning it on explicitly for namespace development.
+
+With help from Eugene Teo <eugene@redhat.com>
+
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ net/ipv6/exthdrs.c |    7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+--- a/net/ipv6/exthdrs.c
++++ b/net/ipv6/exthdrs.c
+@@ -559,6 +559,11 @@ static inline struct inet6_dev *ipv6_skb
+ 	return skb_dst(skb) ? ip6_dst_idev(skb_dst(skb)) : __in6_dev_get(skb->dev);
+ }
+ 
++static inline struct net *ipv6_skb_net(struct sk_buff *skb)
++{
++	return skb_dst(skb) ? dev_net(skb_dst(skb)->dev) : dev_net(skb->dev);
++}
++
+ /* Router Alert as of RFC 2711 */
+ 
+ static int ipv6_hop_ra(struct sk_buff *skb, int optoff)
+@@ -580,8 +585,8 @@ static int ipv6_hop_ra(struct sk_buff *s
+ static int ipv6_hop_jumbo(struct sk_buff *skb, int optoff)
+ {
+ 	const unsigned char *nh = skb_network_header(skb);
++	struct net *net = ipv6_skb_net(skb);
+ 	u32 pkt_len;
+-	struct net *net = dev_net(skb_dst(skb)->dev);
+ 
+ 	if (nh[optoff + 1] != 4 || (optoff & 3) != 2) {
+ 		LIMIT_NETDEBUG(KERN_DEBUG "ipv6_hop_jumbo: wrong jumbo opt length/alignment %d\n",
+
+
