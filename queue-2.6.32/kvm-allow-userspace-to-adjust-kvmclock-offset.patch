@@ -1,0 +1,195 @@
+From mtosatti@redhat.com  Mon Feb  1 13:35:13 2010
+From: Marcelo Tosatti <mtosatti@redhat.com>
+Date: Mon, 1 Feb 2010 16:54:05 -0200
+Subject: KVM: allow userspace to adjust kvmclock offset
+To: Alexander Graf <agraf@suse.de>, Greg KH <gregkh@suse.de>
+Cc: Avi Kivity <avi@redhat.com>, KVM list <kvm@vger.kernel.org>
+Message-ID: <20100201185405.GB5381@amt.cnet>
+Content-Disposition: inline
+
+From: Glauber Costa <glommer@redhat.com>
+
+(cherry picked from afbcf7ab8d1bc8c2d04792f6d9e786e0adeb328d)
+
+When we migrate a kvm guest that uses pvclock between two hosts, we may
+suffer a large skew. This is because there can be significant differences
+between the monotonic clock of the hosts involved. When a new host with
+a much larger monotonic time starts running the guest, the view of time
+will be significantly impacted.
+
+Situation is much worse when we do the opposite, and migrate to a host with
+a smaller monotonic clock.
+
+This proposed ioctl will allow userspace to inform us what is the monotonic
+clock value in the source host, so we can keep the time skew short, and
+more importantly, never goes backwards. Userspace may also need to trigger
+the current data, since from the first migration onwards, it won't be
+reflected by a simple call to clock_gettime() anymore.
+
+[marcelo: future-proof abi with a flags field]
+[jan: fix KVM_GET_CLOCK by clearing flags field instead of checking it]
+
+Signed-off-by: Glauber Costa <glommer@redhat.com>
+Signed-off-by: Marcelo Tosatti <mtosatti@redhat.com>
+Signed-off-by: Avi Kivity <avi@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ Documentation/kvm/api.txt       |   36 ++++++++++++++++++++++++++++++++++
+ arch/x86/include/asm/kvm_host.h |    1 
+ arch/x86/kvm/x86.c              |   42 +++++++++++++++++++++++++++++++++++++++-
+ include/linux/kvm.h             |    9 ++++++++
+ 4 files changed, 87 insertions(+), 1 deletion(-)
+
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -412,6 +412,7 @@ struct kvm_arch{
+ 	unsigned long irq_sources_bitmap;
+ 	unsigned long irq_states[KVM_IOAPIC_NUM_PINS];
+ 	u64 vm_init_tsc;
++	s64 kvmclock_offset;
+ };
+ 
+ struct kvm_vm_stat {
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -680,7 +680,8 @@ static void kvm_write_guest_time(struct 
+ 	/* With all the info we got, fill in the values */
+ 
+ 	vcpu->hv_clock.system_time = ts.tv_nsec +
+-				     (NSEC_PER_SEC * (u64)ts.tv_sec);
++				     (NSEC_PER_SEC * (u64)ts.tv_sec) + v->kvm->arch.kvmclock_offset;
++
+ 	/*
+ 	 * The interface expects us to write an even number signaling that the
+ 	 * update is finished. Since the guest won't see the intermediate
+@@ -1227,6 +1228,7 @@ int kvm_dev_ioctl_check_extension(long e
+ 	case KVM_CAP_PIT2:
+ 	case KVM_CAP_PIT_STATE2:
+ 	case KVM_CAP_SET_IDENTITY_MAP_ADDR:
++	case KVM_CAP_ADJUST_CLOCK:
+ 		r = 1;
+ 		break;
+ 	case KVM_CAP_COALESCED_MMIO:
+@@ -2424,6 +2426,44 @@ long kvm_arch_vm_ioctl(struct file *filp
+ 		r = 0;
+ 		break;
+ 	}
++	case KVM_SET_CLOCK: {
++		struct timespec now;
++		struct kvm_clock_data user_ns;
++		u64 now_ns;
++		s64 delta;
++
++		r = -EFAULT;
++		if (copy_from_user(&user_ns, argp, sizeof(user_ns)))
++			goto out;
++
++		r = -EINVAL;
++		if (user_ns.flags)
++			goto out;
++
++		r = 0;
++		ktime_get_ts(&now);
++		now_ns = timespec_to_ns(&now);
++		delta = user_ns.clock - now_ns;
++		kvm->arch.kvmclock_offset = delta;
++		break;
++	}
++	case KVM_GET_CLOCK: {
++		struct timespec now;
++		struct kvm_clock_data user_ns;
++		u64 now_ns;
++
++		ktime_get_ts(&now);
++		now_ns = timespec_to_ns(&now);
++		user_ns.clock = kvm->arch.kvmclock_offset + now_ns;
++		user_ns.flags = 0;
++
++		r = -EFAULT;
++		if (copy_to_user(argp, &user_ns, sizeof(user_ns)))
++			goto out;
++		r = 0;
++		break;
++	}
++
+ 	default:
+ 		;
+ 	}
+--- a/Documentation/kvm/api.txt
++++ b/Documentation/kvm/api.txt
+@@ -593,6 +593,42 @@ struct kvm_irqchip {
+ 	} chip;
+ };
+ 
++4.27 KVM_GET_CLOCK
++
++Capability: KVM_CAP_ADJUST_CLOCK
++Architectures: x86
++Type: vm ioctl
++Parameters: struct kvm_clock_data (out)
++Returns: 0 on success, -1 on error
++
++Gets the current timestamp of kvmclock as seen by the current guest. In
++conjunction with KVM_SET_CLOCK, it is used to ensure monotonicity on scenarios
++such as migration.
++
++struct kvm_clock_data {
++	__u64 clock;  /* kvmclock current value */
++	__u32 flags;
++	__u32 pad[9];
++};
++
++4.28 KVM_SET_CLOCK
++
++Capability: KVM_CAP_ADJUST_CLOCK
++Architectures: x86
++Type: vm ioctl
++Parameters: struct kvm_clock_data (in)
++Returns: 0 on success, -1 on error
++
++Sets the current timestamp of kvmclock to the valued specific in its parameter.
++In conjunction with KVM_GET_CLOCK, it is used to ensure monotonicity on scenarios
++such as migration.
++
++struct kvm_clock_data {
++	__u64 clock;  /* kvmclock current value */
++	__u32 flags;
++	__u32 pad[9];
++};
++
+ 5. The kvm_run structure
+ 
+ Application code obtains a pointer to the kvm_run structure by
+--- a/include/linux/kvm.h
++++ b/include/linux/kvm.h
+@@ -439,6 +439,7 @@ struct kvm_ioeventfd {
+ #endif
+ #define KVM_CAP_IOEVENTFD 36
+ #define KVM_CAP_SET_IDENTITY_MAP_ADDR 37
++#define KVM_CAP_ADJUST_CLOCK 39
+ 
+ #ifdef KVM_CAP_IRQ_ROUTING
+ 
+@@ -501,6 +502,12 @@ struct kvm_irqfd {
+ 	__u8  pad[20];
+ };
+ 
++struct kvm_clock_data {
++	__u64 clock;
++	__u32 flags;
++	__u32 pad[9];
++};
++
+ /*
+  * ioctls for VM fds
+  */
+@@ -550,6 +557,8 @@ struct kvm_irqfd {
+ #define KVM_CREATE_PIT2		   _IOW(KVMIO, 0x77, struct kvm_pit_config)
+ #define KVM_SET_BOOT_CPU_ID        _IO(KVMIO, 0x78)
+ #define KVM_IOEVENTFD             _IOW(KVMIO, 0x79, struct kvm_ioeventfd)
++#define KVM_SET_CLOCK             _IOW(KVMIO, 0x7b, struct kvm_clock_data)
++#define KVM_GET_CLOCK             _IOR(KVMIO, 0x7c, struct kvm_clock_data)
+ 
+ /*
+  * ioctls for vcpu fds
