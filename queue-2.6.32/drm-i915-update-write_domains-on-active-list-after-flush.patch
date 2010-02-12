@@ -1,0 +1,177 @@
+From 99fcb766a3a50466fe31d743260a3400c1aee855 Mon Sep 17 00:00:00 2001
+From: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date: Sun, 7 Feb 2010 16:20:18 +0100
+Subject: drm/i915: Update write_domains on active list after flush.
+
+From: Daniel Vetter <daniel.vetter@ffwll.ch>
+
+commit 99fcb766a3a50466fe31d743260a3400c1aee855 upstream.
+
+Before changing the status of a buffer with a pending write we will await
+upon a new flush for that buffer. So we can take advantage of any flushes
+posted whilst the buffer is active and pending processing by the GPU, by
+clearing its write_domain and updating its last_rendering_seqno -- thus
+saving a potential flush in deep queues and improves flushing behaviour
+upon eviction for both GTT space and fences.
+
+In order to reduce the time spent searching the active list for matching
+write_domains, we move those to a separate list whose elements are
+the buffers belong to the active/flushing list with pending writes.
+
+Orignal patch by Chris Wilson <chris@chris-wilson.co.uk>, forward-ported
+by me.
+
+In addition to better performance, this also fixes a real bug. Before
+this changes, i915_gem_evict_everything didn't work as advertised. When
+the gpu was actually busy and processing request, the flush and subsequent
+wait would not move active and dirty buffers to the inactive list, but
+just to the flushing list. Which triggered the BUG_ON at the end of this
+function. With the more tight dirty buffer tracking, all currently busy and
+dirty buffers get moved to the inactive list by one i915_gem_flush operation.
+
+I've left the BUG_ON I've used to prove this in there.
+
+References:
+  Bug 25911 - 2.10.0 causes kernel oops and system hangs
+  http://bugs.freedesktop.org/show_bug.cgi?id=25911
+
+  Bug 26101 - [i915] xf86-video-intel 2.10.0 (and git) triggers kernel oops
+              within seconds after login
+  http://bugs.freedesktop.org/show_bug.cgi?id=26101
+
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Tested-by: Adam Lantos <hege@playma.org>
+Signed-off-by: Eric Anholt <eric@anholt.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/gpu/drm/i915/i915_drv.h |   11 +++++++++++
+ drivers/gpu/drm/i915/i915_gem.c |   23 +++++++++++++++++++----
+ 2 files changed, 30 insertions(+), 4 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -467,6 +467,15 @@ typedef struct drm_i915_private {
+ 		struct list_head flushing_list;
+ 
+ 		/**
++		 * List of objects currently pending a GPU write flush.
++		 *
++		 * All elements on this list will belong to either the
++		 * active_list or flushing_list, last_rendering_seqno can
++		 * be used to differentiate between the two elements.
++		 */
++		struct list_head gpu_write_list;
++
++		/**
+ 		 * LRU list of objects which are not in the ringbuffer and
+ 		 * are ready to unbind, but are still in the GTT.
+ 		 *
+@@ -558,6 +567,8 @@ struct drm_i915_gem_object {
+ 
+ 	/** This object's place on the active/flushing/inactive lists */
+ 	struct list_head list;
++	/** This object's place on GPU write list */
++	struct list_head gpu_write_list;
+ 
+ 	/** This object's place on the fenced object LRU */
+ 	struct list_head fence_list;
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -1552,6 +1552,8 @@ i915_gem_object_move_to_inactive(struct
+ 	else
+ 		list_move_tail(&obj_priv->list, &dev_priv->mm.inactive_list);
+ 
++	BUG_ON(!list_empty(&obj_priv->gpu_write_list));
++
+ 	obj_priv->last_rendering_seqno = 0;
+ 	if (obj_priv->active) {
+ 		obj_priv->active = 0;
+@@ -1622,7 +1624,8 @@ i915_add_request(struct drm_device *dev,
+ 		struct drm_i915_gem_object *obj_priv, *next;
+ 
+ 		list_for_each_entry_safe(obj_priv, next,
+-					 &dev_priv->mm.flushing_list, list) {
++					 &dev_priv->mm.gpu_write_list,
++					 gpu_write_list) {
+ 			struct drm_gem_object *obj = obj_priv->obj;
+ 
+ 			if ((obj->write_domain & flush_domains) ==
+@@ -1630,6 +1633,7 @@ i915_add_request(struct drm_device *dev,
+ 				uint32_t old_write_domain = obj->write_domain;
+ 
+ 				obj->write_domain = 0;
++				list_del_init(&obj_priv->gpu_write_list);
+ 				i915_gem_object_move_to_active(obj, seqno);
+ 
+ 				trace_i915_gem_object_change_domain(obj,
+@@ -2073,8 +2077,8 @@ static int
+ i915_gem_evict_everything(struct drm_device *dev)
+ {
+ 	drm_i915_private_t *dev_priv = dev->dev_private;
+-	uint32_t seqno;
+ 	int ret;
++	uint32_t seqno;
+ 	bool lists_empty;
+ 
+ 	spin_lock(&dev_priv->mm.active_list_lock);
+@@ -2096,6 +2100,8 @@ i915_gem_evict_everything(struct drm_dev
+ 	if (ret)
+ 		return ret;
+ 
++	BUG_ON(!list_empty(&dev_priv->mm.flushing_list));
++
+ 	ret = i915_gem_evict_from_inactive_list(dev);
+ 	if (ret)
+ 		return ret;
+@@ -2690,7 +2696,7 @@ i915_gem_object_flush_gpu_write_domain(s
+ 	old_write_domain = obj->write_domain;
+ 	i915_gem_flush(dev, 0, obj->write_domain);
+ 	seqno = i915_add_request(dev, NULL, obj->write_domain);
+-	obj->write_domain = 0;
++	BUG_ON(obj->write_domain);
+ 	i915_gem_object_move_to_active(obj, seqno);
+ 
+ 	trace_i915_gem_object_change_domain(obj,
+@@ -3710,16 +3716,23 @@ i915_gem_execbuffer(struct drm_device *d
+ 		i915_gem_flush(dev,
+ 			       dev->invalidate_domains,
+ 			       dev->flush_domains);
+-		if (dev->flush_domains)
++		if (dev->flush_domains & I915_GEM_GPU_DOMAINS)
+ 			(void)i915_add_request(dev, file_priv,
+ 					       dev->flush_domains);
+ 	}
+ 
+ 	for (i = 0; i < args->buffer_count; i++) {
+ 		struct drm_gem_object *obj = object_list[i];
++		struct drm_i915_gem_object *obj_priv = obj->driver_private;
+ 		uint32_t old_write_domain = obj->write_domain;
+ 
+ 		obj->write_domain = obj->pending_write_domain;
++		if (obj->write_domain)
++			list_move_tail(&obj_priv->gpu_write_list,
++				       &dev_priv->mm.gpu_write_list);
++		else
++			list_del_init(&obj_priv->gpu_write_list);
++
+ 		trace_i915_gem_object_change_domain(obj,
+ 						    obj->read_domains,
+ 						    old_write_domain);
+@@ -4112,6 +4125,7 @@ int i915_gem_init_object(struct drm_gem_
+ 	obj_priv->obj = obj;
+ 	obj_priv->fence_reg = I915_FENCE_REG_NONE;
+ 	INIT_LIST_HEAD(&obj_priv->list);
++	INIT_LIST_HEAD(&obj_priv->gpu_write_list);
+ 	INIT_LIST_HEAD(&obj_priv->fence_list);
+ 	obj_priv->madv = I915_MADV_WILLNEED;
+ 
+@@ -4563,6 +4577,7 @@ i915_gem_load(struct drm_device *dev)
+ 	spin_lock_init(&dev_priv->mm.active_list_lock);
+ 	INIT_LIST_HEAD(&dev_priv->mm.active_list);
+ 	INIT_LIST_HEAD(&dev_priv->mm.flushing_list);
++	INIT_LIST_HEAD(&dev_priv->mm.gpu_write_list);
+ 	INIT_LIST_HEAD(&dev_priv->mm.inactive_list);
+ 	INIT_LIST_HEAD(&dev_priv->mm.request_list);
+ 	INIT_LIST_HEAD(&dev_priv->mm.fence_list);
