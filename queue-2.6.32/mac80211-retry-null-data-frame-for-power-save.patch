@@ -1,0 +1,141 @@
+From c0dbaef59605988b8832d066cb0eedfe30afa319 Mon Sep 17 00:00:00 2001
+From: Vivek Natarajan <vnatarajan@atheros.com>
+Date: Thu, 11 Mar 2010 13:10:03 -0800
+Subject: mac80211: Retry null data frame for power save
+
+From: Vivek Natarajan <vnatarajan@atheros.com>
+
+commit 375177bf35efc08e1bd37bbda4cc0c8cc4db8500 upstream.
+
+Even if the null data frame is not acked by the AP, mac80211
+goes into power save. This might lead to loss of frames
+from the AP.
+Prevent this by restarting dynamic_ps_timer when ack is not
+received for null data frames.
+
+Cc: Johannes Berg <johannes@sipsolutions.net>
+Signed-off-by: Vivek Natarajan <vnatarajan@atheros.com>
+Signed-off-by: John W. Linville <linville@tuxdriver.com>
+Signed-off-by: Luis R. Rodriguez <lrodriguez@atheros.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ include/net/mac80211.h     |    4 ++++
+ net/mac80211/ieee80211_i.h |    1 +
+ net/mac80211/main.c        |   15 +++++++++++++++
+ net/mac80211/mlme.c        |   20 +++++++++++++++-----
+ 4 files changed, 35 insertions(+), 5 deletions(-)
+
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -908,6 +908,9 @@ enum ieee80211_tkip_key_type {
+  * @IEEE80211_HW_BEACON_FILTER:
+  *	Hardware supports dropping of irrelevant beacon frames to
+  *	avoid waking up cpu.
++ * @IEEE80211_HW_REPORTS_TX_ACK_STATUS:
++ *	Hardware can provide ack status reports of Tx frames to
++ *	the stack.
+  */
+ enum ieee80211_hw_flags {
+ 	IEEE80211_HW_RX_INCLUDES_FCS			= 1<<1,
+@@ -924,6 +927,7 @@ enum ieee80211_hw_flags {
+ 	IEEE80211_HW_SUPPORTS_DYNAMIC_PS		= 1<<12,
+ 	IEEE80211_HW_MFP_CAPABLE			= 1<<13,
+ 	IEEE80211_HW_BEACON_FILTER			= 1<<14,
++	IEEE80211_HW_REPORTS_TX_ACK_STATUS		= 1<<15,
+ };
+ 
+ /**
+--- a/net/mac80211/ieee80211_i.h
++++ b/net/mac80211/ieee80211_i.h
+@@ -264,6 +264,7 @@ enum ieee80211_sta_flags {
+ 	IEEE80211_STA_DISABLE_11N	= BIT(4),
+ 	IEEE80211_STA_CSA_RECEIVED	= BIT(5),
+ 	IEEE80211_STA_MFP_ENABLED	= BIT(6),
++	IEEE80211_STA_NULLFUNC_ACKED	= BIT(7),
+ };
+ 
+ /* flags for MLME request */
+--- a/net/mac80211/main.c
++++ b/net/mac80211/main.c
+@@ -441,6 +441,7 @@ void ieee80211_tx_status(struct ieee8021
+ 	rcu_read_lock();
+ 
+ 	sband = local->hw.wiphy->bands[info->band];
++	fc = hdr->frame_control;
+ 
+ 	sta = sta_info_get(local, hdr->addr1);
+ 
+@@ -522,6 +523,20 @@ void ieee80211_tx_status(struct ieee8021
+ 			local->dot11FailedCount++;
+ 	}
+ 
++	if (ieee80211_is_nullfunc(fc) && ieee80211_has_pm(fc) &&
++	    (local->hw.flags & IEEE80211_HW_REPORTS_TX_ACK_STATUS) &&
++	    !(info->flags & IEEE80211_TX_CTL_INJECTED) &&
++	    local->ps_sdata && !(local->scanning)) {
++		if (info->flags & IEEE80211_TX_STAT_ACK) {
++			local->ps_sdata->u.mgd.flags |=
++				IEEE80211_STA_NULLFUNC_ACKED;
++			ieee80211_queue_work(&local->hw,
++					     &local->dynamic_ps_enable_work);
++		} else
++			mod_timer(&local->dynamic_ps_timer, jiffies +
++				  msecs_to_jiffies(10));
++	}
++
+ 	/* this was a transmitted frame, but now we want to reuse it */
+ 	skb_orphan(skb);
+ 
+--- a/net/mac80211/mlme.c
++++ b/net/mac80211/mlme.c
+@@ -650,8 +650,11 @@ static void ieee80211_enable_ps(struct i
+ 	} else {
+ 		if (local->hw.flags & IEEE80211_HW_PS_NULLFUNC_STACK)
+ 			ieee80211_send_nullfunc(local, sdata, 1);
+-		conf->flags |= IEEE80211_CONF_PS;
+-		ieee80211_hw_config(local, IEEE80211_CONF_CHANGE_PS);
++
++		if (!(local->hw.flags & IEEE80211_HW_REPORTS_TX_ACK_STATUS)) {
++			conf->flags |= IEEE80211_CONF_PS;
++			ieee80211_hw_config(local, IEEE80211_CONF_CHANGE_PS);
++		}
+ 	}
+ }
+ 
+@@ -742,6 +745,7 @@ void ieee80211_dynamic_ps_enable_work(st
+ 		container_of(work, struct ieee80211_local,
+ 			     dynamic_ps_enable_work);
+ 	struct ieee80211_sub_if_data *sdata = local->ps_sdata;
++	struct ieee80211_if_managed *ifmgd = &sdata->u.mgd;
+ 
+ 	/* can only happen when PS was just disabled anyway */
+ 	if (!sdata)
+@@ -750,11 +754,16 @@ void ieee80211_dynamic_ps_enable_work(st
+ 	if (local->hw.conf.flags & IEEE80211_CONF_PS)
+ 		return;
+ 
+-	if (local->hw.flags & IEEE80211_HW_PS_NULLFUNC_STACK)
++	if ((local->hw.flags & IEEE80211_HW_PS_NULLFUNC_STACK) &&
++	    (!(ifmgd->flags & IEEE80211_STA_NULLFUNC_ACKED)))
+ 		ieee80211_send_nullfunc(local, sdata, 1);
+ 
+-	local->hw.conf.flags |= IEEE80211_CONF_PS;
+-	ieee80211_hw_config(local, IEEE80211_CONF_CHANGE_PS);
++	if (!(local->hw.flags & IEEE80211_HW_REPORTS_TX_ACK_STATUS) ||
++	    (ifmgd->flags & IEEE80211_STA_NULLFUNC_ACKED)) {
++		ifmgd->flags &= ~IEEE80211_STA_NULLFUNC_ACKED;
++		local->hw.conf.flags |= IEEE80211_CONF_PS;
++		ieee80211_hw_config(local, IEEE80211_CONF_CHANGE_PS);
++	}
+ }
+ 
+ void ieee80211_dynamic_ps_timer(unsigned long data)
+@@ -2458,6 +2467,7 @@ int ieee80211_mgd_assoc(struct ieee80211
+ 	list_add(&wk->list, &ifmgd->work_list);
+ 
+ 	ifmgd->flags &= ~IEEE80211_STA_DISABLE_11N;
++	ifmgd->flags &= ~IEEE80211_STA_NULLFUNC_ACKED;
+ 
+ 	for (i = 0; i < req->crypto.n_ciphers_pairwise; i++)
+ 		if (req->crypto.ciphers_pairwise[i] == WLAN_CIPHER_SUITE_WEP40 ||
