@@ -1,0 +1,506 @@
+From ff9c895f07d36193c75533bda8193bde8ca99d02 Mon Sep 17 00:00:00 2001
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Fri, 2 Apr 2010 13:27:28 -0400
+Subject: USB: fix usbmon and DMA mapping for scatter-gather URBs
+
+From: Alan Stern <stern@rowland.harvard.edu>
+
+commit ff9c895f07d36193c75533bda8193bde8ca99d02 upstream.
+
+This patch (as1368) fixes a rather obscure bug in usbmon: When tracing
+URBs sent by the scatter-gather library, it accesses the data buffers
+while they are still mapped for DMA.
+
+The solution is to move the mapping and unmapping out of the s-g
+library and into the usual place in hcd.c.  This requires the addition
+of new URB flag bits to describe the kind of mapping needed, since we
+have to call dma_map_sg() if the HCD supports native scatter-gather
+operation and dma_map_page() if it doesn't.  The nice thing about
+having the new flags is that they simplify the testing for unmapping.
+
+The patch removes the only caller of usb_buffer_[un]map_sg(), so those
+functions are #if'ed out.  A later patch will remove them entirely.
+
+As a result of this change, urb->sg will be set in situations where
+it wasn't set previously.  Hence the xhci and whci drivers are
+adjusted to test urb->num_sgs instead, which retains its original
+meaning and is nonzero only when the HCD has to handle a scatterlist.
+
+Finally, even when a submission error occurs we don't want to hand
+URBs to usbmon before they are unmapped.  The submission path is
+rearranged so that map_urb_for_dma() is called only for non-root-hub
+URBs and unmap_urb_for_dma() is called immediately after a submission
+error.  This simplifies the error handling.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/hcd.c       |  169 ++++++++++++++++++++++++++-----------------
+ drivers/usb/core/message.c   |   45 ++---------
+ drivers/usb/core/urb.c       |    9 +-
+ drivers/usb/core/usb.c       |    4 +
+ drivers/usb/host/whci/qset.c |    2 
+ drivers/usb/host/xhci-ring.c |    2 
+ drivers/usb/mon/mon_bin.c    |    2 
+ drivers/usb/mon/mon_text.c   |    4 -
+ include/linux/usb.h          |    9 ++
+ 9 files changed, 138 insertions(+), 108 deletions(-)
+
+--- a/drivers/usb/core/hcd.c
++++ b/drivers/usb/core/hcd.c
+@@ -1261,6 +1261,51 @@ static void hcd_free_coherent(struct usb
+ 	*dma_handle = 0;
+ }
+ 
++static void unmap_urb_for_dma(struct usb_hcd *hcd, struct urb *urb)
++{
++	enum dma_data_direction dir;
++
++	if (urb->transfer_flags & URB_SETUP_MAP_SINGLE)
++		dma_unmap_single(hcd->self.controller,
++				urb->setup_dma,
++				sizeof(struct usb_ctrlrequest),
++				DMA_TO_DEVICE);
++	else if (urb->transfer_flags & URB_SETUP_MAP_LOCAL)
++		hcd_free_coherent(urb->dev->bus,
++				&urb->setup_dma,
++				(void **) &urb->setup_packet,
++				sizeof(struct usb_ctrlrequest),
++				DMA_TO_DEVICE);
++
++	dir = usb_urb_dir_in(urb) ? DMA_FROM_DEVICE : DMA_TO_DEVICE;
++	if (urb->transfer_flags & URB_DMA_MAP_SG)
++		dma_unmap_sg(hcd->self.controller,
++				urb->sg->sg,
++				urb->num_sgs,
++				dir);
++	else if (urb->transfer_flags & URB_DMA_MAP_PAGE)
++		dma_unmap_page(hcd->self.controller,
++				urb->transfer_dma,
++				urb->transfer_buffer_length,
++				dir);
++	else if (urb->transfer_flags & URB_DMA_MAP_SINGLE)
++		dma_unmap_single(hcd->self.controller,
++				urb->transfer_dma,
++				urb->transfer_buffer_length,
++				dir);
++	else if (urb->transfer_flags & URB_MAP_LOCAL)
++		hcd_free_coherent(urb->dev->bus,
++				&urb->transfer_dma,
++				&urb->transfer_buffer,
++				urb->transfer_buffer_length,
++				dir);
++
++	/* Make it safe to call this routine more than once */
++	urb->transfer_flags &= ~(URB_SETUP_MAP_SINGLE | URB_SETUP_MAP_LOCAL |
++			URB_DMA_MAP_SG | URB_DMA_MAP_PAGE |
++			URB_DMA_MAP_SINGLE | URB_MAP_LOCAL);
++}
++
+ static int map_urb_for_dma(struct usb_hcd *hcd, struct urb *urb,
+ 			   gfp_t mem_flags)
+ {
+@@ -1272,8 +1317,6 @@ static int map_urb_for_dma(struct usb_hc
+ 	 * unless it uses pio or talks to another transport,
+ 	 * or uses the provided scatter gather list for bulk.
+ 	 */
+-	if (is_root_hub(urb->dev))
+-		return 0;
+ 
+ 	if (usb_endpoint_xfer_control(&urb->ep->desc)
+ 	    && !(urb->transfer_flags & URB_NO_SETUP_DMA_MAP)) {
+@@ -1286,6 +1329,7 @@ static int map_urb_for_dma(struct usb_hc
+ 			if (dma_mapping_error(hcd->self.controller,
+ 						urb->setup_dma))
+ 				return -EAGAIN;
++			urb->transfer_flags |= URB_SETUP_MAP_SINGLE;
+ 		} else if (hcd->driver->flags & HCD_LOCAL_MEM)
+ 			ret = hcd_alloc_coherent(
+ 					urb->dev->bus, mem_flags,
+@@ -1293,20 +1337,57 @@ static int map_urb_for_dma(struct usb_hc
+ 					(void **)&urb->setup_packet,
+ 					sizeof(struct usb_ctrlrequest),
+ 					DMA_TO_DEVICE);
++			if (ret)
++				return ret;
++			urb->transfer_flags |= URB_SETUP_MAP_LOCAL;
+ 	}
+ 
+ 	dir = usb_urb_dir_in(urb) ? DMA_FROM_DEVICE : DMA_TO_DEVICE;
+-	if (ret == 0 && urb->transfer_buffer_length != 0
++	if (urb->transfer_buffer_length != 0
+ 	    && !(urb->transfer_flags & URB_NO_TRANSFER_DMA_MAP)) {
+ 		if (hcd->self.uses_dma) {
+-			urb->transfer_dma = dma_map_single (
+-					hcd->self.controller,
+-					urb->transfer_buffer,
+-					urb->transfer_buffer_length,
+-					dir);
+-			if (dma_mapping_error(hcd->self.controller,
++			if (urb->num_sgs) {
++				int n = dma_map_sg(
++						hcd->self.controller,
++						urb->sg->sg,
++						urb->num_sgs,
++						dir);
++				if (n <= 0)
++					ret = -EAGAIN;
++				else
++					urb->transfer_flags |= URB_DMA_MAP_SG;
++				if (n != urb->num_sgs) {
++					urb->num_sgs = n;
++					urb->transfer_flags |=
++							URB_DMA_SG_COMBINED;
++				}
++			} else if (urb->sg) {
++				struct scatterlist *sg;
++
++				sg = (struct scatterlist *) urb->sg;
++				urb->transfer_dma = dma_map_page(
++						hcd->self.controller,
++						sg_page(sg),
++						sg->offset,
++						urb->transfer_buffer_length,
++						dir);
++				if (dma_mapping_error(hcd->self.controller,
+ 						urb->transfer_dma))
+-				return -EAGAIN;
++					ret = -EAGAIN;
++				else
++					urb->transfer_flags |= URB_DMA_MAP_PAGE;
++			} else {
++				urb->transfer_dma = dma_map_single(
++						hcd->self.controller,
++						urb->transfer_buffer,
++						urb->transfer_buffer_length,
++						dir);
++				if (dma_mapping_error(hcd->self.controller,
++						urb->transfer_dma))
++					ret = -EAGAIN;
++				else
++					urb->transfer_flags |= URB_DMA_MAP_SINGLE;
++			}
+ 		} else if (hcd->driver->flags & HCD_LOCAL_MEM) {
+ 			ret = hcd_alloc_coherent(
+ 					urb->dev->bus, mem_flags,
+@@ -1314,55 +1395,16 @@ static int map_urb_for_dma(struct usb_hc
+ 					&urb->transfer_buffer,
+ 					urb->transfer_buffer_length,
+ 					dir);
+-
+-			if (ret && usb_endpoint_xfer_control(&urb->ep->desc)
+-			    && !(urb->transfer_flags & URB_NO_SETUP_DMA_MAP))
+-				hcd_free_coherent(urb->dev->bus,
+-					&urb->setup_dma,
+-					(void **)&urb->setup_packet,
+-					sizeof(struct usb_ctrlrequest),
+-					DMA_TO_DEVICE);
++			if (ret == 0)
++				urb->transfer_flags |= URB_MAP_LOCAL;
+ 		}
++		if (ret && (urb->transfer_flags & (URB_SETUP_MAP_SINGLE |
++				URB_SETUP_MAP_LOCAL)))
++			unmap_urb_for_dma(hcd, urb);
+ 	}
+ 	return ret;
+ }
+ 
+-static void unmap_urb_for_dma(struct usb_hcd *hcd, struct urb *urb)
+-{
+-	enum dma_data_direction dir;
+-
+-	if (is_root_hub(urb->dev))
+-		return;
+-
+-	if (usb_endpoint_xfer_control(&urb->ep->desc)
+-	    && !(urb->transfer_flags & URB_NO_SETUP_DMA_MAP)) {
+-		if (hcd->self.uses_dma)
+-			dma_unmap_single(hcd->self.controller, urb->setup_dma,
+-					sizeof(struct usb_ctrlrequest),
+-					DMA_TO_DEVICE);
+-		else if (hcd->driver->flags & HCD_LOCAL_MEM)
+-			hcd_free_coherent(urb->dev->bus, &urb->setup_dma,
+-					(void **)&urb->setup_packet,
+-					sizeof(struct usb_ctrlrequest),
+-					DMA_TO_DEVICE);
+-	}
+-
+-	dir = usb_urb_dir_in(urb) ? DMA_FROM_DEVICE : DMA_TO_DEVICE;
+-	if (urb->transfer_buffer_length != 0
+-	    && !(urb->transfer_flags & URB_NO_TRANSFER_DMA_MAP)) {
+-		if (hcd->self.uses_dma)
+-			dma_unmap_single(hcd->self.controller,
+-					urb->transfer_dma,
+-					urb->transfer_buffer_length,
+-					dir);
+-		else if (hcd->driver->flags & HCD_LOCAL_MEM)
+-			hcd_free_coherent(urb->dev->bus, &urb->transfer_dma,
+-					&urb->transfer_buffer,
+-					urb->transfer_buffer_length,
+-					dir);
+-	}
+-}
+-
+ /*-------------------------------------------------------------------------*/
+ 
+ /* may be called in any context with a valid urb->dev usecount
+@@ -1391,21 +1433,20 @@ int usb_hcd_submit_urb (struct urb *urb,
+ 	 * URBs must be submitted in process context with interrupts
+ 	 * enabled.
+ 	 */
+-	status = map_urb_for_dma(hcd, urb, mem_flags);
+-	if (unlikely(status)) {
+-		usbmon_urb_submit_error(&hcd->self, urb, status);
+-		goto error;
+-	}
+ 
+-	if (is_root_hub(urb->dev))
++	if (is_root_hub(urb->dev)) {
+ 		status = rh_urb_enqueue(hcd, urb);
+-	else
+-		status = hcd->driver->urb_enqueue(hcd, urb, mem_flags);
++	} else {
++		status = map_urb_for_dma(hcd, urb, mem_flags);
++		if (likely(status == 0)) {
++			status = hcd->driver->urb_enqueue(hcd, urb, mem_flags);
++			if (unlikely(status))
++				unmap_urb_for_dma(hcd, urb);
++		}
++	}
+ 
+ 	if (unlikely(status)) {
+ 		usbmon_urb_submit_error(&hcd->self, urb, status);
+-		unmap_urb_for_dma(hcd, urb);
+- error:
+ 		urb->hcpriv = NULL;
+ 		INIT_LIST_HEAD(&urb->urb_list);
+ 		atomic_dec(&urb->use_count);
+--- a/drivers/usb/core/message.c
++++ b/drivers/usb/core/message.c
+@@ -259,9 +259,6 @@ static void sg_clean(struct usb_sg_reque
+ 		kfree(io->urbs);
+ 		io->urbs = NULL;
+ 	}
+-	if (io->dev->dev.dma_mask != NULL)
+-		usb_buffer_unmap_sg(io->dev, usb_pipein(io->pipe),
+-				    io->sg, io->nents);
+ 	io->dev = NULL;
+ }
+ 
+@@ -364,7 +361,6 @@ int usb_sg_init(struct usb_sg_request *i
+ {
+ 	int i;
+ 	int urb_flags;
+-	int dma;
+ 	int use_sg;
+ 
+ 	if (!io || !dev || !sg
+@@ -378,21 +374,9 @@ int usb_sg_init(struct usb_sg_request *i
+ 	io->pipe = pipe;
+ 	io->sg = sg;
+ 	io->nents = nents;
+-
+-	/* not all host controllers use DMA (like the mainstream pci ones);
+-	 * they can use PIO (sl811) or be software over another transport.
+-	 */
+-	dma = (dev->dev.dma_mask != NULL);
+-	if (dma)
+-		io->entries = usb_buffer_map_sg(dev, usb_pipein(pipe),
+-						sg, nents);
+-	else
+-		io->entries = nents;
++	io->entries = nents;
+ 
+ 	/* initialize all the urbs we'll use */
+-	if (io->entries <= 0)
+-		return io->entries;
+-
+ 	if (dev->bus->sg_tablesize > 0) {
+ 		io->urbs = kmalloc(sizeof *io->urbs, mem_flags);
+ 		use_sg = true;
+@@ -404,8 +388,6 @@ int usb_sg_init(struct usb_sg_request *i
+ 		goto nomem;
+ 
+ 	urb_flags = 0;
+-	if (dma)
+-		urb_flags |= URB_NO_TRANSFER_DMA_MAP;
+ 	if (usb_pipein(pipe))
+ 		urb_flags |= URB_SHORT_NOT_OK;
+ 
+@@ -423,12 +405,13 @@ int usb_sg_init(struct usb_sg_request *i
+ 
+ 		io->urbs[0]->complete = sg_complete;
+ 		io->urbs[0]->context = io;
++
+ 		/* A length of zero means transfer the whole sg list */
+ 		io->urbs[0]->transfer_buffer_length = length;
+ 		if (length == 0) {
+ 			for_each_sg(sg, sg, io->entries, i) {
+ 				io->urbs[0]->transfer_buffer_length +=
+-					sg_dma_len(sg);
++					sg->length;
+ 			}
+ 		}
+ 		io->urbs[0]->sg = io;
+@@ -454,26 +437,16 @@ int usb_sg_init(struct usb_sg_request *i
+ 			io->urbs[i]->context = io;
+ 
+ 			/*
+-			 * Some systems need to revert to PIO when DMA is temporarily
+-			 * unavailable.  For their sakes, both transfer_buffer and
+-			 * transfer_dma are set when possible.
+-			 *
+-			 * Note that if IOMMU coalescing occurred, we cannot
+-			 * trust sg_page anymore, so check if S/G list shrunk.
++			 * Some systems can't use DMA; they use PIO instead.
++			 * For their sakes, transfer_buffer is set whenever
++			 * possible.
+ 			 */
+-			if (io->nents == io->entries && !PageHighMem(sg_page(sg)))
++			if (!PageHighMem(sg_page(sg)))
+ 				io->urbs[i]->transfer_buffer = sg_virt(sg);
+ 			else
+ 				io->urbs[i]->transfer_buffer = NULL;
+ 
+-			if (dma) {
+-				io->urbs[i]->transfer_dma = sg_dma_address(sg);
+-				len = sg_dma_len(sg);
+-			} else {
+-				/* hc may use _only_ transfer_buffer */
+-				len = sg->length;
+-			}
+-
++			len = sg->length;
+ 			if (length) {
+ 				len = min_t(unsigned, len, length);
+ 				length -= len;
+@@ -481,6 +454,8 @@ int usb_sg_init(struct usb_sg_request *i
+ 					io->entries = i + 1;
+ 			}
+ 			io->urbs[i]->transfer_buffer_length = len;
++
++			io->urbs[i]->sg = (struct usb_sg_request *) sg;
+ 		}
+ 		io->urbs[--i]->transfer_flags &= ~URB_NO_INTERRUPT;
+ 	}
+--- a/drivers/usb/core/urb.c
++++ b/drivers/usb/core/urb.c
+@@ -333,9 +333,12 @@ int usb_submit_urb(struct urb *urb, gfp_
+ 		is_out = usb_endpoint_dir_out(&ep->desc);
+ 	}
+ 
+-	/* Cache the direction for later use */
+-	urb->transfer_flags = (urb->transfer_flags & ~URB_DIR_MASK) |
+-			(is_out ? URB_DIR_OUT : URB_DIR_IN);
++	/* Clear the internal flags and cache the direction for later use */
++	urb->transfer_flags &= ~(URB_DIR_MASK | URB_DMA_MAP_SINGLE |
++			URB_DMA_MAP_PAGE | URB_DMA_MAP_SG | URB_MAP_LOCAL |
++			URB_SETUP_MAP_SINGLE | URB_SETUP_MAP_LOCAL |
++			URB_DMA_SG_COMBINED);
++	urb->transfer_flags |= (is_out ? URB_DIR_OUT : URB_DIR_IN);
+ 
+ 	if (xfertype != USB_ENDPOINT_XFER_CONTROL &&
+ 			dev->state < USB_STATE_CONFIGURED)
+--- a/drivers/usb/core/usb.c
++++ b/drivers/usb/core/usb.c
+@@ -893,6 +893,7 @@ void usb_buffer_unmap(struct urb *urb)
+ EXPORT_SYMBOL_GPL(usb_buffer_unmap);
+ #endif  /*  0  */
+ 
++#if 0
+ /**
+  * usb_buffer_map_sg - create scatterlist DMA mapping(s) for an endpoint
+  * @dev: device to which the scatterlist will be mapped
+@@ -936,6 +937,7 @@ int usb_buffer_map_sg(const struct usb_d
+ 			is_in ? DMA_FROM_DEVICE : DMA_TO_DEVICE) ? : -ENOMEM;
+ }
+ EXPORT_SYMBOL_GPL(usb_buffer_map_sg);
++#endif
+ 
+ /* XXX DISABLED, no users currently.  If you wish to re-enable this
+  * XXX please determine whether the sync is to transfer ownership of
+@@ -972,6 +974,7 @@ void usb_buffer_dmasync_sg(const struct
+ EXPORT_SYMBOL_GPL(usb_buffer_dmasync_sg);
+ #endif
+ 
++#if 0
+ /**
+  * usb_buffer_unmap_sg - free DMA mapping(s) for a scatterlist
+  * @dev: device to which the scatterlist will be mapped
+@@ -997,6 +1000,7 @@ void usb_buffer_unmap_sg(const struct us
+ 			is_in ? DMA_FROM_DEVICE : DMA_TO_DEVICE);
+ }
+ EXPORT_SYMBOL_GPL(usb_buffer_unmap_sg);
++#endif
+ 
+ /* To disable USB, kernel command line is 'nousb' not 'usbcore.nousb' */
+ #ifdef MODULE
+--- a/drivers/usb/host/whci/qset.c
++++ b/drivers/usb/host/whci/qset.c
+@@ -646,7 +646,7 @@ int qset_add_urb(struct whc *whc, struct
+ 	wurb->urb = urb;
+ 	INIT_WORK(&wurb->dequeue_work, urb_dequeue_work);
+ 
+-	if (urb->sg) {
++	if (urb->num_sgs) {
+ 		ret = qset_add_urb_sg(whc, qset, urb, mem_flags);
+ 		if (ret == -EINVAL) {
+ 			qset_free_stds(qset, urb);
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@ -1938,7 +1938,7 @@ int xhci_queue_bulk_tx(struct xhci_hcd *
+ 	int running_total, trb_buff_len, ret;
+ 	u64 addr;
+ 
+-	if (urb->sg)
++	if (urb->num_sgs)
+ 		return queue_bulk_sg_tx(xhci, mem_flags, urb, slot_id, ep_index);
+ 
+ 	ep_ring = xhci->devs[slot_id]->eps[ep_index].ring;
+--- a/drivers/usb/mon/mon_bin.c
++++ b/drivers/usb/mon/mon_bin.c
+@@ -416,7 +416,7 @@ static unsigned int mon_bin_get_data(con
+ 
+ 	} else {
+ 		/* If IOMMU coalescing occurred, we cannot trust sg_page */
+-		if (urb->sg->nents != urb->num_sgs) {
++		if (urb->transfer_flags & URB_DMA_SG_COMBINED) {
+ 			*flag = 'D';
+ 			return length;
+ 		}
+--- a/drivers/usb/mon/mon_text.c
++++ b/drivers/usb/mon/mon_text.c
+@@ -161,9 +161,7 @@ static inline char mon_text_get_data(str
+ 	} else {
+ 		struct scatterlist *sg = urb->sg->sg;
+ 
+-		/* If IOMMU coalescing occurred, we cannot trust sg_page */
+-		if (urb->sg->nents != urb->num_sgs ||
+-				PageHighMem(sg_page(sg)))
++		if (PageHighMem(sg_page(sg)))
+ 			return 'D';
+ 
+ 		/* For the text interface we copy only the first sg buffer */
+--- a/include/linux/usb.h
++++ b/include/linux/usb.h
+@@ -965,10 +965,19 @@ extern int usb_disabled(void);
+ 					 * needed */
+ #define URB_FREE_BUFFER		0x0100	/* Free transfer buffer with the URB */
+ 
++/* The following flags are used internally by usbcore and HCDs */
+ #define URB_DIR_IN		0x0200	/* Transfer from device to host */
+ #define URB_DIR_OUT		0
+ #define URB_DIR_MASK		URB_DIR_IN
+ 
++#define URB_DMA_MAP_SINGLE	0x00010000	/* Non-scatter-gather mapping */
++#define URB_DMA_MAP_PAGE	0x00020000	/* HCD-unsupported S-G */
++#define URB_DMA_MAP_SG		0x00040000	/* HCD-supported S-G */
++#define URB_MAP_LOCAL		0x00080000	/* HCD-local-memory mapping */
++#define URB_SETUP_MAP_SINGLE	0x00100000	/* Setup packet DMA mapped */
++#define URB_SETUP_MAP_LOCAL	0x00200000	/* HCD-local setup packet */
++#define URB_DMA_SG_COMBINED	0x00400000	/* S-G entries were combined */
++
+ struct usb_iso_packet_descriptor {
+ 	unsigned int offset;
+ 	unsigned int length;		/* expected length */

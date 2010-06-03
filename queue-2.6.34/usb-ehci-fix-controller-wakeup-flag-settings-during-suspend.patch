@@ -1,0 +1,391 @@
+From 16032c4f5b291af541e9114a09ea20ff5a0dc474 Mon Sep 17 00:00:00 2001
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Wed, 12 May 2010 18:21:35 -0400
+Subject: USB: EHCI: fix controller wakeup flag settings during suspend
+
+From: Alan Stern <stern@rowland.harvard.edu>
+
+commit 16032c4f5b291af541e9114a09ea20ff5a0dc474 upstream.
+
+This patch (as1380) fixes a bug in the wakeup settings for EHCI host
+controllers.  When the controller is suspended, if it isn't enabled
+for remote wakeup then we have to turn off all the port wakeup flags.
+Disabling PCI PME# isn't good enough, because some systems (Intel)
+evidently use alternate wakeup signalling paths.
+
+In addition, the patch improves the handling of the Intel Moorestown
+hardware by performing various power-up and power-down delays just
+once instead of once for each port (i.e., the delays are moved outside
+of the port loops).  This requires extra code, but the total delay
+time is reduced.
+
+There are also a few additional minor cleanups.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Reported-by: Ondrej Zary <linux@rainbow-software.org>
+CC: Alek Du <alek.du@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/ehci-au1xxx.c |   16 ---
+ drivers/usb/host/ehci-fsl.c    |    2 
+ drivers/usb/host/ehci-hub.c    |  173 +++++++++++++++++++++++++++++------------
+ drivers/usb/host/ehci-pci.c    |   15 ---
+ drivers/usb/host/ehci.h        |   10 ++
+ 5 files changed, 145 insertions(+), 71 deletions(-)
+
+--- a/drivers/usb/host/ehci-au1xxx.c
++++ b/drivers/usb/host/ehci-au1xxx.c
+@@ -215,26 +215,17 @@ static int ehci_hcd_au1xxx_drv_suspend(s
+ 		msleep(10);
+ 
+ 	/* Root hub was already suspended. Disable irq emission and
+-	 * mark HW unaccessible, bail out if RH has been resumed. Use
+-	 * the spinlock to properly synchronize with possible pending
+-	 * RH suspend or resume activity.
+-	 *
+-	 * This is still racy as hcd->state is manipulated outside of
+-	 * any locks =P But that will be a different fix.
++	 * mark HW unaccessible.  The PM and USB cores make sure that
++	 * the root hub is either suspended or stopped.
+ 	 */
+ 	spin_lock_irqsave(&ehci->lock, flags);
+-	if (hcd->state != HC_STATE_SUSPENDED) {
+-		rc = -EINVAL;
+-		goto bail;
+-	}
++	ehci_prepare_ports_for_controller_suspend(ehci);
+ 	ehci_writel(ehci, 0, &ehci->regs->intr_enable);
+ 	(void)ehci_readl(ehci, &ehci->regs->intr_enable);
+ 
+ 	clear_bit(HCD_FLAG_HW_ACCESSIBLE, &hcd->flags);
+ 
+ 	au1xxx_stop_ehc();
+-
+-bail:
+ 	spin_unlock_irqrestore(&ehci->lock, flags);
+ 
+ 	// could save FLADJ in case of Vaux power loss
+@@ -264,6 +255,7 @@ static int ehci_hcd_au1xxx_drv_resume(st
+ 	if (ehci_readl(ehci, &ehci->regs->configured_flag) == FLAG_CF) {
+ 		int	mask = INTR_MASK;
+ 
++		ehci_prepare_ports_for_controller_resume(ehci);
+ 		if (!hcd->self.root_hub->do_remote_wakeup)
+ 			mask &= ~STS_PCD;
+ 		ehci_writel(ehci, mask, &ehci->regs->intr_enable);
+--- a/drivers/usb/host/ehci-fsl.c
++++ b/drivers/usb/host/ehci-fsl.c
+@@ -313,6 +313,7 @@ static int ehci_fsl_drv_suspend(struct d
+ 	struct ehci_fsl *ehci_fsl = hcd_to_ehci_fsl(hcd);
+ 	void __iomem *non_ehci = hcd->regs;
+ 
++	ehci_prepare_ports_for_controller_suspend(hcd_to_ehci(hcd));
+ 	if (!fsl_deep_sleep())
+ 		return 0;
+ 
+@@ -327,6 +328,7 @@ static int ehci_fsl_drv_resume(struct de
+ 	struct ehci_hcd *ehci = hcd_to_ehci(hcd);
+ 	void __iomem *non_ehci = hcd->regs;
+ 
++	ehci_prepare_ports_for_controller_resume(ehci);
+ 	if (!fsl_deep_sleep())
+ 		return 0;
+ 
+--- a/drivers/usb/host/ehci-hub.c
++++ b/drivers/usb/host/ehci-hub.c
+@@ -106,12 +106,75 @@ static void ehci_handover_companion_port
+ 	ehci->owned_ports = 0;
+ }
+ 
++static void ehci_adjust_port_wakeup_flags(struct ehci_hcd *ehci,
++		bool suspending)
++{
++	int		port;
++	u32		temp;
++
++	/* If remote wakeup is enabled for the root hub but disabled
++	 * for the controller, we must adjust all the port wakeup flags
++	 * when the controller is suspended or resumed.  In all other
++	 * cases they don't need to be changed.
++	 */
++	if (!ehci_to_hcd(ehci)->self.root_hub->do_remote_wakeup ||
++			device_may_wakeup(ehci_to_hcd(ehci)->self.controller))
++		return;
++
++	/* clear phy low-power mode before changing wakeup flags */
++	if (ehci->has_hostpc) {
++		port = HCS_N_PORTS(ehci->hcs_params);
++		while (port--) {
++			u32 __iomem	*hostpc_reg;
++
++			hostpc_reg = (u32 __iomem *)((u8 *) ehci->regs
++					+ HOSTPC0 + 4 * port);
++			temp = ehci_readl(ehci, hostpc_reg);
++			ehci_writel(ehci, temp & ~HOSTPC_PHCD, hostpc_reg);
++		}
++		msleep(5);
++	}
++
++	port = HCS_N_PORTS(ehci->hcs_params);
++	while (port--) {
++		u32 __iomem	*reg = &ehci->regs->port_status[port];
++		u32		t1 = ehci_readl(ehci, reg) & ~PORT_RWC_BITS;
++		u32		t2 = t1 & ~PORT_WAKE_BITS;
++
++		/* If we are suspending the controller, clear the flags.
++		 * If we are resuming the controller, set the wakeup flags.
++		 */
++		if (!suspending) {
++			if (t1 & PORT_CONNECT)
++				t2 |= PORT_WKOC_E | PORT_WKDISC_E;
++			else
++				t2 |= PORT_WKOC_E | PORT_WKCONN_E;
++		}
++		ehci_vdbg(ehci, "port %d, %08x -> %08x\n",
++				port + 1, t1, t2);
++		ehci_writel(ehci, t2, reg);
++	}
++
++	/* enter phy low-power mode again */
++	if (ehci->has_hostpc) {
++		port = HCS_N_PORTS(ehci->hcs_params);
++		while (port--) {
++			u32 __iomem	*hostpc_reg;
++
++			hostpc_reg = (u32 __iomem *)((u8 *) ehci->regs
++					+ HOSTPC0 + 4 * port);
++			temp = ehci_readl(ehci, hostpc_reg);
++			ehci_writel(ehci, temp | HOSTPC_PHCD, hostpc_reg);
++		}
++	}
++}
++
+ static int ehci_bus_suspend (struct usb_hcd *hcd)
+ {
+ 	struct ehci_hcd		*ehci = hcd_to_ehci (hcd);
+ 	int			port;
+ 	int			mask;
+-	u32 __iomem		*hostpc_reg = NULL;
++	int			changed;
+ 
+ 	ehci_dbg(ehci, "suspend root hub\n");
+ 
+@@ -155,15 +218,13 @@ static int ehci_bus_suspend (struct usb_
+ 	 */
+ 	ehci->bus_suspended = 0;
+ 	ehci->owned_ports = 0;
++	changed = 0;
+ 	port = HCS_N_PORTS(ehci->hcs_params);
+ 	while (port--) {
+ 		u32 __iomem	*reg = &ehci->regs->port_status [port];
+ 		u32		t1 = ehci_readl(ehci, reg) & ~PORT_RWC_BITS;
+-		u32		t2 = t1;
++		u32		t2 = t1 & ~PORT_WAKE_BITS;
+ 
+-		if (ehci->has_hostpc)
+-			hostpc_reg = (u32 __iomem *)((u8 *)ehci->regs
+-				+ HOSTPC0 + 4 * (port & 0xff));
+ 		/* keep track of which ports we suspend */
+ 		if (t1 & PORT_OWNER)
+ 			set_bit(port, &ehci->owned_ports);
+@@ -172,40 +233,45 @@ static int ehci_bus_suspend (struct usb_
+ 			set_bit(port, &ehci->bus_suspended);
+ 		}
+ 
+-		/* enable remote wakeup on all ports */
++		/* enable remote wakeup on all ports, if told to do so */
+ 		if (hcd->self.root_hub->do_remote_wakeup) {
+ 			/* only enable appropriate wake bits, otherwise the
+ 			 * hardware can not go phy low power mode. If a race
+ 			 * condition happens here(connection change during bits
+ 			 * set), the port change detection will finally fix it.
+ 			 */
+-			if (t1 & PORT_CONNECT) {
++			if (t1 & PORT_CONNECT)
+ 				t2 |= PORT_WKOC_E | PORT_WKDISC_E;
+-				t2 &= ~PORT_WKCONN_E;
+-			} else {
++			else
+ 				t2 |= PORT_WKOC_E | PORT_WKCONN_E;
+-				t2 &= ~PORT_WKDISC_E;
+-			}
+-		} else
+-			t2 &= ~PORT_WAKE_BITS;
++		}
+ 
+ 		if (t1 != t2) {
+ 			ehci_vdbg (ehci, "port %d, %08x -> %08x\n",
+ 				port + 1, t1, t2);
+ 			ehci_writel(ehci, t2, reg);
+-			if (hostpc_reg) {
+-				u32	t3;
++			changed = 1;
++		}
++	}
+ 
+-				spin_unlock_irq(&ehci->lock);
+-				msleep(5);/* 5ms for HCD enter low pwr mode */
+-				spin_lock_irq(&ehci->lock);
+-				t3 = ehci_readl(ehci, hostpc_reg);
+-				ehci_writel(ehci, t3 | HOSTPC_PHCD, hostpc_reg);
+-				t3 = ehci_readl(ehci, hostpc_reg);
+-				ehci_dbg(ehci, "Port%d phy low pwr mode %s\n",
++	if (changed && ehci->has_hostpc) {
++		spin_unlock_irq(&ehci->lock);
++		msleep(5);	/* 5 ms for HCD to enter low-power mode */
++		spin_lock_irq(&ehci->lock);
++
++		port = HCS_N_PORTS(ehci->hcs_params);
++		while (port--) {
++			u32 __iomem	*hostpc_reg;
++			u32		t3;
++
++			hostpc_reg = (u32 __iomem *)((u8 *) ehci->regs
++					+ HOSTPC0 + 4 * port);
++			t3 = ehci_readl(ehci, hostpc_reg);
++			ehci_writel(ehci, t3 | HOSTPC_PHCD, hostpc_reg);
++			t3 = ehci_readl(ehci, hostpc_reg);
++			ehci_dbg(ehci, "Port %d phy low-power mode %s\n",
+ 					port, (t3 & HOSTPC_PHCD) ?
+ 					"succeeded" : "failed");
+-			}
+ 		}
+ 	}
+ 
+@@ -291,19 +357,28 @@ static int ehci_bus_resume (struct usb_h
+ 	msleep(8);
+ 	spin_lock_irq(&ehci->lock);
+ 
++	/* clear phy low-power mode before resume */
++	if (ehci->bus_suspended && ehci->has_hostpc) {
++		i = HCS_N_PORTS(ehci->hcs_params);
++		while (i--) {
++			if (test_bit(i, &ehci->bus_suspended)) {
++				u32 __iomem	*hostpc_reg;
++
++				hostpc_reg = (u32 __iomem *)((u8 *) ehci->regs
++						+ HOSTPC0 + 4 * i);
++				temp = ehci_readl(ehci, hostpc_reg);
++				ehci_writel(ehci, temp & ~HOSTPC_PHCD,
++						hostpc_reg);
++			}
++		}
++		spin_unlock_irq(&ehci->lock);
++		msleep(5);
++		spin_lock_irq(&ehci->lock);
++	}
++
+ 	/* manually resume the ports we suspended during bus_suspend() */
+ 	i = HCS_N_PORTS (ehci->hcs_params);
+ 	while (i--) {
+-		/* clear phy low power mode before resume */
+-		if (ehci->has_hostpc) {
+-			u32 __iomem	*hostpc_reg =
+-				(u32 __iomem *)((u8 *)ehci->regs
+-				+ HOSTPC0 + 4 * (i & 0xff));
+-			temp = ehci_readl(ehci, hostpc_reg);
+-			ehci_writel(ehci, temp & ~HOSTPC_PHCD,
+-				hostpc_reg);
+-			mdelay(5);
+-		}
+ 		temp = ehci_readl(ehci, &ehci->regs->port_status [i]);
+ 		temp &= ~(PORT_RWC_BITS | PORT_WAKE_BITS);
+ 		if (test_bit(i, &ehci->bus_suspended) &&
+@@ -685,23 +760,25 @@ static int ehci_hub_control (
+ 				goto error;
+ 			if (ehci->no_selective_suspend)
+ 				break;
+-			if (temp & PORT_SUSPEND) {
+-				if ((temp & PORT_PE) == 0)
+-					goto error;
+-				/* clear phy low power mode before resume */
+-				if (hostpc_reg) {
+-					temp1 = ehci_readl(ehci, hostpc_reg);
+-					ehci_writel(ehci, temp1 & ~HOSTPC_PHCD,
++			if (!(temp & PORT_SUSPEND))
++				break;
++			if ((temp & PORT_PE) == 0)
++				goto error;
++
++			/* clear phy low-power mode before resume */
++			if (hostpc_reg) {
++				temp1 = ehci_readl(ehci, hostpc_reg);
++				ehci_writel(ehci, temp1 & ~HOSTPC_PHCD,
+ 						hostpc_reg);
+-					mdelay(5);
+-				}
+-				/* resume signaling for 20 msec */
+-				temp &= ~(PORT_RWC_BITS | PORT_WAKE_BITS);
+-				ehci_writel(ehci, temp | PORT_RESUME,
+-						status_reg);
+-				ehci->reset_done [wIndex] = jiffies
+-						+ msecs_to_jiffies (20);
++				spin_unlock_irqrestore(&ehci->lock, flags);
++				msleep(5);/* wait to leave low-power mode */
++				spin_lock_irqsave(&ehci->lock, flags);
+ 			}
++			/* resume signaling for 20 msec */
++			temp &= ~(PORT_RWC_BITS | PORT_WAKE_BITS);
++			ehci_writel(ehci, temp | PORT_RESUME, status_reg);
++			ehci->reset_done[wIndex] = jiffies
++					+ msecs_to_jiffies(20);
+ 			break;
+ 		case USB_PORT_FEAT_C_SUSPEND:
+ 			clear_bit(wIndex, &ehci->port_c_suspend);
+--- a/drivers/usb/host/ehci-pci.c
++++ b/drivers/usb/host/ehci-pci.c
+@@ -284,23 +284,15 @@ static int ehci_pci_suspend(struct usb_h
+ 		msleep(10);
+ 
+ 	/* Root hub was already suspended. Disable irq emission and
+-	 * mark HW unaccessible, bail out if RH has been resumed. Use
+-	 * the spinlock to properly synchronize with possible pending
+-	 * RH suspend or resume activity.
+-	 *
+-	 * This is still racy as hcd->state is manipulated outside of
+-	 * any locks =P But that will be a different fix.
++	 * mark HW unaccessible.  The PM and USB cores make sure that
++	 * the root hub is either suspended or stopped.
+ 	 */
+ 	spin_lock_irqsave (&ehci->lock, flags);
+-	if (hcd->state != HC_STATE_SUSPENDED) {
+-		rc = -EINVAL;
+-		goto bail;
+-	}
++	ehci_prepare_ports_for_controller_suspend(ehci);
+ 	ehci_writel(ehci, 0, &ehci->regs->intr_enable);
+ 	(void)ehci_readl(ehci, &ehci->regs->intr_enable);
+ 
+ 	clear_bit(HCD_FLAG_HW_ACCESSIBLE, &hcd->flags);
+- bail:
+ 	spin_unlock_irqrestore (&ehci->lock, flags);
+ 
+ 	// could save FLADJ in case of Vaux power loss
+@@ -330,6 +322,7 @@ static int ehci_pci_resume(struct usb_hc
+ 				!hibernated) {
+ 		int	mask = INTR_MASK;
+ 
++		ehci_prepare_ports_for_controller_resume(ehci);
+ 		if (!hcd->self.root_hub->do_remote_wakeup)
+ 			mask &= ~STS_PCD;
+ 		ehci_writel(ehci, mask, &ehci->regs->intr_enable);
+--- a/drivers/usb/host/ehci.h
++++ b/drivers/usb/host/ehci.h
+@@ -536,6 +536,16 @@ struct ehci_fstn {
+ 
+ /*-------------------------------------------------------------------------*/
+ 
++/* Prepare the PORTSC wakeup flags during controller suspend/resume */
++
++#define ehci_prepare_ports_for_controller_suspend(ehci)		\
++		ehci_adjust_port_wakeup_flags(ehci, true);
++
++#define ehci_prepare_ports_for_controller_resume(ehci)		\
++		ehci_adjust_port_wakeup_flags(ehci, false);
++
++/*-------------------------------------------------------------------------*/
++
+ #ifdef CONFIG_USB_EHCI_ROOT_HUB_TT
+ 
+ /*
