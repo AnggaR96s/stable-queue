@@ -1,0 +1,204 @@
+From b83733639a494d5f42fa00a2506563fbd2d3015d Mon Sep 17 00:00:00 2001
+From: Jeff Moyer <jmoyer@redhat.com>
+Date: Wed, 26 May 2010 14:44:25 -0700
+Subject: compat: factor out compat_rw_copy_check_uvector from compat_do_readv_writev
+
+From: Jeff Moyer <jmoyer@redhat.com>
+
+commit b83733639a494d5f42fa00a2506563fbd2d3015d upstream.
+
+It was reported in http://lkml.org/lkml/2010/3/8/309 that 32 bit readv and
+writev AIO operations were not functioning properly.  It turns out that
+the code to convert the 32bit io vectors to 64 bits was never written.
+The results of that can be pretty bad, but in my testing, it mostly ended
+up in generating EFAULT as we walked off the list of I/O vectors provided.
+
+This patch set fixes the problem in my environment.  are greatly
+appreciated.
+
+This patch:
+
+Factor out code that will be used by both compat_do_readv_writev and the
+compat aio submission code paths.
+
+Signed-off-by: Jeff Moyer <jmoyer@redhat.com>
+Reported-by: Michael Tokarev <mjt@tls.msk.ru>
+Cc: Zach Brown <zach.brown@oracle.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ fs/compat.c            |  130 +++++++++++++++++++++++++++++--------------------
+ include/linux/compat.h |    4 +
+ 2 files changed, 81 insertions(+), 53 deletions(-)
+
+--- a/fs/compat.c
++++ b/fs/compat.c
+@@ -568,6 +568,79 @@ out:
+ 	return ret;
+ }
+ 
++/* A write operation does a read from user space and vice versa */
++#define vrfy_dir(type) ((type) == READ ? VERIFY_WRITE : VERIFY_READ)
++
++ssize_t compat_rw_copy_check_uvector(int type,
++		const struct compat_iovec __user *uvector, unsigned long nr_segs,
++		unsigned long fast_segs, struct iovec *fast_pointer,
++		struct iovec **ret_pointer)
++{
++	compat_ssize_t tot_len;
++	struct iovec *iov = *ret_pointer = fast_pointer;
++	ssize_t ret = 0;
++	int seg;
++
++	/*
++	 * SuS says "The readv() function *may* fail if the iovcnt argument
++	 * was less than or equal to 0, or greater than {IOV_MAX}.  Linux has
++	 * traditionally returned zero for zero segments, so...
++	 */
++	if (nr_segs == 0)
++		goto out;
++
++	ret = -EINVAL;
++	if (nr_segs > UIO_MAXIOV || nr_segs < 0)
++		goto out;
++	if (nr_segs > fast_segs) {
++		ret = -ENOMEM;
++		iov = kmalloc(nr_segs*sizeof(struct iovec), GFP_KERNEL);
++		if (iov == NULL) {
++			*ret_pointer = fast_pointer;
++			goto out;
++		}
++	}
++	*ret_pointer = iov;
++
++	/*
++	 * Single unix specification:
++	 * We should -EINVAL if an element length is not >= 0 and fitting an
++	 * ssize_t.  The total length is fitting an ssize_t
++	 *
++	 * Be careful here because iov_len is a size_t not an ssize_t
++	 */
++	tot_len = 0;
++	ret = -EINVAL;
++	for (seg = 0; seg < nr_segs; seg++) {
++		compat_ssize_t tmp = tot_len;
++		compat_uptr_t buf;
++		compat_ssize_t len;
++
++		if (__get_user(len, &uvector->iov_len) ||
++		   __get_user(buf, &uvector->iov_base)) {
++			ret = -EFAULT;
++			goto out;
++		}
++		if (len < 0)	/* size_t not fitting in compat_ssize_t .. */
++			goto out;
++		tot_len += len;
++		if (tot_len < tmp) /* maths overflow on the compat_ssize_t */
++			goto out;
++		if (!access_ok(vrfy_dir(type), buf, len)) {
++			ret = -EFAULT;
++			goto out;
++		}
++		iov->iov_base = compat_ptr(buf);
++		iov->iov_len = (compat_size_t) len;
++		uvector++;
++		iov++;
++	}
++	ret = tot_len;
++
++out:
++	return ret;
++}
++
+ static inline long
+ copy_iocb(long nr, u32 __user *ptr32, struct iocb __user * __user *ptr64)
+ {
+@@ -1077,70 +1150,21 @@ static ssize_t compat_do_readv_writev(in
+ {
+ 	compat_ssize_t tot_len;
+ 	struct iovec iovstack[UIO_FASTIOV];
+-	struct iovec *iov=iovstack, *vector;
++	struct iovec *iov;
+ 	ssize_t ret;
+-	int seg;
+ 	io_fn_t fn;
+ 	iov_fn_t fnv;
+ 
+-	/*
+-	 * SuS says "The readv() function *may* fail if the iovcnt argument
+-	 * was less than or equal to 0, or greater than {IOV_MAX}.  Linux has
+-	 * traditionally returned zero for zero segments, so...
+-	 */
+-	ret = 0;
+-	if (nr_segs == 0)
+-		goto out;
+-
+-	/*
+-	 * First get the "struct iovec" from user memory and
+-	 * verify all the pointers
+-	 */
+ 	ret = -EINVAL;
+-	if ((nr_segs > UIO_MAXIOV) || (nr_segs <= 0))
+-		goto out;
+ 	if (!file->f_op)
+ 		goto out;
+-	if (nr_segs > UIO_FASTIOV) {
+-		ret = -ENOMEM;
+-		iov = kmalloc(nr_segs*sizeof(struct iovec), GFP_KERNEL);
+-		if (!iov)
+-			goto out;
+-	}
++
+ 	ret = -EFAULT;
+ 	if (!access_ok(VERIFY_READ, uvector, nr_segs*sizeof(*uvector)))
+ 		goto out;
+ 
+-	/*
+-	 * Single unix specification:
+-	 * We should -EINVAL if an element length is not >= 0 and fitting an
+-	 * ssize_t.  The total length is fitting an ssize_t
+-	 *
+-	 * Be careful here because iov_len is a size_t not an ssize_t
+-	 */
+-	tot_len = 0;
+-	vector = iov;
+-	ret = -EINVAL;
+-	for (seg = 0 ; seg < nr_segs; seg++) {
+-		compat_ssize_t tmp = tot_len;
+-		compat_ssize_t len;
+-		compat_uptr_t buf;
+-
+-		if (__get_user(len, &uvector->iov_len) ||
+-		    __get_user(buf, &uvector->iov_base)) {
+-			ret = -EFAULT;
+-			goto out;
+-		}
+-		if (len < 0)	/* size_t not fitting an compat_ssize_t .. */
+-			goto out;
+-		tot_len += len;
+-		if (tot_len < tmp) /* maths overflow on the compat_ssize_t */
+-			goto out;
+-		vector->iov_base = compat_ptr(buf);
+-		vector->iov_len = (compat_size_t) len;
+-		uvector++;
+-		vector++;
+-	}
++	tot_len = compat_rw_copy_check_uvector(type, uvector, nr_segs,
++					       UIO_FASTIOV, iovstack, &iov);
+ 	if (tot_len == 0) {
+ 		ret = 0;
+ 		goto out;
+--- a/include/linux/compat.h
++++ b/include/linux/compat.h
+@@ -356,5 +356,9 @@ asmlinkage long compat_sys_newfstatat(un
+ asmlinkage long compat_sys_openat(unsigned int dfd, const char __user *filename,
+ 				  int flags, int mode);
+ 
++extern ssize_t compat_rw_copy_check_uvector(int type,
++		const struct compat_iovec __user *uvector, unsigned long nr_segs,
++		unsigned long fast_segs, struct iovec *fast_pointer,
++		struct iovec **ret_pointer);
+ #endif /* CONFIG_COMPAT */
+ #endif /* _LINUX_COMPAT_H */
