@@ -1,0 +1,113 @@
+From e555190d82c0f58e825e3cbd9e6ebe2e7ac713bd Mon Sep 17 00:00:00 2001
+From: NeilBrown <neilb@suse.de>
+Date: Wed, 31 Mar 2010 11:21:44 +1100
+Subject: md/raid1: delay reads that could overtake behind-writes.
+
+From: NeilBrown <neilb@suse.de>
+
+commit e555190d82c0f58e825e3cbd9e6ebe2e7ac713bd upstream.
+
+When a raid1 array is configured to support write-behind
+on some devices, it normally only reads from other devices.
+If all devices are write-behind (because the rest have failed)
+it is possible for a read request to be serviced before a
+behind-write request, which would appear as data corruption.
+
+So when forced to read from a WriteMostly device, wait for any
+write-behind to complete, and don't start any more behind-writes.
+
+Signed-off-by: NeilBrown <neilb@suse.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+
+---
+ drivers/md/bitmap.c |    4 +++-
+ drivers/md/bitmap.h |    3 +++
+ drivers/md/raid1.c  |   25 ++++++++++++++++++-------
+ 3 files changed, 24 insertions(+), 8 deletions(-)
+
+--- a/drivers/md/bitmap.c
++++ b/drivers/md/bitmap.c
+@@ -1317,7 +1317,8 @@ void bitmap_endwrite(struct bitmap *bitm
+ {
+ 	if (!bitmap) return;
+ 	if (behind) {
+-		atomic_dec(&bitmap->behind_writes);
++		if (atomic_dec_and_test(&bitmap->behind_writes))
++			wake_up(&bitmap->behind_wait);
+ 		PRINTK(KERN_DEBUG "dec write-behind count %d/%d\n",
+ 		  atomic_read(&bitmap->behind_writes), bitmap->max_write_behind);
+ 	}
+@@ -1629,6 +1630,7 @@ int bitmap_create(mddev_t *mddev)
+ 	atomic_set(&bitmap->pending_writes, 0);
+ 	init_waitqueue_head(&bitmap->write_wait);
+ 	init_waitqueue_head(&bitmap->overflow_wait);
++	init_waitqueue_head(&bitmap->behind_wait);
+ 
+ 	bitmap->mddev = mddev;
+ 
+--- a/drivers/md/bitmap.h
++++ b/drivers/md/bitmap.h
+@@ -254,6 +254,9 @@ struct bitmap {
+ 	wait_queue_head_t write_wait;
+ 	wait_queue_head_t overflow_wait;
+ 
++#ifndef __GENKSYMS__
++	wait_queue_head_t behind_wait;
++#endif
+ };
+ 
+ /* the bitmap API */
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@ -845,6 +845,15 @@ static int make_request(struct request_q
+ 		}
+ 		mirror = conf->mirrors + rdisk;
+ 
++		if (test_bit(WriteMostly, &mirror->rdev->flags) &&
++		    bitmap) {
++			/* Reading from a write-mostly device must
++			 * take care not to over-take any writes
++			 * that are 'behind'
++			 */
++			wait_event(bitmap->behind_wait,
++				   atomic_read(&bitmap->behind_writes) == 0);
++		}
+ 		r1_bio->read_disk = rdisk;
+ 
+ 		read_bio = bio_clone(bio, GFP_NOIO);
+@@ -922,9 +931,13 @@ static int make_request(struct request_q
+ 		set_bit(R1BIO_Degraded, &r1_bio->state);
+ 	}
+ 
+-	/* do behind I/O ? */
++	/* do behind I/O ?
++	 * Not if there are too many, or cannot allocate memory,
++	 * or a reader on WriteMostly is waiting for behind writes
++	 * to flush */
+ 	if (bitmap &&
+ 	    atomic_read(&bitmap->behind_writes) < bitmap->max_write_behind &&
++	    !waitqueue_active(&bitmap->behind_wait) &&
+ 	    (behind_pages = alloc_behind_pages(bio)) != NULL)
+ 		set_bit(R1BIO_BehindIO, &r1_bio->state);
+ 
+@@ -2105,15 +2118,13 @@ static int stop(mddev_t *mddev)
+ {
+ 	conf_t *conf = mddev->private;
+ 	struct bitmap *bitmap = mddev->bitmap;
+-	int behind_wait = 0;
+ 
+ 	/* wait for behind writes to complete */
+-	while (bitmap && atomic_read(&bitmap->behind_writes) > 0) {
+-		behind_wait++;
+-		printk(KERN_INFO "raid1: behind writes in progress on device %s, waiting to stop (%d)\n", mdname(mddev), behind_wait);
+-		set_current_state(TASK_UNINTERRUPTIBLE);
+-		schedule_timeout(HZ); /* wait a second */
++	if (bitmap && atomic_read(&bitmap->behind_writes) > 0) {
++		printk(KERN_INFO "raid1: behind writes in progress on device %s, waiting to stop.\n", mdname(mddev));
+ 		/* need to kick something here to make sure I/O goes? */
++		wait_event(bitmap->behind_wait,
++			   atomic_read(&bitmap->behind_writes) == 0);
+ 	}
+ 
+ 	raise_barrier(conf);

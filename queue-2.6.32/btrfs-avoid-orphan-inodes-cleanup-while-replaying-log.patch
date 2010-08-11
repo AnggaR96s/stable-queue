@@ -1,0 +1,259 @@
+From c71bf099abddf3e0fdc27f251ba76fca1461d49a Mon Sep 17 00:00:00 2001
+From: Yan, Zheng <zheng.yan@oracle.com>
+Date: Thu, 12 Nov 2009 09:34:40 +0000
+Subject: Btrfs: Avoid orphan inodes cleanup while replaying log
+
+From: Yan, Zheng <zheng.yan@oracle.com>
+
+commit c71bf099abddf3e0fdc27f251ba76fca1461d49a upstream.
+
+We do log replay in a single transaction, so it's not good to do unbound
+operations. This patch cleans up orphan inodes cleanup after replaying
+the log. It also avoids doing other unbound operations such as truncating
+a file during replaying log. These unbound operations are postponed to
+the orphan inode cleanup stage.
+
+Signed-off-by: Yan Zheng <zheng.yan@oracle.com>
+Signed-off-by: Chris Mason <chris.mason@oracle.com>
+Acked-by: Jeff Mahoney <jeffm@suse.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ fs/btrfs/ctree.h      |    5 +++--
+ fs/btrfs/disk-io.c    |   17 +++++++++++------
+ fs/btrfs/inode.c      |   19 ++++++++++++++++---
+ fs/btrfs/relocation.c |    1 +
+ fs/btrfs/tree-log.c   |   49 ++++++++++++++++++++++++-------------------------
+ 5 files changed, 55 insertions(+), 36 deletions(-)
+
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@ -859,8 +859,9 @@ struct btrfs_fs_info {
+ 	struct mutex ordered_operations_mutex;
+ 	struct rw_semaphore extent_commit_sem;
+ 
+-	struct rw_semaphore subvol_sem;
++	struct rw_semaphore cleanup_work_sem;
+ 
++	struct rw_semaphore subvol_sem;
+ 	struct srcu_struct subvol_srcu;
+ 
+ 	struct list_head trans_list;
+@@ -1034,12 +1035,12 @@ struct btrfs_root {
+ 	int ref_cows;
+ 	int track_dirty;
+ 	int in_radix;
++	int clean_orphans;
+ 
+ 	u64 defrag_trans_start;
+ 	struct btrfs_key defrag_progress;
+ 	struct btrfs_key defrag_max;
+ 	int defrag_running;
+-	int defrag_level;
+ 	char *name;
+ 	int in_sysfs;
+ 
+--- a/fs/btrfs/disk-io.c
++++ b/fs/btrfs/disk-io.c
+@@ -892,6 +892,8 @@ static int __setup_root(u32 nodesize, u3
+ 	root->stripesize = stripesize;
+ 	root->ref_cows = 0;
+ 	root->track_dirty = 0;
++	root->in_radix = 0;
++	root->clean_orphans = 0;
+ 
+ 	root->fs_info = fs_info;
+ 	root->objectid = objectid;
+@@ -928,7 +930,6 @@ static int __setup_root(u32 nodesize, u3
+ 	root->defrag_trans_start = fs_info->generation;
+ 	init_completion(&root->kobj_unregister);
+ 	root->defrag_running = 0;
+-	root->defrag_level = 0;
+ 	root->root_key.objectid = objectid;
+ 	root->anon_super.s_root = NULL;
+ 	root->anon_super.s_dev = 0;
+@@ -1210,8 +1211,10 @@ again:
+ 	ret = radix_tree_insert(&fs_info->fs_roots_radix,
+ 				(unsigned long)root->root_key.objectid,
+ 				root);
+-	if (ret == 0)
++	if (ret == 0) {
+ 		root->in_radix = 1;
++		root->clean_orphans = 1;
++	}
+ 	spin_unlock(&fs_info->fs_roots_radix_lock);
+ 	radix_tree_preload_end();
+ 	if (ret) {
+@@ -1225,10 +1228,6 @@ again:
+ 	ret = btrfs_find_dead_roots(fs_info->tree_root,
+ 				    root->root_key.objectid);
+ 	WARN_ON(ret);
+-
+-	if (!(fs_info->sb->s_flags & MS_RDONLY))
+-		btrfs_orphan_cleanup(root);
+-
+ 	return root;
+ fail:
+ 	free_fs_root(root);
+@@ -1689,6 +1688,7 @@ struct btrfs_root *open_ctree(struct sup
+ 	mutex_init(&fs_info->cleaner_mutex);
+ 	mutex_init(&fs_info->volume_mutex);
+ 	init_rwsem(&fs_info->extent_commit_sem);
++	init_rwsem(&fs_info->cleanup_work_sem);
+ 	init_rwsem(&fs_info->subvol_sem);
+ 
+ 	btrfs_init_free_cluster(&fs_info->meta_alloc_cluster);
+@@ -2388,6 +2388,11 @@ int btrfs_commit_super(struct btrfs_root
+ 	mutex_lock(&root->fs_info->cleaner_mutex);
+ 	btrfs_clean_old_snapshots(root);
+ 	mutex_unlock(&root->fs_info->cleaner_mutex);
++
++	/* wait until ongoing cleanup work done */
++	down_write(&root->fs_info->cleanup_work_sem);
++	up_write(&root->fs_info->cleanup_work_sem);
++
+ 	trans = btrfs_start_transaction(root, 1);
+ 	ret = btrfs_commit_transaction(trans, root);
+ 	BUG_ON(ret);
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -2093,16 +2093,17 @@ void btrfs_orphan_cleanup(struct btrfs_r
+ 	struct inode *inode;
+ 	int ret = 0, nr_unlink = 0, nr_truncate = 0;
+ 
+-	path = btrfs_alloc_path();
+-	if (!path)
++	if (!xchg(&root->clean_orphans, 0))
+ 		return;
++
++	path = btrfs_alloc_path();
++	BUG_ON(!path);
+ 	path->reada = -1;
+ 
+ 	key.objectid = BTRFS_ORPHAN_OBJECTID;
+ 	btrfs_set_key_type(&key, BTRFS_ORPHAN_ITEM_KEY);
+ 	key.offset = (u64)-1;
+ 
+-
+ 	while (1) {
+ 		ret = btrfs_search_slot(NULL, root, &key, path, 0, 0);
+ 		if (ret < 0) {
+@@ -3298,6 +3299,11 @@ void btrfs_delete_inode(struct inode *in
+ 	}
+ 	btrfs_wait_ordered_range(inode, 0, (u64)-1);
+ 
++	if (root->fs_info->log_root_recovering) {
++		BUG_ON(!list_empty(&BTRFS_I(inode)->i_orphan));
++		goto no_delete;
++	}
++
+ 	if (inode->i_nlink > 0) {
+ 		BUG_ON(btrfs_root_refs(&root->root_item) != 0);
+ 		goto no_delete;
+@@ -3705,6 +3711,13 @@ struct inode *btrfs_lookup_dentry(struct
+ 	}
+ 	srcu_read_unlock(&root->fs_info->subvol_srcu, index);
+ 
++	if (root != sub_root) {
++		down_read(&root->fs_info->cleanup_work_sem);
++		if (!(inode->i_sb->s_flags & MS_RDONLY))
++			btrfs_orphan_cleanup(sub_root);
++		up_read(&root->fs_info->cleanup_work_sem);
++	}
++
+ 	return inode;
+ }
+ 
+--- a/fs/btrfs/relocation.c
++++ b/fs/btrfs/relocation.c
+@@ -3755,6 +3755,7 @@ out:
+ 				       BTRFS_DATA_RELOC_TREE_OBJECTID);
+ 		if (IS_ERR(fs_root))
+ 			err = PTR_ERR(fs_root);
++		btrfs_orphan_cleanup(fs_root);
+ 	}
+ 	return err;
+ }
+--- a/fs/btrfs/tree-log.c
++++ b/fs/btrfs/tree-log.c
+@@ -930,6 +930,17 @@ out_nowrite:
+ 	return 0;
+ }
+ 
++static int insert_orphan_item(struct btrfs_trans_handle *trans,
++			      struct btrfs_root *root, u64 offset)
++{
++	int ret;
++	ret = btrfs_find_orphan_item(root, offset);
++	if (ret > 0)
++		ret = btrfs_insert_orphan_item(trans, root, offset);
++	return ret;
++}
++
++
+ /*
+  * There are a few corners where the link count of the file can't
+  * be properly maintained during replay.  So, instead of adding
+@@ -997,9 +1008,13 @@ static noinline int fixup_inode_link_cou
+ 	}
+ 	BTRFS_I(inode)->index_cnt = (u64)-1;
+ 
+-	if (inode->i_nlink == 0 && S_ISDIR(inode->i_mode)) {
+-		ret = replay_dir_deletes(trans, root, NULL, path,
+-					 inode->i_ino, 1);
++	if (inode->i_nlink == 0) {
++		if (S_ISDIR(inode->i_mode)) {
++			ret = replay_dir_deletes(trans, root, NULL, path,
++						 inode->i_ino, 1);
++			BUG_ON(ret);
++		}
++		ret = insert_orphan_item(trans, root, inode->i_ino);
+ 		BUG_ON(ret);
+ 	}
+ 	btrfs_free_path(path);
+@@ -1587,7 +1602,6 @@ static int replay_one_buffer(struct btrf
+ 		/* inode keys are done during the first stage */
+ 		if (key.type == BTRFS_INODE_ITEM_KEY &&
+ 		    wc->stage == LOG_WALK_REPLAY_INODES) {
+-			struct inode *inode;
+ 			struct btrfs_inode_item *inode_item;
+ 			u32 mode;
+ 
+@@ -1603,31 +1617,16 @@ static int replay_one_buffer(struct btrf
+ 					     eb, i, &key);
+ 			BUG_ON(ret);
+ 
+-			/* for regular files, truncate away
+-			 * extents past the new EOF
++			/* for regular files, make sure corresponding
++			 * orhpan item exist. extents past the new EOF
++			 * will be truncated later by orphan cleanup.
+ 			 */
+ 			if (S_ISREG(mode)) {
+-				inode = read_one_inode(root,
+-						       key.objectid);
+-				BUG_ON(!inode);
+-
+-				ret = btrfs_truncate_inode_items(wc->trans,
+-					root, inode, inode->i_size,
+-					BTRFS_EXTENT_DATA_KEY);
++				ret = insert_orphan_item(wc->trans, root,
++							 key.objectid);
+ 				BUG_ON(ret);
+-
+-				/* if the nlink count is zero here, the iput
+-				 * will free the inode.  We bump it to make
+-				 * sure it doesn't get freed until the link
+-				 * count fixup is done
+-				 */
+-				if (inode->i_nlink == 0) {
+-					btrfs_inc_nlink(inode);
+-					btrfs_update_inode(wc->trans,
+-							   root, inode);
+-				}
+-				iput(inode);
+ 			}
++
+ 			ret = link_to_fixup_dir(wc->trans, root,
+ 						path, key.objectid);
+ 			BUG_ON(ret);
