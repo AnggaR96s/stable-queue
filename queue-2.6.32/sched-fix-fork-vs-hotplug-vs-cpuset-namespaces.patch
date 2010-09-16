@@ -1,0 +1,184 @@
+From a.p.zijlstra@chello.nl  Thu Sep 16 14:06:15 2010
+From: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Date: Thu, 21 Jan 2010 21:04:57 +0100
+Subject: sched: Fix fork vs hotplug vs cpuset namespaces
+To: stable <stable@kernel.org>
+Cc: Ingo Molnar <mingo@elte.hu>, Peter Zijlstra <a.p.zijlstra@chello.nl>, Greg KH <greg@kroah.com>
+Message-ID: <d69112210cf6fa5909dcd5d12105979f694c228c.1283514307.git.efault@gmx.de>
+
+From: Peter Zijlstra <a.p.zijlstra@chello.nl>
+
+commit fabf318e5e4bda0aca2b0d617b191884fda62703 upstream
+
+There are a number of issues:
+
+1) TASK_WAKING vs cgroup_clone (cpusets)
+
+copy_process():
+
+  sched_fork()
+    child->state = TASK_WAKING; /* waiting for wake_up_new_task() */
+  if (current->nsproxy != p->nsproxy)
+     ns_cgroup_clone()
+       cgroup_clone()
+         mutex_lock(inode->i_mutex)
+         mutex_lock(cgroup_mutex)
+         cgroup_attach_task()
+	   ss->can_attach()
+           ss->attach() [ -> cpuset_attach() ]
+             cpuset_attach_task()
+               set_cpus_allowed_ptr();
+                 while (child->state == TASK_WAKING)
+                   cpu_relax();
+will deadlock the system.
+
+2) cgroup_clone (cpusets) vs copy_process
+
+So even if the above would work we still have:
+
+copy_process():
+
+  if (current->nsproxy != p->nsproxy)
+     ns_cgroup_clone()
+       cgroup_clone()
+         mutex_lock(inode->i_mutex)
+         mutex_lock(cgroup_mutex)
+         cgroup_attach_task()
+	   ss->can_attach()
+           ss->attach() [ -> cpuset_attach() ]
+             cpuset_attach_task()
+               set_cpus_allowed_ptr();
+  ...
+
+  p->cpus_allowed = current->cpus_allowed
+
+over-writing the modified cpus_allowed.
+
+3) fork() vs hotplug
+
+  if we unplug the child's cpu after the sanity check when the child
+  gets attached to the task_list but before wake_up_new_task() shit
+  will meet with fan.
+
+Solve all these issues by moving fork cpu selection into
+wake_up_new_task().
+
+Reported-by: Serge E. Hallyn <serue@us.ibm.com>
+Tested-by: Serge E. Hallyn <serue@us.ibm.com>
+Signed-off-by: Peter Zijlstra <a.p.zijlstra@chello.nl>
+LKML-Reference: <1264106190.4283.1314.camel@laptop>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Mike Galbraith <efault@gmx.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+---
+ kernel/fork.c  |   15 ---------------
+ kernel/sched.c |   39 +++++++++++++++++++++++++++------------
+ 2 files changed, 27 insertions(+), 27 deletions(-)
+
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1233,21 +1233,6 @@ static struct task_struct *copy_process(
+ 	/* Need tasklist lock for parent etc handling! */
+ 	write_lock_irq(&tasklist_lock);
+ 
+-	/*
+-	 * The task hasn't been attached yet, so its cpus_allowed mask will
+-	 * not be changed, nor will its assigned CPU.
+-	 *
+-	 * The cpus_allowed mask of the parent may have changed after it was
+-	 * copied first time - so re-copy it here, then check the child's CPU
+-	 * to ensure it is on a valid CPU (and if not, just force it back to
+-	 * parent's CPU). This avoids alot of nasty races.
+-	 */
+-	p->cpus_allowed = current->cpus_allowed;
+-	p->rt.nr_cpus_allowed = current->rt.nr_cpus_allowed;
+-	if (unlikely(!cpu_isset(task_cpu(p), p->cpus_allowed) ||
+-			!cpu_online(task_cpu(p))))
+-		set_task_cpu(p, smp_processor_id());
+-
+ 	/* CLONE_PARENT re-uses the old parent */
+ 	if (clone_flags & (CLONE_PARENT|CLONE_THREAD)) {
+ 		p->real_parent = current->real_parent;
+--- a/kernel/sched.c
++++ b/kernel/sched.c
+@@ -2351,14 +2351,12 @@ static int select_fallback_rq(int cpu, s
+ }
+ 
+ /*
+- * Called from:
++ * Gets called from 3 sites (exec, fork, wakeup), since it is called without
++ * holding rq->lock we need to ensure ->cpus_allowed is stable, this is done
++ * by:
+  *
+- *  - fork, @p is stable because it isn't on the tasklist yet
+- *
+- *  - exec, @p is unstable, retry loop
+- *
+- *  - wake-up, we serialize ->cpus_allowed against TASK_WAKING so
+- *             we should be good.
++ *  exec:           is unstable, retry loop
++ *  fork & wake-up: serialize ->cpus_allowed against TASK_WAKING
+  */
+ static inline
+ int select_task_rq(struct task_struct *p, int sd_flags, int wake_flags)
+@@ -2652,9 +2650,6 @@ void sched_fork(struct task_struct *p, i
+ 	if (p->sched_class->task_fork)
+ 		p->sched_class->task_fork(p);
+ 
+-#ifdef CONFIG_SMP
+-	cpu = select_task_rq(p, SD_BALANCE_FORK, 0);
+-#endif
+ 	set_task_cpu(p, cpu);
+ 
+ #if defined(CONFIG_SCHEDSTATS) || defined(CONFIG_TASK_DELAY_ACCT)
+@@ -2684,6 +2679,21 @@ void wake_up_new_task(struct task_struct
+ {
+ 	unsigned long flags;
+ 	struct rq *rq;
++	int cpu = get_cpu();
++
++#ifdef CONFIG_SMP
++	/*
++	 * Fork balancing, do it here and not earlier because:
++	 *  - cpus_allowed can change in the fork path
++	 *  - any previously selected cpu might disappear through hotplug
++	 *
++	 * We still have TASK_WAKING but PF_STARTING is gone now, meaning
++	 * ->cpus_allowed is stable, we have preemption disabled, meaning
++	 * cpu_online_mask is stable.
++	 */
++	cpu = select_task_rq(p, SD_BALANCE_FORK, 0);
++	set_task_cpu(p, cpu);
++#endif
+ 
+ 	rq = task_rq_lock(p, &flags);
+ 	BUG_ON(p->state != TASK_WAKING);
+@@ -2697,6 +2707,7 @@ void wake_up_new_task(struct task_struct
+ 		p->sched_class->task_woken(rq, p);
+ #endif
+ 	task_rq_unlock(rq, &flags);
++	put_cpu();
+ }
+ 
+ #ifdef CONFIG_PREEMPT_NOTIFIERS
+@@ -7198,14 +7209,18 @@ int set_cpus_allowed_ptr(struct task_str
+ 	 * the ->cpus_allowed mask from under waking tasks, which would be
+ 	 * possible when we change rq->lock in ttwu(), so synchronize against
+ 	 * TASK_WAKING to avoid that.
++	 *
++	 * Make an exception for freshly cloned tasks, since cpuset namespaces
++	 * might move the task about, we have to validate the target in
++	 * wake_up_new_task() anyway since the cpu might have gone away.
+ 	 */
+ again:
+-	while (p->state == TASK_WAKING)
++	while (p->state == TASK_WAKING && !(p->flags & PF_STARTING))
+ 		cpu_relax();
+ 
+ 	rq = task_rq_lock(p, &flags);
+ 
+-	if (p->state == TASK_WAKING) {
++	if (p->state == TASK_WAKING && !(p->flags & PF_STARTING)) {
+ 		task_rq_unlock(rq, &flags);
+ 		goto again;
+ 	}
