@@ -1,0 +1,265 @@
+From da6699ce4a889c3795624ccdcfe7181cc89f18e8 Mon Sep 17 00:00:00 2001
+From: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Date: Tue, 26 Oct 2010 16:47:13 -0700
+Subject: xhci: Setup array of USB 2.0 and USB 3.0 ports.
+
+From: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+
+commit da6699ce4a889c3795624ccdcfe7181cc89f18e8 upstream.
+
+An xHCI host controller contains USB 2.0 and USB 3.0 ports, which can
+occur in any order in the PORTSC registers.  We cannot read the port speed
+bits in the PORTSC registers at init time to determine the port speed,
+since those bits are only valid when a USB device is plugged into the
+port.
+
+Instead, we read the "Supported Protocol Capability" registers in the xHC
+Extended Capabilities space.  Those describe the protocol, port offset in
+the PORTSC registers, and port count.  We use those registers to create
+two arrays of pointers to the PORTSC registers, one for USB 3.0 ports, and
+another for USB 2.0 ports.  A third array keeps track of the port protocol
+major revision, and is indexed with the internal xHCI port number.
+
+This commit is a bit big, but it should be queued for stable because the "Don't
+let the USB core disable SuperSpeed ports" patch depends on it.  There is no
+other way to determine which ports are SuperSpeed ports without this patch.
+
+Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Tested-by: Don Zickus <dzickus@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/xhci-mem.c |  164 ++++++++++++++++++++++++++++++++++++++++++++
+ drivers/usb/host/xhci.h     |   27 +++++++
+ 2 files changed, 191 insertions(+)
+
+--- a/drivers/usb/host/xhci-mem.c
++++ b/drivers/usb/host/xhci-mem.c
+@@ -1441,6 +1441,13 @@ void xhci_mem_cleanup(struct xhci_hcd *x
+ 	xhci->dcbaa = NULL;
+ 
+ 	scratchpad_free(xhci);
++
++	xhci->num_usb2_ports = 0;
++	xhci->num_usb3_ports = 0;
++	kfree(xhci->usb2_ports);
++	kfree(xhci->usb3_ports);
++	kfree(xhci->port_array);
++
+ 	xhci->page_size = 0;
+ 	xhci->page_shift = 0;
+ }
+@@ -1624,6 +1631,161 @@ static void xhci_set_hc_event_deq(struct
+ 			&xhci->ir_set->erst_dequeue);
+ }
+ 
++static void xhci_add_in_port(struct xhci_hcd *xhci, unsigned int num_ports,
++		u32 __iomem *addr, u8 major_revision)
++{
++	u32 temp, port_offset, port_count;
++	int i;
++
++	if (major_revision > 0x03) {
++		xhci_warn(xhci, "Ignoring unknown port speed, "
++				"Ext Cap %p, revision = 0x%x\n",
++				addr, major_revision);
++		/* Ignoring port protocol we can't understand. FIXME */
++		return;
++	}
++
++	/* Port offset and count in the third dword, see section 7.2 */
++	temp = xhci_readl(xhci, addr + 2);
++	port_offset = XHCI_EXT_PORT_OFF(temp);
++	port_count = XHCI_EXT_PORT_COUNT(temp);
++	xhci_dbg(xhci, "Ext Cap %p, port offset = %u, "
++			"count = %u, revision = 0x%x\n",
++			addr, port_offset, port_count, major_revision);
++	/* Port count includes the current port offset */
++	if (port_offset == 0 || (port_offset + port_count - 1) > num_ports)
++		/* WTF? "Valid values are ‘1’ to MaxPorts" */
++		return;
++	port_offset--;
++	for (i = port_offset; i < (port_offset + port_count); i++) {
++		/* Duplicate entry.  Ignore the port if the revisions differ. */
++		if (xhci->port_array[i] != 0) {
++			xhci_warn(xhci, "Duplicate port entry, Ext Cap %p,"
++					" port %u\n", addr, i);
++			xhci_warn(xhci, "Port was marked as USB %u, "
++					"duplicated as USB %u\n",
++					xhci->port_array[i], major_revision);
++			/* Only adjust the roothub port counts if we haven't
++			 * found a similar duplicate.
++			 */
++			if (xhci->port_array[i] != major_revision &&
++				xhci->port_array[i] != (u8) -1) {
++				if (xhci->port_array[i] == 0x03)
++					xhci->num_usb3_ports--;
++				else
++					xhci->num_usb2_ports--;
++				xhci->port_array[i] = (u8) -1;
++			}
++			/* FIXME: Should we disable the port? */
++		}
++		xhci->port_array[i] = major_revision;
++		if (major_revision == 0x03)
++			xhci->num_usb3_ports++;
++		else
++			xhci->num_usb2_ports++;
++	}
++	/* FIXME: Should we disable ports not in the Extended Capabilities? */
++}
++
++/*
++ * Scan the Extended Capabilities for the "Supported Protocol Capabilities" that
++ * specify what speeds each port is supposed to be.  We can't count on the port
++ * speed bits in the PORTSC register being correct until a device is connected,
++ * but we need to set up the two fake roothubs with the correct number of USB
++ * 3.0 and USB 2.0 ports at host controller initialization time.
++ */
++static int xhci_setup_port_arrays(struct xhci_hcd *xhci, gfp_t flags)
++{
++	u32 __iomem *addr;
++	u32 offset;
++	unsigned int num_ports;
++	int i, port_index;
++
++	addr = &xhci->cap_regs->hcc_params;
++	offset = XHCI_HCC_EXT_CAPS(xhci_readl(xhci, addr));
++	if (offset == 0) {
++		xhci_err(xhci, "No Extended Capability registers, "
++				"unable to set up roothub.\n");
++		return -ENODEV;
++	}
++
++	num_ports = HCS_MAX_PORTS(xhci->hcs_params1);
++	xhci->port_array = kzalloc(sizeof(*xhci->port_array)*num_ports, flags);
++	if (!xhci->port_array)
++		return -ENOMEM;
++
++	/*
++	 * For whatever reason, the first capability offset is from the
++	 * capability register base, not from the HCCPARAMS register.
++	 * See section 5.3.6 for offset calculation.
++	 */
++	addr = &xhci->cap_regs->hc_capbase + offset;
++	while (1) {
++		u32 cap_id;
++
++		cap_id = xhci_readl(xhci, addr);
++		if (XHCI_EXT_CAPS_ID(cap_id) == XHCI_EXT_CAPS_PROTOCOL)
++			xhci_add_in_port(xhci, num_ports, addr,
++					(u8) XHCI_EXT_PORT_MAJOR(cap_id));
++		offset = XHCI_EXT_CAPS_NEXT(cap_id);
++		if (!offset || (xhci->num_usb2_ports + xhci->num_usb3_ports)
++				== num_ports)
++			break;
++		/*
++		 * Once you're into the Extended Capabilities, the offset is
++		 * always relative to the register holding the offset.
++		 */
++		addr += offset;
++	}
++
++	if (xhci->num_usb2_ports == 0 && xhci->num_usb3_ports == 0) {
++		xhci_warn(xhci, "No ports on the roothubs?\n");
++		return -ENODEV;
++	}
++	xhci_dbg(xhci, "Found %u USB 2.0 ports and %u USB 3.0 ports.\n",
++			xhci->num_usb2_ports, xhci->num_usb3_ports);
++	/*
++	 * Note we could have all USB 3.0 ports, or all USB 2.0 ports.
++	 * Not sure how the USB core will handle a hub with no ports...
++	 */
++	if (xhci->num_usb2_ports) {
++		xhci->usb2_ports = kmalloc(sizeof(*xhci->usb2_ports)*
++				xhci->num_usb2_ports, flags);
++		if (!xhci->usb2_ports)
++			return -ENOMEM;
++
++		port_index = 0;
++		for (i = 0; i < num_ports; i++)
++			if (xhci->port_array[i] != 0x03) {
++				xhci->usb2_ports[port_index] =
++					&xhci->op_regs->port_status_base +
++					NUM_PORT_REGS*i;
++				xhci_dbg(xhci, "USB 2.0 port at index %u, "
++						"addr = %p\n", i,
++						xhci->usb2_ports[port_index]);
++				port_index++;
++			}
++	}
++	if (xhci->num_usb3_ports) {
++		xhci->usb3_ports = kmalloc(sizeof(*xhci->usb3_ports)*
++				xhci->num_usb3_ports, flags);
++		if (!xhci->usb3_ports)
++			return -ENOMEM;
++
++		port_index = 0;
++		for (i = 0; i < num_ports; i++)
++			if (xhci->port_array[i] == 0x03) {
++				xhci->usb3_ports[port_index] =
++					&xhci->op_regs->port_status_base +
++					NUM_PORT_REGS*i;
++				xhci_dbg(xhci, "USB 3.0 port at index %u, "
++						"addr = %p\n", i,
++						xhci->usb3_ports[port_index]);
++				port_index++;
++			}
++	}
++	return 0;
++}
+ 
+ int xhci_mem_init(struct xhci_hcd *xhci, gfp_t flags)
+ {
+@@ -1804,6 +1966,8 @@ int xhci_mem_init(struct xhci_hcd *xhci,
+ 
+ 	if (scratchpad_alloc(xhci, flags))
+ 		goto fail;
++	if (xhci_setup_port_arrays(xhci, flags))
++		goto fail;
+ 
+ 	return 0;
+ 
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@ -448,6 +448,24 @@ struct xhci_doorbell_array {
+ 
+ 
+ /**
++ * struct xhci_protocol_caps
++ * @revision:		major revision, minor revision, capability ID,
++ *			and next capability pointer.
++ * @name_string:	Four ASCII characters to say which spec this xHC
++ *			follows, typically "USB ".
++ * @port_info:		Port offset, count, and protocol-defined information.
++ */
++struct xhci_protocol_caps {
++	u32	revision;
++	u32	name_string;
++	u32	port_info;
++};
++
++#define	XHCI_EXT_PORT_MAJOR(x)	(((x) >> 24) & 0xff)
++#define	XHCI_EXT_PORT_OFF(x)	((x) & 0xff)
++#define	XHCI_EXT_PORT_COUNT(x)	(((x) >> 8) & 0xff)
++
++/**
+  * struct xhci_container_ctx
+  * @type: Type of context.  Used to calculated offsets to contained contexts.
+  * @size: Size of the context data
+@@ -1204,6 +1222,15 @@ struct xhci_hcd {
+ #define	XHCI_LINK_TRB_QUIRK	(1 << 0)
+ #define XHCI_RESET_EP_QUIRK	(1 << 1)
+ #define XHCI_NEC_HOST		(1 << 2)
++
++	/* Is each xHCI roothub port a USB 3.0, USB 2.0, or USB 1.1 port? */
++	u8			*port_array;
++	/* Array of pointers to USB 3.0 PORTSC registers */
++	u32 __iomem		**usb3_ports;
++	unsigned int		num_usb3_ports;
++	/* Array of pointers to USB 2.0 PORTSC registers */
++	u32 __iomem		**usb2_ports;
++	unsigned int		num_usb2_ports;
+ };
+ 
+ /* For testing purposes */
