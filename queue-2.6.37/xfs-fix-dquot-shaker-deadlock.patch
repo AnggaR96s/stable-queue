@@ -1,0 +1,143 @@
+From 0fbca4d1c3932c27c4794bf5c2b5fc961cf5a54f Mon Sep 17 00:00:00 2001
+From: Dave Chinner <dchinner@redhat.com>
+Date: Fri, 28 Jan 2011 11:20:46 +1100
+Subject: xfs: fix dquot shaker deadlock
+
+From: Dave Chinner <dchinner@redhat.com>
+
+commit 0fbca4d1c3932c27c4794bf5c2b5fc961cf5a54f upstream.
+
+Commit 368e136 ("xfs: remove duplicate code from dquot reclaim") fails
+to unlock the dquot freelist when the number of loop restarts is
+exceeded in xfs_qm_dqreclaim_one(). This causes hangs in memory
+reclaim.
+
+Rework the loop control logic into an unwind stack that all the
+different cases jump into. This means there is only one set of code
+that processes the loop exit criteria, and simplifies the unlocking
+of all the items from different points in the loop. It also fixes a
+double increment of the restart counter from the qi_dqlist_lock
+case.
+
+Reported-by: Malcolm Scott <lkml@malc.org.uk>
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Alex Elder <aelder@sgi.com>
+Cc: Arkadiusz Miskiewicz <a.miskiewicz@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ fs/xfs/quota/xfs_qm.c |   46 +++++++++++++++++++++-------------------------
+ 1 file changed, 21 insertions(+), 25 deletions(-)
+
+--- a/fs/xfs/quota/xfs_qm.c
++++ b/fs/xfs/quota/xfs_qm.c
+@@ -1863,12 +1863,14 @@ xfs_qm_dqreclaim_one(void)
+ 	xfs_dquot_t	*dqpout;
+ 	xfs_dquot_t	*dqp;
+ 	int		restarts;
++	int		startagain;
+ 
+ 	restarts = 0;
+ 	dqpout = NULL;
+ 
+ 	/* lockorder: hashchainlock, freelistlock, mplistlock, dqlock, dqflock */
+-startagain:
++again:
++	startagain = 0;
+ 	mutex_lock(&xfs_Gqm->qm_dqfrlist_lock);
+ 
+ 	list_for_each_entry(dqp, &xfs_Gqm->qm_dqfrlist, q_freelist) {
+@@ -1885,13 +1887,10 @@ startagain:
+ 			ASSERT(! (dqp->dq_flags & XFS_DQ_INACTIVE));
+ 
+ 			trace_xfs_dqreclaim_want(dqp);
+-
+-			xfs_dqunlock(dqp);
+-			mutex_unlock(&xfs_Gqm->qm_dqfrlist_lock);
+-			if (++restarts >= XFS_QM_RECLAIM_MAX_RESTARTS)
+-				return NULL;
+ 			XQM_STATS_INC(xqmstats.xs_qm_dqwants);
+-			goto startagain;
++			restarts++;
++			startagain = 1;
++			goto dqunlock;
+ 		}
+ 
+ 		/*
+@@ -1906,23 +1905,20 @@ startagain:
+ 			ASSERT(list_empty(&dqp->q_mplist));
+ 			list_del_init(&dqp->q_freelist);
+ 			xfs_Gqm->qm_dqfrlist_cnt--;
+-			xfs_dqunlock(dqp);
+ 			dqpout = dqp;
+ 			XQM_STATS_INC(xqmstats.xs_qm_dqinact_reclaims);
+-			break;
++			goto dqunlock;
+ 		}
+ 
+ 		ASSERT(dqp->q_hash);
+ 		ASSERT(!list_empty(&dqp->q_mplist));
+ 
+ 		/*
+-		 * Try to grab the flush lock. If this dquot is in the process of
+-		 * getting flushed to disk, we don't want to reclaim it.
++		 * Try to grab the flush lock. If this dquot is in the process
++		 * of getting flushed to disk, we don't want to reclaim it.
+ 		 */
+-		if (!xfs_dqflock_nowait(dqp)) {
+-			xfs_dqunlock(dqp);
+-			continue;
+-		}
++		if (!xfs_dqflock_nowait(dqp))
++			goto dqunlock;
+ 
+ 		/*
+ 		 * We have the flush lock so we know that this is not in the
+@@ -1944,8 +1940,7 @@ startagain:
+ 				xfs_fs_cmn_err(CE_WARN, mp,
+ 			"xfs_qm_dqreclaim: dquot %p flush failed", dqp);
+ 			}
+-			xfs_dqunlock(dqp); /* dqflush unlocks dqflock */
+-			continue;
++			goto dqunlock;
+ 		}
+ 
+ 		/*
+@@ -1967,13 +1962,8 @@ startagain:
+ 		 */
+ 		if (!mutex_trylock(&mp->m_quotainfo->qi_dqlist_lock)) {
+ 			restarts++;
+-			mutex_unlock(&dqp->q_hash->qh_lock);
+-			xfs_dqfunlock(dqp);
+-			xfs_dqunlock(dqp);
+-			mutex_unlock(&xfs_Gqm->qm_dqfrlist_lock);
+-			if (restarts++ >= XFS_QM_RECLAIM_MAX_RESTARTS)
+-				return NULL;
+-			goto startagain;
++			startagain = 1;
++			goto qhunlock;
+ 		}
+ 
+ 		ASSERT(dqp->q_nrefs == 0);
+@@ -1986,14 +1976,20 @@ startagain:
+ 		xfs_Gqm->qm_dqfrlist_cnt--;
+ 		dqpout = dqp;
+ 		mutex_unlock(&mp->m_quotainfo->qi_dqlist_lock);
++qhunlock:
+ 		mutex_unlock(&dqp->q_hash->qh_lock);
+ dqfunlock:
+ 		xfs_dqfunlock(dqp);
++dqunlock:
+ 		xfs_dqunlock(dqp);
+ 		if (dqpout)
+ 			break;
+ 		if (restarts >= XFS_QM_RECLAIM_MAX_RESTARTS)
+-			return NULL;
++			break;
++		if (startagain) {
++			mutex_unlock(&xfs_Gqm->qm_dqfrlist_lock);
++			goto again;
++		}
+ 	}
+ 	mutex_unlock(&xfs_Gqm->qm_dqfrlist_lock);
+ 	return dqpout;
