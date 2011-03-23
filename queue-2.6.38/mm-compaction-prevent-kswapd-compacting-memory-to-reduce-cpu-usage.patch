@@ -1,0 +1,189 @@
+From d527caf22e48480b102c7c6ee5b9ba12170148f7 Mon Sep 17 00:00:00 2001
+From: Andrea Arcangeli <aarcange@redhat.com>
+Date: Tue, 22 Mar 2011 16:30:38 -0700
+Subject: mm: compaction: prevent kswapd compacting memory to reduce CPU usage
+
+From: Andrea Arcangeli <aarcange@redhat.com>
+
+commit d527caf22e48480b102c7c6ee5b9ba12170148f7 upstream.
+
+This patch reverts 5a03b051 ("thp: use compaction in kswapd for GFP_ATOMIC
+order > 0") due to reports stating that kswapd CPU usage was higher and
+IRQs were being disabled more frequently.  This was reported at
+http://www.spinics.net/linux/fedora/alsa-user/msg09885.html.
+
+Without this patch applied, CPU usage by kswapd hovers around the 20% mark
+according to the tester (Arthur Marsh:
+http://www.spinics.net/linux/fedora/alsa-user/msg09899.html).  With this
+patch applied, it's around 2%.
+
+The problem is not related to THP which specifies __GFP_NO_KSWAPD but is
+triggered by high-order allocations hitting the low watermark for their
+order and waking kswapd on kernels with CONFIG_COMPACTION set.  The most
+common trigger for this is network cards configured for jumbo frames but
+it's also possible it'll be triggered by fork-heavy workloads (order-1)
+and some wireless cards which depend on order-1 allocations.
+
+The symptoms for the user will be high CPU usage by kswapd in low-memory
+situations which could be confused with another writeback problem.  While
+a patch like 5a03b051 may be reintroduced in the future, this patch plays
+it safe for now and reverts it.
+
+[mel@csn.ul.ie: Beefed up the changelog]
+Signed-off-by: Andrea Arcangeli <aarcange@redhat.com>
+Signed-off-by: Mel Gorman <mel@csn.ul.ie>
+Reported-by: Arthur Marsh <arthur.marsh@internode.on.net>
+Tested-by: Arthur Marsh <arthur.marsh@internode.on.net>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ include/linux/compaction.h |    9 ++-------
+ mm/compaction.c            |   24 +++---------------------
+ mm/vmscan.c                |   18 +-----------------
+ 3 files changed, 6 insertions(+), 45 deletions(-)
+
+--- a/include/linux/compaction.h
++++ b/include/linux/compaction.h
+@@ -11,9 +11,6 @@
+ /* The full zone was compacted */
+ #define COMPACT_COMPLETE	3
+ 
+-#define COMPACT_MODE_DIRECT_RECLAIM	0
+-#define COMPACT_MODE_KSWAPD		1
+-
+ #ifdef CONFIG_COMPACTION
+ extern int sysctl_compact_memory;
+ extern int sysctl_compaction_handler(struct ctl_table *table, int write,
+@@ -28,8 +25,7 @@ extern unsigned long try_to_compact_page
+ 			bool sync);
+ extern unsigned long compaction_suitable(struct zone *zone, int order);
+ extern unsigned long compact_zone_order(struct zone *zone, int order,
+-					gfp_t gfp_mask, bool sync,
+-					int compact_mode);
++					gfp_t gfp_mask, bool sync);
+ 
+ /* Do not skip compaction more than 64 times */
+ #define COMPACT_MAX_DEFER_SHIFT 6
+@@ -74,8 +70,7 @@ static inline unsigned long compaction_s
+ }
+ 
+ static inline unsigned long compact_zone_order(struct zone *zone, int order,
+-					       gfp_t gfp_mask, bool sync,
+-					       int compact_mode)
++					       gfp_t gfp_mask, bool sync)
+ {
+ 	return COMPACT_CONTINUE;
+ }
+--- a/mm/compaction.c
++++ b/mm/compaction.c
+@@ -42,8 +42,6 @@ struct compact_control {
+ 	unsigned int order;		/* order a direct compactor needs */
+ 	int migratetype;		/* MOVABLE, RECLAIMABLE etc */
+ 	struct zone *zone;
+-
+-	int compact_mode;
+ };
+ 
+ static unsigned long release_freepages(struct list_head *freelist)
+@@ -397,10 +395,7 @@ static int compact_finished(struct zone
+ 		return COMPACT_COMPLETE;
+ 
+ 	/* Compaction run is not finished if the watermark is not met */
+-	if (cc->compact_mode != COMPACT_MODE_KSWAPD)
+-		watermark = low_wmark_pages(zone);
+-	else
+-		watermark = high_wmark_pages(zone);
++	watermark = low_wmark_pages(zone);
+ 	watermark += (1 << cc->order);
+ 
+ 	if (!zone_watermark_ok(zone, cc->order, watermark, 0, 0))
+@@ -413,15 +408,6 @@ static int compact_finished(struct zone
+ 	if (cc->order == -1)
+ 		return COMPACT_CONTINUE;
+ 
+-	/*
+-	 * Generating only one page of the right order is not enough
+-	 * for kswapd, we must continue until we're above the high
+-	 * watermark as a pool for high order GFP_ATOMIC allocations
+-	 * too.
+-	 */
+-	if (cc->compact_mode == COMPACT_MODE_KSWAPD)
+-		return COMPACT_CONTINUE;
+-
+ 	/* Direct compactor: Is a suitable page free? */
+ 	for (order = cc->order; order < MAX_ORDER; order++) {
+ 		/* Job done if page is free of the right migratetype */
+@@ -543,8 +529,7 @@ static int compact_zone(struct zone *zon
+ 
+ unsigned long compact_zone_order(struct zone *zone,
+ 				 int order, gfp_t gfp_mask,
+-				 bool sync,
+-				 int compact_mode)
++				 bool sync)
+ {
+ 	struct compact_control cc = {
+ 		.nr_freepages = 0,
+@@ -553,7 +538,6 @@ unsigned long compact_zone_order(struct
+ 		.migratetype = allocflags_to_migratetype(gfp_mask),
+ 		.zone = zone,
+ 		.sync = sync,
+-		.compact_mode = compact_mode,
+ 	};
+ 	INIT_LIST_HEAD(&cc.freepages);
+ 	INIT_LIST_HEAD(&cc.migratepages);
+@@ -599,8 +583,7 @@ unsigned long try_to_compact_pages(struc
+ 								nodemask) {
+ 		int status;
+ 
+-		status = compact_zone_order(zone, order, gfp_mask, sync,
+-					    COMPACT_MODE_DIRECT_RECLAIM);
++		status = compact_zone_order(zone, order, gfp_mask, sync);
+ 		rc = max(status, rc);
+ 
+ 		/* If a normal allocation would succeed, stop compacting */
+@@ -631,7 +614,6 @@ static int compact_node(int nid)
+ 			.nr_freepages = 0,
+ 			.nr_migratepages = 0,
+ 			.order = -1,
+-			.compact_mode = COMPACT_MODE_DIRECT_RECLAIM,
+ 		};
+ 
+ 		zone = &pgdat->node_zones[zoneid];
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -2397,7 +2397,6 @@ loop_again:
+ 		 * cause too much scanning of the lower zones.
+ 		 */
+ 		for (i = 0; i <= end_zone; i++) {
+-			int compaction;
+ 			struct zone *zone = pgdat->node_zones + i;
+ 			int nr_slab;
+ 
+@@ -2428,24 +2427,9 @@ loop_again:
+ 			sc.nr_reclaimed += reclaim_state->reclaimed_slab;
+ 			total_scanned += sc.nr_scanned;
+ 
+-			compaction = 0;
+-			if (order &&
+-			    zone_watermark_ok(zone, 0,
+-					       high_wmark_pages(zone),
+-					      end_zone, 0) &&
+-			    !zone_watermark_ok(zone, order,
+-					       high_wmark_pages(zone),
+-					       end_zone, 0)) {
+-				compact_zone_order(zone,
+-						   order,
+-						   sc.gfp_mask, false,
+-						   COMPACT_MODE_KSWAPD);
+-				compaction = 1;
+-			}
+-
+ 			if (zone->all_unreclaimable)
+ 				continue;
+-			if (!compaction && nr_slab == 0 &&
++			if (nr_slab == 0 &&
+ 			    !zone_reclaimable(zone))
+ 				zone->all_unreclaimable = 1;
+ 			/*
