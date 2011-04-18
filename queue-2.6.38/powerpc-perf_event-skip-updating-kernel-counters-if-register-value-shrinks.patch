@@ -1,0 +1,108 @@
+From 86c74ab317c1ef4d37325e0d7ca8a01a796b0bd7 Mon Sep 17 00:00:00 2001
+From: Eric B Munson <emunson@mgebm.net>
+Date: Fri, 15 Apr 2011 08:12:30 +0000
+Subject: powerpc/perf_event: Skip updating kernel counters if register value shrinks
+
+From: Eric B Munson <emunson@mgebm.net>
+
+commit 86c74ab317c1ef4d37325e0d7ca8a01a796b0bd7 upstream.
+
+Because of speculative event roll back, it is possible for some event coutners
+to decrease between reads on POWER7.  This causes a problem with the way that
+counters are updated.  Delta calues are calculated in a 64 bit value and the
+top 32 bits are masked.  If the register value has decreased, this leaves us
+with a very large positive value added to the kernel counters.  This patch
+protects against this by skipping the update if the delta would be negative.
+This can lead to a lack of precision in the coutner values, but from my testing
+the value is typcially fewer than 10 samples at a time.
+
+Signed-off-by: Eric B Munson <emunson@mgebm.net>
+Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ arch/powerpc/kernel/perf_event.c |   37 ++++++++++++++++++++++++++++++-------
+ 1 file changed, 30 insertions(+), 7 deletions(-)
+
+--- a/arch/powerpc/kernel/perf_event.c
++++ b/arch/powerpc/kernel/perf_event.c
+@@ -398,6 +398,25 @@ static int check_excludes(struct perf_ev
+ 	return 0;
+ }
+ 
++static u64 check_and_compute_delta(u64 prev, u64 val)
++{
++	u64 delta = (val - prev) & 0xfffffffful;
++
++	/*
++	 * POWER7 can roll back counter values, if the new value is smaller
++	 * than the previous value it will cause the delta and the counter to
++	 * have bogus values unless we rolled a counter over.  If a coutner is
++	 * rolled back, it will be smaller, but within 256, which is the maximum
++	 * number of events to rollback at once.  If we dectect a rollback
++	 * return 0.  This can lead to a small lack of precision in the
++	 * counters.
++	 */
++	if (prev > val && (prev - val) < 256)
++		delta = 0;
++
++	return delta;
++}
++
+ static void power_pmu_read(struct perf_event *event)
+ {
+ 	s64 val, delta, prev;
+@@ -416,10 +435,11 @@ static void power_pmu_read(struct perf_e
+ 		prev = local64_read(&event->hw.prev_count);
+ 		barrier();
+ 		val = read_pmc(event->hw.idx);
++		delta = check_and_compute_delta(prev, val);
++		if (!delta)
++			return;
+ 	} while (local64_cmpxchg(&event->hw.prev_count, prev, val) != prev);
+ 
+-	/* The counters are only 32 bits wide */
+-	delta = (val - prev) & 0xfffffffful;
+ 	local64_add(delta, &event->count);
+ 	local64_sub(delta, &event->hw.period_left);
+ }
+@@ -449,8 +469,9 @@ static void freeze_limited_counters(stru
+ 		val = (event->hw.idx == 5) ? pmc5 : pmc6;
+ 		prev = local64_read(&event->hw.prev_count);
+ 		event->hw.idx = 0;
+-		delta = (val - prev) & 0xfffffffful;
+-		local64_add(delta, &event->count);
++		delta = check_and_compute_delta(prev, val);
++		if (delta)
++			local64_add(delta, &event->count);
+ 	}
+ }
+ 
+@@ -458,14 +479,16 @@ static void thaw_limited_counters(struct
+ 				  unsigned long pmc5, unsigned long pmc6)
+ {
+ 	struct perf_event *event;
+-	u64 val;
++	u64 val, prev;
+ 	int i;
+ 
+ 	for (i = 0; i < cpuhw->n_limited; ++i) {
+ 		event = cpuhw->limited_counter[i];
+ 		event->hw.idx = cpuhw->limited_hwidx[i];
+ 		val = (event->hw.idx == 5) ? pmc5 : pmc6;
+-		local64_set(&event->hw.prev_count, val);
++		prev = local64_read(&event->hw.prev_count);
++		if (check_and_compute_delta(prev, val))
++			local64_set(&event->hw.prev_count, val);
+ 		perf_event_update_userpage(event);
+ 	}
+ }
+@@ -1197,7 +1220,7 @@ static void record_and_restart(struct pe
+ 
+ 	/* we don't have to worry about interrupts here */
+ 	prev = local64_read(&event->hw.prev_count);
+-	delta = (val - prev) & 0xfffffffful;
++	delta = check_and_compute_delta(prev, val);
+ 	local64_add(delta, &event->count);
+ 
+ 	/*
