@@ -1,0 +1,110 @@
+From 2e053a27d9d5ad5e0831e002cbf8043836fb2060 Mon Sep 17 00:00:00 2001
+From: B.J. Buchalter <bj@mhlabs.com>
+Date: Mon, 2 May 2011 13:33:42 -0400
+Subject: firewire: Fix for broken configrom updates in quick succession
+
+From: B.J. Buchalter <bj@mhlabs.com>
+
+commit 2e053a27d9d5ad5e0831e002cbf8043836fb2060 upstream.
+
+Current implementation of ohci_set_config_rom() uses a deferred
+bus reset via fw_schedule_bus_reset(). If clients add multiple
+unit descriptors to the config_rom in quick succession, the
+deferred bus reset may not have fired before succeeding update
+requests have come in. This can lead to an incorrect partial
+update of the config_rom for both addition and removal of
+config_rom descriptors, as the ohci_set_config_rom() routine
+will return -EBUSY if a previous pending update has not been
+completed yet; the requested update just gets dropped on the floor.
+
+This patch recognizes that the "in-flight" update can be modified
+until it has been processed by the bus-reset, and the locking
+in the bus_reset_tasklet ensures that the update is done atomically
+with respect to modifications made by ohci_set_config_rom(). The
+-EBUSY error case is simply removed.
+
+[Stefan R:  The bug always existed at least theoretically.  But it
+became easy to trigger since 2.6.36 commit 02d37bed188c "firewire: core:
+integrate software-forced bus resets with bus management" which
+introduced long mandatory delays between janitorial bus resets.]
+
+Signed-off-by: Benjamin Buchalter <bj@mhlabs.com>
+Signed-off-by: Stefan Richter <stefanr@s5r6.in-berlin.de> (trivial style changes)
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/firewire/ohci.c |   39 +++++++++++++++++++++++++--------------
+ 1 file changed, 25 insertions(+), 14 deletions(-)
+
+--- a/drivers/firewire/ohci.c
++++ b/drivers/firewire/ohci.c
+@@ -2163,7 +2163,6 @@ static int ohci_set_config_rom(struct fw
+ {
+ 	struct fw_ohci *ohci;
+ 	unsigned long flags;
+-	int ret = -EBUSY;
+ 	__be32 *next_config_rom;
+ 	dma_addr_t uninitialized_var(next_config_rom_bus);
+ 
+@@ -2204,22 +2203,37 @@ static int ohci_set_config_rom(struct fw
+ 
+ 	spin_lock_irqsave(&ohci->lock, flags);
+ 
++	/*
++	 * If there is not an already pending config_rom update,
++	 * push our new allocation into the ohci->next_config_rom
++	 * and then mark the local variable as null so that we
++	 * won't deallocate the new buffer.
++	 *
++	 * OTOH, if there is a pending config_rom update, just
++	 * use that buffer with the new config_rom data, and
++	 * let this routine free the unused DMA allocation.
++	 */
++
+ 	if (ohci->next_config_rom == NULL) {
+ 		ohci->next_config_rom = next_config_rom;
+ 		ohci->next_config_rom_bus = next_config_rom_bus;
++		next_config_rom = NULL;
++	}
+ 
+-		copy_config_rom(ohci->next_config_rom, config_rom, length);
++	copy_config_rom(ohci->next_config_rom, config_rom, length);
+ 
+-		ohci->next_header = config_rom[0];
+-		ohci->next_config_rom[0] = 0;
++	ohci->next_header = config_rom[0];
++	ohci->next_config_rom[0] = 0;
+ 
+-		reg_write(ohci, OHCI1394_ConfigROMmap,
+-			  ohci->next_config_rom_bus);
+-		ret = 0;
+-	}
++	reg_write(ohci, OHCI1394_ConfigROMmap, ohci->next_config_rom_bus);
+ 
+ 	spin_unlock_irqrestore(&ohci->lock, flags);
+ 
++	/* If we didn't use the DMA allocation, delete it. */
++	if (next_config_rom != NULL)
++		dma_free_coherent(ohci->card.device, CONFIG_ROM_SIZE,
++				  next_config_rom, next_config_rom_bus);
++
+ 	/*
+ 	 * Now initiate a bus reset to have the changes take
+ 	 * effect. We clean up the old config rom memory and DMA
+@@ -2227,13 +2241,10 @@ static int ohci_set_config_rom(struct fw
+ 	 * controller could need to access it before the bus reset
+ 	 * takes effect.
+ 	 */
+-	if (ret == 0)
+-		fw_schedule_bus_reset(&ohci->card, true, true);
+-	else
+-		dma_free_coherent(ohci->card.device, CONFIG_ROM_SIZE,
+-				  next_config_rom, next_config_rom_bus);
+ 
+-	return ret;
++	fw_schedule_bus_reset(&ohci->card, true, true);
++
++	return 0;
+ }
+ 
+ static void ohci_send_request(struct fw_card *card, struct fw_packet *packet)
