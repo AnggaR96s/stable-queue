@@ -1,0 +1,86 @@
+From 59a16ead572330deb38e5848151d30ed1af754bc Mon Sep 17 00:00:00 2001
+From: Hugh Dickins <hughd@google.com>
+Date: Wed, 11 May 2011 15:13:38 -0700
+Subject: tmpfs: fix spurious ENOSPC when racing with unswap
+
+From: Hugh Dickins <hughd@google.com>
+
+commit 59a16ead572330deb38e5848151d30ed1af754bc upstream.
+
+Testing the shmem_swaplist replacements for igrab() revealed another bug:
+writes to /dev/loop0 on a tmpfs file which fills its filesystem were
+sometimes failing with "Buffer I/O error"s.
+
+These came from ENOSPC failures of shmem_getpage(), when racing with
+swapoff: the same could happen when racing with another shmem_getpage(),
+pulling the page in from swap in between our find_lock_page() and our
+taking the info->lock (though not in the single-threaded loop case).
+
+This is unacceptable, and surprising that I've not noticed it before:
+it dates back many years, but (presumably) was made a lot easier to
+reproduce in 2.6.36, which sited a page preallocation in the race window.
+
+Fix it by rechecking the page cache before settling on an ENOSPC error.
+
+Signed-off-by: Hugh Dickins <hughd@google.com>
+Cc: Konstantin Khlebnikov <khlebnikov@openvz.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ mm/shmem.c |   32 ++++++++++++++++++++++----------
+ 1 file changed, 22 insertions(+), 10 deletions(-)
+
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@ -1407,20 +1407,14 @@ repeat:
+ 		if (sbinfo->max_blocks) {
+ 			if (percpu_counter_compare(&sbinfo->used_blocks,
+ 						sbinfo->max_blocks) >= 0 ||
+-			    shmem_acct_block(info->flags)) {
+-				spin_unlock(&info->lock);
+-				error = -ENOSPC;
+-				goto failed;
+-			}
++			    shmem_acct_block(info->flags))
++				goto nospace;
+ 			percpu_counter_inc(&sbinfo->used_blocks);
+ 			spin_lock(&inode->i_lock);
+ 			inode->i_blocks += BLOCKS_PER_PAGE;
+ 			spin_unlock(&inode->i_lock);
+-		} else if (shmem_acct_block(info->flags)) {
+-			spin_unlock(&info->lock);
+-			error = -ENOSPC;
+-			goto failed;
+-		}
++		} else if (shmem_acct_block(info->flags))
++			goto nospace;
+ 
+ 		if (!filepage) {
+ 			int ret;
+@@ -1500,6 +1494,24 @@ done:
+ 	error = 0;
+ 	goto out;
+ 
++nospace:
++	/*
++	 * Perhaps the page was brought in from swap between find_lock_page
++	 * and taking info->lock?  We allow for that at add_to_page_cache_lru,
++	 * but must also avoid reporting a spurious ENOSPC while working on a
++	 * full tmpfs.  (When filepage has been passed in to shmem_getpage, it
++	 * is already in page cache, which prevents this race from occurring.)
++	 */
++	if (!filepage) {
++		struct page *page = find_get_page(mapping, idx);
++		if (page) {
++			spin_unlock(&info->lock);
++			page_cache_release(page);
++			goto repeat;
++		}
++	}
++	spin_unlock(&info->lock);
++	error = -ENOSPC;
+ failed:
+ 	if (*pagep != filepage) {
+ 		unlock_page(filepage);
