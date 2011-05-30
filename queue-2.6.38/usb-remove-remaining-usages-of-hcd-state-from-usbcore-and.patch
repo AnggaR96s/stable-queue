@@ -1,0 +1,192 @@
+From 69fff59de4d844f8b4c2454c3c23d32b69dcbfd7 Mon Sep 17 00:00:00 2001
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Tue, 17 May 2011 17:27:12 -0400
+Subject: USB: remove remaining usages of hcd->state from usbcore and
+ fix regression
+
+From: Alan Stern <stern@rowland.harvard.edu>
+
+commit 69fff59de4d844f8b4c2454c3c23d32b69dcbfd7 upstream.
+
+This patch (as1467) removes the last usages of hcd->state from
+usbcore.  We no longer check to see if an interrupt handler finds that
+a controller has died; instead we rely on host controller drivers to
+make an explicit call to usb_hc_died().
+
+This fixes a regression introduced by commit
+9b37596a2e860404503a3f2a6513db60c296bfdc (USB: move usbcore away from
+hcd->state).  It used to be that when a controller shared an IRQ with
+another device and an interrupt arrived while hcd->state was set to
+HC_STATE_HALT, the interrupt handler would be skipped.  The commit
+removed that test; as a result the current code doesn't skip calling
+the handler and ends up believing the controller has died, even though
+it's only temporarily stopped.  The solution is to ignore HC_STATE_HALT
+following the handler's return.
+
+As a consequence of this change, several of the host controller
+drivers need to be modified.  They can no longer implicitly rely on
+usbcore realizing that a controller has died because of hcd->state.
+The patch adds calls to usb_hc_died() in the appropriate places.
+
+The patch also changes a few of the interrupt handlers.  They don't
+expect to be called when hcd->state is equal to HC_STATE_HALT, even if
+the controller is still alive.  Early returns were added to avoid any
+confusion.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Tested-by: Manuel Lauss <manuel.lauss@googlemail.com>
+CC: Rodolfo Giometti <giometti@linux.it>
+CC: Olav Kongas <ok@artecdesign.ee>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/hcd.c          |    5 +----
+ drivers/usb/host/ehci-hcd.c     |    4 +++-
+ drivers/usb/host/ehci-sched.c   |    8 ++++++--
+ drivers/usb/host/isp116x-hcd.c  |    1 +
+ drivers/usb/host/ohci-hcd.c     |    4 +++-
+ drivers/usb/host/oxu210hp-hcd.c |    6 +++++-
+ 6 files changed, 19 insertions(+), 9 deletions(-)
+
+--- a/drivers/usb/core/hcd.c
++++ b/drivers/usb/core/hcd.c
+@@ -983,7 +983,7 @@ static int register_root_hub(struct usb_
+ 		spin_unlock_irq (&hcd_root_hub_lock);
+ 
+ 		/* Did the HC die before the root hub was registered? */
+-		if (HCD_DEAD(hcd) || hcd->state == HC_STATE_HALT)
++		if (HCD_DEAD(hcd))
+ 			usb_hc_died (hcd);	/* This time clean up */
+ 	}
+ 
+@@ -2103,9 +2103,6 @@ irqreturn_t usb_hcd_irq (int irq, void *
+ 		rc = IRQ_NONE;
+ 	} else {
+ 		set_bit(HCD_FLAG_SAW_IRQ, &hcd->flags);
+-
+-		if (unlikely(hcd->state == HC_STATE_HALT))
+-			usb_hc_died(hcd);
+ 		rc = IRQ_HANDLED;
+ 	}
+ 
+--- a/drivers/usb/host/ehci-hcd.c
++++ b/drivers/usb/host/ehci-hcd.c
+@@ -776,8 +776,9 @@ static irqreturn_t ehci_irq (struct usb_
+ 		goto dead;
+ 	}
+ 
++	/* Shared IRQ? */
+ 	masked_status = status & INTR_MASK;
+-	if (!masked_status) {		/* irq sharing? */
++	if (!masked_status || unlikely(hcd->state == HC_STATE_HALT)) {
+ 		spin_unlock(&ehci->lock);
+ 		return IRQ_NONE;
+ 	}
+@@ -872,6 +873,7 @@ static irqreturn_t ehci_irq (struct usb_
+ dead:
+ 		ehci_reset(ehci);
+ 		ehci_writel(ehci, 0, &ehci->regs->configured_flag);
++		usb_hc_died(hcd);
+ 		/* generic layer kills/unlinks all urbs, then
+ 		 * uses ehci_stop to clean up the rest
+ 		 */
+--- a/drivers/usb/host/ehci-sched.c
++++ b/drivers/usb/host/ehci-sched.c
+@@ -471,8 +471,10 @@ static int enable_periodic (struct ehci_
+ 	 */
+ 	status = handshake_on_error_set_halt(ehci, &ehci->regs->status,
+ 					     STS_PSS, 0, 9 * 125);
+-	if (status)
++	if (status) {
++		usb_hc_died(ehci_to_hcd(ehci));
+ 		return status;
++	}
+ 
+ 	cmd = ehci_readl(ehci, &ehci->regs->command) | CMD_PSE;
+ 	ehci_writel(ehci, cmd, &ehci->regs->command);
+@@ -510,8 +512,10 @@ static int disable_periodic (struct ehci
+ 	 */
+ 	status = handshake_on_error_set_halt(ehci, &ehci->regs->status,
+ 					     STS_PSS, STS_PSS, 9 * 125);
+-	if (status)
++	if (status) {
++		usb_hc_died(ehci_to_hcd(ehci));
+ 		return status;
++	}
+ 
+ 	cmd = ehci_readl(ehci, &ehci->regs->command) & ~CMD_PSE;
+ 	ehci_writel(ehci, cmd, &ehci->regs->command);
+--- a/drivers/usb/host/isp116x-hcd.c
++++ b/drivers/usb/host/isp116x-hcd.c
+@@ -612,6 +612,7 @@ static irqreturn_t isp116x_irq(struct us
+ 			/* IRQ's are off, we do no DMA,
+ 			   perfectly ready to die ... */
+ 			hcd->state = HC_STATE_HALT;
++			usb_hc_died(hcd);
+ 			ret = IRQ_HANDLED;
+ 			goto done;
+ 		}
+--- a/drivers/usb/host/ohci-hcd.c
++++ b/drivers/usb/host/ohci-hcd.c
+@@ -773,6 +773,7 @@ static irqreturn_t ohci_irq (struct usb_
+ 	if (ints == ~(u32)0) {
+ 		disable (ohci);
+ 		ohci_dbg (ohci, "device removed!\n");
++		usb_hc_died(hcd);
+ 		return IRQ_HANDLED;
+ 	}
+ 
+@@ -780,7 +781,7 @@ static irqreturn_t ohci_irq (struct usb_
+ 	ints &= ohci_readl(ohci, &regs->intrenable);
+ 
+ 	/* interrupt for some other device? */
+-	if (ints == 0)
++	if (ints == 0 || unlikely(hcd->state == HC_STATE_HALT))
+ 		return IRQ_NOTMINE;
+ 
+ 	if (ints & OHCI_INTR_UE) {
+@@ -797,6 +798,7 @@ static irqreturn_t ohci_irq (struct usb_
+ 		} else {
+ 			disable (ohci);
+ 			ohci_err (ohci, "OHCI Unrecoverable Error, disabled\n");
++			usb_hc_died(hcd);
+ 		}
+ 
+ 		ohci_dump (ohci, 1);
+--- a/drivers/usb/host/oxu210hp-hcd.c
++++ b/drivers/usb/host/oxu210hp-hcd.c
+@@ -1884,6 +1884,7 @@ static int enable_periodic(struct oxu_hc
+ 	status = handshake(oxu, &oxu->regs->status, STS_PSS, 0, 9 * 125);
+ 	if (status != 0) {
+ 		oxu_to_hcd(oxu)->state = HC_STATE_HALT;
++		usb_hc_died(oxu_to_hcd(oxu));
+ 		return status;
+ 	}
+ 
+@@ -1909,6 +1910,7 @@ static int disable_periodic(struct oxu_h
+ 	status = handshake(oxu, &oxu->regs->status, STS_PSS, STS_PSS, 9 * 125);
+ 	if (status != 0) {
+ 		oxu_to_hcd(oxu)->state = HC_STATE_HALT;
++		usb_hc_died(oxu_to_hcd(oxu));
+ 		return status;
+ 	}
+ 
+@@ -2449,8 +2451,9 @@ static irqreturn_t oxu210_hcd_irq(struct
+ 		goto dead;
+ 	}
+ 
++	/* Shared IRQ? */
+ 	status &= INTR_MASK;
+-	if (!status) {			/* irq sharing? */
++	if (!status || unlikely(hcd->state == HC_STATE_HALT)) {
+ 		spin_unlock(&oxu->lock);
+ 		return IRQ_NONE;
+ 	}
+@@ -2516,6 +2519,7 @@ static irqreturn_t oxu210_hcd_irq(struct
+ dead:
+ 			ehci_reset(oxu);
+ 			writel(0, &oxu->regs->configured_flag);
++			usb_hc_died(hcd);
+ 			/* generic layer kills/unlinks all urbs, then
+ 			 * uses oxu_stop to clean up the rest
+ 			 */
