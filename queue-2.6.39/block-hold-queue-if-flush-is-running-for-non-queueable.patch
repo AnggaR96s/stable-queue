@@ -1,0 +1,111 @@
+From 3ac0cc4508709d42ec9aa351086c7d38bfc0660c Mon Sep 17 00:00:00 2001
+From: "shaohua.li@intel.com" <shaohua.li@intel.com>
+Date: Fri, 6 May 2011 11:34:41 -0600
+Subject: block: hold queue if flush is running for non-queueable
+ flush drive
+
+From: "shaohua.li@intel.com" <shaohua.li@intel.com>
+
+commit 3ac0cc4508709d42ec9aa351086c7d38bfc0660c upstream.
+
+In some drives, flush requests are non-queueable. When flush request is
+running, normal read/write requests can't run. If block layer dispatches
+such request, driver can't handle it and requeue it.  Tejun suggested we
+can hold the queue when flush is running. This can avoid unnecessary
+requeue.  Also this can improve performance. For example, we have
+request flush1, write1, flush 2. flush1 is dispatched, then queue is
+hold, write1 isn't inserted to queue. After flush1 is finished, flush2
+will be dispatched. Since disk cache is already clean, flush2 will be
+finished very soon, so looks like flush2 is folded to flush1.
+
+In my test, the queue holding completely solves a regression introduced by
+commit 53d63e6b0dfb95882ec0219ba6bbd50cde423794:
+
+    block: make the flush insertion use the tail of the dispatch list
+
+    It's not a preempt type request, in fact we have to insert it
+    behind requests that do specify INSERT_FRONT.
+
+which causes about 20% regression running a sysbench fileio
+workload.
+
+Stable: 2.6.39 only
+
+Signed-off-by: Shaohua Li <shaohua.li@intel.com>
+Acked-by: Tejun Heo <tj@kernel.org>
+Signed-off-by: Jens Axboe <jaxboe@fusionio.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ block/blk-flush.c      |   16 +++++++++++-----
+ block/blk.h            |   21 ++++++++++++++++++++-
+ include/linux/blkdev.h |    1 +
+ 3 files changed, 32 insertions(+), 6 deletions(-)
+
+--- a/block/blk-flush.c
++++ b/block/blk-flush.c
+@@ -212,13 +212,19 @@ static void flush_end_io(struct request
+ 	}
+ 
+ 	/*
+-	 * Moving a request silently to empty queue_head may stall the
+-	 * queue.  Kick the queue in those cases.  This function is called
+-	 * from request completion path and calling directly into
+-	 * request_fn may confuse the driver.  Always use kblockd.
++	 * Kick the queue to avoid stall for two cases:
++	 * 1. Moving a request silently to empty queue_head may stall the
++	 * queue.
++	 * 2. When flush request is running in non-queueable queue, the
++	 * queue is hold. Restart the queue after flush request is finished
++	 * to avoid stall.
++	 * This function is called from request completion path and calling
++	 * directly into request_fn may confuse the driver.  Always use
++	 * kblockd.
+ 	 */
+-	if (queued)
++	if (queued || q->flush_queue_delayed)
+ 		blk_run_queue_async(q);
++	q->flush_queue_delayed = 0;
+ }
+ 
+ /**
+--- a/block/blk.h
++++ b/block/blk.h
+@@ -61,7 +61,26 @@ static inline struct request *__elv_next
+ 			rq = list_entry_rq(q->queue_head.next);
+ 			return rq;
+ 		}
+-
++		/*
++		 * Flush request is running and flush request isn't queueable
++		 * in the drive, we can hold the queue till flush request is
++		 * finished. Even we don't do this, driver can't dispatch next
++		 * requests and will requeue them. And this can improve
++		 * throughput too. For example, we have request flush1, write1,
++		 * flush 2. flush1 is dispatched, then queue is hold, write1
++		 * isn't inserted to queue. After flush1 is finished, flush2
++		 * will be dispatched. Since disk cache is already clean,
++		 * flush2 will be finished very soon, so looks like flush2 is
++		 * folded to flush1.
++		 * Since the queue is hold, a flag is set to indicate the queue
++		 * should be restarted later. Please see flush_end_io() for
++		 * details.
++		 */
++		if (q->flush_pending_idx != q->flush_running_idx &&
++				!queue_flush_queueable(q)) {
++			q->flush_queue_delayed = 1;
++			return NULL;
++		}
+ 		if (!q->elevator->ops->elevator_dispatch_fn(q, 0))
+ 			return NULL;
+ 	}
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -365,6 +365,7 @@ struct request_queue
+ 	 */
+ 	unsigned int		flush_flags;
+ 	unsigned int		flush_not_queueable:1;
++	unsigned int		flush_queue_delayed:1;
+ 	unsigned int		flush_pending_idx:1;
+ 	unsigned int		flush_running_idx:1;
+ 	unsigned long		flush_pending_since;
