@@ -1,0 +1,189 @@
+From 51e65257142a87fe46a1ce5c35c86c5baf012614 Mon Sep 17 00:00:00 2001
+From: Stanislaw Gruszka <sgruszka@redhat.com>
+Date: Wed, 8 Jun 2011 15:26:31 +0200
+Subject: iwlegacy: fix channel switch locking
+
+From: Stanislaw Gruszka <sgruszka@redhat.com>
+
+commit 51e65257142a87fe46a1ce5c35c86c5baf012614 upstream.
+
+We use priv->mutex to avoid race conditions between chswitch_done()
+and mac_channel_switch(), when marking channel switch in
+progress. But chswitch_done() can be called in atomic context
+from rx_csa() or with mutex already taken from commit_rxon().
+
+To fix remove mutex from chswitch_done() and use atomic bitops
+for marking channel switch pending.
+
+Signed-off-by: Stanislaw Gruszka <sgruszka@redhat.com>
+Signed-off-by: John W. Linville <linville@tuxdriver.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/net/wireless/iwlegacy/iwl-4965.c     |    9 ++------
+ drivers/net/wireless/iwlegacy/iwl-core.c     |   30 +++++++++++----------------
+ drivers/net/wireless/iwlegacy/iwl-core.h     |    2 -
+ drivers/net/wireless/iwlegacy/iwl-dev.h      |   13 -----------
+ drivers/net/wireless/iwlegacy/iwl4965-base.c |   19 +++++++++--------
+ 5 files changed, 28 insertions(+), 45 deletions(-)
+
+--- a/drivers/net/wireless/iwlegacy/iwl-4965.c
++++ b/drivers/net/wireless/iwlegacy/iwl-4965.c
+@@ -1218,10 +1218,10 @@ static int iwl4965_commit_rxon(struct iw
+ 	 * receive commit_rxon request
+ 	 * abort any previous channel switch if still in process
+ 	 */
+-	if (priv->switch_rxon.switch_in_progress &&
+-	    (priv->switch_rxon.channel != ctx->staging.channel)) {
++	if (test_bit(STATUS_CHANNEL_SWITCH_PENDING, &priv->status) &&
++	    (priv->switch_channel != ctx->staging.channel)) {
+ 		IWL_DEBUG_11H(priv, "abort channel switch on %d\n",
+-		      le16_to_cpu(priv->switch_rxon.channel));
++		      le16_to_cpu(priv->switch_channel));
+ 		iwl_legacy_chswitch_done(priv, false);
+ 	}
+ 
+@@ -1404,9 +1404,6 @@ static int iwl4965_hw_channel_switch(str
+ 		return rc;
+ 	}
+ 
+-	priv->switch_rxon.channel = cmd.channel;
+-	priv->switch_rxon.switch_in_progress = true;
+-
+ 	return iwl_legacy_send_cmd_pdu(priv,
+ 			 REPLY_CHANNEL_SWITCH, sizeof(cmd), &cmd);
+ }
+--- a/drivers/net/wireless/iwlegacy/iwl-core.c
++++ b/drivers/net/wireless/iwlegacy/iwl-core.c
+@@ -862,12 +862,8 @@ void iwl_legacy_chswitch_done(struct iwl
+ 	if (test_bit(STATUS_EXIT_PENDING, &priv->status))
+ 		return;
+ 
+-	if (priv->switch_rxon.switch_in_progress) {
++	if (test_and_clear_bit(STATUS_CHANNEL_SWITCH_PENDING, &priv->status))
+ 		ieee80211_chswitch_done(ctx->vif, is_success);
+-		mutex_lock(&priv->mutex);
+-		priv->switch_rxon.switch_in_progress = false;
+-		mutex_unlock(&priv->mutex);
+-	}
+ }
+ EXPORT_SYMBOL(iwl_legacy_chswitch_done);
+ 
+@@ -879,19 +875,19 @@ void iwl_legacy_rx_csa(struct iwl_priv *
+ 	struct iwl_rxon_context *ctx = &priv->contexts[IWL_RXON_CTX_BSS];
+ 	struct iwl_legacy_rxon_cmd *rxon = (void *)&ctx->active;
+ 
+-	if (priv->switch_rxon.switch_in_progress) {
+-		if (!le32_to_cpu(csa->status) &&
+-		    (csa->channel == priv->switch_rxon.channel)) {
+-			rxon->channel = csa->channel;
+-			ctx->staging.channel = csa->channel;
+-			IWL_DEBUG_11H(priv, "CSA notif: channel %d\n",
+-			      le16_to_cpu(csa->channel));
+-			iwl_legacy_chswitch_done(priv, true);
+-		} else {
+-			IWL_ERR(priv, "CSA notif (fail) : channel %d\n",
++	if (!test_bit(STATUS_CHANNEL_SWITCH_PENDING, &priv->status))
++		return;
++
++	if (!le32_to_cpu(csa->status) && csa->channel == priv->switch_channel) {
++		rxon->channel = csa->channel;
++		ctx->staging.channel = csa->channel;
++		IWL_DEBUG_11H(priv, "CSA notif: channel %d\n",
+ 			      le16_to_cpu(csa->channel));
+-			iwl_legacy_chswitch_done(priv, false);
+-		}
++		iwl_legacy_chswitch_done(priv, true);
++	} else {
++		IWL_ERR(priv, "CSA notif (fail) : channel %d\n",
++			le16_to_cpu(csa->channel));
++		iwl_legacy_chswitch_done(priv, false);
+ 	}
+ }
+ EXPORT_SYMBOL(iwl_legacy_rx_csa);
+--- a/drivers/net/wireless/iwlegacy/iwl-core.h
++++ b/drivers/net/wireless/iwlegacy/iwl-core.h
+@@ -561,7 +561,7 @@ void iwl_legacy_free_geos(struct iwl_pri
+ #define STATUS_SCAN_HW		15
+ #define STATUS_POWER_PMI	16
+ #define STATUS_FW_ERROR		17
+-
++#define STATUS_CHANNEL_SWITCH_PENDING 18
+ 
+ static inline int iwl_legacy_is_ready(struct iwl_priv *priv)
+ {
+--- a/drivers/net/wireless/iwlegacy/iwl-dev.h
++++ b/drivers/net/wireless/iwlegacy/iwl-dev.h
+@@ -854,17 +854,6 @@ struct traffic_stats {
+ };
+ 
+ /*
+- * iwl_switch_rxon: "channel switch" structure
+- *
+- * @ switch_in_progress: channel switch in progress
+- * @ channel: new channel
+- */
+-struct iwl_switch_rxon {
+-	bool switch_in_progress;
+-	__le16 channel;
+-};
+-
+-/*
+  * schedule the timer to wake up every UCODE_TRACE_PERIOD milliseconds
+  * to perform continuous uCode event logging operation if enabled
+  */
+@@ -1115,7 +1104,7 @@ struct iwl_priv {
+ 
+ 	struct iwl_rxon_context contexts[NUM_IWL_RXON_CTX];
+ 
+-	struct iwl_switch_rxon switch_rxon;
++	__le16 switch_channel;
+ 
+ 	/* 1st responses from initialize and runtime uCode images.
+ 	 * _4965's initialize alive response contains some calibration data. */
+--- a/drivers/net/wireless/iwlegacy/iwl4965-base.c
++++ b/drivers/net/wireless/iwlegacy/iwl4965-base.c
+@@ -2851,16 +2851,13 @@ void iwl4965_mac_channel_switch(struct i
+ 		goto out_exit;
+ 
+ 	if (test_bit(STATUS_EXIT_PENDING, &priv->status) ||
+-	    test_bit(STATUS_SCANNING, &priv->status))
++	    test_bit(STATUS_SCANNING, &priv->status) ||
++	    test_bit(STATUS_CHANNEL_SWITCH_PENDING, &priv->status))
+ 		goto out_exit;
+ 
+ 	if (!iwl_legacy_is_associated_ctx(ctx))
+ 		goto out_exit;
+ 
+-	/* channel switch in progress */
+-	if (priv->switch_rxon.switch_in_progress == true)
+-		goto out_exit;
+-
+ 	mutex_lock(&priv->mutex);
+ 	if (priv->cfg->ops->lib->set_channel_switch) {
+ 
+@@ -2910,16 +2907,20 @@ void iwl4965_mac_channel_switch(struct i
+ 			 * at this point, staging_rxon has the
+ 			 * configuration for channel switch
+ 			 */
++			set_bit(STATUS_CHANNEL_SWITCH_PENDING, &priv->status);
++			priv->switch_channel = cpu_to_le16(ch);
+ 			if (priv->cfg->ops->lib->set_channel_switch(priv,
+-								    ch_switch))
+-				priv->switch_rxon.switch_in_progress = false;
++								    ch_switch)) {
++				clear_bit(STATUS_CHANNEL_SWITCH_PENDING,
++					  &priv->status);
++				priv->switch_channel = 0;
++				ieee80211_chswitch_done(ctx->vif, false);
++			}
+ 		}
+ 	}
+ out:
+ 	mutex_unlock(&priv->mutex);
+ out_exit:
+-	if (!priv->switch_rxon.switch_in_progress)
+-		ieee80211_chswitch_done(ctx->vif, false);
+ 	IWL_DEBUG_MAC80211(priv, "leave\n");
+ }
+ 
