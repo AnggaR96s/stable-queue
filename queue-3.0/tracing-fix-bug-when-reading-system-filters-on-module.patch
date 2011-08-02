@@ -1,0 +1,203 @@
+From e9dbfae53eeb9fc3d4bb7da3df87fa9875f5da02 Mon Sep 17 00:00:00 2001
+From: Steven Rostedt <srostedt@redhat.com>
+Date: Tue, 5 Jul 2011 11:36:06 -0400
+Subject: tracing: Fix bug when reading system filters on module
+ removal
+
+From: Steven Rostedt <srostedt@redhat.com>
+
+commit e9dbfae53eeb9fc3d4bb7da3df87fa9875f5da02 upstream.
+
+The event system is freed when its nr_events is set to zero. This happens
+when a module created an event system and then later the module is
+removed. Modules may share systems, so the system is allocated when
+it is created and freed when the modules are unloaded and all the
+events under the system are removed (nr_events set to zero).
+
+The problem arises when a task opened the "filter" file for the
+system. If the module is unloaded and it removed the last event for
+that system, the system structure is freed. If the task that opened
+the filter file accesses the "filter" file after the system has
+been freed, the system will access an invalid pointer.
+
+By adding a ref_count, and using it to keep track of what
+is using the event system, we can free it after all users
+are finished with the event system.
+
+Reported-by: Johannes Berg <johannes.berg@intel.com>
+Signed-off-by: Steven Rostedt <rostedt@goodmis.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ kernel/trace/trace.h               |    1 
+ kernel/trace/trace_events.c        |   86 ++++++++++++++++++++++++++++++++-----
+ kernel/trace/trace_events_filter.c |    6 ++
+ 3 files changed, 82 insertions(+), 11 deletions(-)
+
+--- a/kernel/trace/trace.h
++++ b/kernel/trace/trace.h
+@@ -677,6 +677,7 @@ struct event_subsystem {
+ 	struct dentry		*entry;
+ 	struct event_filter	*filter;
+ 	int			nr_events;
++	int			ref_count;
+ };
+ 
+ #define FILTER_PRED_INVALID	((unsigned short)-1)
+--- a/kernel/trace/trace_events.c
++++ b/kernel/trace/trace_events.c
+@@ -244,6 +244,35 @@ static void ftrace_clear_events(void)
+ 	mutex_unlock(&event_mutex);
+ }
+ 
++static void __put_system(struct event_subsystem *system)
++{
++	struct event_filter *filter = system->filter;
++
++	WARN_ON_ONCE(system->ref_count == 0);
++	if (--system->ref_count)
++		return;
++
++	if (filter) {
++		kfree(filter->filter_string);
++		kfree(filter);
++	}
++	kfree(system->name);
++	kfree(system);
++}
++
++static void __get_system(struct event_subsystem *system)
++{
++	WARN_ON_ONCE(system->ref_count == 0);
++	system->ref_count++;
++}
++
++static void put_system(struct event_subsystem *system)
++{
++	mutex_lock(&event_mutex);
++	__put_system(system);
++	mutex_unlock(&event_mutex);
++}
++
+ /*
+  * __ftrace_set_clr_event(NULL, NULL, NULL, set) will set/unset all events.
+  */
+@@ -826,6 +855,47 @@ event_filter_write(struct file *filp, co
+ 	return cnt;
+ }
+ 
++static LIST_HEAD(event_subsystems);
++
++static int subsystem_open(struct inode *inode, struct file *filp)
++{
++	struct event_subsystem *system = NULL;
++	int ret;
++
++	/* Make sure the system still exists */
++	mutex_lock(&event_mutex);
++	list_for_each_entry(system, &event_subsystems, list) {
++		if (system == inode->i_private) {
++			/* Don't open systems with no events */
++			if (!system->nr_events) {
++				system = NULL;
++				break;
++			}
++			__get_system(system);
++			break;
++		}
++	}
++	mutex_unlock(&event_mutex);
++
++	if (system != inode->i_private)
++		return -ENODEV;
++
++	ret = tracing_open_generic(inode, filp);
++	if (ret < 0)
++		put_system(system);
++
++	return ret;
++}
++
++static int subsystem_release(struct inode *inode, struct file *file)
++{
++	struct event_subsystem *system = inode->i_private;
++
++	put_system(system);
++
++	return 0;
++}
++
+ static ssize_t
+ subsystem_filter_read(struct file *filp, char __user *ubuf, size_t cnt,
+ 		      loff_t *ppos)
+@@ -963,10 +1033,11 @@ static const struct file_operations ftra
+ };
+ 
+ static const struct file_operations ftrace_subsystem_filter_fops = {
+-	.open = tracing_open_generic,
++	.open = subsystem_open,
+ 	.read = subsystem_filter_read,
+ 	.write = subsystem_filter_write,
+ 	.llseek = default_llseek,
++	.release = subsystem_release,
+ };
+ 
+ static const struct file_operations ftrace_system_enable_fops = {
+@@ -1002,8 +1073,6 @@ static struct dentry *event_trace_events
+ 	return d_events;
+ }
+ 
+-static LIST_HEAD(event_subsystems);
+-
+ static struct dentry *
+ event_subsystem_dir(const char *name, struct dentry *d_events)
+ {
+@@ -1013,6 +1082,7 @@ event_subsystem_dir(const char *name, st
+ 	/* First see if we did not already create this dir */
+ 	list_for_each_entry(system, &event_subsystems, list) {
+ 		if (strcmp(system->name, name) == 0) {
++			__get_system(system);
+ 			system->nr_events++;
+ 			return system->entry;
+ 		}
+@@ -1035,6 +1105,7 @@ event_subsystem_dir(const char *name, st
+ 	}
+ 
+ 	system->nr_events = 1;
++	system->ref_count = 1;
+ 	system->name = kstrdup(name, GFP_KERNEL);
+ 	if (!system->name) {
+ 		debugfs_remove(system->entry);
+@@ -1184,16 +1255,9 @@ static void remove_subsystem_dir(const c
+ 	list_for_each_entry(system, &event_subsystems, list) {
+ 		if (strcmp(system->name, name) == 0) {
+ 			if (!--system->nr_events) {
+-				struct event_filter *filter = system->filter;
+-
+ 				debugfs_remove_recursive(system->entry);
+ 				list_del(&system->list);
+-				if (filter) {
+-					kfree(filter->filter_string);
+-					kfree(filter);
+-				}
+-				kfree(system->name);
+-				kfree(system);
++				__put_system(system);
+ 			}
+ 			break;
+ 		}
+--- a/kernel/trace/trace_events_filter.c
++++ b/kernel/trace/trace_events_filter.c
+@@ -1886,6 +1886,12 @@ int apply_subsystem_event_filter(struct
+ 
+ 	mutex_lock(&event_mutex);
+ 
++	/* Make sure the system still has events */
++	if (!system->nr_events) {
++		err = -ENODEV;
++		goto out_unlock;
++	}
++
+ 	if (!strcmp(strstrip(filter_string), "0")) {
+ 		filter_free_subsystem_preds(system);
+ 		remove_filter_string(system->filter);
