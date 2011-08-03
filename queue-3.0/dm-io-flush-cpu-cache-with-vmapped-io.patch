@@ -1,0 +1,116 @@
+From bb91bc7bacb906c9f3a9b22744c53fa7564b51ba Mon Sep 17 00:00:00 2001
+From: Mikulas Patocka <mpatocka@redhat.com>
+Date: Tue, 2 Aug 2011 12:32:01 +0100
+Subject: dm io: flush cpu cache with vmapped io
+
+From: Mikulas Patocka <mpatocka@redhat.com>
+
+commit bb91bc7bacb906c9f3a9b22744c53fa7564b51ba upstream.
+
+For normal kernel pages, CPU cache is synchronized by the dma layer.
+However, this is not done for pages allocated with vmalloc. If we do I/O
+to/from vmallocated pages, we must synchronize CPU cache explicitly.
+
+Prior to doing I/O on vmallocated page we must call
+flush_kernel_vmap_range to flush dirty cache on the virtual address.
+After finished read we must call invalidate_kernel_vmap_range to
+invalidate cache on the virtual address, so that accesses to the virtual
+address return newly read data and not stale data from CPU cache.
+
+This patch fixes metadata corruption on dm-snapshots on PA-RISC and
+possibly other architectures with caches indexed by virtual address.
+
+Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+Signed-off-by: Alasdair G Kergon <agk@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/md/dm-io.c |   29 +++++++++++++++++++++++++++--
+ 1 file changed, 27 insertions(+), 2 deletions(-)
+
+--- a/drivers/md/dm-io.c
++++ b/drivers/md/dm-io.c
+@@ -38,6 +38,8 @@ struct io {
+ 	struct dm_io_client *client;
+ 	io_notify_fn callback;
+ 	void *context;
++	void *vma_invalidate_address;
++	unsigned long vma_invalidate_size;
+ } __attribute__((aligned(DM_IO_MAX_REGIONS)));
+ 
+ static struct kmem_cache *_dm_io_cache;
+@@ -116,6 +118,10 @@ static void dec_count(struct io *io, uns
+ 		set_bit(region, &io->error_bits);
+ 
+ 	if (atomic_dec_and_test(&io->count)) {
++		if (io->vma_invalidate_size)
++			invalidate_kernel_vmap_range(io->vma_invalidate_address,
++						     io->vma_invalidate_size);
++
+ 		if (io->sleeper)
+ 			wake_up_process(io->sleeper);
+ 
+@@ -159,6 +165,9 @@ struct dpages {
+ 
+ 	unsigned context_u;
+ 	void *context_ptr;
++
++	void *vma_invalidate_address;
++	unsigned long vma_invalidate_size;
+ };
+ 
+ /*
+@@ -377,6 +386,9 @@ static int sync_io(struct dm_io_client *
+ 	io->sleeper = current;
+ 	io->client = client;
+ 
++	io->vma_invalidate_address = dp->vma_invalidate_address;
++	io->vma_invalidate_size = dp->vma_invalidate_size;
++
+ 	dispatch_io(rw, num_regions, where, dp, io, 1);
+ 
+ 	while (1) {
+@@ -415,13 +427,21 @@ static int async_io(struct dm_io_client
+ 	io->callback = fn;
+ 	io->context = context;
+ 
++	io->vma_invalidate_address = dp->vma_invalidate_address;
++	io->vma_invalidate_size = dp->vma_invalidate_size;
++
+ 	dispatch_io(rw, num_regions, where, dp, io, 0);
+ 	return 0;
+ }
+ 
+-static int dp_init(struct dm_io_request *io_req, struct dpages *dp)
++static int dp_init(struct dm_io_request *io_req, struct dpages *dp,
++		   unsigned long size)
+ {
+ 	/* Set up dpages based on memory type */
++
++	dp->vma_invalidate_address = NULL;
++	dp->vma_invalidate_size = 0;
++
+ 	switch (io_req->mem.type) {
+ 	case DM_IO_PAGE_LIST:
+ 		list_dp_init(dp, io_req->mem.ptr.pl, io_req->mem.offset);
+@@ -432,6 +452,11 @@ static int dp_init(struct dm_io_request
+ 		break;
+ 
+ 	case DM_IO_VMA:
++		flush_kernel_vmap_range(io_req->mem.ptr.vma, size);
++		if ((io_req->bi_rw & RW_MASK) == READ) {
++			dp->vma_invalidate_address = io_req->mem.ptr.vma;
++			dp->vma_invalidate_size = size;
++		}
+ 		vm_dp_init(dp, io_req->mem.ptr.vma);
+ 		break;
+ 
+@@ -460,7 +485,7 @@ int dm_io(struct dm_io_request *io_req,
+ 	int r;
+ 	struct dpages dp;
+ 
+-	r = dp_init(io_req, &dp);
++	r = dp_init(io_req, &dp, (unsigned long)where->count << SECTOR_SHIFT);
+ 	if (r)
+ 		return r;
+ 
