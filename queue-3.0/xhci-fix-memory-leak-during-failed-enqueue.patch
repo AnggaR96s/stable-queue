@@ -1,0 +1,131 @@
+From d13565c12828ce0cd2a3862bf6260164a0653352 Mon Sep 17 00:00:00 2001
+From: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Date: Fri, 22 Jul 2011 14:34:34 -0700
+Subject: xhci: Fix memory leak during failed enqueue.
+
+From: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+
+commit d13565c12828ce0cd2a3862bf6260164a0653352 upstream.
+
+When the isochronous transfer support was introduced, and the xHCI driver
+switched to using urb->hcpriv to store an "urb_priv" pointer, a couple of
+memory leaks were introduced into the URB enqueue function in its error
+handling paths.
+
+xhci_urb_enqueue allocates urb_priv, but it doesn't free it if changing
+the control endpoint's max packet size fails or the bulk endpoint is in
+the middle of allocating or deallocating streams.
+
+xhci_urb_enqueue also doesn't free urb_priv if any of the four endpoint
+types' enqueue functions fail.  Instead, it expects those functions to
+free urb_priv if an error occurs.  However, the bulk, control, and
+interrupt enqueue functions do not free urb_priv if the endpoint ring is
+NULL.  It will, however, get freed if prepare_transfer() fails in those
+enqueue functions.
+
+Several of the error paths in the isochronous endpoint enqueue function
+also fail to free it.  xhci_queue_isoc_tx_prepare() doesn't free urb_priv
+if prepare_ring() indicates there is not enough room for all the
+isochronous TDs in this URB.  If individual isochronous TDs fail to be
+queued (perhaps due to an endpoint state change), urb_priv is also leaked.
+
+This argues that the freeing of urb_priv should be done in the function
+that allocated it, xhci_urb_enqueue.
+
+This patch looks rather ugly, but refactoring the code will have to wait
+because this patch needs to be backported to stable kernels.
+
+This patch should be backported to kernels as old as 2.6.36.
+
+Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Cc: Andiry Xu <andiry.xu@amd.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/xhci-ring.c |    5 +----
+ drivers/usb/host/xhci.c      |   21 +++++++++++++++++----
+ 2 files changed, 18 insertions(+), 8 deletions(-)
+
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@ -2508,11 +2508,8 @@ static int prepare_transfer(struct xhci_
+ 
+ 	if (td_index == 0) {
+ 		ret = usb_hcd_link_urb_to_ep(bus_to_hcd(urb->dev->bus), urb);
+-		if (unlikely(ret)) {
+-			xhci_urb_free_priv(xhci, urb_priv);
+-			urb->hcpriv = NULL;
++		if (unlikely(ret))
+ 			return ret;
+-		}
+ 	}
+ 
+ 	td->urb = urb;
+--- a/drivers/usb/host/xhci.c
++++ b/drivers/usb/host/xhci.c
+@@ -1085,8 +1085,11 @@ int xhci_urb_enqueue(struct usb_hcd *hcd
+ 		if (urb->dev->speed == USB_SPEED_FULL) {
+ 			ret = xhci_check_maxpacket(xhci, slot_id,
+ 					ep_index, urb);
+-			if (ret < 0)
++			if (ret < 0) {
++				xhci_urb_free_priv(xhci, urb_priv);
++				urb->hcpriv = NULL;
+ 				return ret;
++			}
+ 		}
+ 
+ 		/* We have a spinlock and interrupts disabled, so we must pass
+@@ -1097,6 +1100,8 @@ int xhci_urb_enqueue(struct usb_hcd *hcd
+ 			goto dying;
+ 		ret = xhci_queue_ctrl_tx(xhci, GFP_ATOMIC, urb,
+ 				slot_id, ep_index);
++		if (ret)
++			goto free_priv;
+ 		spin_unlock_irqrestore(&xhci->lock, flags);
+ 	} else if (usb_endpoint_xfer_bulk(&urb->ep->desc)) {
+ 		spin_lock_irqsave(&xhci->lock, flags);
+@@ -1117,6 +1122,8 @@ int xhci_urb_enqueue(struct usb_hcd *hcd
+ 			ret = xhci_queue_bulk_tx(xhci, GFP_ATOMIC, urb,
+ 					slot_id, ep_index);
+ 		}
++		if (ret)
++			goto free_priv;
+ 		spin_unlock_irqrestore(&xhci->lock, flags);
+ 	} else if (usb_endpoint_xfer_int(&urb->ep->desc)) {
+ 		spin_lock_irqsave(&xhci->lock, flags);
+@@ -1124,6 +1131,8 @@ int xhci_urb_enqueue(struct usb_hcd *hcd
+ 			goto dying;
+ 		ret = xhci_queue_intr_tx(xhci, GFP_ATOMIC, urb,
+ 				slot_id, ep_index);
++		if (ret)
++			goto free_priv;
+ 		spin_unlock_irqrestore(&xhci->lock, flags);
+ 	} else {
+ 		spin_lock_irqsave(&xhci->lock, flags);
+@@ -1131,18 +1140,22 @@ int xhci_urb_enqueue(struct usb_hcd *hcd
+ 			goto dying;
+ 		ret = xhci_queue_isoc_tx_prepare(xhci, GFP_ATOMIC, urb,
+ 				slot_id, ep_index);
++		if (ret)
++			goto free_priv;
+ 		spin_unlock_irqrestore(&xhci->lock, flags);
+ 	}
+ exit:
+ 	return ret;
+ dying:
+-	xhci_urb_free_priv(xhci, urb_priv);
+-	urb->hcpriv = NULL;
+ 	xhci_dbg(xhci, "Ep 0x%x: URB %p submitted for "
+ 			"non-responsive xHCI host.\n",
+ 			urb->ep->desc.bEndpointAddress, urb);
++	ret = -ESHUTDOWN;
++free_priv:
++	xhci_urb_free_priv(xhci, urb_priv);
++	urb->hcpriv = NULL;
+ 	spin_unlock_irqrestore(&xhci->lock, flags);
+-	return -ESHUTDOWN;
++	return ret;
+ }
+ 
+ /* Get the right ring for the given URB.
