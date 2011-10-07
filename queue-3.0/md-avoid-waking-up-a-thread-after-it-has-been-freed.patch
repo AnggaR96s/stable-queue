@@ -1,0 +1,177 @@
+From 01f96c0a9922cd9919baf9d16febdf7016177a12 Mon Sep 17 00:00:00 2001
+From: NeilBrown <neilb@suse.de>
+Date: Wed, 21 Sep 2011 15:30:20 +1000
+Subject: md: Avoid waking up a thread after it has been freed.
+
+From: NeilBrown <neilb@suse.de>
+
+commit 01f96c0a9922cd9919baf9d16febdf7016177a12 upstream.
+
+Two related problems:
+
+1/ some error paths call "md_unregister_thread(mddev->thread)"
+   without subsequently clearing ->thread.  A subsequent call
+   to mddev_unlock will try to wake the thread, and crash.
+
+2/ Most calls to md_wakeup_thread are protected against the thread
+   disappeared either by:
+      - holding the ->mutex
+      - having an active request, so something else must be keeping
+        the array active.
+   However mddev_unlock calls md_wakeup_thread after dropping the
+   mutex and without any certainty of an active request, so the
+   ->thread could theoretically disappear.
+   So we need a spinlock to provide some protections.
+
+So change md_unregister_thread to take a pointer to the thread
+pointer, and ensure that it always does the required locking, and
+clears the pointer properly.
+
+Reported-by: "Moshe Melnikov" <moshe@zadarastorage.com>
+Signed-off-by: NeilBrown <neilb@suse.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/md/md.c        |   22 +++++++++++++++++++---
+ drivers/md/md.h        |    2 +-
+ drivers/md/multipath.c |    3 +--
+ drivers/md/raid1.c     |    3 +--
+ drivers/md/raid10.c    |    5 ++---
+ drivers/md/raid5.c     |    6 ++----
+ 6 files changed, 26 insertions(+), 15 deletions(-)
+
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -61,6 +61,11 @@
+ static void autostart_arrays(int part);
+ #endif
+ 
++/* pers_list is a list of registered personalities protected
++ * by pers_lock.
++ * pers_lock does extra service to protect accesses to
++ * mddev->thread when the mutex cannot be held.
++ */
+ static LIST_HEAD(pers_list);
+ static DEFINE_SPINLOCK(pers_lock);
+ 
+@@ -690,7 +695,12 @@ static void mddev_unlock(mddev_t * mddev
+ 	} else
+ 		mutex_unlock(&mddev->reconfig_mutex);
+ 
++	/* was we've dropped the mutex we need a spinlock to
++	 * make sur the thread doesn't disappear
++	 */
++	spin_lock(&pers_lock);
+ 	md_wakeup_thread(mddev->thread);
++	spin_unlock(&pers_lock);
+ }
+ 
+ static mdk_rdev_t * find_rdev_nr(mddev_t *mddev, int nr)
+@@ -6186,11 +6196,18 @@ mdk_thread_t *md_register_thread(void (*
+ 	return thread;
+ }
+ 
+-void md_unregister_thread(mdk_thread_t *thread)
++void md_unregister_thread(mdk_thread_t **threadp)
+ {
++	mdk_thread_t *thread = *threadp;
+ 	if (!thread)
+ 		return;
+ 	dprintk("interrupting MD-thread pid %d\n", task_pid_nr(thread->tsk));
++	/* Locking ensures that mddev_unlock does not wake_up a
++	 * non-existent thread
++	 */
++	spin_lock(&pers_lock);
++	*threadp = NULL;
++	spin_unlock(&pers_lock);
+ 
+ 	kthread_stop(thread->tsk);
+ 	kfree(thread);
+@@ -7125,8 +7142,7 @@ static void reap_sync_thread(mddev_t *md
+ 	mdk_rdev_t *rdev;
+ 
+ 	/* resync has finished, collect result */
+-	md_unregister_thread(mddev->sync_thread);
+-	mddev->sync_thread = NULL;
++	md_unregister_thread(&mddev->sync_thread);
+ 	if (!test_bit(MD_RECOVERY_INTR, &mddev->recovery) &&
+ 	    !test_bit(MD_RECOVERY_REQUESTED, &mddev->recovery)) {
+ 		/* success...*/
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@ -475,7 +475,7 @@ extern int register_md_personality(struc
+ extern int unregister_md_personality(struct mdk_personality *p);
+ extern mdk_thread_t * md_register_thread(void (*run) (mddev_t *mddev),
+ 				mddev_t *mddev, const char *name);
+-extern void md_unregister_thread(mdk_thread_t *thread);
++extern void md_unregister_thread(mdk_thread_t **threadp);
+ extern void md_wakeup_thread(mdk_thread_t *thread);
+ extern void md_check_recovery(mddev_t *mddev);
+ extern void md_write_start(mddev_t *mddev, struct bio *bi);
+--- a/drivers/md/multipath.c
++++ b/drivers/md/multipath.c
+@@ -514,8 +514,7 @@ static int multipath_stop (mddev_t *mdde
+ {
+ 	multipath_conf_t *conf = mddev->private;
+ 
+-	md_unregister_thread(mddev->thread);
+-	mddev->thread = NULL;
++	md_unregister_thread(&mddev->thread);
+ 	blk_sync_queue(mddev->queue); /* the unplug fn references 'conf'*/
+ 	mempool_destroy(conf->pool);
+ 	kfree(conf->multipaths);
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@ -2045,8 +2045,7 @@ static int stop(mddev_t *mddev)
+ 	raise_barrier(conf);
+ 	lower_barrier(conf);
+ 
+-	md_unregister_thread(mddev->thread);
+-	mddev->thread = NULL;
++	md_unregister_thread(&mddev->thread);
+ 	if (conf->r1bio_pool)
+ 		mempool_destroy(conf->r1bio_pool);
+ 	kfree(conf->mirrors);
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@ -2331,7 +2331,7 @@ static int run(mddev_t *mddev)
+ 	return 0;
+ 
+ out_free_conf:
+-	md_unregister_thread(mddev->thread);
++	md_unregister_thread(&mddev->thread);
+ 	if (conf->r10bio_pool)
+ 		mempool_destroy(conf->r10bio_pool);
+ 	safe_put_page(conf->tmppage);
+@@ -2349,8 +2349,7 @@ static int stop(mddev_t *mddev)
+ 	raise_barrier(conf, 0);
+ 	lower_barrier(conf);
+ 
+-	md_unregister_thread(mddev->thread);
+-	mddev->thread = NULL;
++	md_unregister_thread(&mddev->thread);
+ 	blk_sync_queue(mddev->queue); /* the unplug fn references 'conf'*/
+ 	if (conf->r10bio_pool)
+ 		mempool_destroy(conf->r10bio_pool);
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -5162,8 +5162,7 @@ static int run(mddev_t *mddev)
+ 
+ 	return 0;
+ abort:
+-	md_unregister_thread(mddev->thread);
+-	mddev->thread = NULL;
++	md_unregister_thread(&mddev->thread);
+ 	if (conf) {
+ 		print_raid5_conf(conf);
+ 		free_conf(conf);
+@@ -5177,8 +5176,7 @@ static int stop(mddev_t *mddev)
+ {
+ 	raid5_conf_t *conf = mddev->private;
+ 
+-	md_unregister_thread(mddev->thread);
+-	mddev->thread = NULL;
++	md_unregister_thread(&mddev->thread);
+ 	if (mddev->queue)
+ 		mddev->queue->backing_dev_info.congested_fn = NULL;
+ 	free_conf(conf);
