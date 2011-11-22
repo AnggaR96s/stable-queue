@@ -1,0 +1,162 @@
+From 1788ea6e3b2a58cf4fb00206e362d9caff8d86a7 Mon Sep 17 00:00:00 2001
+From: Jeff Layton <jlayton@redhat.com>
+Date: Fri, 4 Nov 2011 13:31:21 -0400
+Subject: nfs: when attempting to open a directory, fall back on normal lookup (try #5)
+
+From: Jeff Layton <jlayton@redhat.com>
+
+commit 1788ea6e3b2a58cf4fb00206e362d9caff8d86a7 upstream.
+
+commit d953126 changed how nfs_atomic_lookup handles an -EISDIR return
+from an OPEN call. Prior to that patch, that caused the client to fall
+back to doing a normal lookup. When that patch went in, the code began
+returning that error to userspace. The d_revalidate codepath however
+never had the corresponding change, so it was still possible to end up
+with a NULL ctx->state pointer after that.
+
+That patch caused a regression. When we attempt to open a directory that
+does not have a cached dentry, that open now errors out with EISDIR. If
+you attempt the same open with a cached dentry, it will succeed.
+
+Fix this by reverting the change in nfs_atomic_lookup and allowing
+attempts to open directories to fall back to a normal lookup
+
+Also, add a NFSv4-specific f_ops->open routine that just returns
+-ENOTDIR. This should never be called if things are working properly,
+but if it ever is, then the dprintk may help in debugging.
+
+To facilitate this, a new file_operations field is also added to the
+nfs_rpc_ops struct.
+
+Signed-off-by: Jeff Layton <jlayton@redhat.com>
+Signed-off-by: Trond Myklebust <Trond.Myklebust@netapp.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ fs/nfs/dir.c            |    2 +-
+ fs/nfs/file.c           |   32 ++++++++++++++++++++++++++++++++
+ fs/nfs/inode.c          |    2 +-
+ fs/nfs/nfs3proc.c       |    1 +
+ fs/nfs/nfs4proc.c       |    1 +
+ fs/nfs/proc.c           |    1 +
+ include/linux/nfs_fs.h  |    3 +++
+ include/linux/nfs_xdr.h |    1 +
+ 8 files changed, 41 insertions(+), 2 deletions(-)
+
+--- a/fs/nfs/dir.c
++++ b/fs/nfs/dir.c
+@@ -1468,12 +1468,12 @@ static struct dentry *nfs_atomic_lookup(
+ 				res = NULL;
+ 				goto out;
+ 			/* This turned out not to be a regular file */
++			case -EISDIR:
+ 			case -ENOTDIR:
+ 				goto no_open;
+ 			case -ELOOP:
+ 				if (!(nd->intent.open.flags & O_NOFOLLOW))
+ 					goto no_open;
+-			/* case -EISDIR: */
+ 			/* case -EINVAL: */
+ 			default:
+ 				res = ERR_CAST(inode);
+--- a/fs/nfs/file.c
++++ b/fs/nfs/file.c
+@@ -895,3 +895,35 @@ static int nfs_setlease(struct file *fil
+ 			file->f_path.dentry->d_name.name, arg);
+ 	return -EINVAL;
+ }
++
++#ifdef CONFIG_NFS_V4
++static int
++nfs4_file_open(struct inode *inode, struct file *filp)
++{
++	/*
++	 * NFSv4 opens are handled in d_lookup and d_revalidate. If we get to
++	 * this point, then something is very wrong
++	 */
++	dprintk("NFS: %s called! inode=%p filp=%p\n", __func__, inode, filp);
++	return -ENOTDIR;
++}
++
++const struct file_operations nfs4_file_operations = {
++	.llseek		= nfs_file_llseek,
++	.read		= do_sync_read,
++	.write		= do_sync_write,
++	.aio_read	= nfs_file_read,
++	.aio_write	= nfs_file_write,
++	.mmap		= nfs_file_mmap,
++	.open		= nfs4_file_open,
++	.flush		= nfs_file_flush,
++	.release	= nfs_file_release,
++	.fsync		= nfs_file_fsync,
++	.lock		= nfs_lock,
++	.flock		= nfs_flock,
++	.splice_read	= nfs_file_splice_read,
++	.splice_write	= nfs_file_splice_write,
++	.check_flags	= nfs_check_flags,
++	.setlease	= nfs_setlease,
++};
++#endif /* CONFIG_NFS_V4 */
+--- a/fs/nfs/inode.c
++++ b/fs/nfs/inode.c
+@@ -291,7 +291,7 @@ nfs_fhget(struct super_block *sb, struct
+ 		 */
+ 		inode->i_op = NFS_SB(sb)->nfs_client->rpc_ops->file_inode_ops;
+ 		if (S_ISREG(inode->i_mode)) {
+-			inode->i_fop = &nfs_file_operations;
++			inode->i_fop = NFS_SB(sb)->nfs_client->rpc_ops->file_ops;
+ 			inode->i_data.a_ops = &nfs_file_aops;
+ 			inode->i_data.backing_dev_info = &NFS_SB(sb)->backing_dev_info;
+ 		} else if (S_ISDIR(inode->i_mode)) {
+--- a/fs/nfs/nfs3proc.c
++++ b/fs/nfs/nfs3proc.c
+@@ -853,6 +853,7 @@ const struct nfs_rpc_ops nfs_v3_clientop
+ 	.dentry_ops	= &nfs_dentry_operations,
+ 	.dir_inode_ops	= &nfs3_dir_inode_operations,
+ 	.file_inode_ops	= &nfs3_file_inode_operations,
++	.file_ops	= &nfs_file_operations,
+ 	.getroot	= nfs3_proc_get_root,
+ 	.getattr	= nfs3_proc_getattr,
+ 	.setattr	= nfs3_proc_setattr,
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@ -6267,6 +6267,7 @@ const struct nfs_rpc_ops nfs_v4_clientop
+ 	.dentry_ops	= &nfs4_dentry_operations,
+ 	.dir_inode_ops	= &nfs4_dir_inode_operations,
+ 	.file_inode_ops	= &nfs4_file_inode_operations,
++	.file_ops	= &nfs4_file_operations,
+ 	.getroot	= nfs4_proc_get_root,
+ 	.getattr	= nfs4_proc_getattr,
+ 	.setattr	= nfs4_proc_setattr,
+--- a/fs/nfs/proc.c
++++ b/fs/nfs/proc.c
+@@ -710,6 +710,7 @@ const struct nfs_rpc_ops nfs_v2_clientop
+ 	.dentry_ops	= &nfs_dentry_operations,
+ 	.dir_inode_ops	= &nfs_dir_inode_operations,
+ 	.file_inode_ops	= &nfs_file_inode_operations,
++	.file_ops	= &nfs_file_operations,
+ 	.getroot	= nfs_proc_get_root,
+ 	.getattr	= nfs_proc_getattr,
+ 	.setattr	= nfs_proc_setattr,
+--- a/include/linux/nfs_fs.h
++++ b/include/linux/nfs_fs.h
+@@ -410,6 +410,9 @@ extern const struct inode_operations nfs
+ extern const struct inode_operations nfs3_file_inode_operations;
+ #endif /* CONFIG_NFS_V3 */
+ extern const struct file_operations nfs_file_operations;
++#ifdef CONFIG_NFS_V4
++extern const struct file_operations nfs4_file_operations;
++#endif /* CONFIG_NFS_V4 */
+ extern const struct address_space_operations nfs_file_aops;
+ extern const struct address_space_operations nfs_dir_aops;
+ 
+--- a/include/linux/nfs_xdr.h
++++ b/include/linux/nfs_xdr.h
+@@ -1194,6 +1194,7 @@ struct nfs_rpc_ops {
+ 	const struct dentry_operations *dentry_ops;
+ 	const struct inode_operations *dir_inode_ops;
+ 	const struct inode_operations *file_inode_ops;
++	const struct file_operations *file_ops;
+ 
+ 	int	(*getroot) (struct nfs_server *, struct nfs_fh *,
+ 			    struct nfs_fsinfo *);
