@@ -1,0 +1,258 @@
+From 580da35a31f91a594f3090b7a2c39b85cb051a12 Mon Sep 17 00:00:00 2001
+From: Eric Dumazet <eric.dumazet@gmail.com>
+Date: Tue, 29 Nov 2011 22:31:23 +0100
+Subject: IB: Fix RCU lockdep splats
+
+From: Eric Dumazet <eric.dumazet@gmail.com>
+
+commit 580da35a31f91a594f3090b7a2c39b85cb051a12 upstream.
+
+Commit f2c31e32b37 ("net: fix NULL dereferences in check_peer_redir()")
+forgot to take care of infiniband uses of dst neighbours.
+
+Many thanks to Marc Aurele who provided a nice bug report and feedback.
+
+Reported-by: Marc Aurele La France <tsi@ualberta.ca>
+Signed-off-by: Eric Dumazet <eric.dumazet@gmail.com>
+Cc: David Miller <davem@davemloft.net>
+Signed-off-by: Roland Dreier <roland@purestorage.com>
+
+---
+ drivers/infiniband/core/addr.c                 |    9 ++++++---
+ drivers/infiniband/hw/cxgb3/iwch_cm.c          |    4 ++++
+ drivers/infiniband/hw/cxgb4/cm.c               |    4 ++++
+ drivers/infiniband/hw/mlx4/qp.c                |    2 +-
+ drivers/infiniband/hw/nes/nes_cm.c             |    6 ++++--
+ drivers/infiniband/ulp/ipoib/ipoib_main.c      |   18 +++++++++++-------
+ drivers/infiniband/ulp/ipoib/ipoib_multicast.c |    6 ++++--
+ 7 files changed, 34 insertions(+), 15 deletions(-)
+
+--- a/drivers/infiniband/core/addr.c
++++ b/drivers/infiniband/core/addr.c
+@@ -215,7 +215,9 @@ static int addr4_resolve(struct sockaddr
+ 
+ 	neigh = neigh_lookup(&arp_tbl, &rt->rt_gateway, rt->dst.dev);
+ 	if (!neigh || !(neigh->nud_state & NUD_VALID)) {
++		rcu_read_lock();
+ 		neigh_event_send(dst_get_neighbour(&rt->dst), NULL);
++		rcu_read_unlock();
+ 		ret = -ENODATA;
+ 		if (neigh)
+ 			goto release;
+@@ -273,15 +275,16 @@ static int addr6_resolve(struct sockaddr
+ 		goto put;
+ 	}
+ 
++	rcu_read_lock();
+ 	neigh = dst_get_neighbour(dst);
+ 	if (!neigh || !(neigh->nud_state & NUD_VALID)) {
+ 		if (neigh)
+ 			neigh_event_send(neigh, NULL);
+ 		ret = -ENODATA;
+-		goto put;
++	} else {
++		ret = rdma_copy_addr(addr, dst->dev, neigh->ha);
+ 	}
+-
+-	ret = rdma_copy_addr(addr, dst->dev, neigh->ha);
++	rcu_read_unlock();
+ put:
+ 	dst_release(dst);
+ 	return ret;
+--- a/drivers/infiniband/hw/cxgb3/iwch_cm.c
++++ b/drivers/infiniband/hw/cxgb3/iwch_cm.c
+@@ -1365,8 +1365,10 @@ static int pass_accept_req(struct t3cdev
+ 		goto reject;
+ 	}
+ 	dst = &rt->dst;
++	rcu_read_lock();
+ 	neigh = dst_get_neighbour(dst);
+ 	l2t = t3_l2t_get(tdev, neigh, neigh->dev);
++	rcu_read_unlock();
+ 	if (!l2t) {
+ 		printk(KERN_ERR MOD "%s - failed to allocate l2t entry!\n",
+ 		       __func__);
+@@ -1936,10 +1938,12 @@ int iwch_connect(struct iw_cm_id *cm_id,
+ 	}
+ 	ep->dst = &rt->dst;
+ 
++	rcu_read_lock();
+ 	neigh = dst_get_neighbour(ep->dst);
+ 
+ 	/* get a l2t entry */
+ 	ep->l2t = t3_l2t_get(ep->com.tdev, neigh, neigh->dev);
++	rcu_read_unlock();
+ 	if (!ep->l2t) {
+ 		printk(KERN_ERR MOD "%s - cannot alloc l2e.\n", __func__);
+ 		err = -ENOMEM;
+--- a/drivers/infiniband/hw/cxgb4/cm.c
++++ b/drivers/infiniband/hw/cxgb4/cm.c
+@@ -1358,6 +1358,7 @@ static int pass_accept_req(struct c4iw_d
+ 		goto reject;
+ 	}
+ 	dst = &rt->dst;
++	rcu_read_lock();
+ 	neigh = dst_get_neighbour(dst);
+ 	if (neigh->dev->flags & IFF_LOOPBACK) {
+ 		pdev = ip_dev_find(&init_net, peer_ip);
+@@ -1384,6 +1385,7 @@ static int pass_accept_req(struct c4iw_d
+ 		rss_qid = dev->rdev.lldi.rxq_ids[
+ 			  cxgb4_port_idx(neigh->dev) * step];
+ 	}
++	rcu_read_unlock();
+ 	if (!l2t) {
+ 		printk(KERN_ERR MOD "%s - failed to allocate l2t entry!\n",
+ 		       __func__);
+@@ -1909,6 +1911,7 @@ int c4iw_connect(struct iw_cm_id *cm_id,
+ 	}
+ 	ep->dst = &rt->dst;
+ 
++	rcu_read_lock();
+ 	neigh = dst_get_neighbour(ep->dst);
+ 
+ 	/* get a l2t entry */
+@@ -1945,6 +1948,7 @@ int c4iw_connect(struct iw_cm_id *cm_id,
+ 		ep->rss_qid = ep->com.dev->rdev.lldi.rxq_ids[
+ 			      cxgb4_port_idx(neigh->dev) * step];
+ 	}
++	rcu_read_unlock();
+ 	if (!ep->l2t) {
+ 		printk(KERN_ERR MOD "%s - cannot alloc l2e.\n", __func__);
+ 		err = -ENOMEM;
+--- a/drivers/infiniband/hw/mlx4/qp.c
++++ b/drivers/infiniband/hw/mlx4/qp.c
+@@ -1309,7 +1309,7 @@ static int build_mlx_header(struct mlx4_
+ 	int is_eth;
+ 	int is_vlan = 0;
+ 	int is_grh;
+-	u16 vlan;
++	u16 vlan = 0;
+ 
+ 	send_size = 0;
+ 	for (i = 0; i < wr->num_sge; ++i)
+--- a/drivers/infiniband/hw/nes/nes_cm.c
++++ b/drivers/infiniband/hw/nes/nes_cm.c
+@@ -1150,9 +1150,11 @@ static int nes_addr_resolve_neigh(struct
+ 		neigh_release(neigh);
+ 	}
+ 
+-	if ((neigh == NULL) || (!(neigh->nud_state & NUD_VALID)))
++	if ((neigh == NULL) || (!(neigh->nud_state & NUD_VALID))) {
++		rcu_read_lock();
+ 		neigh_event_send(dst_get_neighbour(&rt->dst), NULL);
+-
++		rcu_read_unlock();
++	}
+ 	ip_rt_put(rt);
+ 	return rc;
+ }
+--- a/drivers/infiniband/ulp/ipoib/ipoib_main.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+@@ -555,6 +555,7 @@ static int path_rec_start(struct net_dev
+ 	return 0;
+ }
+ 
++/* called with rcu_read_lock */
+ static void neigh_add_path(struct sk_buff *skb, struct net_device *dev)
+ {
+ 	struct ipoib_dev_priv *priv = netdev_priv(dev);
+@@ -636,6 +637,7 @@ err_drop:
+ 	spin_unlock_irqrestore(&priv->lock, flags);
+ }
+ 
++/* called with rcu_read_lock */
+ static void ipoib_path_lookup(struct sk_buff *skb, struct net_device *dev)
+ {
+ 	struct ipoib_dev_priv *priv = netdev_priv(skb->dev);
+@@ -720,13 +722,14 @@ static int ipoib_start_xmit(struct sk_bu
+ 	struct neighbour *n = NULL;
+ 	unsigned long flags;
+ 
++	rcu_read_lock();
+ 	if (likely(skb_dst(skb)))
+ 		n = dst_get_neighbour(skb_dst(skb));
+ 
+ 	if (likely(n)) {
+ 		if (unlikely(!*to_ipoib_neigh(n))) {
+ 			ipoib_path_lookup(skb, dev);
+-			return NETDEV_TX_OK;
++			goto unlock;
+ 		}
+ 
+ 		neigh = *to_ipoib_neigh(n);
+@@ -749,17 +752,17 @@ static int ipoib_start_xmit(struct sk_bu
+ 			ipoib_neigh_free(dev, neigh);
+ 			spin_unlock_irqrestore(&priv->lock, flags);
+ 			ipoib_path_lookup(skb, dev);
+-			return NETDEV_TX_OK;
++			goto unlock;
+ 		}
+ 
+ 		if (ipoib_cm_get(neigh)) {
+ 			if (ipoib_cm_up(neigh)) {
+ 				ipoib_cm_send(dev, skb, ipoib_cm_get(neigh));
+-				return NETDEV_TX_OK;
++				goto unlock;
+ 			}
+ 		} else if (neigh->ah) {
+ 			ipoib_send(dev, skb, neigh->ah, IPOIB_QPN(n->ha));
+-			return NETDEV_TX_OK;
++			goto unlock;
+ 		}
+ 
+ 		if (skb_queue_len(&neigh->queue) < IPOIB_MAX_PATH_REC_QUEUE) {
+@@ -793,13 +796,14 @@ static int ipoib_start_xmit(struct sk_bu
+ 					   phdr->hwaddr + 4);
+ 				dev_kfree_skb_any(skb);
+ 				++dev->stats.tx_dropped;
+-				return NETDEV_TX_OK;
++				goto unlock;
+ 			}
+ 
+ 			unicast_arp_send(skb, dev, phdr);
+ 		}
+ 	}
+-
++unlock:
++	rcu_read_unlock();
+ 	return NETDEV_TX_OK;
+ }
+ 
+@@ -837,7 +841,7 @@ static int ipoib_hard_header(struct sk_b
+ 	dst = skb_dst(skb);
+ 	n = NULL;
+ 	if (dst)
+-		n = dst_get_neighbour(dst);
++		n = dst_get_neighbour_raw(dst);
+ 	if ((!dst || !n) && daddr) {
+ 		struct ipoib_pseudoheader *phdr =
+ 			(struct ipoib_pseudoheader *) skb_push(skb, sizeof *phdr);
+--- a/drivers/infiniband/ulp/ipoib/ipoib_multicast.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_multicast.c
+@@ -265,7 +265,7 @@ static int ipoib_mcast_join_finish(struc
+ 
+ 		skb->dev = dev;
+ 		if (dst)
+-			n = dst_get_neighbour(dst);
++			n = dst_get_neighbour_raw(dst);
+ 		if (!dst || !n) {
+ 			/* put pseudoheader back on for next time */
+ 			skb_push(skb, sizeof (struct ipoib_pseudoheader));
+@@ -721,6 +721,8 @@ out:
+ 	if (mcast && mcast->ah) {
+ 		struct dst_entry *dst = skb_dst(skb);
+ 		struct neighbour *n = NULL;
++
++		rcu_read_lock();
+ 		if (dst)
+ 			n = dst_get_neighbour(dst);
+ 		if (n && !*to_ipoib_neigh(n)) {
+@@ -733,7 +735,7 @@ out:
+ 				list_add_tail(&neigh->list, &mcast->neigh_list);
+ 			}
+ 		}
+-
++		rcu_read_unlock();
+ 		spin_unlock_irqrestore(&priv->lock, flags);
+ 		ipoib_send(dev, skb, mcast->ah, IB_MULTICAST_QPN);
+ 		return;
