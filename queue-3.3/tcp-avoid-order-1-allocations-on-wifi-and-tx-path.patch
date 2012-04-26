@@ -1,0 +1,127 @@
+From f016eec62af8177d9f9c6608b4d541cb7e114391 Mon Sep 17 00:00:00 2001
+From: Eric Dumazet <eric.dumazet@gmail.com>
+Date: Tue, 24 Apr 2012 23:01:22 -0400
+Subject: [PATCH 28/28] tcp: avoid order-1 allocations on wifi and tx path
+
+
+From: Eric Dumazet <eric.dumazet@gmail.com>
+
+[ This combines upstream commit
+  a21d45726acacc963d8baddf74607d9b74e2b723 and the follow-on bug fix
+  commit a21d45726acacc963d8baddf74607d9b74e2b723 ]
+
+Marc Merlin reported many order-1 allocations failures in TX path on its
+wireless setup, that dont make any sense with MTU=1500 network, and non
+SG capable hardware.
+
+After investigation, it turns out TCP uses sk_stream_alloc_skb() and
+used as a convention skb_tailroom(skb) to know how many bytes of data
+payload could be put in this skb (for non SG capable devices)
+
+Note : these skb used kmalloc-4096 (MTU=1500 + MAX_HEADER +
+sizeof(struct skb_shared_info) being above 2048)
+
+Later, mac80211 layer need to add some bytes at the tail of skb
+(IEEE80211_ENCRYPT_TAILROOM = 18 bytes) and since no more tailroom is
+available has to call pskb_expand_head() and request order-1
+allocations.
+
+This patch changes sk_stream_alloc_skb() so that only
+sk->sk_prot->max_header bytes of headroom are reserved, and use a new
+skb field, avail_size to hold the data payload limit.
+
+This way, order-0 allocations done by TCP stack can leave more than 2 KB
+of tailroom and no more allocation is performed in mac80211 layer (or
+any layer needing some tailroom)
+
+avail_size is unioned with mark/dropcount, since mark will be set later
+in IP stack for output packets. Therefore, skb size is unchanged.
+
+Reported-by: Marc MERLIN <marc@merlins.org>
+Tested-by: Marc MERLIN <marc@merlins.org>
+Signed-off-by: Eric Dumazet <eric.dumazet@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/linux/skbuff.h |   13 +++++++++++++
+ net/ipv4/tcp.c         |    8 ++++----
+ net/ipv4/tcp_output.c  |    3 ++-
+ 3 files changed, 19 insertions(+), 5 deletions(-)
+
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -468,6 +468,7 @@ struct sk_buff {
+ 	union {
+ 		__u32		mark;
+ 		__u32		dropcount;
++		__u32		avail_size;
+ 	};
+ 
+ 	__u16			vlan_tci;
+@@ -1338,6 +1339,18 @@ static inline int skb_tailroom(const str
+ }
+ 
+ /**
++ *	skb_availroom - bytes at buffer end
++ *	@skb: buffer to check
++ *
++ *	Return the number of bytes of free space at the tail of an sk_buff
++ *	allocated by sk_stream_alloc()
++ */
++static inline int skb_availroom(const struct sk_buff *skb)
++{
++	return skb_is_nonlinear(skb) ? 0 : skb->avail_size - skb->len;
++}
++
++/**
+  *	skb_reserve - adjust headroom
+  *	@skb: buffer to alter
+  *	@len: bytes to move
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -699,11 +699,12 @@ struct sk_buff *sk_stream_alloc_skb(stru
+ 	skb = alloc_skb_fclone(size + sk->sk_prot->max_header, gfp);
+ 	if (skb) {
+ 		if (sk_wmem_schedule(sk, skb->truesize)) {
++			skb_reserve(skb, sk->sk_prot->max_header);
+ 			/*
+ 			 * Make sure that we have exactly size bytes
+ 			 * available to the caller, no more, no less.
+ 			 */
+-			skb_reserve(skb, skb_tailroom(skb) - size);
++			skb->avail_size = size;
+ 			return skb;
+ 		}
+ 		__kfree_skb(skb);
+@@ -993,10 +994,9 @@ new_segment:
+ 				copy = seglen;
+ 
+ 			/* Where to copy to? */
+-			if (skb_tailroom(skb) > 0) {
++			if (skb_availroom(skb) > 0) {
+ 				/* We have some space in skb head. Superb! */
+-				if (copy > skb_tailroom(skb))
+-					copy = skb_tailroom(skb);
++				copy = min_t(int, copy, skb_availroom(skb));
+ 				err = skb_add_data_nocache(sk, skb, from, copy);
+ 				if (err)
+ 					goto do_fault;
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@ -1096,6 +1096,7 @@ static void __pskb_trim_head(struct sk_b
+ 	eat = min_t(int, len, skb_headlen(skb));
+ 	if (eat) {
+ 		__skb_pull(skb, eat);
++		skb->avail_size -= eat;
+ 		len -= eat;
+ 		if (!len)
+ 			return;
+@@ -2060,7 +2061,7 @@ static void tcp_retrans_try_collapse(str
+ 		/* Punt if not enough space exists in the first SKB for
+ 		 * the data in the second
+ 		 */
+-		if (skb->len > skb_tailroom(to))
++		if (skb->len > skb_availroom(to))
+ 			break;
+ 
+ 		if (after(TCP_SKB_CB(skb)->end_seq, tcp_wnd_end(tp)))
