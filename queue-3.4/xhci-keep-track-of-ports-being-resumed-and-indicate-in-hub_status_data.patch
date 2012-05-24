@@ -1,0 +1,126 @@
+From f370b9968a220a3d79d870dd7dee674cc0ff3d10 Mon Sep 17 00:00:00 2001
+From: Andiry Xu <andiry.xu@amd.com>
+Date: Sat, 14 Apr 2012 02:54:30 +0800
+Subject: xHCI: keep track of ports being resumed and indicate in hub_status_data
+
+From: Andiry Xu <andiry.xu@amd.com>
+
+commit f370b9968a220a3d79d870dd7dee674cc0ff3d10 upstream.
+
+This commit adds a bit-array to xhci bus_state for keeping track of
+which ports are undergoing a resume transition. If any of the bits
+are set when xhci_hub_status_data() is called, the routine will return
+a non-zero value even if no ports have any status changes pending.
+This will allow usbcore to handle races between root-hub suspend and
+port wakeup.
+
+This patch should be backported to kernels as old as 3.4, that contain
+the commit 879d38e6bc36d73b0ac40ec9b0d839fda9fa8b1a "USB: fix race
+between root-hub suspend and remote wakeup".
+
+Signed-off-by: Andiry Xu <andiry.xu@amd.com>
+Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Cc: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/usb/host/xhci-hub.c  |   22 ++++++++++++----------
+ drivers/usb/host/xhci-ring.c |    1 +
+ drivers/usb/host/xhci.c      |   12 ++++++++++--
+ drivers/usb/host/xhci.h      |    2 ++
+ 4 files changed, 25 insertions(+), 12 deletions(-)
+
+--- a/drivers/usb/host/xhci-hub.c
++++ b/drivers/usb/host/xhci-hub.c
+@@ -558,6 +558,7 @@ int xhci_hub_control(struct usb_hcd *hcd
+ 				xhci_dbg(xhci, "Resume USB2 port %d\n",
+ 					wIndex + 1);
+ 				bus_state->resume_done[wIndex] = 0;
++				clear_bit(wIndex, &bus_state->resuming_ports);
+ 				xhci_set_link_state(xhci, port_array, wIndex,
+ 							XDEV_U0);
+ 				xhci_dbg(xhci, "set port %d resume\n",
+@@ -845,7 +846,12 @@ int xhci_hub_status_data(struct usb_hcd
+ 	/* Initial status is no changes */
+ 	retval = (max_ports + 8) / 8;
+ 	memset(buf, 0, retval);
+-	status = 0;
++
++	/*
++	 * Inform the usbcore about resume-in-progress by returning
++	 * a non-zero value even if there are no status changes.
++	 */
++	status = bus_state->resuming_ports;
+ 
+ 	mask = PORT_CSC | PORT_PEC | PORT_OCC | PORT_PLC | PORT_WRC;
+ 
+@@ -885,15 +891,11 @@ int xhci_bus_suspend(struct usb_hcd *hcd
+ 	spin_lock_irqsave(&xhci->lock, flags);
+ 
+ 	if (hcd->self.root_hub->do_remote_wakeup) {
+-		port_index = max_ports;
+-		while (port_index--) {
+-			if (bus_state->resume_done[port_index] != 0) {
+-				spin_unlock_irqrestore(&xhci->lock, flags);
+-				xhci_dbg(xhci, "suspend failed because "
+-						"port %d is resuming\n",
+-						port_index + 1);
+-				return -EBUSY;
+-			}
++		if (bus_state->resuming_ports) {
++			spin_unlock_irqrestore(&xhci->lock, flags);
++			xhci_dbg(xhci, "suspend failed because "
++						"a port is resuming\n");
++			return -EBUSY;
+ 		}
+ 	}
+ 
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@ -1377,6 +1377,7 @@ static void handle_port_status(struct xh
+ 			xhci_dbg(xhci, "resume HS port %d\n", port_id);
+ 			bus_state->resume_done[faked_port_index] = jiffies +
+ 				msecs_to_jiffies(20);
++			set_bit(faked_port_index, &bus_state->resuming_ports);
+ 			mod_timer(&hcd->rh_timer,
+ 				  bus_state->resume_done[faked_port_index]);
+ 			/* Do the rest in GetPortStatus */
+--- a/drivers/usb/host/xhci.c
++++ b/drivers/usb/host/xhci.c
+@@ -152,7 +152,7 @@ int xhci_reset(struct xhci_hcd *xhci)
+ {
+ 	u32 command;
+ 	u32 state;
+-	int ret;
++	int ret, i;
+ 
+ 	state = xhci_readl(xhci, &xhci->op_regs->status);
+ 	if ((state & STS_HALT) == 0) {
+@@ -175,7 +175,15 @@ int xhci_reset(struct xhci_hcd *xhci)
+ 	 * xHCI cannot write to any doorbells or operational registers other
+ 	 * than status until the "Controller Not Ready" flag is cleared.
+ 	 */
+-	return handshake(xhci, &xhci->op_regs->status, STS_CNR, 0, 250 * 1000);
++	ret = handshake(xhci, &xhci->op_regs->status, STS_CNR, 0, 250 * 1000);
++
++	for (i = 0; i < 2; ++i) {
++		xhci->bus_state[i].port_c_suspend = 0;
++		xhci->bus_state[i].suspended_ports = 0;
++		xhci->bus_state[i].resuming_ports = 0;
++	}
++
++	return ret;
+ }
+ 
+ #ifdef CONFIG_PCI
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@ -1362,6 +1362,8 @@ struct xhci_bus_state {
+ 	u32			suspended_ports;
+ 	u32			port_remote_wakeup;
+ 	unsigned long		resume_done[USB_MAXCHILDREN];
++	/* which ports have started to resume */
++	unsigned long		resuming_ports;
+ };
+ 
+ static inline unsigned int hcd_index(struct usb_hcd *hcd)
