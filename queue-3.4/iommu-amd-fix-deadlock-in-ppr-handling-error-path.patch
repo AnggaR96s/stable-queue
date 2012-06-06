@@ -1,0 +1,136 @@
+From eee53537c476c947bf7faa1c916d2f5a0ae8ec93 Mon Sep 17 00:00:00 2001
+From: Joerg Roedel <joerg.roedel@amd.com>
+Date: Fri, 1 Jun 2012 15:20:23 +0200
+Subject: iommu/amd: Fix deadlock in ppr-handling error path
+
+From: Joerg Roedel <joerg.roedel@amd.com>
+
+commit eee53537c476c947bf7faa1c916d2f5a0ae8ec93 upstream.
+
+In the error path of the ppr_notifer it can happen that the
+iommu->lock is taken recursivly. This patch fixes the
+problem by releasing the iommu->lock before any notifier is
+invoked. This also requires to move the erratum workaround
+for the ppr-log (interrupt may be faster than data in the log)
+one function up.
+
+Signed-off-by: Joerg Roedel <joerg.roedel@amd.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/iommu/amd_iommu.c |   73 ++++++++++++++++++++++++++++------------------
+ 1 file changed, 45 insertions(+), 28 deletions(-)
+
+--- a/drivers/iommu/amd_iommu.c
++++ b/drivers/iommu/amd_iommu.c
+@@ -547,26 +547,12 @@ static void iommu_poll_events(struct amd
+ 	spin_unlock_irqrestore(&iommu->lock, flags);
+ }
+ 
+-static void iommu_handle_ppr_entry(struct amd_iommu *iommu, u32 head)
++static void iommu_handle_ppr_entry(struct amd_iommu *iommu, u64 *raw)
+ {
+ 	struct amd_iommu_fault fault;
+-	volatile u64 *raw;
+-	int i;
+ 
+ 	INC_STATS_COUNTER(pri_requests);
+ 
+-	raw = (u64 *)(iommu->ppr_log + head);
+-
+-	/*
+-	 * Hardware bug: Interrupt may arrive before the entry is written to
+-	 * memory. If this happens we need to wait for the entry to arrive.
+-	 */
+-	for (i = 0; i < LOOP_TIMEOUT; ++i) {
+-		if (PPR_REQ_TYPE(raw[0]) != 0)
+-			break;
+-		udelay(1);
+-	}
+-
+ 	if (PPR_REQ_TYPE(raw[0]) != PPR_REQ_FAULT) {
+ 		pr_err_ratelimited("AMD-Vi: Unknown PPR request received\n");
+ 		return;
+@@ -578,12 +564,6 @@ static void iommu_handle_ppr_entry(struc
+ 	fault.tag       = PPR_TAG(raw[0]);
+ 	fault.flags     = PPR_FLAGS(raw[0]);
+ 
+-	/*
+-	 * To detect the hardware bug we need to clear the entry
+-	 * to back to zero.
+-	 */
+-	raw[0] = raw[1] = 0;
+-
+ 	atomic_notifier_call_chain(&ppr_notifier, 0, &fault);
+ }
+ 
+@@ -595,25 +575,62 @@ static void iommu_poll_ppr_log(struct am
+ 	if (iommu->ppr_log == NULL)
+ 		return;
+ 
++	/* enable ppr interrupts again */
++	writel(MMIO_STATUS_PPR_INT_MASK, iommu->mmio_base + MMIO_STATUS_OFFSET);
++
+ 	spin_lock_irqsave(&iommu->lock, flags);
+ 
+ 	head = readl(iommu->mmio_base + MMIO_PPR_HEAD_OFFSET);
+ 	tail = readl(iommu->mmio_base + MMIO_PPR_TAIL_OFFSET);
+ 
+ 	while (head != tail) {
++		volatile u64 *raw;
++		u64 entry[2];
++		int i;
++
++		raw = (u64 *)(iommu->ppr_log + head);
++
++		/*
++		 * Hardware bug: Interrupt may arrive before the entry is
++		 * written to memory. If this happens we need to wait for the
++		 * entry to arrive.
++		 */
++		for (i = 0; i < LOOP_TIMEOUT; ++i) {
++			if (PPR_REQ_TYPE(raw[0]) != 0)
++				break;
++			udelay(1);
++		}
++
++		/* Avoid memcpy function-call overhead */
++		entry[0] = raw[0];
++		entry[1] = raw[1];
++
++		/*
++		 * To detect the hardware bug we need to clear the entry
++		 * back to zero.
++		 */
++		raw[0] = raw[1] = 0UL;
+ 
+-		/* Handle PPR entry */
+-		iommu_handle_ppr_entry(iommu, head);
+-
+-		/* Update and refresh ring-buffer state*/
++		/* Update head pointer of hardware ring-buffer */
+ 		head = (head + PPR_ENTRY_SIZE) % PPR_LOG_SIZE;
+ 		writel(head, iommu->mmio_base + MMIO_PPR_HEAD_OFFSET);
++
++		/*
++		 * Release iommu->lock because ppr-handling might need to
++		 * re-aquire it
++		 */
++		spin_unlock_irqrestore(&iommu->lock, flags);
++
++		/* Handle PPR entry */
++		iommu_handle_ppr_entry(iommu, entry);
++
++		spin_lock_irqsave(&iommu->lock, flags);
++
++		/* Refresh ring-buffer information */
++		head = readl(iommu->mmio_base + MMIO_PPR_HEAD_OFFSET);
+ 		tail = readl(iommu->mmio_base + MMIO_PPR_TAIL_OFFSET);
+ 	}
+ 
+-	/* enable ppr interrupts again */
+-	writel(MMIO_STATUS_PPR_INT_MASK, iommu->mmio_base + MMIO_STATUS_OFFSET);
+-
+ 	spin_unlock_irqrestore(&iommu->lock, flags);
+ }
+ 
