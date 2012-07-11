@@ -1,0 +1,107 @@
+From 0d9f78a92ef5e97d9fe51d9215ebe22f6f0d289d Mon Sep 17 00:00:00 2001
+From: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Date: Thu, 21 Jun 2012 16:28:30 -0700
+Subject: xhci: Fix hang on back-to-back Set TR Deq Ptr commands.
+
+From: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+
+commit 0d9f78a92ef5e97d9fe51d9215ebe22f6f0d289d upstream.
+
+The Microsoft LifeChat 3000 USB headset was causing a very reproducible
+hang whenever it was plugged in.  At first, I thought the host
+controller was producing bad transfer events, because the log was filled
+with errors like:
+
+xhci_hcd 0000:00:14.0: ERROR Transfer event TRB DMA ptr not part of current TD
+
+However, it turned out to be an xHCI driver bug in the ring expansion
+patches.  The bug is triggered When there are two ring segments, and a
+TD that ends just before a link TRB, like so:
+
+ ______________                     _____________
+|              |              ---> | setup TRB B |
+ ______________               |     _____________
+|              |              |    |  data TRB B |
+ ______________               |     _____________
+| setup TRB A  | <-- deq      |    |  data TRB B |
+ ______________               |     _____________
+| data TRB A   |              |    |             | <-- enq, deq''
+ ______________               |     _____________
+| status TRB A |              |    |             |
+ ______________               |     _____________
+|  link TRB    |---------------    |  link TRB   |
+ _____________  <--- deq'           _____________
+
+TD A (the first control transfer) stalls on the data phase.  That halts
+the ring.  The xHCI driver moves the hardware dequeue pointer to the
+first TRB after the stalled transfer, which happens to be the link TRB.
+
+Once the Set TR dequeue pointer command completes, the function
+update_ring_for_set_deq_completion runs.  That function is supposed to
+update the xHCI driver's dequeue pointer to match the internal hardware
+dequeue pointer.  On the first call this would work fine, and the
+software dequeue pointer would move to deq'.
+
+However, if the transfer immediately after that stalled (TD B in this
+case), another Set TR Dequeue command would be issued.  That would move
+the hardware dequeue pointer to deq''.  Once that command completed,
+update_ring_for_set_deq_completion would run again.
+
+The original code would unconditionally increment the software dequeue
+pointer, which moved the pointer off the ring segment into la-la-land.
+The while loop would happy increment the dequeue pointer (possibly
+wrapping it) until it matched the hardware pointer value.
+
+The while loop would also access all the memory in between the first
+ring segment and the second ring segment to determine if it was a link
+TRB.  This could cause general protection faults, although it was
+unlikely because the ring segments came from a DMA pool, and would often
+have consecutive memory addresses.
+
+If nothing in that space looked like a link TRB, the deq_seg pointer for
+the ring would remain on the first segment.  Thus, the deq_seg and the
+software dequeue pointer would get out of sync.
+
+When the next transfer event came in after the stalled transfer, the
+xHCI driver code would attempt to convert the software dequeue pointer
+into a DMA address in order to compare the DMA address for the completed
+transfer.  Since the deq_seg and the dequeue pointer were out of sync,
+xhci_trb_virt_to_dma would return NULL.
+
+The transfer event would get ignored, the transfer would eventually
+timeout, and we would mistakenly convert the finished transfer to no-op
+TRBs.  Some kernel driver (maybe xHCI?) would then get stuck in an
+infinite loop in interrupt context, and the whole machine would hang.
+
+This patch should be backported to kernels as old as 3.4, that contain
+the commit b008df60c6369ba0290fa7daa177375407a12e07 "xHCI: count free
+TRBs on transfer ring"
+
+Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Cc: Andiry Xu <andiry.xu@amd.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/usb/host/xhci-ring.c |   11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@ -885,6 +885,17 @@ static void update_ring_for_set_deq_comp
+ 	num_trbs_free_temp = ep_ring->num_trbs_free;
+ 	dequeue_temp = ep_ring->dequeue;
+ 
++	/* If we get two back-to-back stalls, and the first stalled transfer
++	 * ends just before a link TRB, the dequeue pointer will be left on
++	 * the link TRB by the code in the while loop.  So we have to update
++	 * the dequeue pointer one segment further, or we'll jump off
++	 * the segment into la-la-land.
++	 */
++	if (last_trb(xhci, ep_ring, ep_ring->deq_seg, ep_ring->dequeue)) {
++		ep_ring->deq_seg = ep_ring->deq_seg->next;
++		ep_ring->dequeue = ep_ring->deq_seg->trbs;
++	}
++
+ 	while (ep_ring->dequeue != dev->eps[ep_index].queued_deq_ptr) {
+ 		/* We have more usable TRBs */
+ 		ep_ring->num_trbs_free++;
