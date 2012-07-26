@@ -1,0 +1,119 @@
+From 3cf003c08be785af4bee9ac05891a15bcbff856a Mon Sep 17 00:00:00 2001
+From: Jeff Layton <jlayton@redhat.com>
+Date: Wed, 11 Jul 2012 09:09:36 -0400
+Subject: cifs: when CONFIG_HIGHMEM is set, serialize the read/write kmaps
+
+From: Jeff Layton <jlayton@redhat.com>
+
+commit 3cf003c08be785af4bee9ac05891a15bcbff856a upstream.
+
+[The async read code was broadened to include uncached reads in 3.5, so
+the mainline patch did not apply directly. This patch is just a backport
+to account for that change.]
+
+Jian found that when he ran fsx on a 32 bit arch with a large wsize the
+process and one of the bdi writeback kthreads would sometimes deadlock
+with a stack trace like this:
+
+crash> bt
+PID: 2789   TASK: f02edaa0  CPU: 3   COMMAND: "fsx"
+ #0 [eed63cbc] schedule at c083c5b3
+ #1 [eed63d80] kmap_high at c0500ec8
+ #2 [eed63db0] cifs_async_writev at f7fabcd7 [cifs]
+ #3 [eed63df0] cifs_writepages at f7fb7f5c [cifs]
+ #4 [eed63e50] do_writepages at c04f3e32
+ #5 [eed63e54] __filemap_fdatawrite_range at c04e152a
+ #6 [eed63ea4] filemap_fdatawrite at c04e1b3e
+ #7 [eed63eb4] cifs_file_aio_write at f7fa111a [cifs]
+ #8 [eed63ecc] do_sync_write at c052d202
+ #9 [eed63f74] vfs_write at c052d4ee
+#10 [eed63f94] sys_write at c052df4c
+#11 [eed63fb0] ia32_sysenter_target at c0409a98
+    EAX: 00000004  EBX: 00000003  ECX: abd73b73  EDX: 012a65c6
+    DS:  007b      ESI: 012a65c6  ES:  007b      EDI: 00000000
+    SS:  007b      ESP: bf8db178  EBP: bf8db1f8  GS:  0033
+    CS:  0073      EIP: 40000424  ERR: 00000004  EFLAGS: 00000246
+
+Each task would kmap part of its address array before getting stuck, but
+not enough to actually issue the write.
+
+This patch fixes this by serializing the marshal_iov operations for
+async reads and writes. The idea here is to ensure that cifs
+aggressively tries to populate a request before attempting to fulfill
+another one. As soon as all of the pages are kmapped for a request, then
+we can unlock and allow another one to proceed.
+
+There's no need to do this serialization on non-CONFIG_HIGHMEM arches
+however, so optimize all of this out when CONFIG_HIGHMEM isn't set.
+
+Reported-by: Jian Li <jiali@redhat.com>
+Signed-off-by: Jeff Layton <jlayton@redhat.com>
+Signed-off-by: Steve French <smfrench@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+
+---
+ fs/cifs/cifssmb.c |   30 ++++++++++++++++++++++++++++++
+ 1 file changed, 30 insertions(+)
+
+--- a/fs/cifs/cifssmb.c
++++ b/fs/cifs/cifssmb.c
+@@ -89,6 +89,32 @@ static struct {
+ /* Forward declarations */
+ static void cifs_readv_complete(struct work_struct *work);
+ 
++#ifdef CONFIG_HIGHMEM
++/*
++ * On arches that have high memory, kmap address space is limited. By
++ * serializing the kmap operations on those arches, we ensure that we don't
++ * end up with a bunch of threads in writeback with partially mapped page
++ * arrays, stuck waiting for kmap to come back. That situation prevents
++ * progress and can deadlock.
++ */
++static DEFINE_MUTEX(cifs_kmap_mutex);
++
++static inline void
++cifs_kmap_lock(void)
++{
++	mutex_lock(&cifs_kmap_mutex);
++}
++
++static inline void
++cifs_kmap_unlock(void)
++{
++	mutex_unlock(&cifs_kmap_mutex);
++}
++#else /* !CONFIG_HIGHMEM */
++#define cifs_kmap_lock() do { ; } while(0)
++#define cifs_kmap_unlock() do { ; } while(0)
++#endif /* CONFIG_HIGHMEM */
++
+ /* Mark as invalid, all open files on tree connections since they
+    were closed when session to server was lost */
+ static void mark_open_files_invalid(struct cifs_tcon *pTcon)
+@@ -1557,6 +1583,7 @@ cifs_readv_receive(struct TCP_Server_Inf
+ 	eof_index = eof ? (eof - 1) >> PAGE_CACHE_SHIFT : 0;
+ 	cFYI(1, "eof=%llu eof_index=%lu", eof, eof_index);
+ 
++	cifs_kmap_lock();
+ 	list_for_each_entry_safe(page, tpage, &rdata->pages, lru) {
+ 		if (remaining >= PAGE_CACHE_SIZE) {
+ 			/* enough data to fill the page */
+@@ -1606,6 +1633,7 @@ cifs_readv_receive(struct TCP_Server_Inf
+ 			page_cache_release(page);
+ 		}
+ 	}
++	cifs_kmap_unlock();
+ 
+ 	/* issue the read if we have any iovecs left to fill */
+ 	if (rdata->nr_iov > 1) {
+@@ -2194,7 +2222,9 @@ cifs_async_writev(struct cifs_writedata
+ 	 * and set the iov_len properly for each one. It may also set
+ 	 * wdata->bytes too.
+ 	 */
++	cifs_kmap_lock();
+ 	wdata->marshal_iov(iov, wdata);
++	cifs_kmap_unlock();
+ 
+ 	cFYI(1, "async write at %llu %u bytes", wdata->offset, wdata->bytes);
+ 
