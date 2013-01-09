@@ -1,0 +1,154 @@
+From 3a0d8556d354b51d7c936b99ee4fb059602293da Mon Sep 17 00:00:00 2001
+From: Eric Dumazet <edumazet@google.com>
+Date: Tue, 17 Jul 2012 10:13:05 +0200
+Subject: tcp: implement RFC 5961 3.2
+
+
+From: Eric Dumazet <edumazet@google.com>
+
+[ Upstream commit 282f23c6ee343126156dd41218b22ece96d747e3 ]
+
+Implement the RFC 5691 mitigation against Blind
+Reset attack using RST bit.
+
+Idea is to validate incoming RST sequence,
+to match RCV.NXT value, instead of previouly accepted
+window : (RCV.NXT <= SEG.SEQ < RCV.NXT+RCV.WND)
+
+If sequence is in window but not an exact match, send
+a "challenge ACK", so that the other part can resend an
+RST with the appropriate sequence.
+
+Add a new sysctl, tcp_challenge_ack_limit, to limit
+number of challenge ACK sent per second.
+
+Add a new SNMP counter to count number of challenge acks sent.
+(netstat -s | grep TCPChallengeACK)
+
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Cc: Kiran Kumar Kella <kkiran@broadcom.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ Documentation/networking/ip-sysctl.txt |    5 +++++
+ include/linux/snmp.h                   |    1 +
+ include/net/tcp.h                      |    1 +
+ net/ipv4/proc.c                        |    1 +
+ net/ipv4/sysctl_net_ipv4.c             |    7 +++++++
+ net/ipv4/tcp_input.c                   |   31 ++++++++++++++++++++++++++++++-
+ 6 files changed, 45 insertions(+), 1 deletion(-)
+
+--- a/Documentation/networking/ip-sysctl.txt
++++ b/Documentation/networking/ip-sysctl.txt
+@@ -537,6 +537,11 @@ tcp_thin_dupack - BOOLEAN
+ 	Documentation/networking/tcp-thin.txt
+ 	Default: 0
+ 
++tcp_challenge_ack_limit - INTEGER
++	Limits number of Challenge ACK sent per second, as recommended
++	in RFC 5961 (Improving TCP's Robustness to Blind In-Window Attacks)
++	Default: 100
++
+ UDP variables:
+ 
+ udp_mem - vector of 3 INTEGERs: min, pressure, max
+--- a/include/linux/snmp.h
++++ b/include/linux/snmp.h
+@@ -234,6 +234,7 @@ enum
+ 	LINUX_MIB_TCPREQQFULLDROP,		/* TCPReqQFullDrop */
+ 	LINUX_MIB_TCPRETRANSFAIL,		/* TCPRetransFail */
+ 	LINUX_MIB_TCPRCVCOALESCE,			/* TCPRcvCoalesce */
++	LINUX_MIB_TCPCHALLENGEACK,		/* TCPChallengeACK */
+ 	__LINUX_MIB_MAX
+ };
+ 
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -252,6 +252,7 @@ extern int sysctl_tcp_max_ssthresh;
+ extern int sysctl_tcp_cookie_size;
+ extern int sysctl_tcp_thin_linear_timeouts;
+ extern int sysctl_tcp_thin_dupack;
++extern int sysctl_tcp_challenge_ack_limit;
+ 
+ extern atomic_long_t tcp_memory_allocated;
+ extern struct percpu_counter tcp_sockets_allocated;
+--- a/net/ipv4/proc.c
++++ b/net/ipv4/proc.c
+@@ -258,6 +258,7 @@ static const struct snmp_mib snmp4_net_l
+ 	SNMP_MIB_ITEM("TCPReqQFullDrop", LINUX_MIB_TCPREQQFULLDROP),
+ 	SNMP_MIB_ITEM("TCPRetransFail", LINUX_MIB_TCPRETRANSFAIL),
+ 	SNMP_MIB_ITEM("TCPRcvCoalesce", LINUX_MIB_TCPRCVCOALESCE),
++	SNMP_MIB_ITEM("TCPChallengeACK", LINUX_MIB_TCPCHALLENGEACK),
+ 	SNMP_MIB_SENTINEL
+ };
+ 
+--- a/net/ipv4/sysctl_net_ipv4.c
++++ b/net/ipv4/sysctl_net_ipv4.c
+@@ -590,6 +590,13 @@ static struct ctl_table ipv4_table[] = {
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec
+ 	},
++	{
++		.procname	= "tcp_challenge_ack_limit",
++		.data		= &sysctl_tcp_challenge_ack_limit,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec
++	},
+ #ifdef CONFIG_NET_DMA
+ 	{
+ 		.procname	= "tcp_dma_copybreak",
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -88,6 +88,9 @@ int sysctl_tcp_app_win __read_mostly = 3
+ int sysctl_tcp_adv_win_scale __read_mostly = 1;
+ EXPORT_SYMBOL(sysctl_tcp_adv_win_scale);
+ 
++/* rfc5961 challenge ack rate limiting */
++int sysctl_tcp_challenge_ack_limit = 100;
++
+ int sysctl_tcp_stdurg __read_mostly;
+ int sysctl_tcp_rfc1337 __read_mostly;
+ int sysctl_tcp_max_orphans __read_mostly = NR_FILE;
+@@ -5265,6 +5268,23 @@ out:
+ }
+ #endif /* CONFIG_NET_DMA */
+ 
++static void tcp_send_challenge_ack(struct sock *sk)
++{
++	/* unprotected vars, we dont care of overwrites */
++	static u32 challenge_timestamp;
++	static unsigned int challenge_count;
++	u32 now = jiffies / HZ;
++
++	if (now != challenge_timestamp) {
++		challenge_timestamp = now;
++		challenge_count = 0;
++	}
++	if (++challenge_count <= sysctl_tcp_challenge_ack_limit) {
++		NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPCHALLENGEACK);
++		tcp_send_ack(sk);
++	}
++}
++
+ /* Does PAWS and seqno based validation of an incoming segment, flags will
+  * play significant role here.
+  */
+@@ -5301,7 +5321,16 @@ static int tcp_validate_incoming(struct
+ 
+ 	/* Step 2: check RST bit */
+ 	if (th->rst) {
+-		tcp_reset(sk);
++		/* RFC 5961 3.2 :
++		 * If sequence number exactly matches RCV.NXT, then
++		 *     RESET the connection
++		 * else
++		 *     Send a challenge ACK
++		 */
++		if (TCP_SKB_CB(skb)->seq == tp->rcv_nxt)
++			tcp_reset(sk);
++		else
++			tcp_send_challenge_ack(sk);
+ 		goto discard;
+ 	}
+ 
