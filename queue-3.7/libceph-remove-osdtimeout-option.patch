@@ -1,0 +1,161 @@
+From aa852ff17166b53b1d29388af472bb9c32297f05 Mon Sep 17 00:00:00 2001
+From: Sage Weil <sage@inktank.com>
+Date: Wed, 28 Nov 2012 12:28:24 -0800
+Subject: libceph: remove 'osdtimeout' option
+
+
+From: Sage Weil <sage@inktank.com>
+
+(cherry picked from commit 83aff95eb9d60aff5497e9f44a2ae906b86d8e88)
+
+This would reset a connection with any OSD that had an outstanding
+request that was taking more than N seconds.  The idea was that if the
+OSD was buggy, the client could compensate by resending the request.
+
+In reality, this only served to hide server bugs, and we haven't
+actually seen such a bug in quite a while.  Moreover, the userspace
+client code never did this.
+
+More importantly, often the request is taking a long time because the
+OSD is trying to recover, or overloaded, and killing the connection
+and retrying would only make the situation worse by giving the OSD
+more work to do.
+
+Signed-off-by: Sage Weil <sage@inktank.com>
+Reviewed-by: Alex Elder <elder@inktank.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/ceph/super.c              |    2 -
+ include/linux/ceph/libceph.h |    2 -
+ net/ceph/ceph_common.c       |    3 --
+ net/ceph/osd_client.c        |   47 +++----------------------------------------
+ 4 files changed, 5 insertions(+), 49 deletions(-)
+
+--- a/fs/ceph/super.c
++++ b/fs/ceph/super.c
+@@ -403,8 +403,6 @@ static int ceph_show_options(struct seq_
+ 		seq_printf(m, ",mount_timeout=%d", opt->mount_timeout);
+ 	if (opt->osd_idle_ttl != CEPH_OSD_IDLE_TTL_DEFAULT)
+ 		seq_printf(m, ",osd_idle_ttl=%d", opt->osd_idle_ttl);
+-	if (opt->osd_timeout != CEPH_OSD_TIMEOUT_DEFAULT)
+-		seq_printf(m, ",osdtimeout=%d", opt->osd_timeout);
+ 	if (opt->osd_keepalive_timeout != CEPH_OSD_KEEPALIVE_DEFAULT)
+ 		seq_printf(m, ",osdkeepalivetimeout=%d",
+ 			   opt->osd_keepalive_timeout);
+--- a/include/linux/ceph/libceph.h
++++ b/include/linux/ceph/libceph.h
+@@ -43,7 +43,6 @@ struct ceph_options {
+ 	struct ceph_entity_addr my_addr;
+ 	int mount_timeout;
+ 	int osd_idle_ttl;
+-	int osd_timeout;
+ 	int osd_keepalive_timeout;
+ 
+ 	/*
+@@ -63,7 +62,6 @@ struct ceph_options {
+  * defaults
+  */
+ #define CEPH_MOUNT_TIMEOUT_DEFAULT  60
+-#define CEPH_OSD_TIMEOUT_DEFAULT    60  /* seconds */
+ #define CEPH_OSD_KEEPALIVE_DEFAULT  5
+ #define CEPH_OSD_IDLE_TTL_DEFAULT    60
+ 
+--- a/net/ceph/ceph_common.c
++++ b/net/ceph/ceph_common.c
+@@ -305,7 +305,6 @@ ceph_parse_options(char *options, const
+ 
+ 	/* start with defaults */
+ 	opt->flags = CEPH_OPT_DEFAULT;
+-	opt->osd_timeout = CEPH_OSD_TIMEOUT_DEFAULT;
+ 	opt->osd_keepalive_timeout = CEPH_OSD_KEEPALIVE_DEFAULT;
+ 	opt->mount_timeout = CEPH_MOUNT_TIMEOUT_DEFAULT; /* seconds */
+ 	opt->osd_idle_ttl = CEPH_OSD_IDLE_TTL_DEFAULT;   /* seconds */
+@@ -391,7 +390,7 @@ ceph_parse_options(char *options, const
+ 
+ 			/* misc */
+ 		case Opt_osdtimeout:
+-			opt->osd_timeout = intval;
++			pr_warning("ignoring deprecated osdtimeout option\n");
+ 			break;
+ 		case Opt_osdkeepalivetimeout:
+ 			opt->osd_keepalive_timeout = intval;
+--- a/net/ceph/osd_client.c
++++ b/net/ceph/osd_client.c
+@@ -608,14 +608,6 @@ static void __kick_osd_requests(struct c
+ 	}
+ }
+ 
+-static void kick_osd_requests(struct ceph_osd_client *osdc,
+-			      struct ceph_osd *kickosd)
+-{
+-	mutex_lock(&osdc->request_mutex);
+-	__kick_osd_requests(osdc, kickosd);
+-	mutex_unlock(&osdc->request_mutex);
+-}
+-
+ /*
+  * If the osd connection drops, we need to resubmit all requests.
+  */
+@@ -629,7 +621,9 @@ static void osd_reset(struct ceph_connec
+ 	dout("osd_reset osd%d\n", osd->o_osd);
+ 	osdc = osd->o_osdc;
+ 	down_read(&osdc->map_sem);
+-	kick_osd_requests(osdc, osd);
++	mutex_lock(&osdc->request_mutex);
++	__kick_osd_requests(osdc, osd);
++	mutex_unlock(&osdc->request_mutex);
+ 	send_queued(osdc);
+ 	up_read(&osdc->map_sem);
+ }
+@@ -1093,12 +1087,10 @@ static void handle_timeout(struct work_s
+ {
+ 	struct ceph_osd_client *osdc =
+ 		container_of(work, struct ceph_osd_client, timeout_work.work);
+-	struct ceph_osd_request *req, *last_req = NULL;
++	struct ceph_osd_request *req;
+ 	struct ceph_osd *osd;
+-	unsigned long timeout = osdc->client->options->osd_timeout * HZ;
+ 	unsigned long keepalive =
+ 		osdc->client->options->osd_keepalive_timeout * HZ;
+-	unsigned long last_stamp = 0;
+ 	struct list_head slow_osds;
+ 	dout("timeout\n");
+ 	down_read(&osdc->map_sem);
+@@ -1108,37 +1100,6 @@ static void handle_timeout(struct work_s
+ 	mutex_lock(&osdc->request_mutex);
+ 
+ 	/*
+-	 * reset osds that appear to be _really_ unresponsive.  this
+-	 * is a failsafe measure.. we really shouldn't be getting to
+-	 * this point if the system is working properly.  the monitors
+-	 * should mark the osd as failed and we should find out about
+-	 * it from an updated osd map.
+-	 */
+-	while (timeout && !list_empty(&osdc->req_lru)) {
+-		req = list_entry(osdc->req_lru.next, struct ceph_osd_request,
+-				 r_req_lru_item);
+-
+-		/* hasn't been long enough since we sent it? */
+-		if (time_before(jiffies, req->r_stamp + timeout))
+-			break;
+-
+-		/* hasn't been long enough since it was acked? */
+-		if (req->r_request->ack_stamp == 0 ||
+-		    time_before(jiffies, req->r_request->ack_stamp + timeout))
+-			break;
+-
+-		BUG_ON(req == last_req && req->r_stamp == last_stamp);
+-		last_req = req;
+-		last_stamp = req->r_stamp;
+-
+-		osd = req->r_osd;
+-		BUG_ON(!osd);
+-		pr_warning(" tid %llu timed out on osd%d, will reset osd\n",
+-			   req->r_tid, osd->o_osd);
+-		__kick_osd_requests(osdc, osd);
+-	}
+-
+-	/*
+ 	 * ping osds that are a bit slow.  this ensures that if there
+ 	 * is a break in the TCP connection we will notice, and reopen
+ 	 * a connection with that osd (from the fault callback).
