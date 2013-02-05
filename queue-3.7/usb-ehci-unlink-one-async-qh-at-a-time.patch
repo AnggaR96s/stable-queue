@@ -1,0 +1,122 @@
+From 6e0c3339a6f19d748f16091d0a05adeb1e1f822b Mon Sep 17 00:00:00 2001
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Fri, 25 Jan 2013 16:54:22 -0500
+Subject: USB: EHCI: unlink one async QH at a time
+
+From: Alan Stern <stern@rowland.harvard.edu>
+
+commit 6e0c3339a6f19d748f16091d0a05adeb1e1f822b upstream.
+
+This patch (as1648) fixes a regression affecting nVidia EHCI
+controllers.  Evidently they don't like to have more than one async QH
+unlinked at a time.  I can't imagine how they manage to mess it up,
+but at least one of them does.
+
+The patch changes the async unlink logic in two ways:
+
+	Each time an IAA cycle is started, only the first QH on the
+	async unlink list is handled (rather than all of them).
+
+	Async QHs do not all get unlinked as soon as they have been
+	empty for long enough.  Instead, only the last one (i.e., the
+	one that has been on the schedule the longest) is unlinked,
+	and then only if no other unlinks are in progress at the time.
+
+This means that when multiple QHs are empty, they won't be unlinked as
+quickly as before.  That's okay; it won't affect correct operation of
+the driver or add an excessive load.  Multiple unlinks tend to be
+relatively rare in any case.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Reported-and-tested-by: Piergiorgio Sartor <piergiorgio.sartor@nexgo.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/usb/host/ehci-q.c |   50 +++++++++++++++++++++++++++-------------------
+ 1 file changed, 30 insertions(+), 20 deletions(-)
+
+--- a/drivers/usb/host/ehci-q.c
++++ b/drivers/usb/host/ehci-q.c
+@@ -1197,17 +1197,26 @@ static void start_iaa_cycle(struct ehci_
+ 	if (ehci->async_iaa || ehci->async_unlinking)
+ 		return;
+ 
+-	/* Do all the waiting QHs at once */
+-	ehci->async_iaa = ehci->async_unlink;
+-	ehci->async_unlink = NULL;
+-
+ 	/* If the controller isn't running, we don't have to wait for it */
+ 	if (unlikely(ehci->rh_state < EHCI_RH_RUNNING)) {
++
++		/* Do all the waiting QHs */
++		ehci->async_iaa = ehci->async_unlink;
++		ehci->async_unlink = NULL;
++
+ 		if (!nested)		/* Avoid recursion */
+ 			end_unlink_async(ehci);
+ 
+ 	/* Otherwise start a new IAA cycle */
+ 	} else if (likely(ehci->rh_state == EHCI_RH_RUNNING)) {
++		struct ehci_qh		*qh;
++
++		/* Do only the first waiting QH (nVidia bug?) */
++		qh = ehci->async_unlink;
++		ehci->async_iaa = qh;
++		ehci->async_unlink = qh->unlink_next;
++		qh->unlink_next = NULL;
++
+ 		/* Make sure the unlinks are all visible to the hardware */
+ 		wmb();
+ 
+@@ -1255,34 +1264,35 @@ static void end_unlink_async(struct ehci
+ 	}
+ }
+ 
++static void start_unlink_async(struct ehci_hcd *ehci, struct ehci_qh *qh);
++
+ static void unlink_empty_async(struct ehci_hcd *ehci)
+ {
+-	struct ehci_qh		*qh, *next;
+-	bool			stopped = (ehci->rh_state < EHCI_RH_RUNNING);
++	struct ehci_qh		*qh;
++	struct ehci_qh		*qh_to_unlink = NULL;
+ 	bool			check_unlinks_later = false;
++	int			count = 0;
+ 
+-	/* Unlink all the async QHs that have been empty for a timer cycle */
+-	next = ehci->async->qh_next.qh;
+-	while (next) {
+-		qh = next;
+-		next = qh->qh_next.qh;
+-
++	/* Find the last async QH which has been empty for a timer cycle */
++	for (qh = ehci->async->qh_next.qh; qh; qh = qh->qh_next.qh) {
+ 		if (list_empty(&qh->qtd_list) &&
+ 				qh->qh_state == QH_STATE_LINKED) {
+-			if (!stopped && qh->unlink_cycle ==
+-					ehci->async_unlink_cycle)
++			++count;
++			if (qh->unlink_cycle == ehci->async_unlink_cycle)
+ 				check_unlinks_later = true;
+ 			else
+-				single_unlink_async(ehci, qh);
++				qh_to_unlink = qh;
+ 		}
+ 	}
+ 
+-	/* Start a new IAA cycle if any QHs are waiting for it */
+-	if (ehci->async_unlink)
+-		start_iaa_cycle(ehci, false);
++	/* If nothing else is being unlinked, unlink the last empty QH */
++	if (!ehci->async_iaa && !ehci->async_unlink && qh_to_unlink) {
++		start_unlink_async(ehci, qh_to_unlink);
++		--count;
++	}
+ 
+-	/* QHs that haven't been empty for long enough will be handled later */
+-	if (check_unlinks_later) {
++	/* Other QHs will be handled later */
++	if (count > 0) {
+ 		ehci_enable_event(ehci, EHCI_HRTIMER_ASYNC_UNLINKS, true);
+ 		++ehci->async_unlink_cycle;
+ 	}
