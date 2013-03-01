@@ -1,0 +1,162 @@
+From da27a24383b2b10bf6ebd0db29b325548aafecb4 Mon Sep 17 00:00:00 2001
+From: Matt Fleming <matt.fleming@intel.com>
+Date: Fri, 1 Feb 2013 11:02:28 +0000
+Subject: efivarfs: guid part of filenames are case-insensitive
+
+From: Matt Fleming <matt.fleming@intel.com>
+
+commit da27a24383b2b10bf6ebd0db29b325548aafecb4 upstream.
+
+It makes no sense to treat the following filenames as unique,
+
+	VarName-abcdefab-abcd-abcd-abcd-abcdefabcdef
+	VarName-ABCDEFAB-ABCD-ABCD-ABCD-ABCDEFABCDEF
+	VarName-ABcDEfAB-ABcD-ABcD-ABcD-ABcDEfABcDEf
+	VarName-aBcDEfAB-aBcD-aBcD-aBcD-aBcDEfaBcDEf
+	... etc ...
+
+since the guid will be converted into a binary representation, which
+has no case.
+
+Roll our own dentry operations so that we can treat the variable name
+part of filenames ("VarName" in the above example) as case-sensitive,
+but the guid portion as case-insensitive. That way, efivarfs will
+refuse to create the above files if any one already exists.
+
+Reported-by: Lingzhu Xiang <lxiang@redhat.com>
+Cc: Matthew Garrett <mjg59@srcf.ucam.org>
+Cc: Jeremy Kerr <jeremy.kerr@canonical.com>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Signed-off-by: Matt Fleming <matt.fleming@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/firmware/efivars.c |   95 ++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 93 insertions(+), 2 deletions(-)
+
+--- a/drivers/firmware/efivars.c
++++ b/drivers/firmware/efivars.c
+@@ -1043,6 +1043,84 @@ static int efivarfs_unlink(struct inode
+ 	return -EINVAL;
+ };
+ 
++/*
++ * Compare two efivarfs file names.
++ *
++ * An efivarfs filename is composed of two parts,
++ *
++ *	1. A case-sensitive variable name
++ *	2. A case-insensitive GUID
++ *
++ * So we need to perform a case-sensitive match on part 1 and a
++ * case-insensitive match on part 2.
++ */
++static int efivarfs_d_compare(const struct dentry *parent, const struct inode *pinode,
++			      const struct dentry *dentry, const struct inode *inode,
++			      unsigned int len, const char *str,
++			      const struct qstr *name)
++{
++	int guid = len - GUID_LEN;
++
++	if (name->len != len)
++		return 1;
++
++	/* Case-sensitive compare for the variable name */
++	if (memcmp(str, name->name, guid))
++		return 1;
++
++	/* Case-insensitive compare for the GUID */
++	return strncasecmp(name->name + guid, str + guid, GUID_LEN);
++}
++
++static int efivarfs_d_hash(const struct dentry *dentry,
++			   const struct inode *inode, struct qstr *qstr)
++{
++	unsigned long hash = init_name_hash();
++	const unsigned char *s = qstr->name;
++	unsigned int len = qstr->len;
++
++	if (!efivarfs_valid_name(s, len))
++		return -EINVAL;
++
++	while (len-- > GUID_LEN)
++		hash = partial_name_hash(*s++, hash);
++
++	/* GUID is case-insensitive. */
++	while (len--)
++		hash = partial_name_hash(tolower(*s++), hash);
++
++	qstr->hash = end_name_hash(hash);
++	return 0;
++}
++
++/*
++ * Retaining negative dentries for an in-memory filesystem just wastes
++ * memory and lookup time: arrange for them to be deleted immediately.
++ */
++static int efivarfs_delete_dentry(const struct dentry *dentry)
++{
++	return 1;
++}
++
++static struct dentry_operations efivarfs_d_ops = {
++	.d_compare = efivarfs_d_compare,
++	.d_hash = efivarfs_d_hash,
++	.d_delete = efivarfs_delete_dentry,
++};
++
++static struct dentry *efivarfs_alloc_dentry(struct dentry *parent, char *name)
++{
++	struct qstr q;
++
++	q.name = name;
++	q.len = strlen(name);
++
++	if (efivarfs_d_hash(NULL, NULL, &q))
++		return NULL;
++
++	return d_alloc(parent, &q);
++}
++
+ static int efivarfs_fill_super(struct super_block *sb, void *data, int silent)
+ {
+ 	struct inode *inode = NULL;
+@@ -1058,6 +1136,7 @@ static int efivarfs_fill_super(struct su
+ 	sb->s_blocksize_bits    = PAGE_CACHE_SHIFT;
+ 	sb->s_magic             = EFIVARFS_MAGIC;
+ 	sb->s_op                = &efivarfs_ops;
++	sb->s_d_op		= &efivarfs_d_ops;
+ 	sb->s_time_gran         = 1;
+ 
+ 	inode = efivarfs_get_inode(sb, NULL, S_IFDIR | 0755, 0);
+@@ -1098,7 +1177,7 @@ static int efivarfs_fill_super(struct su
+ 		if (!inode)
+ 			goto fail_name;
+ 
+-		dentry = d_alloc_name(root, name);
++		dentry = efivarfs_alloc_dentry(root, name);
+ 		if (!dentry)
+ 			goto fail_inode;
+ 
+@@ -1148,8 +1227,20 @@ static struct file_system_type efivarfs_
+ 	.kill_sb = efivarfs_kill_sb,
+ };
+ 
++/*
++ * Handle negative dentry.
++ */
++static struct dentry *efivarfs_lookup(struct inode *dir, struct dentry *dentry,
++				      unsigned int flags)
++{
++	if (dentry->d_name.len > NAME_MAX)
++		return ERR_PTR(-ENAMETOOLONG);
++	d_add(dentry, NULL);
++	return NULL;
++}
++
+ static const struct inode_operations efivarfs_dir_inode_operations = {
+-	.lookup = simple_lookup,
++	.lookup = efivarfs_lookup,
+ 	.unlink = efivarfs_unlink,
+ 	.create = efivarfs_create,
+ };
