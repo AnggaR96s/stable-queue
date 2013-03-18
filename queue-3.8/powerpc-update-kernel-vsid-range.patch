@@ -1,0 +1,491 @@
+From c60ac5693c47df32a2b4b18af97fca5635def015 Mon Sep 17 00:00:00 2001
+From: "Aneesh Kumar K.V" <aneesh.kumar@linux.vnet.ibm.com>
+Date: Wed, 13 Mar 2013 03:34:54 +0000
+Subject: powerpc: Update kernel VSID range
+
+From: "Aneesh Kumar K.V" <aneesh.kumar@linux.vnet.ibm.com>
+
+commit c60ac5693c47df32a2b4b18af97fca5635def015 upstream.
+
+This patch change the kernel VSID range so that we limit VSID_BITS to 37.
+This enables us to support 64TB with 65 bit VA (37+28). Without this patch
+we have boot hangs on platforms that only support 65 bit VA.
+
+With this patch we now have proto vsid generated as below:
+
+We first generate a 37-bit "proto-VSID". Proto-VSIDs are generated
+from mmu context id and effective segment id of the address.
+
+For user processes max context id is limited to ((1ul << 19) - 5)
+for kernel space, we use the top 4 context ids to map address as below
+0x7fffc -  [ 0xc000000000000000 - 0xc0003fffffffffff ]
+0x7fffd -  [ 0xd000000000000000 - 0xd0003fffffffffff ]
+0x7fffe -  [ 0xe000000000000000 - 0xe0003fffffffffff ]
+0x7ffff -  [ 0xf000000000000000 - 0xf0003fffffffffff ]
+
+Acked-by: Paul Mackerras <paulus@samba.org>
+Signed-off-by: Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+Tested-by: Geoff Levand <geoff@infradead.org>
+Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ arch/powerpc/include/asm/mmu-hash64.h |  121 +++++++++++++++++-----------------
+ arch/powerpc/kernel/exceptions-64s.S  |   34 +++++++--
+ arch/powerpc/mm/hash_utils_64.c       |   20 ++++-
+ arch/powerpc/mm/mmu_context_hash64.c  |   11 ---
+ arch/powerpc/mm/slb_low.S             |   50 +++++++-------
+ arch/powerpc/mm/tlb_hash64.c          |    2 
+ 6 files changed, 129 insertions(+), 109 deletions(-)
+
+--- a/arch/powerpc/include/asm/mmu-hash64.h
++++ b/arch/powerpc/include/asm/mmu-hash64.h
+@@ -343,17 +343,16 @@ extern void slb_set_size(u16 size);
+ /*
+  * VSID allocation (256MB segment)
+  *
+- * We first generate a 38-bit "proto-VSID".  For kernel addresses this
+- * is equal to the ESID | 1 << 37, for user addresses it is:
+- *	(context << USER_ESID_BITS) | (esid & ((1U << USER_ESID_BITS) - 1)
+- *
+- * This splits the proto-VSID into the below range
+- *  0 - (2^(CONTEXT_BITS + USER_ESID_BITS) - 1) : User proto-VSID range
+- *  2^(CONTEXT_BITS + USER_ESID_BITS) - 2^(VSID_BITS) : Kernel proto-VSID range
+- *
+- * We also have CONTEXT_BITS + USER_ESID_BITS = VSID_BITS - 1
+- * That is, we assign half of the space to user processes and half
+- * to the kernel.
++ * We first generate a 37-bit "proto-VSID". Proto-VSIDs are generated
++ * from mmu context id and effective segment id of the address.
++ *
++ * For user processes max context id is limited to ((1ul << 19) - 5)
++ * for kernel space, we use the top 4 context ids to map address as below
++ * NOTE: each context only support 64TB now.
++ * 0x7fffc -  [ 0xc000000000000000 - 0xc0003fffffffffff ]
++ * 0x7fffd -  [ 0xd000000000000000 - 0xd0003fffffffffff ]
++ * 0x7fffe -  [ 0xe000000000000000 - 0xe0003fffffffffff ]
++ * 0x7ffff -  [ 0xf000000000000000 - 0xf0003fffffffffff ]
+  *
+  * The proto-VSIDs are then scrambled into real VSIDs with the
+  * multiplicative hash:
+@@ -363,22 +362,19 @@ extern void slb_set_size(u16 size);
+  * VSID_MULTIPLIER is prime, so in particular it is
+  * co-prime to VSID_MODULUS, making this a 1:1 scrambling function.
+  * Because the modulus is 2^n-1 we can compute it efficiently without
+- * a divide or extra multiply (see below).
+- *
+- * This scheme has several advantages over older methods:
+- *
+- *	- We have VSIDs allocated for every kernel address
+- * (i.e. everything above 0xC000000000000000), except the very top
+- * segment, which simplifies several things.
+- *
+- *	- We allow for USER_ESID_BITS significant bits of ESID and
+- * CONTEXT_BITS  bits of context for user addresses.
+- *  i.e. 64T (46 bits) of address space for up to half a million contexts.
+- *
+- *	- The scramble function gives robust scattering in the hash
+- * table (at least based on some initial results).  The previous
+- * method was more susceptible to pathological cases giving excessive
+- * hash collisions.
++ * a divide or extra multiply (see below). The scramble function gives
++ * robust scattering in the hash table (at least based on some initial
++ * results).
++ *
++ * We also consider VSID 0 special. We use VSID 0 for slb entries mapping
++ * bad address. This enables us to consolidate bad address handling in
++ * hash_page.
++ *
++ * We also need to avoid the last segment of the last context, because that
++ * would give a protovsid of 0x1fffffffff. That will result in a VSID 0
++ * because of the modulo operation in vsid scramble. But the vmemmap
++ * (which is what uses region 0xf) will never be close to 64TB in size
++ * (it's 56 bytes per page of system memory).
+  */
+ 
+ #define CONTEXT_BITS		19
+@@ -386,15 +382,25 @@ extern void slb_set_size(u16 size);
+ #define USER_ESID_BITS_1T	6
+ 
+ /*
++ * 256MB segment
++ * The proto-VSID space has 2^(CONTEX_BITS + USER_ESID_BITS) - 1 segments
++ * available for user + kernel mapping. The top 4 contexts are used for
++ * kernel mapping. Each segment contains 2^28 bytes. Each
++ * context maps 2^46 bytes (64TB) so we can support 2^19-1 contexts
++ * (19 == 37 + 28 - 46).
++ */
++#define MAX_USER_CONTEXT	((ASM_CONST(1) << CONTEXT_BITS) - 5)
++
++/*
+  * This should be computed such that protovosid * vsid_mulitplier
+  * doesn't overflow 64 bits. It should also be co-prime to vsid_modulus
+  */
+ #define VSID_MULTIPLIER_256M	ASM_CONST(12538073)	/* 24-bit prime */
+-#define VSID_BITS_256M		(CONTEXT_BITS + USER_ESID_BITS + 1)
++#define VSID_BITS_256M		(CONTEXT_BITS + USER_ESID_BITS)
+ #define VSID_MODULUS_256M	((1UL<<VSID_BITS_256M)-1)
+ 
+ #define VSID_MULTIPLIER_1T	ASM_CONST(12538073)	/* 24-bit prime */
+-#define VSID_BITS_1T		(CONTEXT_BITS + USER_ESID_BITS_1T + 1)
++#define VSID_BITS_1T		(CONTEXT_BITS + USER_ESID_BITS_1T)
+ #define VSID_MODULUS_1T		((1UL<<VSID_BITS_1T)-1)
+ 
+ 
+@@ -422,7 +428,8 @@ extern void slb_set_size(u16 size);
+ 	srdi	rx,rt,VSID_BITS_##size;					\
+ 	clrldi	rt,rt,(64-VSID_BITS_##size);				\
+ 	add	rt,rt,rx;		/* add high and low bits */	\
+-	/* Now, r3 == VSID (mod 2^36-1), and lies between 0 and		\
++	/* NOTE: explanation based on VSID_BITS_##size = 36		\
++	 * Now, r3 == VSID (mod 2^36-1), and lies between 0 and		\
+ 	 * 2^36-1+2^28-1.  That in particular means that if r3 >=	\
+ 	 * 2^36-1, then r3+1 has the 2^36 bit set.  So, if r3+1 has	\
+ 	 * the bit clear, r3 already has the answer we want, if it	\
+@@ -514,34 +521,6 @@ typedef struct {
+ 	})
+ #endif /* 1 */
+ 
+-/*
+- * This is only valid for addresses >= PAGE_OFFSET
+- * The proto-VSID space is divided into two class
+- * User:   0 to 2^(CONTEXT_BITS + USER_ESID_BITS) -1
+- * kernel: 2^(CONTEXT_BITS + USER_ESID_BITS) to 2^(VSID_BITS) - 1
+- *
+- * With KERNEL_START at 0xc000000000000000, the proto vsid for
+- * the kernel ends up with 0xc00000000 (36 bits). With 64TB
+- * support we need to have kernel proto-VSID in the
+- * [2^37 to 2^38 - 1] range due to the increased USER_ESID_BITS.
+- */
+-static inline unsigned long get_kernel_vsid(unsigned long ea, int ssize)
+-{
+-	unsigned long proto_vsid;
+-	/*
+-	 * We need to make sure proto_vsid for the kernel is
+-	 * >= 2^(CONTEXT_BITS + USER_ESID_BITS[_1T])
+-	 */
+-	if (ssize == MMU_SEGSIZE_256M) {
+-		proto_vsid = ea >> SID_SHIFT;
+-		proto_vsid |= (1UL << (CONTEXT_BITS + USER_ESID_BITS));
+-		return vsid_scramble(proto_vsid, 256M);
+-	}
+-	proto_vsid = ea >> SID_SHIFT_1T;
+-	proto_vsid |= (1UL << (CONTEXT_BITS + USER_ESID_BITS_1T));
+-	return vsid_scramble(proto_vsid, 1T);
+-}
+-
+ /* Returns the segment size indicator for a user address */
+ static inline int user_segment_size(unsigned long addr)
+ {
+@@ -551,10 +530,15 @@ static inline int user_segment_size(unsi
+ 	return MMU_SEGSIZE_256M;
+ }
+ 
+-/* This is only valid for user addresses (which are below 2^44) */
+ static inline unsigned long get_vsid(unsigned long context, unsigned long ea,
+ 				     int ssize)
+ {
++	/*
++	 * Bad address. We return VSID 0 for that
++	 */
++	if ((ea & ~REGION_MASK) >= PGTABLE_RANGE)
++		return 0;
++
+ 	if (ssize == MMU_SEGSIZE_256M)
+ 		return vsid_scramble((context << USER_ESID_BITS)
+ 				     | (ea >> SID_SHIFT), 256M);
+@@ -562,6 +546,25 @@ static inline unsigned long get_vsid(uns
+ 			     | (ea >> SID_SHIFT_1T), 1T);
+ }
+ 
++/*
++ * This is only valid for addresses >= PAGE_OFFSET
++ *
++ * For kernel space, we use the top 4 context ids to map address as below
++ * 0x7fffc -  [ 0xc000000000000000 - 0xc0003fffffffffff ]
++ * 0x7fffd -  [ 0xd000000000000000 - 0xd0003fffffffffff ]
++ * 0x7fffe -  [ 0xe000000000000000 - 0xe0003fffffffffff ]
++ * 0x7ffff -  [ 0xf000000000000000 - 0xf0003fffffffffff ]
++ */
++static inline unsigned long get_kernel_vsid(unsigned long ea, int ssize)
++{
++	unsigned long context;
++
++	/*
++	 * kernel take the top 4 context from the available range
++	 */
++	context = (MAX_USER_CONTEXT) + ((ea >> 60) - 0xc) + 1;
++	return get_vsid(context, ea, ssize);
++}
+ #endif /* __ASSEMBLY__ */
+ 
+ #endif /* _ASM_POWERPC_MMU_HASH64_H_ */
+--- a/arch/powerpc/kernel/exceptions-64s.S
++++ b/arch/powerpc/kernel/exceptions-64s.S
+@@ -1268,20 +1268,36 @@ do_ste_alloc:
+ _GLOBAL(do_stab_bolted)
+ 	stw	r9,PACA_EXSLB+EX_CCR(r13)	/* save CR in exc. frame */
+ 	std	r11,PACA_EXSLB+EX_SRR0(r13)	/* save SRR0 in exc. frame */
++	mfspr	r11,SPRN_DAR			/* ea */
+ 
++	/*
++	 * check for bad kernel/user address
++	 * (ea & ~REGION_MASK) >= PGTABLE_RANGE
++	 */
++	rldicr. r9,r11,4,(63 - 46 - 4)
++	li	r9,0	/* VSID = 0 for bad address */
++	bne-	0f
++
++	/*
++	 * Calculate VSID:
++	 * This is the kernel vsid, we take the top for context from
++	 * the range. context = (MAX_USER_CONTEXT) + ((ea >> 60) - 0xc) + 1
++	 * Here we know that (ea >> 60) == 0xc
++	 */
++	lis	r9,(MAX_USER_CONTEXT + 1)@ha
++	addi	r9,r9,(MAX_USER_CONTEXT + 1)@l
++
++	srdi	r10,r11,SID_SHIFT
++	rldimi  r10,r9,USER_ESID_BITS,0 /* proto vsid */
++	ASM_VSID_SCRAMBLE(r10, r9, 256M)
++	rldic	r9,r10,12,16	/* r9 = vsid << 12 */
++
++0:
+ 	/* Hash to the primary group */
+ 	ld	r10,PACASTABVIRT(r13)
+-	mfspr	r11,SPRN_DAR
+-	srdi	r11,r11,28
++	srdi	r11,r11,SID_SHIFT
+ 	rldimi	r10,r11,7,52	/* r10 = first ste of the group */
+ 
+-	/* Calculate VSID */
+-	/* This is a kernel address, so protovsid = ESID | 1 << 37 */
+-	li	r9,0x1
+-	rldimi  r11,r9,(CONTEXT_BITS + USER_ESID_BITS),0
+-	ASM_VSID_SCRAMBLE(r11, r9, 256M)
+-	rldic	r9,r11,12,16	/* r9 = vsid << 12 */
+-
+ 	/* Search the primary group for a free entry */
+ 1:	ld	r11,0(r10)	/* Test valid bit of the current ste	*/
+ 	andi.	r11,r11,0x80
+--- a/arch/powerpc/mm/hash_utils_64.c
++++ b/arch/powerpc/mm/hash_utils_64.c
+@@ -194,6 +194,11 @@ int htab_bolt_mapping(unsigned long vsta
+ 		unsigned long vpn  = hpt_vpn(vaddr, vsid, ssize);
+ 		unsigned long tprot = prot;
+ 
++		/*
++		 * If we hit a bad address return error.
++		 */
++		if (!vsid)
++			return -1;
+ 		/* Make kernel text executable */
+ 		if (overlaps_kernel_text(vaddr, vaddr + step))
+ 			tprot &= ~HPTE_R_N;
+@@ -923,11 +928,6 @@ int hash_page(unsigned long ea, unsigned
+ 	DBG_LOW("hash_page(ea=%016lx, access=%lx, trap=%lx\n",
+ 		ea, access, trap);
+ 
+-	if ((ea & ~REGION_MASK) >= PGTABLE_RANGE) {
+-		DBG_LOW(" out of pgtable range !\n");
+- 		return 1;
+-	}
+-
+ 	/* Get region & vsid */
+  	switch (REGION_ID(ea)) {
+ 	case USER_REGION_ID:
+@@ -958,6 +958,11 @@ int hash_page(unsigned long ea, unsigned
+ 	}
+ 	DBG_LOW(" mm=%p, mm->pgdir=%p, vsid=%016lx\n", mm, mm->pgd, vsid);
+ 
++	/* Bad address. */
++	if (!vsid) {
++		DBG_LOW("Bad address!\n");
++		return 1;
++	}
+ 	/* Get pgdir */
+ 	pgdir = mm->pgd;
+ 	if (pgdir == NULL)
+@@ -1127,6 +1132,8 @@ void hash_preload(struct mm_struct *mm,
+ 	/* Get VSID */
+ 	ssize = user_segment_size(ea);
+ 	vsid = get_vsid(mm->context.id, ea, ssize);
++	if (!vsid)
++		return;
+ 
+ 	/* Hash doesn't like irqs */
+ 	local_irq_save(flags);
+@@ -1219,6 +1226,9 @@ static void kernel_map_linear_page(unsig
+ 	hash = hpt_hash(vpn, PAGE_SHIFT, mmu_kernel_ssize);
+ 	hpteg = ((hash & htab_hash_mask) * HPTES_PER_GROUP);
+ 
++	/* Don't create HPTE entries for bad address */
++	if (!vsid)
++		return;
+ 	ret = ppc_md.hpte_insert(hpteg, vpn, __pa(vaddr),
+ 				 mode, HPTE_V_BOLTED,
+ 				 mmu_linear_psize, mmu_kernel_ssize);
+--- a/arch/powerpc/mm/mmu_context_hash64.c
++++ b/arch/powerpc/mm/mmu_context_hash64.c
+@@ -29,15 +29,6 @@
+ static DEFINE_SPINLOCK(mmu_context_lock);
+ static DEFINE_IDA(mmu_context_ida);
+ 
+-/*
+- * 256MB segment
+- * The proto-VSID space has 2^(CONTEX_BITS + USER_ESID_BITS) - 1 segments
+- * available for user mappings. Each segment contains 2^28 bytes. Each
+- * context maps 2^46 bytes (64TB) so we can support 2^19-1 contexts
+- * (19 == 37 + 28 - 46).
+- */
+-#define MAX_CONTEXT	((1UL << CONTEXT_BITS) - 1)
+-
+ int __init_new_context(void)
+ {
+ 	int index;
+@@ -56,7 +47,7 @@ again:
+ 	else if (err)
+ 		return err;
+ 
+-	if (index > MAX_CONTEXT) {
++	if (index > MAX_USER_CONTEXT) {
+ 		spin_lock(&mmu_context_lock);
+ 		ida_remove(&mmu_context_ida, index);
+ 		spin_unlock(&mmu_context_lock);
+--- a/arch/powerpc/mm/slb_low.S
++++ b/arch/powerpc/mm/slb_low.S
+@@ -31,10 +31,15 @@
+  * No other registers are examined or changed.
+  */
+ _GLOBAL(slb_allocate_realmode)
+-	/* r3 = faulting address */
++	/*
++	 * check for bad kernel/user address
++	 * (ea & ~REGION_MASK) >= PGTABLE_RANGE
++	 */
++	rldicr. r9,r3,4,(63 - 46 - 4)
++	bne-	8f
+ 
+ 	srdi	r9,r3,60		/* get region */
+-	srdi	r10,r3,28		/* get esid */
++	srdi	r10,r3,SID_SHIFT	/* get esid */
+ 	cmpldi	cr7,r9,0xc		/* cmp PAGE_OFFSET for later use */
+ 
+ 	/* r3 = address, r10 = esid, cr7 = <> PAGE_OFFSET */
+@@ -56,12 +61,14 @@ _GLOBAL(slb_allocate_realmode)
+ 	 */
+ _GLOBAL(slb_miss_kernel_load_linear)
+ 	li	r11,0
+-	li	r9,0x1
+ 	/*
+-	 * for 1T we shift 12 bits more.  slb_finish_load_1T will do
+-	 * the necessary adjustment
++	 * context = (MAX_USER_CONTEXT) + ((ea >> 60) - 0xc) + 1
++	 * r9 = region id.
+ 	 */
+-	rldimi  r10,r9,(CONTEXT_BITS + USER_ESID_BITS),0
++	addis	r9,r9,(MAX_USER_CONTEXT - 0xc + 1)@ha
++	addi	r9,r9,(MAX_USER_CONTEXT - 0xc + 1)@l
++
++
+ BEGIN_FTR_SECTION
+ 	b	slb_finish_load
+ END_MMU_FTR_SECTION_IFCLR(MMU_FTR_1T_SEGMENT)
+@@ -91,24 +98,19 @@ _GLOBAL(slb_miss_kernel_load_vmemmap)
+ 	_GLOBAL(slb_miss_kernel_load_io)
+ 	li	r11,0
+ 6:
+-	li	r9,0x1
+ 	/*
+-	 * for 1T we shift 12 bits more.  slb_finish_load_1T will do
+-	 * the necessary adjustment
++	 * context = (MAX_USER_CONTEXT) + ((ea >> 60) - 0xc) + 1
++	 * r9 = region id.
+ 	 */
+-	rldimi  r10,r9,(CONTEXT_BITS + USER_ESID_BITS),0
++	addis	r9,r9,(MAX_USER_CONTEXT - 0xc + 1)@ha
++	addi	r9,r9,(MAX_USER_CONTEXT - 0xc + 1)@l
++
+ BEGIN_FTR_SECTION
+ 	b	slb_finish_load
+ END_MMU_FTR_SECTION_IFCLR(MMU_FTR_1T_SEGMENT)
+ 	b	slb_finish_load_1T
+ 
+-0:	/* user address: proto-VSID = context << 15 | ESID. First check
+-	 * if the address is within the boundaries of the user region
+-	 */
+-	srdi.	r9,r10,USER_ESID_BITS
+-	bne-	8f			/* invalid ea bits set */
+-
+-
++0:
+ 	/* when using slices, we extract the psize off the slice bitmaps
+ 	 * and then we need to get the sllp encoding off the mmu_psize_defs
+ 	 * array.
+@@ -164,15 +166,13 @@ END_MMU_FTR_SECTION_IFCLR(MMU_FTR_1T_SEG
+ 	ld	r9,PACACONTEXTID(r13)
+ BEGIN_FTR_SECTION
+ 	cmpldi	r10,0x1000
+-END_MMU_FTR_SECTION_IFSET(MMU_FTR_1T_SEGMENT)
+-	rldimi	r10,r9,USER_ESID_BITS,0
+-BEGIN_FTR_SECTION
+ 	bge	slb_finish_load_1T
+ END_MMU_FTR_SECTION_IFSET(MMU_FTR_1T_SEGMENT)
+ 	b	slb_finish_load
+ 
+ 8:	/* invalid EA */
+ 	li	r10,0			/* BAD_VSID */
++	li	r9,0			/* BAD_VSID */
+ 	li	r11,SLB_VSID_USER	/* flags don't much matter */
+ 	b	slb_finish_load
+ 
+@@ -221,8 +221,6 @@ _GLOBAL(slb_allocate_user)
+ 
+ 	/* get context to calculate proto-VSID */
+ 	ld	r9,PACACONTEXTID(r13)
+-	rldimi	r10,r9,USER_ESID_BITS,0
+-
+ 	/* fall through slb_finish_load */
+ 
+ #endif /* __DISABLED__ */
+@@ -231,9 +229,10 @@ _GLOBAL(slb_allocate_user)
+ /*
+  * Finish loading of an SLB entry and return
+  *
+- * r3 = EA, r10 = proto-VSID, r11 = flags, clobbers r9, cr7 = <> PAGE_OFFSET
++ * r3 = EA, r9 = context, r10 = ESID, r11 = flags, clobbers r9, cr7 = <> PAGE_OFFSET
+  */
+ slb_finish_load:
++	rldimi  r10,r9,USER_ESID_BITS,0
+ 	ASM_VSID_SCRAMBLE(r10,r9,256M)
+ 	/*
+ 	 * bits above VSID_BITS_256M need to be ignored from r10
+@@ -298,10 +297,11 @@ _GLOBAL(slb_compare_rr_to_size)
+ /*
+  * Finish loading of a 1T SLB entry (for the kernel linear mapping) and return.
+  *
+- * r3 = EA, r10 = proto-VSID, r11 = flags, clobbers r9
++ * r3 = EA, r9 = context, r10 = ESID(256MB), r11 = flags, clobbers r9
+  */
+ slb_finish_load_1T:
+-	srdi	r10,r10,40-28		/* get 1T ESID */
++	srdi	r10,r10,(SID_SHIFT_1T - SID_SHIFT)	/* get 1T ESID */
++	rldimi  r10,r9,USER_ESID_BITS_1T,0
+ 	ASM_VSID_SCRAMBLE(r10,r9,1T)
+ 	/*
+ 	 * bits above VSID_BITS_1T need to be ignored from r10
+--- a/arch/powerpc/mm/tlb_hash64.c
++++ b/arch/powerpc/mm/tlb_hash64.c
+@@ -82,11 +82,11 @@ void hpte_need_flush(struct mm_struct *m
+ 	if (!is_kernel_addr(addr)) {
+ 		ssize = user_segment_size(addr);
+ 		vsid = get_vsid(mm->context.id, addr, ssize);
+-		WARN_ON(vsid == 0);
+ 	} else {
+ 		vsid = get_kernel_vsid(addr, mmu_kernel_ssize);
+ 		ssize = mmu_kernel_ssize;
+ 	}
++	WARN_ON(vsid == 0);
+ 	vpn = hpt_vpn(addr, vsid, ssize);
+ 	rpte = __real_pte(__pte(pte), ptep);
+ 
