@@ -1,0 +1,182 @@
+From d4d3c7d9249ba373627a09c4e9469cfe46c343a6 Mon Sep 17 00:00:00 2001
+From: Hannes Frederic Sowa <hannes@stressinduktion.org>
+Date: Fri, 15 Mar 2013 11:32:30 +0000
+Subject: inet: limit length of fragment queue hash table bucket lists
+
+
+From: Hannes Frederic Sowa <hannes@stressinduktion.org>
+
+[ Upstream commit 5a3da1fe9561828d0ca7eca664b16ec2b9bf0055 ]
+
+This patch introduces a constant limit of the fragment queue hash
+table bucket list lengths. Currently the limit 128 is choosen somewhat
+arbitrary and just ensures that we can fill up the fragment cache with
+empty packets up to the default ip_frag_high_thresh limits. It should
+just protect from list iteration eating considerable amounts of cpu.
+
+If we reach the maximum length in one hash bucket a warning is printed.
+This is implemented on the caller side of inet_frag_find to distinguish
+between the different users of inet_fragment.c.
+
+I dropped the out of memory warning in the ipv4 fragment lookup path,
+because we already get a warning by the slab allocator.
+
+Cc: Eric Dumazet <eric.dumazet@gmail.com>
+Cc: Jesper Dangaard Brouer <jbrouer@redhat.com>
+Signed-off-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+Acked-by: Eric Dumazet <edumazet@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/net/inet_frag.h                 |    9 +++++++++
+ net/ipv4/inet_fragment.c                |   20 +++++++++++++++++++-
+ net/ipv4/ip_fragment.c                  |   11 ++++-------
+ net/ipv6/netfilter/nf_conntrack_reasm.c |   12 ++++++------
+ net/ipv6/reassembly.c                   |    8 ++++++--
+ 5 files changed, 44 insertions(+), 16 deletions(-)
+
+--- a/include/net/inet_frag.h
++++ b/include/net/inet_frag.h
+@@ -35,6 +35,13 @@ struct inet_frag_queue {
+ 
+ #define INETFRAGS_HASHSZ		64
+ 
++/* averaged:
++ * max_depth = default ipfrag_high_thresh / INETFRAGS_HASHSZ /
++ *	       rounded up (SKB_TRUELEN(0) + sizeof(struct ipq or
++ *	       struct frag_queue))
++ */
++#define INETFRAGS_MAXDEPTH		128
++
+ struct inet_frags {
+ 	struct hlist_head	hash[INETFRAGS_HASHSZ];
+ 	rwlock_t		lock;
+@@ -65,6 +72,8 @@ int inet_frag_evictor(struct netns_frags
+ struct inet_frag_queue *inet_frag_find(struct netns_frags *nf,
+ 		struct inet_frags *f, void *key, unsigned int hash)
+ 	__releases(&f->lock);
++void inet_frag_maybe_warn_overflow(struct inet_frag_queue *q,
++				   const char *prefix);
+ 
+ static inline void inet_frag_put(struct inet_frag_queue *q, struct inet_frags *f)
+ {
+--- a/net/ipv4/inet_fragment.c
++++ b/net/ipv4/inet_fragment.c
+@@ -21,6 +21,7 @@
+ #include <linux/rtnetlink.h>
+ #include <linux/slab.h>
+ 
++#include <net/sock.h>
+ #include <net/inet_frag.h>
+ 
+ static void inet_frag_secret_rebuild(unsigned long dummy)
+@@ -276,6 +277,7 @@ struct inet_frag_queue *inet_frag_find(s
+ {
+ 	struct inet_frag_queue *q;
+ 	struct hlist_node *n;
++	int depth = 0;
+ 
+ 	hlist_for_each_entry(q, n, &f->hash[hash], list) {
+ 		if (q->net == nf && f->match(q, key)) {
+@@ -283,9 +285,25 @@ struct inet_frag_queue *inet_frag_find(s
+ 			read_unlock(&f->lock);
+ 			return q;
+ 		}
++		depth++;
+ 	}
+ 	read_unlock(&f->lock);
+ 
+-	return inet_frag_create(nf, f, key);
++	if (depth <= INETFRAGS_MAXDEPTH)
++		return inet_frag_create(nf, f, key);
++	else
++		return ERR_PTR(-ENOBUFS);
+ }
+ EXPORT_SYMBOL(inet_frag_find);
++
++void inet_frag_maybe_warn_overflow(struct inet_frag_queue *q,
++				   const char *prefix)
++{
++	static const char msg[] = "inet_frag_find: Fragment hash bucket"
++		" list length grew over limit " __stringify(INETFRAGS_MAXDEPTH)
++		". Dropping fragment.\n";
++
++	if (PTR_ERR(q) == -ENOBUFS)
++		LIMIT_NETDEBUG(KERN_WARNING "%s%s", prefix, msg);
++}
++EXPORT_SYMBOL(inet_frag_maybe_warn_overflow);
+--- a/net/ipv4/ip_fragment.c
++++ b/net/ipv4/ip_fragment.c
+@@ -299,14 +299,11 @@ static inline struct ipq *ip_find(struct
+ 	hash = ipqhashfn(iph->id, iph->saddr, iph->daddr, iph->protocol);
+ 
+ 	q = inet_frag_find(&net->ipv4.frags, &ip4_frags, &arg, hash);
+-	if (q == NULL)
+-		goto out_nomem;
+-
++	if (IS_ERR_OR_NULL(q)) {
++		inet_frag_maybe_warn_overflow(q, pr_fmt());
++		return NULL;
++	}
+ 	return container_of(q, struct ipq, q);
+-
+-out_nomem:
+-	LIMIT_NETDEBUG(KERN_ERR pr_fmt("ip_frag_create: no memory left !\n"));
+-	return NULL;
+ }
+ 
+ /* Is the fragment too far ahead to be part of ipq? */
+--- a/net/ipv6/netfilter/nf_conntrack_reasm.c
++++ b/net/ipv6/netfilter/nf_conntrack_reasm.c
+@@ -14,6 +14,8 @@
+  * 2 of the License, or (at your option) any later version.
+  */
+ 
++#define pr_fmt(fmt) "IPv6-nf: " fmt
++
+ #include <linux/errno.h>
+ #include <linux/types.h>
+ #include <linux/string.h>
+@@ -180,13 +182,11 @@ static inline struct frag_queue *fq_find
+ 
+ 	q = inet_frag_find(&net->nf_frag.frags, &nf_frags, &arg, hash);
+ 	local_bh_enable();
+-	if (q == NULL)
+-		goto oom;
+-
++	if (IS_ERR_OR_NULL(q)) {
++		inet_frag_maybe_warn_overflow(q, pr_fmt());
++		return NULL;
++	}
+ 	return container_of(q, struct frag_queue, q);
+-
+-oom:
+-	return NULL;
+ }
+ 
+ 
+--- a/net/ipv6/reassembly.c
++++ b/net/ipv6/reassembly.c
+@@ -26,6 +26,9 @@
+  *	YOSHIFUJI,H. @USAGI	Always remove fragment header to
+  *				calculate ICV correctly.
+  */
++
++#define pr_fmt(fmt) "IPv6: " fmt
++
+ #include <linux/errno.h>
+ #include <linux/types.h>
+ #include <linux/string.h>
+@@ -197,9 +200,10 @@ fq_find(struct net *net, __be32 id, cons
+ 	hash = inet6_hash_frag(id, src, dst, ip6_frags.rnd);
+ 
+ 	q = inet_frag_find(&net->ipv6.frags, &ip6_frags, &arg, hash);
+-	if (q == NULL)
++	if (IS_ERR_OR_NULL(q)) {
++		inet_frag_maybe_warn_overflow(q, pr_fmt());
+ 		return NULL;
+-
++	}
+ 	return container_of(q, struct frag_queue, q);
+ }
+ 
