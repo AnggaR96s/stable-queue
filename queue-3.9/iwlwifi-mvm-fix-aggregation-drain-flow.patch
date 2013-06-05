@@ -1,0 +1,181 @@
+From e3d4bc8cc0230e8dc8033484666f03f87392a8c4 Mon Sep 17 00:00:00 2001
+From: Emmanuel Grumbach <emmanuel.grumbach@intel.com>
+Date: Tue, 7 May 2013 14:08:24 +0300
+Subject: iwlwifi: mvm: fix aggregation drain flow
+
+From: Emmanuel Grumbach <emmanuel.grumbach@intel.com>
+
+commit e3d4bc8cc0230e8dc8033484666f03f87392a8c4 upstream.
+
+Move the counter for non-AMPDU frames to mvm. It is needed
+for the drain flow which happens once the ieee80211_sta has
+been freed, so keeping it in iwl_mvm_sta which is embed into
+ieee80211_sta is not a good idea.
+
+Also, since its purpose it to remove the STA in the fw only
+after all the frames for this station have exited the shared
+Tx queues, we need to decrement it in the reclaim flow. This
+flow can happen after ieee80211_sta has been removed, which
+means that we have no iwl_mvm_sta there. So we can't know
+what is the vif type. Hence, we know audit these frames for
+all the vif types.
+In order to avoid spawning sta_drained_wk all the time, we
+now check that we are in a flow in which draining might
+happen - only when mvmsta is NULL. This is better than
+previous code that would spawn sta_drained_wk all the time
+in AP mode.
+
+Signed-off-by: Emmanuel Grumbach <emmanuel.grumbach@intel.com>
+Reviewed-by: Ilan Peer <ilan.peer@intel.com>
+Reviewed-by: Johannes Berg <johannes.berg@intel.com>
+Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+Signed-off-by: Lingzhu Xiang <lxiang@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/net/wireless/iwlwifi/mvm/mac80211.c |    2 -
+ drivers/net/wireless/iwlwifi/mvm/mvm.h      |    1 
+ drivers/net/wireless/iwlwifi/mvm/sta.c      |   13 +++++--
+ drivers/net/wireless/iwlwifi/mvm/sta.h      |    2 -
+ drivers/net/wireless/iwlwifi/mvm/tx.c       |   48 +++++++++++++++++++++-------
+ 5 files changed, 48 insertions(+), 18 deletions(-)
+
+--- a/drivers/net/wireless/iwlwifi/mvm/mac80211.c
++++ b/drivers/net/wireless/iwlwifi/mvm/mac80211.c
+@@ -886,7 +886,7 @@ static void iwl_mvm_mac_sta_notify(struc
+ 
+ 	switch (cmd) {
+ 	case STA_NOTIFY_SLEEP:
+-		if (atomic_read(&mvmsta->pending_frames) > 0)
++		if (atomic_read(&mvm->pending_frames[mvmsta->sta_id]) > 0)
+ 			ieee80211_sta_block_awake(hw, sta, true);
+ 		/*
+ 		 * The fw updates the STA to be asleep. Tx packets on the Tx
+--- a/drivers/net/wireless/iwlwifi/mvm/mvm.h
++++ b/drivers/net/wireless/iwlwifi/mvm/mvm.h
+@@ -293,6 +293,7 @@ struct iwl_mvm {
+ 	struct ieee80211_sta __rcu *fw_id_to_mac_id[IWL_MVM_STATION_COUNT];
+ 	struct work_struct sta_drained_wk;
+ 	unsigned long sta_drained[BITS_TO_LONGS(IWL_MVM_STATION_COUNT)];
++	atomic_t pending_frames[IWL_MVM_STATION_COUNT];
+ 
+ 	/* configured by mac80211 */
+ 	u32 rts_threshold;
+--- a/drivers/net/wireless/iwlwifi/mvm/sta.c
++++ b/drivers/net/wireless/iwlwifi/mvm/sta.c
+@@ -172,7 +172,7 @@ int iwl_mvm_add_sta(struct iwl_mvm *mvm,
+ 	mvm_sta->max_agg_bufsize = LINK_QUAL_AGG_FRAME_LIMIT_DEF;
+ 
+ 	/* HW restart, don't assume the memory has been zeroed */
+-	atomic_set(&mvm_sta->pending_frames, 0);
++	atomic_set(&mvm->pending_frames[sta_id], 0);
+ 	mvm_sta->tid_disable_agg = 0;
+ 	mvm_sta->tfd_queue_msk = 0;
+ 	for (i = 0; i < IEEE80211_NUM_ACS; i++)
+@@ -360,14 +360,21 @@ int iwl_mvm_rm_sta(struct iwl_mvm *mvm,
+ 	}
+ 
+ 	/*
++	 * Make sure that the tx response code sees the station as -EBUSY and
++	 * calls the drain worker.
++	 */
++	spin_lock_bh(&mvm_sta->lock);
++	/*
+ 	 * There are frames pending on the AC queues for this station.
+ 	 * We need to wait until all the frames are drained...
+ 	 */
+-	if (atomic_read(&mvm_sta->pending_frames)) {
+-		ret = iwl_mvm_drain_sta(mvm, mvm_sta, true);
++	if (atomic_read(&mvm->pending_frames[mvm_sta->sta_id])) {
+ 		rcu_assign_pointer(mvm->fw_id_to_mac_id[mvm_sta->sta_id],
+ 				   ERR_PTR(-EBUSY));
++		spin_unlock_bh(&mvm_sta->lock);
++		ret = iwl_mvm_drain_sta(mvm, mvm_sta, true);
+ 	} else {
++		spin_unlock_bh(&mvm_sta->lock);
+ 		ret = iwl_mvm_rm_sta_common(mvm, mvm_sta->sta_id);
+ 		rcu_assign_pointer(mvm->fw_id_to_mac_id[mvm_sta->sta_id], NULL);
+ 	}
+--- a/drivers/net/wireless/iwlwifi/mvm/sta.h
++++ b/drivers/net/wireless/iwlwifi/mvm/sta.h
+@@ -273,7 +273,6 @@ struct iwl_mvm_tid_data {
+  * @max_agg_bufsize: the maximal size of the AGG buffer for this station
+  * @lock: lock to protect the whole struct. Since %tid_data is access from Tx
+  * and from Tx response flow, it needs a spinlock.
+- * @pending_frames: number of frames for this STA on the shared Tx queues.
+  * @tid_data: per tid data. Look at %iwl_mvm_tid_data.
+  *
+  * When mac80211 creates a station it reserves some space (hw->sta_data_size)
+@@ -288,7 +287,6 @@ struct iwl_mvm_sta {
+ 	u16 tid_disable_agg;
+ 	u8 max_agg_bufsize;
+ 	spinlock_t lock;
+-	atomic_t pending_frames;
+ 	struct iwl_mvm_tid_data tid_data[IWL_MAX_TID_COUNT];
+ 	struct iwl_lq_sta lq_sta;
+ 	struct ieee80211_vif *vif;
+--- a/drivers/net/wireless/iwlwifi/mvm/tx.c
++++ b/drivers/net/wireless/iwlwifi/mvm/tx.c
+@@ -416,9 +416,8 @@ int iwl_mvm_tx_skb(struct iwl_mvm *mvm,
+ 
+ 	spin_unlock(&mvmsta->lock);
+ 
+-	if (mvmsta->vif->type == NL80211_IFTYPE_AP &&
+-	    txq_id < IWL_FIRST_AMPDU_QUEUE)
+-		atomic_inc(&mvmsta->pending_frames);
++	if (txq_id < IWL_FIRST_AMPDU_QUEUE)
++		atomic_inc(&mvm->pending_frames[mvmsta->sta_id]);
+ 
+ 	return 0;
+ 
+@@ -678,16 +677,41 @@ static void iwl_mvm_rx_tx_cmd_single(str
+ 	/*
+ 	 * If the txq is not an AMPDU queue, there is no chance we freed
+ 	 * several skbs. Check that out...
+-	 * If there are no pending frames for this STA, notify mac80211 that
+-	 * this station can go to sleep in its STA table.
+ 	 */
+-	if (txq_id < IWL_FIRST_AMPDU_QUEUE && mvmsta &&
+-	    !WARN_ON(skb_freed > 1) &&
+-	    mvmsta->vif->type == NL80211_IFTYPE_AP &&
+-	    atomic_sub_and_test(skb_freed, &mvmsta->pending_frames)) {
+-		ieee80211_sta_block_awake(mvm->hw, sta, false);
+-		set_bit(sta_id, mvm->sta_drained);
+-		schedule_work(&mvm->sta_drained_wk);
++	if (txq_id < IWL_FIRST_AMPDU_QUEUE && !WARN_ON(skb_freed > 1) &&
++	    atomic_sub_and_test(skb_freed, &mvm->pending_frames[sta_id])) {
++		if (mvmsta) {
++			/*
++			 * If there are no pending frames for this STA, notify
++			 * mac80211 that this station can go to sleep in its
++			 * STA table.
++			 */
++			if (mvmsta->vif->type == NL80211_IFTYPE_AP)
++				ieee80211_sta_block_awake(mvm->hw, sta, false);
++			/*
++			 * We might very well have taken mvmsta pointer while
++			 * the station was being removed. The remove flow might
++			 * have seen a pending_frame (because we didn't take
++			 * the lock) even if now the queues are drained. So make
++			 * really sure now that this the station is not being
++			 * removed. If it is, run the drain worker to remove it.
++			 */
++			spin_lock_bh(&mvmsta->lock);
++			sta = rcu_dereference(mvm->fw_id_to_mac_id[sta_id]);
++			if (IS_ERR_OR_NULL(sta)) {
++				/*
++				 * Station disappeared in the meantime:
++				 * so we are draining.
++				 */
++				set_bit(sta_id, mvm->sta_drained);
++				schedule_work(&mvm->sta_drained_wk);
++			}
++			spin_unlock_bh(&mvmsta->lock);
++		} else if (!mvmsta) {
++			/* Tx response without STA, so we are draining */
++			set_bit(sta_id, mvm->sta_drained);
++			schedule_work(&mvm->sta_drained_wk);
++		}
+ 	}
+ 
+ 	rcu_read_unlock();
