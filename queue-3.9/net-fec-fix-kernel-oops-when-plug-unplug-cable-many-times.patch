@@ -1,0 +1,174 @@
+From 0197f9ab0a6d40f1f7d58787e2dfdb2908f4eb27 Mon Sep 17 00:00:00 2001
+From: Frank Li <Frank.Li@freescale.com>
+Date: Tue, 7 May 2013 14:08:44 +0000
+Subject: net: fec: fix kernel oops when plug/unplug cable many times
+
+From: Frank Li <Frank.Li@freescale.com>
+
+[ Upstream commits 54309fa60b5f57b90c1842176f6045e665d21142 and
+  3169134478a9638baf0dbb4fdca5a0718cbe8e27 ]
+
+reproduce steps
+ 1. flood ping from other machine
+ 	ping -f -s 41000 IP
+ 2. run below script
+    while [ 1 ]; do ethtool -s eth0 autoneg off;
+    sleep 3;ethtool -s eth0 autoneg on; sleep 4; done;
+
+You can see oops in one hour.
+
+The reason is fec_restart clear BD but NAPI may use it.
+The solution is disable NAPI and stop xmit when reset BD.
+disable NAPI may sleep, so fec_restart can't be call in
+atomic context.
+
+Signed-off-by: Frank Li <Frank.Li@freescale.com>
+Reviewed-by: Lucas Stach <l.stach@pengutronix.de>
+Tested-by: Lucas Stach <l.stach@pengutronix.de>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/ethernet/freescale/fec.c |   44 ++++++++++++++++++++++++++---------
+ drivers/net/ethernet/freescale/fec.h |   10 ++++---
+ 2 files changed, 39 insertions(+), 15 deletions(-)
+
+--- a/drivers/net/ethernet/freescale/fec.c
++++ b/drivers/net/ethernet/freescale/fec.c
+@@ -407,6 +407,13 @@ fec_restart(struct net_device *ndev, int
+ 	u32 rcntl = OPT_FRAME_SIZE | 0x04;
+ 	u32 ecntl = 0x2; /* ETHEREN */
+ 
++	if (netif_running(ndev)) {
++		netif_device_detach(ndev);
++		napi_disable(&fep->napi);
++		netif_stop_queue(ndev);
++		netif_tx_lock_bh(ndev);
++	}
++
+ 	/* Whack a reset.  We should wait for this. */
+ 	writel(1, fep->hwp + FEC_ECNTRL);
+ 	udelay(10);
+@@ -559,6 +566,13 @@ fec_restart(struct net_device *ndev, int
+ 
+ 	/* Enable interrupts we wish to service */
+ 	writel(FEC_DEFAULT_IMASK, fep->hwp + FEC_IMASK);
++
++	if (netif_running(ndev)) {
++		netif_device_attach(ndev);
++		napi_enable(&fep->napi);
++		netif_wake_queue(ndev);
++		netif_tx_unlock_bh(ndev);
++	}
+ }
+ 
+ static void
+@@ -598,8 +612,22 @@ fec_timeout(struct net_device *ndev)
+ 
+ 	ndev->stats.tx_errors++;
+ 
+-	fec_restart(ndev, fep->full_duplex);
+-	netif_wake_queue(ndev);
++	fep->delay_work.timeout = true;
++	schedule_delayed_work(&(fep->delay_work.delay_work), 0);
++}
++
++static void fec_enet_work(struct work_struct *work)
++{
++	struct fec_enet_private *fep =
++		container_of(work,
++			     struct fec_enet_private,
++			     delay_work.delay_work.work);
++
++	if (fep->delay_work.timeout) {
++		fep->delay_work.timeout = false;
++		fec_restart(fep->netdev, fep->full_duplex);
++		netif_wake_queue(fep->netdev);
++	}
+ }
+ 
+ static void
+@@ -970,16 +998,12 @@ static void fec_enet_adjust_link(struct
+ {
+ 	struct fec_enet_private *fep = netdev_priv(ndev);
+ 	struct phy_device *phy_dev = fep->phy_dev;
+-	unsigned long flags;
+-
+ 	int status_change = 0;
+ 
+-	spin_lock_irqsave(&fep->hw_lock, flags);
+-
+ 	/* Prevent a state halted on mii error */
+ 	if (fep->mii_timeout && phy_dev->state == PHY_HALTED) {
+ 		phy_dev->state = PHY_RESUMING;
+-		goto spin_unlock;
++		return;
+ 	}
+ 
+ 	if (phy_dev->link) {
+@@ -1007,9 +1031,6 @@ static void fec_enet_adjust_link(struct
+ 		}
+ 	}
+ 
+-spin_unlock:
+-	spin_unlock_irqrestore(&fep->hw_lock, flags);
+-
+ 	if (status_change)
+ 		phy_print_status(phy_dev);
+ }
+@@ -1656,7 +1677,6 @@ static int fec_enet_init(struct net_devi
+ 	}
+ 
+ 	memset(cbd_base, 0, PAGE_SIZE);
+-	spin_lock_init(&fep->hw_lock);
+ 
+ 	fep->netdev = ndev;
+ 
+@@ -1882,6 +1902,7 @@ fec_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		goto failed_register;
+ 
++	INIT_DELAYED_WORK(&(fep->delay_work.delay_work), fec_enet_work);
+ 	return 0;
+ 
+ failed_register:
+@@ -1918,6 +1939,7 @@ fec_drv_remove(struct platform_device *p
+ 	struct resource *r;
+ 	int i;
+ 
++	cancel_delayed_work_sync(&(fep->delay_work.delay_work));
+ 	unregister_netdev(ndev);
+ 	fec_enet_mii_remove(fep);
+ 	del_timer_sync(&fep->time_keep);
+--- a/drivers/net/ethernet/freescale/fec.h
++++ b/drivers/net/ethernet/freescale/fec.h
+@@ -191,6 +191,11 @@ struct bufdesc_ex {
+ #define BD_ENET_RX_INT          0x00800000
+ #define BD_ENET_RX_PTP          ((ushort)0x0400)
+ 
++struct fec_enet_delayed_work {
++	struct delayed_work delay_work;
++	bool timeout;
++};
++
+ /* The FEC buffer descriptors track the ring buffers.  The rx_bd_base and
+  * tx_bd_base always point to the base of the buffer descriptors.  The
+  * cur_rx and cur_tx point to the currently available buffer.
+@@ -224,9 +229,6 @@ struct fec_enet_private {
+ 	/* The ring entries to be free()ed */
+ 	struct bufdesc	*dirty_tx;
+ 
+-	/* hold while accessing the HW like ringbuffer for tx/rx but not MAC */
+-	spinlock_t hw_lock;
+-
+ 	struct	platform_device *pdev;
+ 
+ 	int	opened;
+@@ -260,7 +262,7 @@ struct fec_enet_private {
+ 	int hwts_rx_en;
+ 	int hwts_tx_en;
+ 	struct timer_list time_keep;
+-
++	struct fec_enet_delayed_work delay_work;
+ };
+ 
+ void fec_ptp_init(struct net_device *ndev, struct platform_device *pdev);
