@@ -1,0 +1,88 @@
+From 058ebd0eba3aff16b144eabf4510ed9510e1416e Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Fri, 12 Jul 2013 11:08:33 +0200
+Subject: perf: Fix perf_lock_task_context() vs RCU
+
+From: Peter Zijlstra <peterz@infradead.org>
+
+commit 058ebd0eba3aff16b144eabf4510ed9510e1416e upstream.
+
+Jiri managed to trigger this warning:
+
+ [] ======================================================
+ [] [ INFO: possible circular locking dependency detected ]
+ [] 3.10.0+ #228 Tainted: G        W
+ [] -------------------------------------------------------
+ [] p/6613 is trying to acquire lock:
+ []  (rcu_node_0){..-...}, at: [<ffffffff810ca797>] rcu_read_unlock_special+0xa7/0x250
+ []
+ [] but task is already holding lock:
+ []  (&ctx->lock){-.-...}, at: [<ffffffff810f2879>] perf_lock_task_context+0xd9/0x2c0
+ []
+ [] which lock already depends on the new lock.
+ []
+ [] the existing dependency chain (in reverse order) is:
+ []
+ [] -> #4 (&ctx->lock){-.-...}:
+ [] -> #3 (&rq->lock){-.-.-.}:
+ [] -> #2 (&p->pi_lock){-.-.-.}:
+ [] -> #1 (&rnp->nocb_gp_wq[1]){......}:
+ [] -> #0 (rcu_node_0){..-...}:
+
+Paul was quick to explain that due to preemptible RCU we cannot call
+rcu_read_unlock() while holding scheduler (or nested) locks when part
+of the read side critical section was preemptible.
+
+Therefore solve it by making the entire RCU read side non-preemptible.
+
+Also pull out the retry from under the non-preempt to play nice with RT.
+
+Reported-by: Jiri Olsa <jolsa@redhat.com>
+Helped-out-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ kernel/events/core.c |   15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -651,8 +651,18 @@ perf_lock_task_context(struct task_struc
+ {
+ 	struct perf_event_context *ctx;
+ 
+-	rcu_read_lock();
+ retry:
++	/*
++	 * One of the few rules of preemptible RCU is that one cannot do
++	 * rcu_read_unlock() while holding a scheduler (or nested) lock when
++	 * part of the read side critical section was preemptible -- see
++	 * rcu_read_unlock_special().
++	 *
++	 * Since ctx->lock nests under rq->lock we must ensure the entire read
++	 * side critical section is non-preemptible.
++	 */
++	preempt_disable();
++	rcu_read_lock();
+ 	ctx = rcu_dereference(task->perf_event_ctxp[ctxn]);
+ 	if (ctx) {
+ 		/*
+@@ -668,6 +678,8 @@ retry:
+ 		raw_spin_lock_irqsave(&ctx->lock, *flags);
+ 		if (ctx != rcu_dereference(task->perf_event_ctxp[ctxn])) {
+ 			raw_spin_unlock_irqrestore(&ctx->lock, *flags);
++			rcu_read_unlock();
++			preempt_enable();
+ 			goto retry;
+ 		}
+ 
+@@ -677,6 +689,7 @@ retry:
+ 		}
+ 	}
+ 	rcu_read_unlock();
++	preempt_enable();
+ 	return ctx;
+ }
+ 
