@@ -1,0 +1,154 @@
+From 8e2e2fa47129532a30cff6c25a47078dc97d9260 Mon Sep 17 00:00:00 2001
+From: "Steven Rostedt (Red Hat)" <rostedt@goodmis.org>
+Date: Tue, 2 Jul 2013 15:30:53 -0400
+Subject: tracing: Add trace_array_get/put() to event handling
+
+From: "Steven Rostedt (Red Hat)" <rostedt@goodmis.org>
+
+commit 8e2e2fa47129532a30cff6c25a47078dc97d9260 upstream.
+
+Commit a695cb58162 "tracing: Prevent deleting instances when they are being read"
+tried to fix a race between deleting a trace instance and reading contents
+of a trace file. But it wasn't good enough. The following could crash the kernel:
+
+ # cd /sys/kernel/debug/tracing/instances
+ # ( while :; do mkdir foo; rmdir foo; done ) &
+ # ( while :; do echo 1 > foo/events/sched/sched_switch 2> /dev/null; done ) &
+
+Luckily this can only be done by root user, but it should be fixed regardless.
+
+The problem is that a delete of the file can happen after the write to the event
+is opened, but before the enabling happens.
+
+The solution is to make sure the trace_array is available before succeeding in
+opening for write, and incerment the ref counter while opened.
+
+Now the instance can be deleted when the events are writing to the buffer,
+but the deletion of the instance will disable all events before the instance
+is actually deleted.
+
+Reported-by: Alexander Lam <azl@google.com>
+Signed-off-by: Steven Rostedt <rostedt@goodmis.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ kernel/trace/trace.h        |    3 ++
+ kernel/trace/trace_events.c |   55 ++++++++++++++++++++++++++++++++++++++++----
+ 2 files changed, 54 insertions(+), 4 deletions(-)
+
+--- a/kernel/trace/trace.h
++++ b/kernel/trace/trace.h
+@@ -226,6 +226,9 @@ extern struct list_head ftrace_trace_arr
+ 
+ extern struct mutex trace_types_lock;
+ 
++extern int trace_array_get(struct trace_array *tr);
++extern void trace_array_put(struct trace_array *tr);
++
+ /*
+  * The global tracer (top) should be the first trace array added,
+  * but we check the flag anyway.
+--- a/kernel/trace/trace_events.c
++++ b/kernel/trace/trace_events.c
+@@ -413,6 +413,35 @@ static void put_system(struct ftrace_sub
+ }
+ 
+ /*
++ * Open and update trace_array ref count.
++ * Must have the current trace_array passed to it.
++ */
++static int tracing_open_generic_file(struct inode *inode, struct file *filp)
++{
++	struct ftrace_event_file *file = inode->i_private;
++	struct trace_array *tr = file->tr;
++	int ret;
++
++	if (trace_array_get(tr) < 0)
++		return -ENODEV;
++
++	ret = tracing_open_generic(inode, filp);
++	if (ret < 0)
++		trace_array_put(tr);
++	return ret;
++}
++
++static int tracing_release_generic_file(struct inode *inode, struct file *filp)
++{
++	struct ftrace_event_file *file = inode->i_private;
++	struct trace_array *tr = file->tr;
++
++	trace_array_put(tr);
++
++	return 0;
++}
++
++/*
+  * __ftrace_set_clr_event(NULL, NULL, NULL, set) will set/unset all events.
+  */
+ static int
+@@ -1046,9 +1075,17 @@ static int subsystem_open(struct inode *
+ 	/* Some versions of gcc think dir can be uninitialized here */
+ 	WARN_ON(!dir);
+ 
++	/* Still need to increment the ref count of the system */
++	if (trace_array_get(tr) < 0) {
++		put_system(dir);
++		return -ENODEV;
++	}
++
+ 	ret = tracing_open_generic(inode, filp);
+-	if (ret < 0)
++	if (ret < 0) {
++		trace_array_put(tr);
+ 		put_system(dir);
++	}
+ 
+ 	return ret;
+ }
+@@ -1059,16 +1096,23 @@ static int system_tr_open(struct inode *
+ 	struct trace_array *tr = inode->i_private;
+ 	int ret;
+ 
++	if (trace_array_get(tr) < 0)
++		return -ENODEV;
++
+ 	/* Make a temporary dir that has no system but points to tr */
+ 	dir = kzalloc(sizeof(*dir), GFP_KERNEL);
+-	if (!dir)
++	if (!dir) {
++		trace_array_put(tr);
+ 		return -ENOMEM;
++	}
+ 
+ 	dir->tr = tr;
+ 
+ 	ret = tracing_open_generic(inode, filp);
+-	if (ret < 0)
++	if (ret < 0) {
++		trace_array_put(tr);
+ 		kfree(dir);
++	}
+ 
+ 	filp->private_data = dir;
+ 
+@@ -1079,6 +1123,8 @@ static int subsystem_release(struct inod
+ {
+ 	struct ftrace_subsystem_dir *dir = file->private_data;
+ 
++	trace_array_put(dir->tr);
++
+ 	/*
+ 	 * If dir->subsystem is NULL, then this is a temporary
+ 	 * descriptor that was made for a trace_array to enable
+@@ -1206,9 +1252,10 @@ static const struct file_operations ftra
+ };
+ 
+ static const struct file_operations ftrace_enable_fops = {
+-	.open = tracing_open_generic,
++	.open = tracing_open_generic_file,
+ 	.read = event_enable_read,
+ 	.write = event_enable_write,
++	.release = tracing_release_generic_file,
+ 	.llseek = default_llseek,
+ };
+ 
