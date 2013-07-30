@@ -1,0 +1,195 @@
+From b2cb96494d83b894a43ba8b9023eead8ff50684b Mon Sep 17 00:00:00 2001
+From: Nicholas Bellinger <nab@linux-iscsi.org>
+Date: Wed, 3 Jul 2013 03:05:37 -0700
+Subject: iser-target: Fix session reset bug with RDMA_CM_EVENT_DISCONNECTED
+
+From: Nicholas Bellinger <nab@linux-iscsi.org>
+
+commit b2cb96494d83b894a43ba8b9023eead8ff50684b upstream.
+
+This patch addresses a bug where RDMA_CM_EVENT_DISCONNECTED may occur
+before the connection shutdown has been completed by rx/tx threads,
+that causes isert_free_conn() to wait indefinately on ->conn_wait.
+
+This patch allows isert_disconnect_work code to invoke rdma_disconnect
+when isert_disconnect_work() process context is started by client
+session reset before isert_free_conn() code has been reached.
+
+It also adds isert_conn->conn_mutex protection for ->state within
+isert_disconnect_work(), isert_cq_comp_err() and isert_free_conn()
+code, along with isert_check_state() for wait_event usage.
+
+(v2: Add explicit iscsit_cause_connection_reinstatement call
+     during isert_disconnect_work() to force conn reset)
+
+Cc: Or Gerlitz <ogerlitz@mellanox.com>
+Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/infiniband/ulp/isert/ib_isert.c  |   70 ++++++++++++++++++++++++++-----
+ drivers/infiniband/ulp/isert/ib_isert.h  |    1 
+ drivers/target/iscsi/iscsi_target_erl0.c |    1 
+ include/target/iscsi/iscsi_transport.h   |    4 +
+ 4 files changed, 66 insertions(+), 10 deletions(-)
+
+--- a/drivers/infiniband/ulp/isert/ib_isert.c
++++ b/drivers/infiniband/ulp/isert/ib_isert.c
+@@ -388,6 +388,7 @@ isert_connect_request(struct rdma_cm_id
+ 	init_waitqueue_head(&isert_conn->conn_wait_comp_err);
+ 	kref_init(&isert_conn->conn_kref);
+ 	kref_get(&isert_conn->conn_kref);
++	mutex_init(&isert_conn->conn_mutex);
+ 
+ 	cma_id->context = isert_conn;
+ 	isert_conn->conn_cm_id = cma_id;
+@@ -540,15 +541,32 @@ isert_disconnect_work(struct work_struct
+ 				struct isert_conn, conn_logout_work);
+ 
+ 	pr_debug("isert_disconnect_work(): >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>\n");
+-
++	mutex_lock(&isert_conn->conn_mutex);
+ 	isert_conn->state = ISER_CONN_DOWN;
+ 
+ 	if (isert_conn->post_recv_buf_count == 0 &&
+ 	    atomic_read(&isert_conn->post_send_buf_count) == 0) {
+ 		pr_debug("Calling wake_up(&isert_conn->conn_wait);\n");
+-		wake_up(&isert_conn->conn_wait);
++		mutex_unlock(&isert_conn->conn_mutex);
++		goto wake_up;
++	}
++	if (!isert_conn->conn_cm_id) {
++		mutex_unlock(&isert_conn->conn_mutex);
++		isert_put_conn(isert_conn);
++		return;
++	}
++	if (!isert_conn->logout_posted) {
++		pr_debug("Calling rdma_disconnect for !logout_posted from"
++			 " isert_disconnect_work\n");
++		rdma_disconnect(isert_conn->conn_cm_id);
++		mutex_unlock(&isert_conn->conn_mutex);
++		iscsit_cause_connection_reinstatement(isert_conn->conn, 0);
++		goto wake_up;
+ 	}
++	mutex_unlock(&isert_conn->conn_mutex);
+ 
++wake_up:
++	wake_up(&isert_conn->conn_wait);
+ 	isert_put_conn(isert_conn);
+ }
+ 
+@@ -1423,7 +1441,11 @@ isert_cq_comp_err(struct iser_tx_desc *t
+ 		pr_debug("isert_cq_comp_err >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>\n");
+ 		pr_debug("Calling wake_up from isert_cq_comp_err\n");
+ 
+-		isert_conn->state = ISER_CONN_TERMINATING;
++		mutex_lock(&isert_conn->conn_mutex);
++		if (isert_conn->state != ISER_CONN_DOWN)
++			isert_conn->state = ISER_CONN_TERMINATING;
++		mutex_unlock(&isert_conn->conn_mutex);
++
+ 		wake_up(&isert_conn->conn_wait_comp_err);
+ 	}
+ }
+@@ -2193,6 +2215,17 @@ isert_free_np(struct iscsi_np *np)
+ 	kfree(isert_np);
+ }
+ 
++static int isert_check_state(struct isert_conn *isert_conn, int state)
++{
++	int ret;
++
++	mutex_lock(&isert_conn->conn_mutex);
++	ret = (isert_conn->state == state);
++	mutex_unlock(&isert_conn->conn_mutex);
++
++	return ret;
++}
++
+ static void isert_free_conn(struct iscsi_conn *conn)
+ {
+ 	struct isert_conn *isert_conn = conn->context;
+@@ -2202,26 +2235,43 @@ static void isert_free_conn(struct iscsi
+ 	 * Decrement post_send_buf_count for special case when called
+ 	 * from isert_do_control_comp() -> iscsit_logout_post_handler()
+ 	 */
++	mutex_lock(&isert_conn->conn_mutex);
+ 	if (isert_conn->logout_posted)
+ 		atomic_dec(&isert_conn->post_send_buf_count);
+ 
+-	if (isert_conn->conn_cm_id)
++	if (isert_conn->conn_cm_id && isert_conn->state != ISER_CONN_DOWN) {
++		pr_debug("Calling rdma_disconnect from isert_free_conn\n");
+ 		rdma_disconnect(isert_conn->conn_cm_id);
++	}
+ 	/*
+ 	 * Only wait for conn_wait_comp_err if the isert_conn made it
+ 	 * into full feature phase..
+ 	 */
+-	if (isert_conn->state > ISER_CONN_INIT) {
++	if (isert_conn->state == ISER_CONN_UP) {
+ 		pr_debug("isert_free_conn: Before wait_event comp_err %d\n",
+ 			 isert_conn->state);
++		mutex_unlock(&isert_conn->conn_mutex);
++
+ 		wait_event(isert_conn->conn_wait_comp_err,
+-			   isert_conn->state == ISER_CONN_TERMINATING);
+-		pr_debug("isert_free_conn: After wait_event #1 >>>>>>>>>>>>\n");
++			  (isert_check_state(isert_conn, ISER_CONN_TERMINATING)));
++
++		wait_event(isert_conn->conn_wait,
++			  (isert_check_state(isert_conn, ISER_CONN_DOWN)));
++
++		isert_put_conn(isert_conn);
++		return;
++	}
++	if (isert_conn->state == ISER_CONN_INIT) {
++		mutex_unlock(&isert_conn->conn_mutex);
++		isert_put_conn(isert_conn);
++		return;
+ 	}
++	pr_debug("isert_free_conn: wait_event conn_wait %d\n",
++		 isert_conn->state);
++	mutex_unlock(&isert_conn->conn_mutex);
+ 
+-	pr_debug("isert_free_conn: wait_event conn_wait %d\n", isert_conn->state);
+-	wait_event(isert_conn->conn_wait, isert_conn->state == ISER_CONN_DOWN);
+-	pr_debug("isert_free_conn: After wait_event #2 >>>>>>>>>>>>>>>>>>>>\n");
++	wait_event(isert_conn->conn_wait,
++		  (isert_check_state(isert_conn, ISER_CONN_DOWN)));
+ 
+ 	isert_put_conn(isert_conn);
+ }
+--- a/drivers/infiniband/ulp/isert/ib_isert.h
++++ b/drivers/infiniband/ulp/isert/ib_isert.h
+@@ -102,6 +102,7 @@ struct isert_conn {
+ 	struct ib_qp		*conn_qp;
+ 	struct isert_device	*conn_device;
+ 	struct work_struct	conn_logout_work;
++	struct mutex		conn_mutex;
+ 	wait_queue_head_t	conn_wait;
+ 	wait_queue_head_t	conn_wait_comp_err;
+ 	struct kref		conn_kref;
+--- a/drivers/target/iscsi/iscsi_target_erl0.c
++++ b/drivers/target/iscsi/iscsi_target_erl0.c
+@@ -909,6 +909,7 @@ void iscsit_cause_connection_reinstateme
+ 	wait_for_completion(&conn->conn_wait_comp);
+ 	complete(&conn->conn_post_wait_comp);
+ }
++EXPORT_SYMBOL(iscsit_cause_connection_reinstatement);
+ 
+ void iscsit_fall_back_to_erl0(struct iscsi_session *sess)
+ {
+--- a/include/target/iscsi/iscsi_transport.h
++++ b/include/target/iscsi/iscsi_transport.h
+@@ -67,6 +67,10 @@ extern int iscsit_logout_post_handler(st
+  */
+ extern void iscsit_increment_maxcmdsn(struct iscsi_cmd *, struct iscsi_session *);
+ /*
++ * From iscsi_target_erl0.c
++ */
++extern void iscsit_cause_connection_reinstatement(struct iscsi_conn *, int);
++/*
+  * From iscsi_target_erl1.c
+  */
+ extern void iscsit_stop_dataout_timer(struct iscsi_cmd *);
