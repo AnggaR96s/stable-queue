@@ -1,0 +1,237 @@
+From 48be69a026b2c17350a5ef18a1959a919f60be7d Mon Sep 17 00:00:00 2001
+From: Russell King <rmk+kernel@arm.linux.org.uk>
+Date: Wed, 24 Jul 2013 00:29:18 +0100
+Subject: ARM: move signal handlers into a vdso-like page
+
+From: Russell King <rmk+kernel@arm.linux.org.uk>
+
+commit 48be69a026b2c17350a5ef18a1959a919f60be7d upstream.
+
+Move the signal handlers into a VDSO page rather than keeping them in
+the vectors page.  This allows us to place them randomly within this
+page, and also map the page at a random location within userspace
+further protecting these code fragments from ROP attacks.  The new
+VDSO page is also poisoned in the same way as the vector page.
+
+Signed-off-by: Russell King <rmk+kernel@arm.linux.org.uk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ arch/arm/include/asm/elf.h |    4 +++
+ arch/arm/include/asm/mmu.h |    1 
+ arch/arm/kernel/process.c  |   40 +++++++++++++++++++++++++++++++++---
+ arch/arm/kernel/signal.c   |   49 ++++++++++++++++++++++++++++++++++++++++-----
+ arch/arm/kernel/signal.h   |   12 -----------
+ arch/arm/kernel/traps.c    |    9 --------
+ 6 files changed, 86 insertions(+), 29 deletions(-)
+
+--- a/arch/arm/include/asm/elf.h
++++ b/arch/arm/include/asm/elf.h
+@@ -130,4 +130,8 @@ struct mm_struct;
+ extern unsigned long arch_randomize_brk(struct mm_struct *mm);
+ #define arch_randomize_brk arch_randomize_brk
+ 
++#define ARCH_HAS_SETUP_ADDITIONAL_PAGES 1
++struct linux_binprm;
++int arch_setup_additional_pages(struct linux_binprm *, int);
++
+ #endif
+--- a/arch/arm/include/asm/mmu.h
++++ b/arch/arm/include/asm/mmu.h
+@@ -8,6 +8,7 @@ typedef struct {
+ 	atomic64_t	id;
+ #endif
+ 	unsigned int	vmalloc_seq;
++	unsigned long	sigpage;
+ } mm_context_t;
+ 
+ #ifdef CONFIG_CPU_HAS_ASID
+--- a/arch/arm/kernel/process.c
++++ b/arch/arm/kernel/process.c
+@@ -435,8 +435,8 @@ unsigned long arch_randomize_brk(struct
+ #ifdef CONFIG_MMU
+ /*
+  * The vectors page is always readable from user space for the
+- * atomic helpers and the signal restart code. Insert it into the
+- * gate_vma so that it is visible through ptrace and /proc/<pid>/mem.
++ * atomic helpers. Insert it into the gate_vma so that it is visible
++ * through ptrace and /proc/<pid>/mem.
+  */
+ static struct vm_area_struct gate_vma = {
+ 	.vm_start	= 0xffff0000,
+@@ -468,6 +468,40 @@ int in_gate_area_no_mm(unsigned long add
+ 
+ const char *arch_vma_name(struct vm_area_struct *vma)
+ {
+-	return (vma == &gate_vma) ? "[vectors]" : NULL;
++	return (vma == &gate_vma) ? "[vectors]" :
++		(vma->vm_mm && vma->vm_start == vma->vm_mm->context.sigpage) ?
++		 "[sigpage]" : NULL;
++}
++
++extern struct page *get_signal_page(void);
++
++int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
++{
++	struct mm_struct *mm = current->mm;
++	struct page *page;
++	unsigned long addr;
++	int ret;
++
++	page = get_signal_page();
++	if (!page)
++		return -ENOMEM;
++
++	down_write(&mm->mmap_sem);
++	addr = get_unmapped_area(NULL, 0, PAGE_SIZE, 0, 0);
++	if (IS_ERR_VALUE(addr)) {
++		ret = addr;
++		goto up_fail;
++	}
++
++	ret = install_special_mapping(mm, addr, PAGE_SIZE,
++		VM_READ | VM_EXEC | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC,
++		&page);
++
++	if (ret == 0)
++		mm->context.sigpage = addr;
++
++ up_fail:
++	up_write(&mm->mmap_sem);
++	return ret;
+ }
+ #endif
+--- a/arch/arm/kernel/signal.c
++++ b/arch/arm/kernel/signal.c
+@@ -8,6 +8,7 @@
+  * published by the Free Software Foundation.
+  */
+ #include <linux/errno.h>
++#include <linux/random.h>
+ #include <linux/signal.h>
+ #include <linux/personality.h>
+ #include <linux/uaccess.h>
+@@ -15,12 +16,11 @@
+ 
+ #include <asm/elf.h>
+ #include <asm/cacheflush.h>
++#include <asm/traps.h>
+ #include <asm/ucontext.h>
+ #include <asm/unistd.h>
+ #include <asm/vfp.h>
+ 
+-#include "signal.h"
+-
+ /*
+  * For ARM syscalls, we encode the syscall number into the instruction.
+  */
+@@ -40,11 +40,13 @@
+ #define SWI_THUMB_SIGRETURN	(0xdf00 << 16 | 0x2700 | (__NR_sigreturn - __NR_SYSCALL_BASE))
+ #define SWI_THUMB_RT_SIGRETURN	(0xdf00 << 16 | 0x2700 | (__NR_rt_sigreturn - __NR_SYSCALL_BASE))
+ 
+-const unsigned long sigreturn_codes[7] = {
++static const unsigned long sigreturn_codes[7] = {
+ 	MOV_R7_NR_SIGRETURN,    SWI_SYS_SIGRETURN,    SWI_THUMB_SIGRETURN,
+ 	MOV_R7_NR_RT_SIGRETURN, SWI_SYS_RT_SIGRETURN, SWI_THUMB_RT_SIGRETURN,
+ };
+ 
++static unsigned long signal_return_offset;
++
+ #ifdef CONFIG_CRUNCH
+ static int preserve_crunch_context(struct crunch_sigframe __user *frame)
+ {
+@@ -397,11 +399,15 @@ setup_return(struct pt_regs *regs, struc
+ 			return 1;
+ 
+ 		if (cpsr & MODE32_BIT) {
++			struct mm_struct *mm = current->mm;
+ 			/*
+-			 * 32-bit code can use the new high-page
+-			 * signal return code support.
++			 * 32-bit code can use the signal return page
++			 * except when the MPU has protected the vectors
++			 * page from PL0
+ 			 */
+ 			retcode = KERN_SIGRETURN_CODE + (idx << 2) + thumb;
++			retcode = mm->context.sigpage + signal_return_offset +
++				  (idx << 2) + thumb;
+ 		} else {
+ 			/*
+ 			 * Ensure that the instruction cache sees
+@@ -603,3 +609,36 @@ do_work_pending(struct pt_regs *regs, un
+ 	} while (thread_flags & _TIF_WORK_MASK);
+ 	return 0;
+ }
++
++static struct page *signal_page;
++
++struct page *get_signal_page(void)
++{
++	if (!signal_page) {
++		unsigned long ptr;
++		unsigned offset;
++		void *addr;
++
++		signal_page = alloc_pages(GFP_KERNEL, 0);
++
++		if (!signal_page)
++			return NULL;
++
++		addr = page_address(signal_page);
++
++		/* Give the signal return code some randomness */
++		offset = 0x200 + (get_random_int() & 0x7fc);
++		signal_return_offset = offset;
++
++		/*
++		 * Copy signal return handlers into the vector page, and
++		 * set sigreturn to be a pointer to these.
++		 */
++		memcpy(addr + offset, sigreturn_codes, sizeof(sigreturn_codes));
++
++		ptr = (unsigned long)addr + offset;
++		flush_icache_range(ptr, ptr + sizeof(sigreturn_codes));
++	}
++
++	return signal_page;
++}
+--- a/arch/arm/kernel/signal.h
++++ /dev/null
+@@ -1,12 +0,0 @@
+-/*
+- *  linux/arch/arm/kernel/signal.h
+- *
+- *  Copyright (C) 2005-2009 Russell King.
+- *
+- * This program is free software; you can redistribute it and/or modify
+- * it under the terms of the GNU General Public License version 2 as
+- * published by the Free Software Foundation.
+- */
+-#define KERN_SIGRETURN_CODE	(CONFIG_VECTORS_BASE + 0x00000500)
+-
+-extern const unsigned long sigreturn_codes[7];
+--- a/arch/arm/kernel/traps.c
++++ b/arch/arm/kernel/traps.c
+@@ -35,8 +35,6 @@
+ #include <asm/tls.h>
+ #include <asm/system_misc.h>
+ 
+-#include "signal.h"
+-
+ static const char *handler[]= { "prefetch abort", "data abort", "address exception", "interrupt" };
+ 
+ void *vectors_page;
+@@ -849,13 +847,6 @@ void __init early_trap_init(void *vector
+ 
+ 	kuser_init(vectors_base);
+ 
+-	/*
+-	 * Copy signal return handlers into the vector page, and
+-	 * set sigreturn to be a pointer to these.
+-	 */
+-	memcpy((void *)(vectors + KERN_SIGRETURN_CODE - CONFIG_VECTORS_BASE),
+-	       sigreturn_codes, sizeof(sigreturn_codes));
+-
+ 	flush_icache_range(vectors, vectors + PAGE_SIZE * 2);
+ 	modify_domain(DOMAIN_USER, DOMAIN_CLIENT);
+ }
