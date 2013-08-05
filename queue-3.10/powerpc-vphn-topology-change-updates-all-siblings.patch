@@ -1,0 +1,155 @@
+From 3be7db6ab45b21345386d1a466da133b19cde5e4 Mon Sep 17 00:00:00 2001
+From: Robert Jennings <rcj@linux.vnet.ibm.com>
+Date: Wed, 24 Jul 2013 20:13:21 -0500
+Subject: powerpc: VPHN topology change updates all siblings
+
+From: Robert Jennings <rcj@linux.vnet.ibm.com>
+
+commit 3be7db6ab45b21345386d1a466da133b19cde5e4 upstream.
+
+When an associativity level change is found for one thread, the
+siblings threads need to be updated as well.  This is done today
+for PRRN in stage_topology_update() but is missing for VPHN in
+update_cpu_associativity_changes_mask().  This patch will correctly
+update all thread siblings during a topology change.
+
+Without this patch a topology update can result in a CPU in
+init_sched_groups_power() getting stuck indefinitely in a loop.
+
+This loop is built in build_sched_groups(). As a result of the thread
+moving to a node separate from its siblings the struct sched_group will
+have its next pointer set to point to itself rather than the sched_group
+struct of the next thread.  This happens because we have a domain without
+the SD_OVERLAP flag, which is correct, and a topology that doesn't conform
+with reality (threads on the same core assigned to different numa nodes).
+When this list is traversed by init_sched_groups_power() it will reach
+the thread's sched_group structure and loop indefinitely; the cpu will
+be stuck at this point.
+
+The bug was exposed when VPHN was enabled in commit b7abef0 (v3.9).
+
+Reported-by: Jan Stancek <jstancek@redhat.com>
+Signed-off-by: Robert Jennings <rcj@linux.vnet.ibm.com>
+Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ arch/powerpc/include/asm/smp.h |    4 ++
+ arch/powerpc/mm/numa.c         |   59 ++++++++++++++++++++++++++++++-----------
+ 2 files changed, 48 insertions(+), 15 deletions(-)
+
+--- a/arch/powerpc/include/asm/smp.h
++++ b/arch/powerpc/include/asm/smp.h
+@@ -145,6 +145,10 @@ extern void __cpu_die(unsigned int cpu);
+ #define smp_setup_cpu_maps()
+ static inline void inhibit_secondary_onlining(void) {}
+ static inline void uninhibit_secondary_onlining(void) {}
++static inline const struct cpumask *cpu_sibling_mask(int cpu)
++{
++	return cpumask_of(cpu);
++}
+ 
+ #endif /* CONFIG_SMP */
+ 
+--- a/arch/powerpc/mm/numa.c
++++ b/arch/powerpc/mm/numa.c
+@@ -27,6 +27,7 @@
+ #include <linux/seq_file.h>
+ #include <linux/uaccess.h>
+ #include <linux/slab.h>
++#include <asm/cputhreads.h>
+ #include <asm/sparsemem.h>
+ #include <asm/prom.h>
+ #include <asm/smp.h>
+@@ -1319,7 +1320,8 @@ static int update_cpu_associativity_chan
+ 			}
+ 		}
+ 		if (changed) {
+-			cpumask_set_cpu(cpu, changes);
++			cpumask_or(changes, changes, cpu_sibling_mask(cpu));
++			cpu = cpu_last_thread_sibling(cpu);
+ 		}
+ 	}
+ 
+@@ -1427,7 +1429,7 @@ static int update_cpu_topology(void *dat
+ 	if (!data)
+ 		return -EINVAL;
+ 
+-	cpu = get_cpu();
++	cpu = smp_processor_id();
+ 
+ 	for (update = data; update; update = update->next) {
+ 		if (cpu != update->cpu)
+@@ -1447,12 +1449,12 @@ static int update_cpu_topology(void *dat
+  */
+ int arch_update_cpu_topology(void)
+ {
+-	unsigned int cpu, changed = 0;
++	unsigned int cpu, sibling, changed = 0;
+ 	struct topology_update_data *updates, *ud;
+ 	unsigned int associativity[VPHN_ASSOC_BUFSIZE] = {0};
+ 	cpumask_t updated_cpus;
+ 	struct device *dev;
+-	int weight, i = 0;
++	int weight, new_nid, i = 0;
+ 
+ 	weight = cpumask_weight(&cpu_associativity_changes_mask);
+ 	if (!weight)
+@@ -1465,19 +1467,46 @@ int arch_update_cpu_topology(void)
+ 	cpumask_clear(&updated_cpus);
+ 
+ 	for_each_cpu(cpu, &cpu_associativity_changes_mask) {
+-		ud = &updates[i++];
+-		ud->cpu = cpu;
+-		vphn_get_associativity(cpu, associativity);
+-		ud->new_nid = associativity_to_nid(associativity);
+-
+-		if (ud->new_nid < 0 || !node_online(ud->new_nid))
+-			ud->new_nid = first_online_node;
++		/*
++		 * If siblings aren't flagged for changes, updates list
++		 * will be too short. Skip on this update and set for next
++		 * update.
++		 */
++		if (!cpumask_subset(cpu_sibling_mask(cpu),
++					&cpu_associativity_changes_mask)) {
++			pr_info("Sibling bits not set for associativity "
++					"change, cpu%d\n", cpu);
++			cpumask_or(&cpu_associativity_changes_mask,
++					&cpu_associativity_changes_mask,
++					cpu_sibling_mask(cpu));
++			cpu = cpu_last_thread_sibling(cpu);
++			continue;
++		}
+ 
+-		ud->old_nid = numa_cpu_lookup_table[cpu];
+-		cpumask_set_cpu(cpu, &updated_cpus);
++		/* Use associativity from first thread for all siblings */
++		vphn_get_associativity(cpu, associativity);
++		new_nid = associativity_to_nid(associativity);
++		if (new_nid < 0 || !node_online(new_nid))
++			new_nid = first_online_node;
++
++		if (new_nid == numa_cpu_lookup_table[cpu]) {
++			cpumask_andnot(&cpu_associativity_changes_mask,
++					&cpu_associativity_changes_mask,
++					cpu_sibling_mask(cpu));
++			cpu = cpu_last_thread_sibling(cpu);
++			continue;
++		}
+ 
+-		if (i < weight)
+-			ud->next = &updates[i];
++		for_each_cpu(sibling, cpu_sibling_mask(cpu)) {
++			ud = &updates[i++];
++			ud->cpu = sibling;
++			ud->new_nid = new_nid;
++			ud->old_nid = numa_cpu_lookup_table[sibling];
++			cpumask_set_cpu(sibling, &updated_cpus);
++			if (i < weight)
++				ud->next = &updates[i];
++		}
++		cpu = cpu_last_thread_sibling(cpu);
+ 	}
+ 
+ 	stop_machine(update_cpu_topology, &updates[0], &updated_cpus);
