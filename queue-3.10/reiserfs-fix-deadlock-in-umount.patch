@@ -1,0 +1,233 @@
+From 672fe15d091ce76d6fb98e489962e9add7c1ba4c Mon Sep 17 00:00:00 2001
+From: Al Viro <viro@zeniv.linux.org.uk>
+Date: Mon, 5 Aug 2013 17:37:37 +0400
+Subject: reiserfs: fix deadlock in umount
+
+From: Al Viro <viro@zeniv.linux.org.uk>
+
+commit 672fe15d091ce76d6fb98e489962e9add7c1ba4c upstream.
+
+Since remove_proc_entry() started to wait for IO in progress (i.e.
+since 2007 or so), the locking in fs/reiserfs/proc.c became wrong;
+if procfs read happens between the moment when umount() locks the
+victim superblock and removal of /proc/fs/reiserfs/<device>/*,
+we'll get a deadlock - read will wait for s_umount (in sget(),
+called by r_start()), while umount will wait in remove_proc_entry()
+for that read to finish, holding s_umount all along.
+
+Fortunately, the same change allows a much simpler race avoidance -
+all we need to do is remove the procfs entries in the very beginning
+of reiserfs ->kill_sb(); that'll guarantee that pointer to superblock
+will remain valid for the duration for procfs IO, so we don't need
+sget() to keep the sucker alive.  As the matter of fact, we can
+get rid of the home-grown iterator completely, and use single_open()
+instead.
+
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/reiserfs/procfs.c |   99 +++++++++------------------------------------------
+ fs/reiserfs/super.c  |    3 -
+ 2 files changed, 20 insertions(+), 82 deletions(-)
+
+--- a/fs/reiserfs/procfs.c
++++ b/fs/reiserfs/procfs.c
+@@ -19,12 +19,13 @@
+ /*
+  * LOCKING:
+  *
+- * We rely on new Alexander Viro's super-block locking.
++ * These guys are evicted from procfs as the very first step in ->kill_sb().
+  *
+  */
+ 
+-static int show_version(struct seq_file *m, struct super_block *sb)
++static int show_version(struct seq_file *m, void *unused)
+ {
++	struct super_block *sb = m->private;
+ 	char *format;
+ 
+ 	if (REISERFS_SB(sb)->s_properties & (1 << REISERFS_3_6)) {
+@@ -66,8 +67,9 @@ static int show_version(struct seq_file
+ #define DJP( x ) le32_to_cpu( jp -> x )
+ #define JF( x ) ( r -> s_journal -> x )
+ 
+-static int show_super(struct seq_file *m, struct super_block *sb)
++static int show_super(struct seq_file *m, void *unused)
+ {
++	struct super_block *sb = m->private;
+ 	struct reiserfs_sb_info *r = REISERFS_SB(sb);
+ 
+ 	seq_printf(m, "state: \t%s\n"
+@@ -128,8 +130,9 @@ static int show_super(struct seq_file *m
+ 	return 0;
+ }
+ 
+-static int show_per_level(struct seq_file *m, struct super_block *sb)
++static int show_per_level(struct seq_file *m, void *unused)
+ {
++	struct super_block *sb = m->private;
+ 	struct reiserfs_sb_info *r = REISERFS_SB(sb);
+ 	int level;
+ 
+@@ -186,8 +189,9 @@ static int show_per_level(struct seq_fil
+ 	return 0;
+ }
+ 
+-static int show_bitmap(struct seq_file *m, struct super_block *sb)
++static int show_bitmap(struct seq_file *m, void *unused)
+ {
++	struct super_block *sb = m->private;
+ 	struct reiserfs_sb_info *r = REISERFS_SB(sb);
+ 
+ 	seq_printf(m, "free_block: %lu\n"
+@@ -218,8 +222,9 @@ static int show_bitmap(struct seq_file *
+ 	return 0;
+ }
+ 
+-static int show_on_disk_super(struct seq_file *m, struct super_block *sb)
++static int show_on_disk_super(struct seq_file *m, void *unused)
+ {
++	struct super_block *sb = m->private;
+ 	struct reiserfs_sb_info *sb_info = REISERFS_SB(sb);
+ 	struct reiserfs_super_block *rs = sb_info->s_rs;
+ 	int hash_code = DFL(s_hash_function_code);
+@@ -261,8 +266,9 @@ static int show_on_disk_super(struct seq
+ 	return 0;
+ }
+ 
+-static int show_oidmap(struct seq_file *m, struct super_block *sb)
++static int show_oidmap(struct seq_file *m, void *unused)
+ {
++	struct super_block *sb = m->private;
+ 	struct reiserfs_sb_info *sb_info = REISERFS_SB(sb);
+ 	struct reiserfs_super_block *rs = sb_info->s_rs;
+ 	unsigned int mapsize = le16_to_cpu(rs->s_v1.s_oid_cursize);
+@@ -291,8 +297,9 @@ static int show_oidmap(struct seq_file *
+ 	return 0;
+ }
+ 
+-static int show_journal(struct seq_file *m, struct super_block *sb)
++static int show_journal(struct seq_file *m, void *unused)
+ {
++	struct super_block *sb = m->private;
+ 	struct reiserfs_sb_info *r = REISERFS_SB(sb);
+ 	struct reiserfs_super_block *rs = r->s_rs;
+ 	struct journal_params *jp = &rs->s_v1.s_journal;
+@@ -383,92 +390,24 @@ static int show_journal(struct seq_file
+ 	return 0;
+ }
+ 
+-/* iterator */
+-static int test_sb(struct super_block *sb, void *data)
+-{
+-	return data == sb;
+-}
+-
+-static int set_sb(struct super_block *sb, void *data)
+-{
+-	return -ENOENT;
+-}
+-
+-struct reiserfs_seq_private {
+-	struct super_block *sb;
+-	int (*show) (struct seq_file *, struct super_block *);
+-};
+-
+-static void *r_start(struct seq_file *m, loff_t * pos)
+-{
+-	struct reiserfs_seq_private *priv = m->private;
+-	loff_t l = *pos;
+-
+-	if (l)
+-		return NULL;
+-
+-	if (IS_ERR(sget(&reiserfs_fs_type, test_sb, set_sb, 0, priv->sb)))
+-		return NULL;
+-
+-	up_write(&priv->sb->s_umount);
+-	return priv->sb;
+-}
+-
+-static void *r_next(struct seq_file *m, void *v, loff_t * pos)
+-{
+-	++*pos;
+-	if (v)
+-		deactivate_super(v);
+-	return NULL;
+-}
+-
+-static void r_stop(struct seq_file *m, void *v)
+-{
+-	if (v)
+-		deactivate_super(v);
+-}
+-
+-static int r_show(struct seq_file *m, void *v)
+-{
+-	struct reiserfs_seq_private *priv = m->private;
+-	return priv->show(m, v);
+-}
+-
+-static const struct seq_operations r_ops = {
+-	.start = r_start,
+-	.next = r_next,
+-	.stop = r_stop,
+-	.show = r_show,
+-};
+-
+ static int r_open(struct inode *inode, struct file *file)
+ {
+-	struct reiserfs_seq_private *priv;
+-	int ret = seq_open_private(file, &r_ops,
+-				   sizeof(struct reiserfs_seq_private));
+-
+-	if (!ret) {
+-		struct seq_file *m = file->private_data;
+-		priv = m->private;
+-		priv->sb = proc_get_parent_data(inode);
+-		priv->show = PDE_DATA(inode);
+-	}
+-	return ret;
++	return single_open(file, PDE_DATA(inode),
++				proc_get_parent_data(inode));
+ }
+ 
+ static const struct file_operations r_file_operations = {
+ 	.open = r_open,
+ 	.read = seq_read,
+ 	.llseek = seq_lseek,
+-	.release = seq_release_private,
+-	.owner = THIS_MODULE,
++	.release = single_release,
+ };
+ 
+ static struct proc_dir_entry *proc_info_root = NULL;
+ static const char proc_info_root_name[] = "fs/reiserfs";
+ 
+ static void add_file(struct super_block *sb, char *name,
+-		     int (*func) (struct seq_file *, struct super_block *))
++		     int (*func) (struct seq_file *, void *))
+ {
+ 	proc_create_data(name, 0, REISERFS_SB(sb)->procdir,
+ 			 &r_file_operations, func);
+--- a/fs/reiserfs/super.c
++++ b/fs/reiserfs/super.c
+@@ -499,6 +499,7 @@ int remove_save_link(struct inode *inode
+ static void reiserfs_kill_sb(struct super_block *s)
+ {
+ 	if (REISERFS_SB(s)) {
++		reiserfs_proc_info_done(s);
+ 		/*
+ 		 * Force any pending inode evictions to occur now. Any
+ 		 * inodes to be removed that have extended attributes
+@@ -554,8 +555,6 @@ static void reiserfs_put_super(struct su
+ 				 REISERFS_SB(s)->reserved_blocks);
+ 	}
+ 
+-	reiserfs_proc_info_done(s);
+-
+ 	reiserfs_write_unlock(s);
+ 	mutex_destroy(&REISERFS_SB(s)->lock);
+ 	kfree(s->s_fs_info);
