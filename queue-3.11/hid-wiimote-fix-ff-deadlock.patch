@@ -1,0 +1,168 @@
+From f50f9aabf32db7414551ffdfdccc71be5f3d6e7d Mon Sep 17 00:00:00 2001
+From: David Herrmann <dh.herrmann@gmail.com>
+Date: Wed, 2 Oct 2013 13:47:28 +0200
+Subject: HID: wiimote: fix FF deadlock
+
+From: David Herrmann <dh.herrmann@gmail.com>
+
+commit f50f9aabf32db7414551ffdfdccc71be5f3d6e7d upstream.
+
+The input core has an internal spinlock that is acquired during event
+injection via input_event() and friends but also held during FF callbacks.
+That means, there is no way to share a lock between event-injection and FF
+handling. Unfortunately, this is what is required for wiimote state
+tracking and what we do with state.lock and input->lock.
+
+This deadlock can be triggered when using continuous data reporting and FF
+on a wiimote device at the same time. I takes me at least 30m of
+stress-testing to trigger it but users reported considerably shorter
+times (http://bpaste.net/show/132504/) when using some gaming-console
+emulators.
+
+The real problem is that we have two copies of internal state, one in the
+wiimote objects and the other in the input device. As the input-lock is
+not supposed to be accessed from outside of input-core, we have no other
+chance than offloading FF handling into a worker. This actually works
+pretty nice and also allows to implictly merge fast rumble changes into a
+single request.
+
+Due to the 3-layered workers (rumble+queue+l2cap) this might reduce FF
+responsiveness. Initial tests were fine so lets fix the race first and if
+it turns out to be too slow we can always handle FF out-of-band and skip
+the queue-worker.
+
+Reported-by: Thomas Schneider
+Signed-off-by: David Herrmann <dh.herrmann@gmail.com>
+Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/hid/hid-wiimote-modules.c |   40 +++++++++++++++++++++++++++-----------
+ drivers/hid/hid-wiimote.h         |    4 ++-
+ 2 files changed, 32 insertions(+), 12 deletions(-)
+
+--- a/drivers/hid/hid-wiimote-modules.c
++++ b/drivers/hid/hid-wiimote-modules.c
+@@ -119,12 +119,22 @@ static const struct wiimod_ops wiimod_ke
+  * the rumble motor, this flag shouldn't be set.
+  */
+ 
++/* used by wiimod_rumble and wiipro_rumble */
++static void wiimod_rumble_worker(struct work_struct *work)
++{
++	struct wiimote_data *wdata = container_of(work, struct wiimote_data,
++						  rumble_worker);
++
++	spin_lock_irq(&wdata->state.lock);
++	wiiproto_req_rumble(wdata, wdata->state.cache_rumble);
++	spin_unlock_irq(&wdata->state.lock);
++}
++
+ static int wiimod_rumble_play(struct input_dev *dev, void *data,
+ 			      struct ff_effect *eff)
+ {
+ 	struct wiimote_data *wdata = input_get_drvdata(dev);
+ 	__u8 value;
+-	unsigned long flags;
+ 
+ 	/*
+ 	 * The wiimote supports only a single rumble motor so if any magnitude
+@@ -137,9 +147,10 @@ static int wiimod_rumble_play(struct inp
+ 	else
+ 		value = 0;
+ 
+-	spin_lock_irqsave(&wdata->state.lock, flags);
+-	wiiproto_req_rumble(wdata, value);
+-	spin_unlock_irqrestore(&wdata->state.lock, flags);
++	/* Locking state.lock here might deadlock with input_event() calls.
++	 * schedule_work acts as barrier. Merging multiple changes is fine. */
++	wdata->state.cache_rumble = value;
++	schedule_work(&wdata->rumble_worker);
+ 
+ 	return 0;
+ }
+@@ -147,6 +158,8 @@ static int wiimod_rumble_play(struct inp
+ static int wiimod_rumble_probe(const struct wiimod_ops *ops,
+ 			       struct wiimote_data *wdata)
+ {
++	INIT_WORK(&wdata->rumble_worker, wiimod_rumble_worker);
++
+ 	set_bit(FF_RUMBLE, wdata->input->ffbit);
+ 	if (input_ff_create_memless(wdata->input, NULL, wiimod_rumble_play))
+ 		return -ENOMEM;
+@@ -159,6 +172,8 @@ static void wiimod_rumble_remove(const s
+ {
+ 	unsigned long flags;
+ 
++	cancel_work_sync(&wdata->rumble_worker);
++
+ 	spin_lock_irqsave(&wdata->state.lock, flags);
+ 	wiiproto_req_rumble(wdata, 0);
+ 	spin_unlock_irqrestore(&wdata->state.lock, flags);
+@@ -1731,7 +1746,6 @@ static int wiimod_pro_play(struct input_
+ {
+ 	struct wiimote_data *wdata = input_get_drvdata(dev);
+ 	__u8 value;
+-	unsigned long flags;
+ 
+ 	/*
+ 	 * The wiimote supports only a single rumble motor so if any magnitude
+@@ -1744,9 +1758,10 @@ static int wiimod_pro_play(struct input_
+ 	else
+ 		value = 0;
+ 
+-	spin_lock_irqsave(&wdata->state.lock, flags);
+-	wiiproto_req_rumble(wdata, value);
+-	spin_unlock_irqrestore(&wdata->state.lock, flags);
++	/* Locking state.lock here might deadlock with input_event() calls.
++	 * schedule_work acts as barrier. Merging multiple changes is fine. */
++	wdata->state.cache_rumble = value;
++	schedule_work(&wdata->rumble_worker);
+ 
+ 	return 0;
+ }
+@@ -1756,6 +1771,8 @@ static int wiimod_pro_probe(const struct
+ {
+ 	int ret, i;
+ 
++	INIT_WORK(&wdata->rumble_worker, wiimod_rumble_worker);
++
+ 	wdata->extension.input = input_allocate_device();
+ 	if (!wdata->extension.input)
+ 		return -ENOMEM;
+@@ -1817,12 +1834,13 @@ static void wiimod_pro_remove(const stru
+ 	if (!wdata->extension.input)
+ 		return;
+ 
++	input_unregister_device(wdata->extension.input);
++	wdata->extension.input = NULL;
++	cancel_work_sync(&wdata->rumble_worker);
++
+ 	spin_lock_irqsave(&wdata->state.lock, flags);
+ 	wiiproto_req_rumble(wdata, 0);
+ 	spin_unlock_irqrestore(&wdata->state.lock, flags);
+-
+-	input_unregister_device(wdata->extension.input);
+-	wdata->extension.input = NULL;
+ }
+ 
+ static const struct wiimod_ops wiimod_pro = {
+--- a/drivers/hid/hid-wiimote.h
++++ b/drivers/hid/hid-wiimote.h
+@@ -133,13 +133,15 @@ struct wiimote_state {
+ 	__u8 *cmd_read_buf;
+ 	__u8 cmd_read_size;
+ 
+-	/* calibration data */
++	/* calibration/cache data */
+ 	__u16 calib_bboard[4][3];
++	__u8 cache_rumble;
+ };
+ 
+ struct wiimote_data {
+ 	struct hid_device *hdev;
+ 	struct input_dev *input;
++	struct work_struct rumble_worker;
+ 	struct led_classdev *leds[4];
+ 	struct input_dev *accel;
+ 	struct input_dev *ir;
