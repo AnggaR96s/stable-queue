@@ -1,0 +1,86 @@
+From 6c00350b573c0bd3635436e43e8696951dd6e1b6 Mon Sep 17 00:00:00 2001
+From: Vineet Gupta <vgupta@synopsys.com>
+Date: Wed, 25 Sep 2013 16:53:32 +0530
+Subject: ARC: Workaround spinlock livelock in SMP SystemC simulation
+
+From: Vineet Gupta <vgupta@synopsys.com>
+
+commit 6c00350b573c0bd3635436e43e8696951dd6e1b6 upstream.
+
+Some ARC SMP systems lack native atomic R-M-W (LLOCK/SCOND) insns and
+can only use atomic EX insn (reg with mem) to build higher level R-M-W
+primitives. This includes a SystemC based SMP simulation model.
+
+So rwlocks need to use a protecting spinlock for atomic cmp-n-exchange
+operation to update reader(s)/writer count.
+
+The spinlock operation itself looks as follows:
+
+	mov reg, 1		; 1=locked, 0=unlocked
+retry:
+	EX reg, [lock]		; load existing, store 1, atomically
+	BREQ reg, 1, rety	; if already locked, retry
+
+In single-threaded simulation, SystemC alternates between the 2 cores
+with "N" insn each based scheduling. Additionally for insn with global
+side effect, such as EX writing to shared mem, a core switch is
+enforced too.
+
+Given that, 2 cores doing a repeated EX on same location, Linux often
+got into a livelock e.g. when both cores were fiddling with tasklist
+lock (gdbserver / hackbench) for read/write respectively as the
+sequence diagram below shows:
+
+           core1                                   core2
+         --------                                --------
+1. spin lock [EX r=0, w=1] - LOCKED
+2. rwlock(Read)            - LOCKED
+3. spin unlock  [ST 0]     - UNLOCKED
+                                         spin lock [EX r=0,w=1] - LOCKED
+                      -- resched core 1----
+
+5. spin lock [EX r=1] - ALREADY-LOCKED
+
+                      -- resched core 2----
+6.                                       rwlock(Write) - READER-LOCKED
+7.                                       spin unlock [ST 0]
+8.                                       rwlock failed, retry again
+
+9.                                       spin lock  [EX r=0, w=1]
+                      -- resched core 1----
+
+10  spinlock locked in #9, retry #5
+11. spin lock [EX gets 1]
+                      -- resched core 2----
+...
+...
+
+The fix was to unlock using the EX insn too (step 7), to trigger another
+SystemC scheduling pass which would let core1 proceed, eliding the
+livelock.
+
+Signed-off-by: Vineet Gupta <vgupta@synopsys.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ arch/arc/include/asm/spinlock.h |    9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+--- a/arch/arc/include/asm/spinlock.h
++++ b/arch/arc/include/asm/spinlock.h
+@@ -45,7 +45,14 @@ static inline int arch_spin_trylock(arch
+ 
+ static inline void arch_spin_unlock(arch_spinlock_t *lock)
+ {
+-	lock->slock = __ARCH_SPIN_LOCK_UNLOCKED__;
++	unsigned int tmp = __ARCH_SPIN_LOCK_UNLOCKED__;
++
++	__asm__ __volatile__(
++	"	ex  %0, [%1]		\n"
++	: "+r" (tmp)
++	: "r"(&(lock->slock))
++	: "memory");
++
+ 	smp_mb();
+ }
+ 
