@@ -1,0 +1,107 @@
+From 1b6c7d9979e1db1d42bd0545452a9d204c019582 Mon Sep 17 00:00:00 2001
+From: Eric Dumazet <edumazet@google.com>
+Date: Fri, 27 Sep 2013 03:28:54 -0700
+Subject: tcp: TSQ can use a dynamic limit
+
+From: Eric Dumazet <edumazet@google.com>
+
+[ Upstream commit c9eeec26e32e087359160406f96e0949b3cc6f10 ]
+
+When TCP Small Queues was added, we used a sysctl to limit amount of
+packets queues on Qdisc/device queues for a given TCP flow.
+
+Problem is this limit is either too big for low rates, or too small
+for high rates.
+
+Now TCP stack has rate estimation in sk->sk_pacing_rate, and TSO
+auto sizing, it can better control number of packets in Qdisc/device
+queues.
+
+New limit is two packets or at least 1 to 2 ms worth of packets.
+
+Low rates flows benefit from this patch by having even smaller
+number of packets in queues, allowing for faster recovery,
+better RTT estimations.
+
+High rates flows benefit from this patch by allowing more than 2 packets
+in flight as we had reports this was a limiting factor to reach line
+rate. [ In particular if TX completion is delayed because of coalescing
+parameters ]
+
+Example for a single flow on 10Gbp link controlled by FQ/pacing
+
+14 packets in flight instead of 2
+
+$ tc -s -d qd
+qdisc fq 8001: dev eth0 root refcnt 32 limit 10000p flow_limit 100p
+buckets 1024 quantum 3028 initial_quantum 15140
+ Sent 1168459366606 bytes 771822841 pkt (dropped 0, overlimits 0
+requeues 6822476)
+ rate 9346Mbit 771713pps backlog 953820b 14p requeues 6822476
+  2047 flow, 2046 inactive, 1 throttled, delay 15673 ns
+  2372 gc, 0 highprio, 0 retrans, 9739249 throttled, 0 flows_plimit
+
+Note that sk_pacing_rate is currently set to twice the actual rate, but
+this might be refined in the future when a flow is in congestion
+avoidance.
+
+Additional change : skb->destructor should be set to tcp_wfree().
+
+A future patch (for linux 3.13+) might remove tcp_limit_output_bytes
+
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Cc: Wei Liu <wei.liu2@citrix.com>
+Cc: Cong Wang <xiyou.wangcong@gmail.com>
+Cc: Yuchung Cheng <ycheng@google.com>
+Cc: Neal Cardwell <ncardwell@google.com>
+Acked-by: Neal Cardwell <ncardwell@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/ipv4/tcp_output.c |   17 +++++++++++------
+ 1 file changed, 11 insertions(+), 6 deletions(-)
+
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@ -892,8 +892,7 @@ static int tcp_transmit_skb(struct sock
+ 
+ 	skb_orphan(skb);
+ 	skb->sk = sk;
+-	skb->destructor = (sysctl_tcp_limit_output_bytes > 0) ?
+-			  tcp_wfree : sock_wfree;
++	skb->destructor = tcp_wfree;
+ 	atomic_add(skb->truesize, &sk->sk_wmem_alloc);
+ 
+ 	/* Build TCP header and checksum it. */
+@@ -1837,7 +1836,6 @@ static bool tcp_write_xmit(struct sock *
+ 	while ((skb = tcp_send_head(sk))) {
+ 		unsigned int limit;
+ 
+-
+ 		tso_segs = tcp_init_tso_segs(sk, skb, mss_now);
+ 		BUG_ON(!tso_segs);
+ 
+@@ -1866,13 +1864,20 @@ static bool tcp_write_xmit(struct sock *
+ 				break;
+ 		}
+ 
+-		/* TSQ : sk_wmem_alloc accounts skb truesize,
+-		 * including skb overhead. But thats OK.
++		/* TCP Small Queues :
++		 * Control number of packets in qdisc/devices to two packets / or ~1 ms.
++		 * This allows for :
++		 *  - better RTT estimation and ACK scheduling
++		 *  - faster recovery
++		 *  - high rates
+ 		 */
+-		if (atomic_read(&sk->sk_wmem_alloc) >= sysctl_tcp_limit_output_bytes) {
++		limit = max(skb->truesize, sk->sk_pacing_rate >> 10);
++
++		if (atomic_read(&sk->sk_wmem_alloc) > limit) {
+ 			set_bit(TSQ_THROTTLED, &tp->tsq_flags);
+ 			break;
+ 		}
++
+ 		limit = mss_now;
+ 		if (tso_segs > 1 && !tcp_urg_mode(tp))
+ 			limit = tcp_mss_split_point(sk, skb, mss_now,
