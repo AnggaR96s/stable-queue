@@ -1,0 +1,108 @@
+From fc7dc61d9a87011aaf8a6eb3144ebf9552adf5d2 Mon Sep 17 00:00:00 2001
+From: Oskar Schirmer <oskar@scara.com>
+Date: Tue, 12 Nov 2013 15:46:38 +0000
+Subject: ASoC: fsl: imx-pcm-fiq: omit fiq counter to avoid harm in unbalanced situations
+
+From: Oskar Schirmer <oskar@scara.com>
+
+commit fc7dc61d9a87011aaf8a6eb3144ebf9552adf5d2 upstream.
+
+Unbalanced calls to snd_imx_pcm_trigger() may result in endless
+FIQ activity and thus provoke eternal sound. While on the first glance,
+the switch statement looks pretty symmetric, the SUSPEND/RESUME
+pair is not: the suspend case comes along snd_pcm_suspend_all(),
+which for fsl/imx-pcm-fiq is called only at snd_soc_suspend(),
+but the resume case originates straight from the SNDRV_PCM_IOCTL_RESUME.
+This way userland may provoke an unbalanced resume, which might cause
+the fiq_enable counter to increase and never return to zero again,
+so eventually imx_pcm_fiq is never disabled.
+
+Simply removing the fiq_enable will solve the problem, as long as
+one never goes play and capture game simultaneously, but beware
+trying both at once, the early TRIGGER_STOP will cut off the other
+activity prematurely. So now playing and capturing is scrutinized
+separately, instead of by counting.
+
+Signed-off-by: Oskar Schirmer <oskar@scara.com>
+Signed-off-by: Mark Brown <broonie@linaro.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ sound/soc/fsl/imx-pcm-fiq.c |   29 +++++++++++++++++------------
+ 1 file changed, 17 insertions(+), 12 deletions(-)
+
+--- a/sound/soc/fsl/imx-pcm-fiq.c
++++ b/sound/soc/fsl/imx-pcm-fiq.c
+@@ -44,7 +44,8 @@ struct imx_pcm_runtime_data {
+ 	struct hrtimer hrt;
+ 	int poll_time_ns;
+ 	struct snd_pcm_substream *substream;
+-	atomic_t running;
++	atomic_t playing;
++	atomic_t capturing;
+ };
+ 
+ static enum hrtimer_restart snd_hrtimer_callback(struct hrtimer *hrt)
+@@ -56,7 +57,7 @@ static enum hrtimer_restart snd_hrtimer_
+ 	struct pt_regs regs;
+ 	unsigned long delta;
+ 
+-	if (!atomic_read(&iprtd->running))
++	if (!atomic_read(&iprtd->playing) && !atomic_read(&iprtd->capturing))
+ 		return HRTIMER_NORESTART;
+ 
+ 	get_fiq_regs(&regs);
+@@ -124,7 +125,6 @@ static int snd_imx_pcm_prepare(struct sn
+ 	return 0;
+ }
+ 
+-static int fiq_enable;
+ static int imx_pcm_fiq;
+ 
+ static int snd_imx_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
+@@ -136,23 +136,27 @@ static int snd_imx_pcm_trigger(struct sn
+ 	case SNDRV_PCM_TRIGGER_START:
+ 	case SNDRV_PCM_TRIGGER_RESUME:
+ 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+-		atomic_set(&iprtd->running, 1);
++		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
++			atomic_set(&iprtd->playing, 1);
++		else
++			atomic_set(&iprtd->capturing, 1);
+ 		hrtimer_start(&iprtd->hrt, ns_to_ktime(iprtd->poll_time_ns),
+ 		      HRTIMER_MODE_REL);
+-		if (++fiq_enable == 1)
+-			enable_fiq(imx_pcm_fiq);
+-
++		enable_fiq(imx_pcm_fiq);
+ 		break;
+ 
+ 	case SNDRV_PCM_TRIGGER_STOP:
+ 	case SNDRV_PCM_TRIGGER_SUSPEND:
+ 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+-		atomic_set(&iprtd->running, 0);
+-
+-		if (--fiq_enable == 0)
++		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
++			atomic_set(&iprtd->playing, 0);
++		else
++			atomic_set(&iprtd->capturing, 0);
++		if (!atomic_read(&iprtd->playing) &&
++				!atomic_read(&iprtd->capturing))
+ 			disable_fiq(imx_pcm_fiq);
+-
+ 		break;
++
+ 	default:
+ 		return -EINVAL;
+ 	}
+@@ -200,7 +204,8 @@ static int snd_imx_open(struct snd_pcm_s
+ 
+ 	iprtd->substream = substream;
+ 
+-	atomic_set(&iprtd->running, 0);
++	atomic_set(&iprtd->playing, 0);
++	atomic_set(&iprtd->capturing, 0);
+ 	hrtimer_init(&iprtd->hrt, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+ 	iprtd->hrt.function = snd_hrtimer_callback;
+ 
