@@ -1,0 +1,122 @@
+From e5fca243abae1445afbfceebda5f08462ef869d3 Mon Sep 17 00:00:00 2001
+From: Tejun Heo <tj@kernel.org>
+Date: Fri, 22 Nov 2013 17:14:39 -0500
+Subject: cgroup: use a dedicated workqueue for cgroup destruction
+
+From: Tejun Heo <tj@kernel.org>
+
+commit e5fca243abae1445afbfceebda5f08462ef869d3 upstream.
+
+Since be44562613851 ("cgroup: remove synchronize_rcu() from
+cgroup_diput()"), cgroup destruction path makes use of workqueue.  css
+freeing is performed from a work item from that point on and a later
+commit, ea15f8ccdb430 ("cgroup: split cgroup destruction into two
+steps"), moves css offlining to workqueue too.
+
+As cgroup destruction isn't depended upon for memory reclaim, the
+destruction work items were put on the system_wq; unfortunately, some
+controller may block in the destruction path for considerable duration
+while holding cgroup_mutex.  As large part of destruction path is
+synchronized through cgroup_mutex, when combined with high rate of
+cgroup removals, this has potential to fill up system_wq's max_active
+of 256.
+
+Also, it turns out that memcg's css destruction path ends up queueing
+and waiting for work items on system_wq through work_on_cpu().  If
+such operation happens while system_wq is fully occupied by cgroup
+destruction work items, work_on_cpu() can't make forward progress
+because system_wq is full and other destruction work items on
+system_wq can't make forward progress because the work item waiting
+for work_on_cpu() is holding cgroup_mutex, leading to deadlock.
+
+This can be fixed by queueing destruction work items on a separate
+workqueue.  This patch creates a dedicated workqueue -
+cgroup_destroy_wq - for this purpose.  As these work items shouldn't
+have inter-dependencies and mostly serialized by cgroup_mutex anyway,
+giving high concurrency level doesn't buy anything and the workqueue's
+@max_active is set to 1 so that destruction work items are executed
+one by one on each CPU.
+
+Hugh Dickins: Because cgroup_init() is run before init_workqueues(),
+cgroup_destroy_wq can't be allocated from cgroup_init().  Do it from a
+separate core_initcall().  In the future, we probably want to reorder
+so that workqueue init happens before cgroup_init().
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Reported-by: Hugh Dickins <hughd@google.com>
+Reported-by: Shawn Bohrer <shawn.bohrer@gmail.com>
+Link: http://lkml.kernel.org/r/20131111220626.GA7509@sbohrermbp13-local.rgmadvisors.com
+Link: http://lkml.kernel.org/g/alpine.LNX.2.00.1310301606080.2333@eggly.anvils
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ kernel/cgroup.c |   30 +++++++++++++++++++++++++++---
+ 1 file changed, 27 insertions(+), 3 deletions(-)
+
+--- a/kernel/cgroup.c
++++ b/kernel/cgroup.c
+@@ -90,6 +90,14 @@ static DEFINE_MUTEX(cgroup_mutex);
+ static DEFINE_MUTEX(cgroup_root_mutex);
+ 
+ /*
++ * cgroup destruction makes heavy use of work items and there can be a lot
++ * of concurrent destructions.  Use a separate workqueue so that cgroup
++ * destruction work items don't end up filling up max_active of system_wq
++ * which may lead to deadlock.
++ */
++static struct workqueue_struct *cgroup_destroy_wq;
++
++/*
+  * Generate an array of cgroup subsystem pointers. At boot time, this is
+  * populated with the built in subsystems, and modular subsystems are
+  * registered after that. The mutable section of this array is protected by
+@@ -908,7 +916,7 @@ static void cgroup_free_rcu(struct rcu_h
+ 	struct cgroup *cgrp = container_of(head, struct cgroup, rcu_head);
+ 
+ 	INIT_WORK(&cgrp->destroy_work, cgroup_free_fn);
+-	schedule_work(&cgrp->destroy_work);
++	queue_work(cgroup_destroy_wq, &cgrp->destroy_work);
+ }
+ 
+ static void cgroup_diput(struct dentry *dentry, struct inode *inode)
+@@ -4306,7 +4314,7 @@ static void css_free_rcu_fn(struct rcu_h
+ 	 * css_put().  dput() requires process context which we don't have.
+ 	 */
+ 	INIT_WORK(&css->destroy_work, css_free_work_fn);
+-	schedule_work(&css->destroy_work);
++	queue_work(cgroup_destroy_wq, &css->destroy_work);
+ }
+ 
+ static void css_release(struct percpu_ref *ref)
+@@ -4603,7 +4611,7 @@ static void css_killed_ref_fn(struct per
+ 		container_of(ref, struct cgroup_subsys_state, refcnt);
+ 
+ 	INIT_WORK(&css->destroy_work, css_killed_work_fn);
+-	schedule_work(&css->destroy_work);
++	queue_work(cgroup_destroy_wq, &css->destroy_work);
+ }
+ 
+ /**
+@@ -5139,6 +5147,22 @@ out:
+ 	return err;
+ }
+ 
++static int __init cgroup_wq_init(void)
++{
++	/*
++	 * There isn't much point in executing destruction path in
++	 * parallel.  Good chunk is serialized with cgroup_mutex anyway.
++	 * Use 1 for @max_active.
++	 *
++	 * We would prefer to do this in cgroup_init() above, but that
++	 * is called before init_workqueues(): so leave this until after.
++	 */
++	cgroup_destroy_wq = alloc_workqueue("cgroup_destroy", 0, 1);
++	BUG_ON(!cgroup_destroy_wq);
++	return 0;
++}
++core_initcall(cgroup_wq_init);
++
+ /*
+  * proc_cgroup_show()
+  *  - Print task's cgroup paths into seq_file, one line for each hierarchy
