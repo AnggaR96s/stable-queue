@@ -1,0 +1,178 @@
+From 8e321fefb0e60bae4e2a28d20fc4fa30758d27c6 Mon Sep 17 00:00:00 2001
+From: Benjamin LaHaise <bcrl@kvack.org>
+Date: Sat, 21 Dec 2013 17:56:08 -0500
+Subject: aio/migratepages: make aio migrate pages sane
+
+From: Benjamin LaHaise <bcrl@kvack.org>
+
+commit 8e321fefb0e60bae4e2a28d20fc4fa30758d27c6 upstream.
+
+The arbitrary restriction on page counts offered by the core
+migrate_page_move_mapping() code results in rather suspicious looking
+fiddling with page reference counts in the aio_migratepage() operation.
+To fix this, make migrate_page_move_mapping() take an extra_count parameter
+that allows aio to tell the code about its own reference count on the page
+being migrated.
+
+While cleaning up aio_migratepage(), make it validate that the old page
+being passed in is actually what aio_migratepage() expects to prevent
+misbehaviour in the case of races.
+
+Signed-off-by: Benjamin LaHaise <bcrl@kvack.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/aio.c                |   52 ++++++++++++++++++++++++++++++++++++++++--------
+ include/linux/migrate.h |    3 +-
+ mm/migrate.c            |   13 ++++++------
+ 3 files changed, 53 insertions(+), 15 deletions(-)
+
+--- a/fs/aio.c
++++ b/fs/aio.c
+@@ -244,9 +244,14 @@ static void aio_free_ring(struct kioctx
+ 	int i;
+ 
+ 	for (i = 0; i < ctx->nr_pages; i++) {
++		struct page *page;
+ 		pr_debug("pid(%d) [%d] page->count=%d\n", current->pid, i,
+ 				page_count(ctx->ring_pages[i]));
+-		put_page(ctx->ring_pages[i]);
++		page = ctx->ring_pages[i];
++		if (!page)
++			continue;
++		ctx->ring_pages[i] = NULL;
++		put_page(page);
+ 	}
+ 
+ 	put_aio_ring_file(ctx);
+@@ -280,18 +285,38 @@ static int aio_migratepage(struct addres
+ 	unsigned long flags;
+ 	int rc;
+ 
++	rc = 0;
++
++	/* Make sure the old page hasn't already been changed */
++	spin_lock(&mapping->private_lock);
++	ctx = mapping->private_data;
++	if (ctx) {
++		pgoff_t idx;
++		spin_lock_irqsave(&ctx->completion_lock, flags);
++		idx = old->index;
++		if (idx < (pgoff_t)ctx->nr_pages) {
++			if (ctx->ring_pages[idx] != old)
++				rc = -EAGAIN;
++		} else
++			rc = -EINVAL;
++		spin_unlock_irqrestore(&ctx->completion_lock, flags);
++	} else
++		rc = -EINVAL;
++	spin_unlock(&mapping->private_lock);
++
++	if (rc != 0)
++		return rc;
++
+ 	/* Writeback must be complete */
+ 	BUG_ON(PageWriteback(old));
+-	put_page(old);
++	get_page(new);
+ 
+-	rc = migrate_page_move_mapping(mapping, new, old, NULL, mode);
++	rc = migrate_page_move_mapping(mapping, new, old, NULL, mode, 1);
+ 	if (rc != MIGRATEPAGE_SUCCESS) {
+-		get_page(old);
++		put_page(new);
+ 		return rc;
+ 	}
+ 
+-	get_page(new);
+-
+ 	/* We can potentially race against kioctx teardown here.  Use the
+ 	 * address_space's private data lock to protect the mapping's
+ 	 * private_data.
+@@ -303,13 +328,24 @@ static int aio_migratepage(struct addres
+ 		spin_lock_irqsave(&ctx->completion_lock, flags);
+ 		migrate_page_copy(new, old);
+ 		idx = old->index;
+-		if (idx < (pgoff_t)ctx->nr_pages)
+-			ctx->ring_pages[idx] = new;
++		if (idx < (pgoff_t)ctx->nr_pages) {
++			/* And only do the move if things haven't changed */
++			if (ctx->ring_pages[idx] == old)
++				ctx->ring_pages[idx] = new;
++			else
++				rc = -EAGAIN;
++		} else
++			rc = -EINVAL;
+ 		spin_unlock_irqrestore(&ctx->completion_lock, flags);
+ 	} else
+ 		rc = -EBUSY;
+ 	spin_unlock(&mapping->private_lock);
+ 
++	if (rc == MIGRATEPAGE_SUCCESS)
++		put_page(old);
++	else
++		put_page(new);
++
+ 	return rc;
+ }
+ #endif
+--- a/include/linux/migrate.h
++++ b/include/linux/migrate.h
+@@ -55,7 +55,8 @@ extern int migrate_huge_page_move_mappin
+ 				  struct page *newpage, struct page *page);
+ extern int migrate_page_move_mapping(struct address_space *mapping,
+ 		struct page *newpage, struct page *page,
+-		struct buffer_head *head, enum migrate_mode mode);
++		struct buffer_head *head, enum migrate_mode mode,
++		int extra_count);
+ #else
+ 
+ static inline void putback_lru_pages(struct list_head *l) {}
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -315,14 +315,15 @@ static inline bool buffer_migrate_lock_b
+  */
+ int migrate_page_move_mapping(struct address_space *mapping,
+ 		struct page *newpage, struct page *page,
+-		struct buffer_head *head, enum migrate_mode mode)
++		struct buffer_head *head, enum migrate_mode mode,
++		int extra_count)
+ {
+-	int expected_count = 0;
++	int expected_count = 1 + extra_count;
+ 	void **pslot;
+ 
+ 	if (!mapping) {
+ 		/* Anonymous page without mapping */
+-		if (page_count(page) != 1)
++		if (page_count(page) != expected_count)
+ 			return -EAGAIN;
+ 		return MIGRATEPAGE_SUCCESS;
+ 	}
+@@ -332,7 +333,7 @@ int migrate_page_move_mapping(struct add
+ 	pslot = radix_tree_lookup_slot(&mapping->page_tree,
+  					page_index(page));
+ 
+-	expected_count = 2 + page_has_private(page);
++	expected_count += 1 + page_has_private(page);
+ 	if (page_count(page) != expected_count ||
+ 		radix_tree_deref_slot_protected(pslot, &mapping->tree_lock) != page) {
+ 		spin_unlock_irq(&mapping->tree_lock);
+@@ -525,7 +526,7 @@ int migrate_page(struct address_space *m
+ 
+ 	BUG_ON(PageWriteback(page));	/* Writeback must be complete */
+ 
+-	rc = migrate_page_move_mapping(mapping, newpage, page, NULL, mode);
++	rc = migrate_page_move_mapping(mapping, newpage, page, NULL, mode, 0);
+ 
+ 	if (rc != MIGRATEPAGE_SUCCESS)
+ 		return rc;
+@@ -552,7 +553,7 @@ int buffer_migrate_page(struct address_s
+ 
+ 	head = page_buffers(page);
+ 
+-	rc = migrate_page_move_mapping(mapping, newpage, page, head, mode);
++	rc = migrate_page_move_mapping(mapping, newpage, page, head, mode, 0);
+ 
+ 	if (rc != MIGRATEPAGE_SUCCESS)
+ 		return rc;
