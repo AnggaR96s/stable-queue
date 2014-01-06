@@ -1,0 +1,111 @@
+From 85fbd722ad0f5d64d1ad15888cd1eb2188bfb557 Mon Sep 17 00:00:00 2001
+From: Tejun Heo <tj@kernel.org>
+Date: Wed, 18 Dec 2013 07:07:32 -0500
+Subject: libata, freezer: avoid block device removal while system is frozen
+
+From: Tejun Heo <tj@kernel.org>
+
+commit 85fbd722ad0f5d64d1ad15888cd1eb2188bfb557 upstream.
+
+Freezable kthreads and workqueues are fundamentally problematic in
+that they effectively introduce a big kernel lock widely used in the
+kernel and have already been the culprit of several deadlock
+scenarios.  This is the latest occurrence.
+
+During resume, libata rescans all the ports and revalidates all
+pre-existing devices.  If it determines that a device has gone
+missing, the device is removed from the system which involves
+invalidating block device and flushing bdi while holding driver core
+layer locks.  Unfortunately, this can race with the rest of device
+resume.  Because freezable kthreads and workqueues are thawed after
+device resume is complete and block device removal depends on
+freezable workqueues and kthreads (e.g. bdi_wq, jbd2) to make
+progress, this can lead to deadlock - block device removal can't
+proceed because kthreads are frozen and kthreads can't be thawed
+because device resume is blocked behind block device removal.
+
+839a8e8660b6 ("writeback: replace custom worker pool implementation
+with unbound workqueue") made this particular deadlock scenario more
+visible but the underlying problem has always been there - the
+original forker task and jbd2 are freezable too.  In fact, this is
+highly likely just one of many possible deadlock scenarios given that
+freezer behaves as a big kernel lock and we don't have any debug
+mechanism around it.
+
+I believe the right thing to do is getting rid of freezable kthreads
+and workqueues.  This is something fundamentally broken.  For now,
+implement a funny workaround in libata - just avoid doing block device
+hot[un]plug while the system is frozen.  Kernel engineering at its
+finest.  :(
+
+v2: Add EXPORT_SYMBOL_GPL(pm_freezing) for cases where libata is built
+    as a module.
+
+v3: Comment updated and polling interval changed to 10ms as suggested
+    by Rafael.
+
+v4: Add #ifdef CONFIG_FREEZER around the hack as pm_freezing is not
+    defined when FREEZER is not configured thus breaking build.
+    Reported by kbuild test robot.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Reported-by: Tomaž Šolc <tomaz.solc@tablix.org>
+Reviewed-by: "Rafael J. Wysocki" <rjw@rjwysocki.net>
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=62801
+Link: http://lkml.kernel.org/r/20131213174932.GA27070@htj.dyndns.org
+Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: Len Brown <len.brown@intel.com>
+Cc: Oleg Nesterov <oleg@redhat.com>
+Cc: kbuild test robot <fengguang.wu@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/ata/libata-scsi.c |   21 +++++++++++++++++++++
+ kernel/freezer.c          |    6 ++++++
+ 2 files changed, 27 insertions(+)
+
+--- a/drivers/ata/libata-scsi.c
++++ b/drivers/ata/libata-scsi.c
+@@ -3864,6 +3864,27 @@ void ata_scsi_hotplug(struct work_struct
+ 		return;
+ 	}
+ 
++	/*
++	 * XXX - UGLY HACK
++	 *
++	 * The block layer suspend/resume path is fundamentally broken due
++	 * to freezable kthreads and workqueue and may deadlock if a block
++	 * device gets removed while resume is in progress.  I don't know
++	 * what the solution is short of removing freezable kthreads and
++	 * workqueues altogether.
++	 *
++	 * The following is an ugly hack to avoid kicking off device
++	 * removal while freezer is active.  This is a joke but does avoid
++	 * this particular deadlock scenario.
++	 *
++	 * https://bugzilla.kernel.org/show_bug.cgi?id=62801
++	 * http://marc.info/?l=linux-kernel&m=138695698516487
++	 */
++#ifdef CONFIG_FREEZER
++	while (pm_freezing)
++		msleep(10);
++#endif
++
+ 	DPRINTK("ENTER\n");
+ 	mutex_lock(&ap->scsi_scan_mutex);
+ 
+--- a/kernel/freezer.c
++++ b/kernel/freezer.c
+@@ -19,6 +19,12 @@ EXPORT_SYMBOL(system_freezing_cnt);
+ bool pm_freezing;
+ bool pm_nosig_freezing;
+ 
++/*
++ * Temporary export for the deadlock workaround in ata_scsi_hotplug().
++ * Remove once the hack becomes unnecessary.
++ */
++EXPORT_SYMBOL_GPL(pm_freezing);
++
+ /* protects freezing and frozen transitions */
+ static DEFINE_SPINLOCK(freezer_lock);
+ 
