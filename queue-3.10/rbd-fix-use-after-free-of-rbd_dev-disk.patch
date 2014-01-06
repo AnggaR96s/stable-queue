@@ -1,0 +1,103 @@
+From 9875201e10496612080e7d164acc8f625c18725c Mon Sep 17 00:00:00 2001
+From: Josh Durgin <josh.durgin@inktank.com>
+Date: Thu, 29 Aug 2013 17:26:31 -0700
+Subject: rbd: fix use-after free of rbd_dev->disk
+
+From: Josh Durgin <josh.durgin@inktank.com>
+
+commit 9875201e10496612080e7d164acc8f625c18725c upstream.
+
+Removing a device deallocates the disk, unschedules the watch, and
+finally cleans up the rbd_dev structure. rbd_dev_refresh(), called
+from the watch callback, updates the disk size and rbd_dev
+structure. With no locking between them, rbd_dev_refresh() may use the
+device or rbd_dev after they've been freed.
+
+To fix this, check whether RBD_DEV_FLAG_REMOVING is set before
+updating the disk size in rbd_dev_refresh(). In order to prevent a
+race where rbd_dev_refresh() is already revalidating the disk when
+rbd_remove() is called, move the call to rbd_bus_del_dev() after the
+watch is unregistered and all notifies are complete. It's safe to
+defer deleting this structure because no new requests can be submitted
+once the RBD_DEV_FLAG_REMOVING is set, since the device cannot be
+opened.
+
+Fixes: http://tracker.ceph.com/issues/5636
+Signed-off-by: Josh Durgin <josh.durgin@inktank.com>
+Reviewed-by: Alex Elder <elder@linaro.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/block/rbd.c |   40 +++++++++++++++++++++++++++++++++-------
+ 1 file changed, 33 insertions(+), 7 deletions(-)
+
+--- a/drivers/block/rbd.c
++++ b/drivers/block/rbd.c
+@@ -3336,6 +3336,31 @@ static void rbd_exists_validate(struct r
+ 		clear_bit(RBD_DEV_FLAG_EXISTS, &rbd_dev->flags);
+ }
+ 
++static void rbd_dev_update_size(struct rbd_device *rbd_dev)
++{
++	sector_t size;
++	bool removing;
++
++	/*
++	 * Don't hold the lock while doing disk operations,
++	 * or lock ordering will conflict with the bdev mutex via:
++	 * rbd_add() -> blkdev_get() -> rbd_open()
++	 */
++	spin_lock_irq(&rbd_dev->lock);
++	removing = test_bit(RBD_DEV_FLAG_REMOVING, &rbd_dev->flags);
++	spin_unlock_irq(&rbd_dev->lock);
++	/*
++	 * If the device is being removed, rbd_dev->disk has
++	 * been destroyed, so don't try to update its size
++	 */
++	if (!removing) {
++		size = (sector_t)rbd_dev->mapping.size / SECTOR_SIZE;
++		dout("setting size to %llu sectors", (unsigned long long)size);
++		set_capacity(rbd_dev->disk, size);
++		revalidate_disk(rbd_dev->disk);
++	}
++}
++
+ static int rbd_dev_refresh(struct rbd_device *rbd_dev)
+ {
+ 	u64 mapping_size;
+@@ -3354,12 +3379,7 @@ static int rbd_dev_refresh(struct rbd_de
+ 	rbd_exists_validate(rbd_dev);
+ 	mutex_unlock(&ctl_mutex);
+ 	if (mapping_size != rbd_dev->mapping.size) {
+-		sector_t size;
+-
+-		size = (sector_t)rbd_dev->mapping.size / SECTOR_SIZE;
+-		dout("setting size to %llu sectors", (unsigned long long)size);
+-		set_capacity(rbd_dev->disk, size);
+-		revalidate_disk(rbd_dev->disk);
++		rbd_dev_update_size(rbd_dev);
+ 	}
+ 
+ 	return ret;
+@@ -5147,7 +5167,6 @@ static ssize_t rbd_remove(struct bus_typ
+ 	if (ret < 0 || already)
+ 		goto done;
+ 
+-	rbd_bus_del_dev(rbd_dev);
+ 	ret = rbd_dev_header_watch_sync(rbd_dev, false);
+ 	if (ret)
+ 		rbd_warn(rbd_dev, "failed to cancel watch event (%d)\n", ret);
+@@ -5158,6 +5177,13 @@ static ssize_t rbd_remove(struct bus_typ
+ 	 */
+ 	dout("%s: flushing notifies", __func__);
+ 	ceph_osdc_flush_notifies(&rbd_dev->rbd_client->client->osdc);
++	/*
++	 * Don't free anything from rbd_dev->disk until after all
++	 * notifies are completely processed. Otherwise
++	 * rbd_bus_del_dev() will race with rbd_watch_cb(), resulting
++	 * in a potential use after free of rbd_dev->disk or rbd_dev.
++	 */
++	rbd_bus_del_dev(rbd_dev);
+ 	rbd_dev_image_release(rbd_dev);
+ 	module_put(THIS_MODULE);
+ 	ret = count;
