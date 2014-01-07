@@ -1,0 +1,117 @@
+From mgorman@suse.de  Tue Jan  7 10:23:21 2014
+From: Mel Gorman <mgorman@suse.de>
+Date: Tue,  7 Jan 2014 14:00:45 +0000
+Subject: mm: numa: avoid unnecessary disruption of NUMA hinting during migration
+To: gregkh@linuxfoundation.org
+Cc: athorlton@sgi.com, riel@redhat.com, chegu_vinod@hp.com, Mel Gorman <mgorman@suse.de>, stable@vger.kernel.org
+Message-ID: <1389103248-17617-11-git-send-email-mgorman@suse.de>
+
+From: Mel Gorman <mgorman@suse.de>
+
+commit de466bd628e8d663fdf3f791bc8db318ee85c714 upstream.
+
+do_huge_pmd_numa_page() handles the case where there is parallel THP
+migration.  However, by the time it is checked the NUMA hinting
+information has already been disrupted.  This patch adds an earlier
+check with some helpers.
+
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+Reviewed-by: Rik van Riel <riel@redhat.com>
+Cc: Alex Thorlton <athorlton@sgi.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/linux/migrate.h |   10 +++++++++-
+ mm/huge_memory.c        |   22 ++++++++++++++++------
+ mm/migrate.c            |   12 ++++++++++++
+ 3 files changed, 37 insertions(+), 7 deletions(-)
+
+--- a/include/linux/migrate.h
++++ b/include/linux/migrate.h
+@@ -90,10 +90,18 @@ static inline int migrate_huge_page_move
+ #endif /* CONFIG_MIGRATION */
+ 
+ #ifdef CONFIG_NUMA_BALANCING
+-extern int migrate_misplaced_page(struct page *page, int node);
++extern bool pmd_trans_migrating(pmd_t pmd);
++extern void wait_migrate_huge_page(struct anon_vma *anon_vma, pmd_t *pmd);
+ extern int migrate_misplaced_page(struct page *page, int node);
+ extern bool migrate_ratelimited(int node);
+ #else
++static inline bool pmd_trans_migrating(pmd_t pmd)
++{
++	return false;
++}
++static inline void wait_migrate_huge_page(struct anon_vma *anon_vma, pmd_t *pmd)
++{
++}
+ static inline int migrate_misplaced_page(struct page *page, int node)
+ {
+ 	return -EAGAIN; /* can't migrate now */
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -884,6 +884,10 @@ int copy_huge_pmd(struct mm_struct *dst_
+ 		ret = 0;
+ 		goto out_unlock;
+ 	}
++
++	/* mmap_sem prevents this happening but warn if that changes */
++	WARN_ON(pmd_trans_migrating(pmd));
++
+ 	if (unlikely(pmd_trans_splitting(pmd))) {
+ 		/* split huge page running from under us */
+ 		spin_unlock(&src_mm->page_table_lock);
+@@ -1294,6 +1298,17 @@ int do_huge_pmd_numa_page(struct mm_stru
+ 	if (unlikely(!pmd_same(pmd, *pmdp)))
+ 		goto out_unlock;
+ 
++	/*
++	 * If there are potential migrations, wait for completion and retry
++	 * without disrupting NUMA hinting information. Do not relock and
++	 * check_same as the page may no longer be mapped.
++	 */
++	if (unlikely(pmd_trans_migrating(*pmdp))) {
++		spin_unlock(&mm->page_table_lock);
++		wait_migrate_huge_page(vma->anon_vma, pmdp);
++		goto out;
++	}
++
+ 	page = pmd_page(pmd);
+ 	page_nid = page_to_nid(page);
+ 	count_vm_numa_event(NUMA_HINT_FAULTS);
+@@ -1312,12 +1327,7 @@ int do_huge_pmd_numa_page(struct mm_stru
+ 			goto clear_pmdnuma;
+ 	}
+ 
+-	/*
+-	 * If there are potential migrations, wait for completion and retry. We
+-	 * do not relock and check_same as the page may no longer be mapped.
+-	 * Furtermore, even if the page is currently misplaced, there is no
+-	 * guarantee it is still misplaced after the migration completes.
+-	 */
++	/* Migration could have started since the pmd_trans_migrating check */
+ 	if (!page_locked) {
+ 		spin_unlock(&mm->page_table_lock);
+ 		wait_on_page_locked(page);
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -1597,6 +1597,18 @@ int numamigrate_isolate_page(pg_data_t *
+ 	return 1;
+ }
+ 
++bool pmd_trans_migrating(pmd_t pmd)
++{
++	struct page *page = pmd_page(pmd);
++	return PageLocked(page);
++}
++
++void wait_migrate_huge_page(struct anon_vma *anon_vma, pmd_t *pmd)
++{
++	struct page *page = pmd_page(*pmd);
++	wait_on_page_locked(page);
++}
++
+ /*
+  * Attempt to migrate a misplaced page to the specified destination
+  * node. Caller is expected to have an elevated reference count on
