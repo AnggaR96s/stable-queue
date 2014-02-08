@@ -1,0 +1,89 @@
+From ed7e5423014ad89720fcf315c0b73f2c5d0c7bd2 Mon Sep 17 00:00:00 2001
+From: Boaz Harrosh <bharrosh@panasas.com>
+Date: Wed, 22 Jan 2014 20:34:54 +0200
+Subject: pnfs: Proper delay for NFS4ERR_RECALLCONFLICT in layout_get_done
+
+From: Boaz Harrosh <bharrosh@panasas.com>
+
+commit ed7e5423014ad89720fcf315c0b73f2c5d0c7bd2 upstream.
+
+An NFS4ERR_RECALLCONFLICT is returned by server from a GET_LAYOUT
+only when a Server Sent a RECALL do to that GET_LAYOUT, or
+the RECALL and GET_LAYOUT crossed on the wire.
+In any way this means we want to wait at most until in-flight IO
+is finished and the RECALL can be satisfied.
+
+So a proper wait here is more like 1/10 of a second, not 15 seconds
+like we have now. In case of a server bug we delay exponentially
+longer on each retry.
+
+Current code totally craps out performance of very large files on
+most pnfs-objects layouts, because of how the map changes when the
+file has grown into the next raid group.
+
+[Stable: This will patch back to 3.9. If there are earlier still
+ maintained trees, please tell me I'll send a patch]
+
+Signed-off-by: Boaz Harrosh <bharrosh@panasas.com>
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/nfs/nfs4proc.c |   34 ++++++++++++++++++++++++++++++----
+ 1 file changed, 30 insertions(+), 4 deletions(-)
+
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@ -7409,9 +7409,9 @@ static void nfs4_layoutget_done(struct r
+ 	struct nfs_server *server = NFS_SERVER(inode);
+ 	struct pnfs_layout_hdr *lo;
+ 	struct nfs4_state *state = NULL;
+-	unsigned long timeo, giveup;
++	unsigned long timeo, now, giveup;
+ 
+-	dprintk("--> %s\n", __func__);
++	dprintk("--> %s tk_status => %d\n", __func__, -task->tk_status);
+ 
+ 	if (!nfs41_sequence_done(task, &lgp->res.seq_res))
+ 		goto out;
+@@ -7419,12 +7419,38 @@ static void nfs4_layoutget_done(struct r
+ 	switch (task->tk_status) {
+ 	case 0:
+ 		goto out;
++	/*
++	 * NFS4ERR_LAYOUTTRYLATER is a conflict with another client
++	 * (or clients) writing to the same RAID stripe
++	 */
+ 	case -NFS4ERR_LAYOUTTRYLATER:
++	/*
++	 * NFS4ERR_RECALLCONFLICT is when conflict with self (must recall
++	 * existing layout before getting a new one).
++	 */
+ 	case -NFS4ERR_RECALLCONFLICT:
+ 		timeo = rpc_get_timeout(task->tk_client);
+ 		giveup = lgp->args.timestamp + timeo;
+-		if (time_after(giveup, jiffies))
+-			task->tk_status = -NFS4ERR_DELAY;
++		now = jiffies;
++		if (time_after(giveup, now)) {
++			unsigned long delay;
++
++			/* Delay for:
++			 * - Not less then NFS4_POLL_RETRY_MIN.
++			 * - One last time a jiffie before we give up
++			 * - exponential backoff (time_now minus start_attempt)
++			 */
++			delay = max_t(unsigned long, NFS4_POLL_RETRY_MIN,
++				    min((giveup - now - 1),
++					now - lgp->args.timestamp));
++
++			dprintk("%s: NFS4ERR_RECALLCONFLICT waiting %lu\n",
++				__func__, delay);
++			rpc_delay(task, delay);
++			task->tk_status = 0;
++			rpc_restart_call_prepare(task);
++			goto out; /* Do not call nfs4_async_handle_error() */
++		}
+ 		break;
+ 	case -NFS4ERR_EXPIRED:
+ 	case -NFS4ERR_BAD_STATEID:
