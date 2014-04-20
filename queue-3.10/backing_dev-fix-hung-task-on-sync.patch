@@ -1,0 +1,94 @@
+From 6ca738d60c563d5c6cf6253ee4b8e76fa77b2b9e Mon Sep 17 00:00:00 2001
+From: Derek Basehore <dbasehore@chromium.org>
+Date: Thu, 3 Apr 2014 14:46:22 -0700
+Subject: backing_dev: fix hung task on sync
+
+From: Derek Basehore <dbasehore@chromium.org>
+
+commit 6ca738d60c563d5c6cf6253ee4b8e76fa77b2b9e upstream.
+
+bdi_wakeup_thread_delayed() used the mod_delayed_work() function to
+schedule work to writeback dirty inodes.  The problem with this is that
+it can delay work that is scheduled for immediate execution, such as the
+work from sync_inodes_sb().  This can happen since mod_delayed_work()
+can now steal work from a work_queue.  This fixes the problem by using
+queue_delayed_work() instead.  This is a regression caused by commit
+839a8e8660b6 ("writeback: replace custom worker pool implementation with
+unbound workqueue").
+
+The reason that this causes a problem is that laptop-mode will change
+the delay, dirty_writeback_centisecs, to 60000 (10 minutes) by default.
+In the case that bdi_wakeup_thread_delayed() races with
+sync_inodes_sb(), sync will be stopped for 10 minutes and trigger a hung
+task.  Even if dirty_writeback_centisecs is not long enough to cause a
+hung task, we still don't want to delay sync for that long.
+
+We fix the problem by using queue_delayed_work() when we want to
+schedule writeback sometime in future.  This function doesn't change the
+timer if it is already armed.
+
+For the same reason, we also change bdi_writeback_workfn() to
+immediately queue the work again in the case that the work_list is not
+empty.  The same problem can happen if the sync work is run on the
+rescue worker.
+
+[jack@suse.cz: update changelog, add comment, use bdi_wakeup_thread_delayed()]
+Signed-off-by: Derek Basehore <dbasehore@chromium.org>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Cc: Alexander Viro <viro@zento.linux.org.uk>
+Reviewed-by: Tejun Heo <tj@kernel.org>
+Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: "Darrick J. Wong" <darrick.wong@oracle.com>
+Cc: Derek Basehore <dbasehore@chromium.org>
+Cc: Kees Cook <keescook@chromium.org>
+Cc: Benson Leung <bleung@chromium.org>
+Cc: Sonny Rao <sonnyrao@chromium.org>
+Cc: Luigi Semenzato <semenzato@chromium.org>
+Cc: Jens Axboe <axboe@kernel.dk>
+Cc: Dave Chinner <david@fromorbit.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/fs-writeback.c |    8 ++++----
+ mm/backing-dev.c  |    5 ++++-
+ 2 files changed, 8 insertions(+), 5 deletions(-)
+
+--- a/fs/fs-writeback.c
++++ b/fs/fs-writeback.c
+@@ -1038,10 +1038,10 @@ void bdi_writeback_workfn(struct work_st
+ 		trace_writeback_pages_written(pages_written);
+ 	}
+ 
+-	if (!list_empty(&bdi->work_list) ||
+-	    (wb_has_dirty_io(wb) && dirty_writeback_interval))
+-		queue_delayed_work(bdi_wq, &wb->dwork,
+-			msecs_to_jiffies(dirty_writeback_interval * 10));
++	if (!list_empty(&bdi->work_list))
++		mod_delayed_work(bdi_wq, &wb->dwork, 0);
++	else if (wb_has_dirty_io(wb) && dirty_writeback_interval)
++		bdi_wakeup_thread_delayed(bdi);
+ 
+ 	current->flags &= ~PF_SWAPWRITE;
+ }
+--- a/mm/backing-dev.c
++++ b/mm/backing-dev.c
+@@ -287,13 +287,16 @@ int bdi_has_dirty_io(struct backing_dev_
+  * Note, we wouldn't bother setting up the timer, but this function is on the
+  * fast-path (used by '__mark_inode_dirty()'), so we save few context switches
+  * by delaying the wake-up.
++ *
++ * We have to be careful not to postpone flush work if it is scheduled for
++ * earlier. Thus we use queue_delayed_work().
+  */
+ void bdi_wakeup_thread_delayed(struct backing_dev_info *bdi)
+ {
+ 	unsigned long timeout;
+ 
+ 	timeout = msecs_to_jiffies(dirty_writeback_interval * 10);
+-	mod_delayed_work(bdi_wq, &bdi->wb.dwork, timeout);
++	queue_delayed_work(bdi_wq, &bdi->wb.dwork, timeout);
+ }
+ 
+ /*
