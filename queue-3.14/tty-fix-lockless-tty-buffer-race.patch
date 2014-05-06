@@ -1,0 +1,85 @@
+From 62a0d8d7c2b29f92850e4ee3c38e5dfd936e92b2 Mon Sep 17 00:00:00 2001
+From: Peter Hurley <peter@hurleysoftware.com>
+Date: Fri, 2 May 2014 10:56:12 -0400
+Subject: tty: Fix lockless tty buffer race
+
+From: Peter Hurley <peter@hurleysoftware.com>
+
+commit 62a0d8d7c2b29f92850e4ee3c38e5dfd936e92b2 upstream.
+
+Commit 6a20dbd6caa2358716136144bf524331d70b1e03,
+"tty: Fix race condition between __tty_buffer_request_room and flush_to_ldisc"
+correctly identifies an unsafe race condition between
+__tty_buffer_request_room() and flush_to_ldisc(), where the consumer
+flush_to_ldisc() prematurely advances the head before consuming the
+last of the data committed. For example:
+
+           CPU 0                     |            CPU 1
+__tty_buffer_request_room            | flush_to_ldisc
+  ...                                |   ...
+                                     |   count = head->commit - head->read
+  n = tty_buffer_alloc()             |
+  b->commit = b->used                |
+  b->next = n                        |
+                                     |   if (!count)                /* T */
+                                     |     if (head->next == NULL)  /* F */
+                                     |     buf->head = head->next
+
+In this case, buf->head has been advanced but head->commit may have
+been updated with a new value.
+
+Instead of reintroducing an unnecessary lock, fix the race locklessly.
+Read the commit-next pair in the reverse order of writing, which guarantees
+the commit value read is the latest value written if the head is
+advancing.
+
+Reported-by: Manfred Schlaegl <manfred.schlaegl@gmx.at>
+Signed-off-by: Peter Hurley <peter@hurleysoftware.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/tty/tty_buffer.c |   17 ++++++++++++++---
+ 1 file changed, 14 insertions(+), 3 deletions(-)
+
+--- a/drivers/tty/tty_buffer.c
++++ b/drivers/tty/tty_buffer.c
+@@ -258,7 +258,11 @@ static int __tty_buffer_request_room(str
+ 			n->flags = flags;
+ 			buf->tail = n;
+ 			b->commit = b->used;
+-			smp_mb();
++			/* paired w/ barrier in flush_to_ldisc(); ensures the
++			 * latest commit value can be read before the head is
++			 * advanced to the next buffer
++			 */
++			smp_wmb();
+ 			b->next = n;
+ 		} else if (change)
+ 			size = 0;
+@@ -444,17 +448,24 @@ static void flush_to_ldisc(struct work_s
+ 
+ 	while (1) {
+ 		struct tty_buffer *head = buf->head;
++		struct tty_buffer *next;
+ 		int count;
+ 
+ 		/* Ldisc or user is trying to gain exclusive access */
+ 		if (atomic_read(&buf->priority))
+ 			break;
+ 
++		next = head->next;
++		/* paired w/ barrier in __tty_buffer_request_room();
++		 * ensures commit value read is not stale if the head
++		 * is advancing to the next buffer
++		 */
++		smp_rmb();
+ 		count = head->commit - head->read;
+ 		if (!count) {
+-			if (head->next == NULL)
++			if (next == NULL)
+ 				break;
+-			buf->head = head->next;
++			buf->head = next;
+ 			tty_buffer_free(port, head);
+ 			continue;
+ 		}
