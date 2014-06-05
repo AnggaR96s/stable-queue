@@ -1,0 +1,136 @@
+From a93bc0c6e07ed9bac44700280e65e2945d864fd4 Mon Sep 17 00:00:00 2001
+From: Seiji Aguchi <seiji.aguchi@hds.com>
+Date: Tue, 12 Feb 2013 13:04:41 -0800
+Subject: efi_pstore: Introducing workqueue updating sysfs
+
+From: Seiji Aguchi <seiji.aguchi@hds.com>
+
+commit a93bc0c6e07ed9bac44700280e65e2945d864fd4 upstream.
+
+[Problem]
+efi_pstore creates sysfs entries, which enable users to access to NVRAM,
+in a write callback. If a kernel panic happens in an interrupt context,
+it may fail because it could sleep due to dynamic memory allocations during
+creating sysfs entries.
+
+[Patch Description]
+This patch removes sysfs operations from a write callback by introducing
+a workqueue updating sysfs entries which is scheduled after the write
+callback is called.
+
+Also, the workqueue is kicked in a just oops case.
+A system will go down in other cases such as panic, clean shutdown and emergency
+restart. And we don't need to create sysfs entries because there is no chance for
+users to access to them.
+
+efi_pstore will be robust against a kernel panic in an interrupt context with this patch.
+
+Signed-off-by: Seiji Aguchi <seiji.aguchi@hds.com>
+Acked-by: Matt Fleming <matt.fleming@intel.com>
+Signed-off-by: Tony Luck <tony.luck@intel.com>
+[xr: Backported to 3.4:
+  - Adjust contest
+  - Remove repeated definition of helper function variable_is_present]
+Signed-off-by: Rui Xiang <rui.xiang@huawei.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/firmware/efivars.c |   61 +++++++++++++++++++++++++++++++++++++++++----
+ include/linux/efi.h        |    3 +-
+ 2 files changed, 58 insertions(+), 6 deletions(-)
+
+--- a/drivers/firmware/efivars.c
++++ b/drivers/firmware/efivars.c
+@@ -154,6 +154,13 @@ efivar_create_sysfs_entry(struct efivars
+ 			  efi_char16_t *variable_name,
+ 			  efi_guid_t *vendor_guid);
+ 
++/*
++ * Prototype for workqueue functions updating sysfs entry
++ */
++
++static void efivar_update_sysfs_entries(struct work_struct *);
++static DECLARE_WORK(efivar_work, efivar_update_sysfs_entries);
++
+ /* Return the number of unicode characters in data */
+ static unsigned long
+ utf16_strnlen(efi_char16_t *s, size_t maxlength)
+@@ -839,11 +846,8 @@ static int efi_pstore_write(enum pstore_
+ 	if (found)
+ 		efivar_unregister(found);
+ 
+-	if (size)
+-		ret = efivar_create_sysfs_entry(efivars,
+-					  utf16_strsize(efi_name,
+-							DUMP_NAME_LEN * 2),
+-					  efi_name, &vendor);
++	if (reason == KMSG_DUMP_OOPS)
++		schedule_work(&efivar_work);
+ 
+ 	*id = part;
+ 	return ret;
+@@ -1044,6 +1048,53 @@ static bool variable_is_present(efi_char
+ 	return found;
+ }
+ 
++static void efivar_update_sysfs_entries(struct work_struct *work)
++{
++	struct efivars *efivars = &__efivars;
++	efi_guid_t vendor;
++	efi_char16_t *variable_name;
++	unsigned long variable_name_size = 1024;
++	efi_status_t status = EFI_NOT_FOUND;
++	bool found;
++
++	/* Add new sysfs entries */
++	while (1) {
++		variable_name = kzalloc(variable_name_size, GFP_KERNEL);
++		if (!variable_name) {
++			pr_err("efivars: Memory allocation failed.\n");
++			return;
++		}
++
++		spin_lock_irq(&efivars->lock);
++		found = false;
++		while (1) {
++			variable_name_size = 1024;
++			status = efivars->ops->get_next_variable(
++							&variable_name_size,
++							variable_name,
++							&vendor);
++			if (status != EFI_SUCCESS) {
++				break;
++			} else {
++				if (!variable_is_present(variable_name,
++				    &vendor)) {
++					found = true;
++					break;
++				}
++			}
++		}
++		spin_unlock_irq(&efivars->lock);
++
++		if (!found) {
++			kfree(variable_name);
++			break;
++		} else
++			efivar_create_sysfs_entry(efivars,
++						  variable_name_size,
++						  variable_name, &vendor);
++	}
++}
++
+ /*
+  * Returns the size of variable_name, in bytes, including the
+  * terminating NULL character, or variable_name_size if no NULL
+--- a/include/linux/efi.h
++++ b/include/linux/efi.h
+@@ -666,7 +666,8 @@ struct efivars {
+ 	 * 1) ->list - adds, removals, reads, writes
+ 	 * 2) ops.[gs]et_variable() calls.
+ 	 * It must not be held when creating sysfs entries or calling kmalloc.
+-	 * ops.get_next_variable() is only called from register_efivars(),
++	 * ops.get_next_variable() is only called from register_efivars()
++	 * or efivar_update_sysfs_entries(),
+ 	 * which is protected by the BKL, so that path is safe.
+ 	 */
+ 	spinlock_t lock;
