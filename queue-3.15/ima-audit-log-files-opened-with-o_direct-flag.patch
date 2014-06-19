@@ -1,0 +1,147 @@
+From f9b2a735bdddf836214b5dca74f6ca7712e5a08c Mon Sep 17 00:00:00 2001
+From: Mimi Zohar <zohar@linux.vnet.ibm.com>
+Date: Mon, 12 May 2014 09:28:11 -0400
+Subject: ima: audit log files opened with O_DIRECT flag
+
+From: Mimi Zohar <zohar@linux.vnet.ibm.com>
+
+commit f9b2a735bdddf836214b5dca74f6ca7712e5a08c upstream.
+
+Files are measured or appraised based on the IMA policy.  When a
+file, in policy, is opened with the O_DIRECT flag, a deadlock
+occurs.
+
+The first attempt at resolving this lockdep temporarily removed the
+O_DIRECT flag and restored it, after calculating the hash.  The
+second attempt introduced the O_DIRECT_HAVELOCK flag. Based on this
+flag, do_blockdev_direct_IO() would skip taking the i_mutex a second
+time.  The third attempt, by Dmitry Kasatkin, resolves the i_mutex
+locking issue, by re-introducing the IMA mutex, but uncovered
+another problem.  Reading a file with O_DIRECT flag set, writes
+directly to userspace pages.  A second patch allocates a user-space
+like memory.  This works for all IMA hooks, except ima_file_free(),
+which is called on __fput() to recalculate the file hash.
+
+Until this last issue is addressed, do not 'collect' the
+measurement for measuring, appraising, or auditing files opened
+with the O_DIRECT flag set.  Based on policy, permit or deny file
+access.  This patch defines a new IMA policy rule option named
+'permit_directio'.  Policy rules could be defined, based on LSM
+or other criteria, to permit specific applications to open files
+with the O_DIRECT flag set.
+
+Changelog v1:
+- permit or deny file access based IMA policy rules
+
+Signed-off-by: Mimi Zohar <zohar@linux.vnet.ibm.com>
+Acked-by: Dmitry Kasatkin <d.kasatkin@samsung.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ Documentation/ABI/testing/ima_policy |    2 +-
+ security/integrity/ima/ima_api.c     |   10 +++++++++-
+ security/integrity/ima/ima_main.c    |    5 ++++-
+ security/integrity/ima/ima_policy.c  |    6 +++++-
+ security/integrity/integrity.h       |    1 +
+ 5 files changed, 20 insertions(+), 4 deletions(-)
+
+--- a/Documentation/ABI/testing/ima_policy
++++ b/Documentation/ABI/testing/ima_policy
+@@ -23,7 +23,7 @@ Description:
+ 				 [fowner]]
+ 			lsm:	[[subj_user=] [subj_role=] [subj_type=]
+ 				 [obj_user=] [obj_role=] [obj_type=]]
+-			option:	[[appraise_type=]]
++			option:	[[appraise_type=]] [permit_directio]
+ 
+ 		base: 	func:= [BPRM_CHECK][MMAP_CHECK][FILE_CHECK][MODULE_CHECK]
+ 			mask:= [MAY_READ] [MAY_WRITE] [MAY_APPEND] [MAY_EXEC]
+--- a/security/integrity/ima/ima_api.c
++++ b/security/integrity/ima/ima_api.c
+@@ -199,6 +199,7 @@ int ima_collect_measurement(struct integ
+ 			    struct evm_ima_xattr_data **xattr_value,
+ 			    int *xattr_len)
+ {
++	const char *audit_cause = "failed";
+ 	struct inode *inode = file_inode(file);
+ 	const char *filename = file->f_dentry->d_name.name;
+ 	int result = 0;
+@@ -213,6 +214,12 @@ int ima_collect_measurement(struct integ
+ 	if (!(iint->flags & IMA_COLLECTED)) {
+ 		u64 i_version = file_inode(file)->i_version;
+ 
++		if (file->f_flags & O_DIRECT) {
++			audit_cause = "failed(directio)";
++			result = -EACCES;
++			goto out;
++		}
++
+ 		/* use default hash algorithm */
+ 		hash.hdr.algo = ima_hash_algo;
+ 
+@@ -233,9 +240,10 @@ int ima_collect_measurement(struct integ
+ 				result = -ENOMEM;
+ 		}
+ 	}
++out:
+ 	if (result)
+ 		integrity_audit_msg(AUDIT_INTEGRITY_DATA, inode,
+-				    filename, "collect_data", "failed",
++				    filename, "collect_data", audit_cause,
+ 				    result, 0);
+ 	return result;
+ }
+--- a/security/integrity/ima/ima_main.c
++++ b/security/integrity/ima/ima_main.c
+@@ -214,8 +214,11 @@ static int process_measurement(struct fi
+ 		xattr_ptr = &xattr_value;
+ 
+ 	rc = ima_collect_measurement(iint, file, xattr_ptr, &xattr_len);
+-	if (rc != 0)
++	if (rc != 0) {
++		if (file->f_flags & O_DIRECT)
++			rc = (iint->flags & IMA_PERMIT_DIRECTIO) ? 0 : -EACCES;
+ 		goto out_digsig;
++	}
+ 
+ 	pathname = filename ?: ima_d_path(&file->f_path, &pathbuf);
+ 
+--- a/security/integrity/ima/ima_policy.c
++++ b/security/integrity/ima/ima_policy.c
+@@ -353,7 +353,7 @@ enum {
+ 	Opt_obj_user, Opt_obj_role, Opt_obj_type,
+ 	Opt_subj_user, Opt_subj_role, Opt_subj_type,
+ 	Opt_func, Opt_mask, Opt_fsmagic, Opt_uid, Opt_fowner,
+-	Opt_appraise_type, Opt_fsuuid
++	Opt_appraise_type, Opt_fsuuid, Opt_permit_directio
+ };
+ 
+ static match_table_t policy_tokens = {
+@@ -375,6 +375,7 @@ static match_table_t policy_tokens = {
+ 	{Opt_uid, "uid=%s"},
+ 	{Opt_fowner, "fowner=%s"},
+ 	{Opt_appraise_type, "appraise_type=%s"},
++	{Opt_permit_directio, "permit_directio"},
+ 	{Opt_err, NULL}
+ };
+ 
+@@ -622,6 +623,9 @@ static int ima_parse_rule(char *rule, st
+ 			else
+ 				result = -EINVAL;
+ 			break;
++		case Opt_permit_directio:
++			entry->flags |= IMA_PERMIT_DIRECTIO;
++			break;
+ 		case Opt_err:
+ 			ima_log_string(ab, "UNKNOWN", p);
+ 			result = -EINVAL;
+--- a/security/integrity/integrity.h
++++ b/security/integrity/integrity.h
+@@ -30,6 +30,7 @@
+ #define IMA_ACTION_FLAGS	0xff000000
+ #define IMA_DIGSIG		0x01000000
+ #define IMA_DIGSIG_REQUIRED	0x02000000
++#define IMA_PERMIT_DIRECTIO	0x04000000
+ 
+ #define IMA_DO_MASK		(IMA_MEASURE | IMA_APPRAISE | IMA_AUDIT | \
+ 				 IMA_APPRAISE_SUBMASK)
