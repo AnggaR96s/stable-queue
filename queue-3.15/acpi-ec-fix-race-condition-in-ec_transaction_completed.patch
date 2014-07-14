@@ -1,0 +1,135 @@
+From c0d653412fc8450370167a3268b78fc772ff9c87 Mon Sep 17 00:00:00 2001
+From: Lv Zheng <lv.zheng@intel.com>
+Date: Sun, 15 Jun 2014 08:42:07 +0800
+Subject: ACPI / EC: Fix race condition in ec_transaction_completed()
+
+From: Lv Zheng <lv.zheng@intel.com>
+
+commit c0d653412fc8450370167a3268b78fc772ff9c87 upstream.
+
+There is a race condition in ec_transaction_completed().
+
+When ec_transaction_completed() is called in the GPE handler, it could
+return true because of (ec->curr == NULL). Then the wake_up() invocation
+could complete the next command unexpectedly since there is no lock between
+the 2 invocations. With the previous cleanup, the IBF=0 waiter race need
+not be handled any more. It's now safe to return a flag from
+advance_condition() to indicate the requirement of wakeup, the flag is
+returned from a locked context.
+
+The ec_transaction_completed() is now only invoked by the ec_poll() where
+the ec->curr is ensured to be different from NULL.
+
+After cleaning up, the EVT_SCI=1 check should be moved out of the wakeup
+condition so that an EVT_SCI raised with (ec->curr == NULL) can trigger a
+QR_SC command.
+
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=70891
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=63931
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=59911
+Reported-and-tested-by: Gareth Williams <gareth@garethwilliams.me.uk>
+Reported-and-tested-by: Hans de Goede <jwrdegoede@fedoraproject.org>
+Reported-by: Barton Xu <tank.xuhan@gmail.com>
+Tested-by: Steffen Weber <steffen.weber@gmail.com>
+Tested-by: Arthur Chen <axchen@nvidia.com>
+Signed-off-by: Lv Zheng <lv.zheng@intel.com>
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/acpi/ec.c |   30 +++++++++++++++++-------------
+ 1 file changed, 17 insertions(+), 13 deletions(-)
+
+--- a/drivers/acpi/ec.c
++++ b/drivers/acpi/ec.c
+@@ -158,16 +158,17 @@ static int ec_transaction_completed(stru
+ 	unsigned long flags;
+ 	int ret = 0;
+ 	spin_lock_irqsave(&ec->lock, flags);
+-	if (!ec->curr || (ec->curr->flags & ACPI_EC_COMMAND_COMPLETE))
++	if (ec->curr && (ec->curr->flags & ACPI_EC_COMMAND_COMPLETE))
+ 		ret = 1;
+ 	spin_unlock_irqrestore(&ec->lock, flags);
+ 	return ret;
+ }
+ 
+-static void advance_transaction(struct acpi_ec *ec)
++static bool advance_transaction(struct acpi_ec *ec)
+ {
+ 	struct transaction *t;
+ 	u8 status;
++	bool wakeup = false;
+ 
+ 	pr_debug("===== %s =====\n", in_interrupt() ? "IRQ" : "TASK");
+ 	status = acpi_ec_read_status(ec);
+@@ -183,21 +184,25 @@ static void advance_transaction(struct a
+ 		} else if (t->rlen > t->ri) {
+ 			if ((status & ACPI_EC_FLAG_OBF) == 1) {
+ 				t->rdata[t->ri++] = acpi_ec_read_data(ec);
+-				if (t->rlen == t->ri)
++				if (t->rlen == t->ri) {
+ 					t->flags |= ACPI_EC_COMMAND_COMPLETE;
++					wakeup = true;
++				}
+ 			} else
+ 				goto err;
+ 		} else if (t->wlen == t->wi &&
+-			   (status & ACPI_EC_FLAG_IBF) == 0)
++			   (status & ACPI_EC_FLAG_IBF) == 0) {
+ 			t->flags |= ACPI_EC_COMMAND_COMPLETE;
+-		return;
++			wakeup = true;
++		}
++		return wakeup;
+ 	} else {
+ 		if ((status & ACPI_EC_FLAG_IBF) == 0) {
+ 			acpi_ec_write_cmd(ec, t->command);
+ 			t->flags |= ACPI_EC_COMMAND_POLL;
+ 		} else
+ 			goto err;
+-		return;
++		return wakeup;
+ 	}
+ err:
+ 	/*
+@@ -208,13 +213,14 @@ err:
+ 		if (in_interrupt() && t)
+ 			++t->irq_count;
+ 	}
++	return wakeup;
+ }
+ 
+ static void start_transaction(struct acpi_ec *ec)
+ {
+ 	ec->curr->irq_count = ec->curr->wi = ec->curr->ri = 0;
+ 	ec->curr->flags = 0;
+-	advance_transaction(ec);
++	(void)advance_transaction(ec);
+ }
+ 
+ static int acpi_ec_sync_query(struct acpi_ec *ec, u8 *data);
+@@ -248,7 +254,7 @@ static int ec_poll(struct acpi_ec *ec)
+ 					return 0;
+ 			}
+ 			spin_lock_irqsave(&ec->lock, flags);
+-			advance_transaction(ec);
++			(void)advance_transaction(ec);
+ 			spin_unlock_irqrestore(&ec->lock, flags);
+ 		} while (time_before(jiffies, delay));
+ 		pr_debug("controller reset, restart transaction\n");
+@@ -627,12 +633,10 @@ static u32 acpi_ec_gpe_handler(acpi_hand
+ 	struct acpi_ec *ec = data;
+ 
+ 	spin_lock_irqsave(&ec->lock, flags);
+-	advance_transaction(ec);
+-	spin_unlock_irqrestore(&ec->lock, flags);
+-	if (ec_transaction_completed(ec)) {
++	if (advance_transaction(ec))
+ 		wake_up(&ec->wait);
+-		ec_check_sci(ec, acpi_ec_read_status(ec));
+-	}
++	spin_unlock_irqrestore(&ec->lock, flags);
++	ec_check_sci(ec, acpi_ec_read_status(ec));
+ 	return ACPI_INTERRUPT_HANDLED | ACPI_REENABLE_GPE;
+ }
+ 
