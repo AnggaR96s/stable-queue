@@ -1,0 +1,85 @@
+From 200612ec33e555a356eebc717630b866ae2b694f Mon Sep 17 00:00:00 2001
+From: Jeff Moyer <jmoyer@redhat.com>
+Date: Fri, 8 Aug 2014 11:03:41 -0400
+Subject: dm table: propagate QUEUE_FLAG_NO_SG_MERGE
+
+From: Jeff Moyer <jmoyer@redhat.com>
+
+commit 200612ec33e555a356eebc717630b866ae2b694f upstream.
+
+Commit 05f1dd5 ("block: add queue flag for disabling SG merging")
+introduced a new queue flag: QUEUE_FLAG_NO_SG_MERGE.  This gets set by
+default in blk_mq_init_queue for mq-enabled devices.  The effect of
+the flag is to bypass the SG segment merging.  Instead, the
+bio->bi_vcnt is used as the number of hardware segments.
+
+With a device mapper target on top of a device with
+QUEUE_FLAG_NO_SG_MERGE set, we can end up sending down more segments
+than a driver is prepared to handle.  I ran into this when backporting
+the virtio_blk mq support.  It triggerred this BUG_ON, in
+virtio_queue_rq:
+
+        BUG_ON(req->nr_phys_segments + 2 > vblk->sg_elems);
+
+The queue's max is set here:
+        blk_queue_max_segments(q, vblk->sg_elems-2);
+
+Basically, what happens is that a bio is built up for the dm device
+(which does not have the QUEUE_FLAG_NO_SG_MERGE flag set) using
+bio_add_page.  That path will call into __blk_recalc_rq_segments, so
+what you end up with is bi_phys_segments being much smaller than bi_vcnt
+(and bi_vcnt grows beyond the maximum sg elements).  Then, when the bio
+is submitted, it gets cloned.  When the cloned bio is submitted, it will
+end up in blk_recount_segments, here:
+
+        if (test_bit(QUEUE_FLAG_NO_SG_MERGE, &q->queue_flags))
+                bio->bi_phys_segments = bio->bi_vcnt;
+
+and now we've set bio->bi_phys_segments to a number that is beyond what
+was registered as queue_max_segments by the driver.
+
+The right way to fix this is to propagate the queue flag up the stack.
+
+The rules for propagating the flag are simple:
+- if the flag is set for any underlying device, it must be set for the
+  upper device
+- consequently, if the flag is not set for any underlying device, it
+  should not be set for the upper device.
+
+Signed-off-by: Jeff Moyer <jmoyer@redhat.com>
+Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/md/dm-table.c |   13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+--- a/drivers/md/dm-table.c
++++ b/drivers/md/dm-table.c
+@@ -1386,6 +1386,14 @@ static int device_is_not_random(struct d
+ 	return q && !blk_queue_add_random(q);
+ }
+ 
++static int queue_supports_sg_merge(struct dm_target *ti, struct dm_dev *dev,
++				   sector_t start, sector_t len, void *data)
++{
++	struct request_queue *q = bdev_get_queue(dev->bdev);
++
++	return q && !test_bit(QUEUE_FLAG_NO_SG_MERGE, &q->queue_flags);
++}
++
+ static bool dm_table_all_devices_attribute(struct dm_table *t,
+ 					   iterate_devices_callout_fn func)
+ {
+@@ -1464,6 +1472,11 @@ void dm_table_set_restrictions(struct dm
+ 	if (!dm_table_supports_write_same(t))
+ 		q->limits.max_write_same_sectors = 0;
+ 
++	if (dm_table_all_devices_attribute(t, queue_supports_sg_merge))
++		queue_flag_clear_unlocked(QUEUE_FLAG_NO_SG_MERGE, q);
++	else
++		queue_flag_set_unlocked(QUEUE_FLAG_NO_SG_MERGE, q);
++
+ 	dm_table_set_integrity(t);
+ 
+ 	/*
