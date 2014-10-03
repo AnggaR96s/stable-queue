@@ -1,0 +1,149 @@
+From 5f151b240192a1557119d5375af71efc26825bc8 Mon Sep 17 00:00:00 2001
+From: "Steven Rostedt (Red Hat)" <rostedt@goodmis.org>
+Date: Fri, 15 Aug 2014 17:18:46 -0400
+Subject: ftrace: Fix function_profiler and function tracer together
+
+From: "Steven Rostedt (Red Hat)" <rostedt@goodmis.org>
+
+commit 5f151b240192a1557119d5375af71efc26825bc8 upstream.
+
+The latest rewrite of ftrace removed the separate ftrace_ops of
+the function tracer and the function graph tracer and had them
+share the same ftrace_ops. This simplified the accounting by removing
+the multiple layers of functions called, where the global_ops func
+would call a special list that would iterate over the other ops that
+were registered within it (like function and function graph), which
+itself was registered to the ftrace ops list of all functions
+currently active. If that sounds confusing, the code that implemented
+it was also confusing and its removal is a good thing.
+
+The problem with this change was that it assumed that the function
+and function graph tracer can never be used at the same time.
+This is mostly true, but there is an exception. That is when the
+function profiler uses the function graph tracer to profile.
+The function profiler can be activated the same time as the function
+tracer, and this breaks the assumption and the result is that ftrace
+will crash (it detects the error and shuts itself down, it does not
+cause a kernel oops).
+
+To solve this issue, a previous change allowed the hash tables
+for the functions traced by a ftrace_ops to be a pointer and let
+multiple ftrace_ops share the same hash. This allows the function
+and function_graph tracer to have separate ftrace_ops, but still
+share the hash, which is what is done.
+
+Now the function and function graph tracers have separate ftrace_ops
+again, and the function tracer can be run while the function_profile
+is active.
+
+Signed-off-by: Steven Rostedt <rostedt@goodmis.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+
+---
+ kernel/trace/ftrace.c |   49 ++++++++++++++++++++++++++++++++++++-------------
+ 1 file changed, 36 insertions(+), 13 deletions(-)
+
+--- a/kernel/trace/ftrace.c
++++ b/kernel/trace/ftrace.c
+@@ -68,8 +68,12 @@
+ #define INIT_OPS_HASH(opsname)	\
+ 	.func_hash		= &opsname.local_hash,			\
+ 	.local_hash.regex_lock	= __MUTEX_INITIALIZER(opsname.local_hash.regex_lock),
++#define ASSIGN_OPS_HASH(opsname, val) \
++	.func_hash		= val, \
++	.local_hash.regex_lock	= __MUTEX_INITIALIZER(opsname.local_hash.regex_lock),
+ #else
+ #define INIT_OPS_HASH(opsname)
++#define ASSIGN_OPS_HASH(opsname, val)
+ #endif
+ 
+ static struct ftrace_ops ftrace_list_end __read_mostly = {
+@@ -110,6 +114,7 @@ static struct ftrace_ops *ftrace_ops_lis
+ ftrace_func_t ftrace_trace_function __read_mostly = ftrace_stub;
+ ftrace_func_t ftrace_pid_function __read_mostly = ftrace_stub;
+ static struct ftrace_ops global_ops;
++static struct ftrace_ops graph_ops;
+ static struct ftrace_ops control_ops;
+ 
+ #if ARCH_SUPPORTS_FTRACE_OPS
+@@ -4339,7 +4344,6 @@ void __init ftrace_init(void)
+ static struct ftrace_ops global_ops = {
+ 	.func			= ftrace_stub,
+ 	.flags			= FTRACE_OPS_FL_RECURSION_SAFE | FTRACE_OPS_FL_INITIALIZED,
+-	INIT_OPS_HASH(global_ops)
+ };
+ 
+ static int __init ftrace_nodyn_init(void)
+@@ -4877,6 +4881,14 @@ ftrace_enable_sysctl(struct ctl_table *t
+ 
+ #ifdef CONFIG_FUNCTION_GRAPH_TRACER
+ 
++static struct ftrace_ops graph_ops = {
++	.func			= ftrace_stub,
++	.flags			= FTRACE_OPS_FL_RECURSION_SAFE |
++				   FTRACE_OPS_FL_INITIALIZED |
++				   FTRACE_OPS_FL_STUB,
++	ASSIGN_OPS_HASH(graph_ops, &global_ops.local_hash)
++};
++
+ static int ftrace_graph_active;
+ 
+ int ftrace_graph_entry_stub(struct ftrace_graph_ent *trace)
+@@ -5039,12 +5051,28 @@ static int ftrace_graph_entry_test(struc
+  */
+ static void update_function_graph_func(void)
+ {
+-	if (ftrace_ops_list == &ftrace_list_end ||
+-	    (ftrace_ops_list == &global_ops &&
+-	     global_ops.next == &ftrace_list_end))
+-		ftrace_graph_entry = __ftrace_graph_entry;
+-	else
++	struct ftrace_ops *op;
++	bool do_test = false;
++
++	/*
++	 * The graph and global ops share the same set of functions
++	 * to test. If any other ops is on the list, then
++	 * the graph tracing needs to test if its the function
++	 * it should call.
++	 */
++	do_for_each_ftrace_op(op, ftrace_ops_list) {
++		if (op != &global_ops && op != &graph_ops &&
++		    op != &ftrace_list_end) {
++			do_test = true;
++			/* in double loop, break out with goto */
++			goto out;
++		}
++	} while_for_each_ftrace_op(op);
++ out:
++	if (do_test)
+ 		ftrace_graph_entry = ftrace_graph_entry_test;
++	else
++		ftrace_graph_entry = __ftrace_graph_entry;
+ }
+ 
+ static struct notifier_block ftrace_suspend_notifier = {
+@@ -5085,11 +5113,7 @@ int register_ftrace_graph(trace_func_gra
+ 	ftrace_graph_entry = ftrace_graph_entry_test;
+ 	update_function_graph_func();
+ 
+-	/* Function graph doesn't use the .func field of global_ops */
+-	global_ops.flags |= FTRACE_OPS_FL_STUB;
+-
+-	ret = ftrace_startup(&global_ops, FTRACE_START_FUNC_RET);
+-
++	ret = ftrace_startup(&graph_ops, FTRACE_START_FUNC_RET);
+ out:
+ 	mutex_unlock(&ftrace_lock);
+ 	return ret;
+@@ -5106,8 +5130,7 @@ void unregister_ftrace_graph(void)
+ 	ftrace_graph_return = (trace_func_graph_ret_t)ftrace_stub;
+ 	ftrace_graph_entry = ftrace_graph_entry_stub;
+ 	__ftrace_graph_entry = ftrace_graph_entry_stub;
+-	ftrace_shutdown(&global_ops, FTRACE_STOP_FUNC_RET);
+-	global_ops.flags &= ~FTRACE_OPS_FL_STUB;
++	ftrace_shutdown(&graph_ops, FTRACE_STOP_FUNC_RET);
+ 	unregister_pm_notifier(&ftrace_suspend_notifier);
+ 	unregister_trace_sched_switch(ftrace_graph_probe_sched_switch, NULL);
+ 
