@@ -1,0 +1,107 @@
+From a4189487da1b4f8260c6006b9dc47c3c4107a5ae Mon Sep 17 00:00:00 2001
+From: Li Zefan <lizefan@huawei.com>
+Date: Thu, 4 Sep 2014 14:43:07 +0800
+Subject: cgroup: delay the clearing of cgrp->kn->priv
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+From: Li Zefan <lizefan@huawei.com>
+
+commit a4189487da1b4f8260c6006b9dc47c3c4107a5ae upstream.
+
+Run these two scripts concurrently:
+
+    for ((; ;))
+    {
+        mkdir /cgroup/sub
+        rmdir /cgroup/sub
+    }
+
+    for ((; ;))
+    {
+        echo $$ > /cgroup/sub/cgroup.procs
+        echo $$ > /cgroup/cgroup.procs
+    }
+
+A kernel bug will be triggered:
+
+BUG: unable to handle kernel NULL pointer dereference at 00000038
+IP: [<c10bbd69>] cgroup_put+0x9/0x80
+...
+Call Trace:
+ [<c10bbe19>] cgroup_kn_unlock+0x39/0x50
+ [<c10bbe91>] cgroup_kn_lock_live+0x61/0x70
+ [<c10be3c1>] __cgroup_procs_write.isra.26+0x51/0x230
+ [<c10be5b2>] cgroup_tasks_write+0x12/0x20
+ [<c10bb7b0>] cgroup_file_write+0x40/0x130
+ [<c11aee71>] kernfs_fop_write+0xd1/0x160
+ [<c1148e58>] vfs_write+0x98/0x1e0
+ [<c114934d>] SyS_write+0x4d/0xa0
+ [<c16f656b>] sysenter_do_call+0x12/0x12
+
+We clear cgrp->kn->priv in the end of cgroup_rmdir(), but another
+concurrent thread can access kn->priv after the clearing.
+
+We should move the clearing to css_release_work_fn(). At that time
+no one is holding reference to the cgroup and no one can gain a new
+reference to access it.
+
+v2:
+- move RCU_INIT_POINTER() into the else block. (Tejun)
+- remove the cgroup_parent() check. (Tejun)
+- update the comment in css_tryget_online_from_dir().
+
+Reported-by: Toralf Förster <toralf.foerster@gmx.de>
+Signed-off-by: Zefan Li <lizefan@huawei.com>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ kernel/cgroup.c |   21 ++++++++++-----------
+ 1 file changed, 10 insertions(+), 11 deletions(-)
+
+--- a/kernel/cgroup.c
++++ b/kernel/cgroup.c
+@@ -4242,6 +4242,15 @@ static void css_release_work_fn(struct w
+ 		/* cgroup release path */
+ 		cgroup_idr_remove(&cgrp->root->cgroup_idr, cgrp->id);
+ 		cgrp->id = -1;
++
++		/*
++		 * There are two control paths which try to determine
++		 * cgroup from dentry without going through kernfs -
++		 * cgroupstats_build() and css_tryget_online_from_dir().
++		 * Those are supported by RCU protecting clearing of
++		 * cgrp->kn->priv backpointer.
++		 */
++		RCU_INIT_POINTER(*(void __rcu __force **)&cgrp->kn->priv, NULL);
+ 	}
+ 
+ 	mutex_unlock(&cgroup_mutex);
+@@ -4667,16 +4676,6 @@ static int cgroup_rmdir(struct kernfs_no
+ 
+ 	cgroup_kn_unlock(kn);
+ 
+-	/*
+-	 * There are two control paths which try to determine cgroup from
+-	 * dentry without going through kernfs - cgroupstats_build() and
+-	 * css_tryget_online_from_dir().  Those are supported by RCU
+-	 * protecting clearing of cgrp->kn->priv backpointer, which should
+-	 * happen after all files under it have been removed.
+-	 */
+-	if (!ret)
+-		RCU_INIT_POINTER(*(void __rcu __force **)&kn->priv, NULL);
+-
+ 	cgroup_put(cgrp);
+ 	return ret;
+ }
+@@ -5242,7 +5241,7 @@ struct cgroup_subsys_state *css_tryget_o
+ 	/*
+ 	 * This path doesn't originate from kernfs and @kn could already
+ 	 * have been or be removed at any point.  @kn->priv is RCU
+-	 * protected for this access.  See cgroup_rmdir() for details.
++	 * protected for this access.  See css_release_work_fn() for details.
+ 	 */
+ 	cgrp = rcu_dereference(kn->priv);
+ 	if (cgrp)
