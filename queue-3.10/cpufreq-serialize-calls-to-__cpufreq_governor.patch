@@ -1,0 +1,88 @@
+From 19c763031acb831a5ab9c1a701b7fedda073eb3f Mon Sep 17 00:00:00 2001
+From: Viresh Kumar <viresh.kumar@linaro.org>
+Date: Sat, 31 Aug 2013 17:48:23 +0530
+Subject: cpufreq: serialize calls to __cpufreq_governor()
+
+From: Viresh Kumar <viresh.kumar@linaro.org>
+
+commit 19c763031acb831a5ab9c1a701b7fedda073eb3f upstream.
+
+We can't take a big lock around __cpufreq_governor() as this causes
+recursive locking for some cases. But calls to this routine must be
+serialized for every policy. Otherwise we can see some unpredictable
+events.
+
+For example, consider following scenario:
+
+__cpufreq_remove_dev()
+ __cpufreq_governor(policy, CPUFREQ_GOV_STOP);
+   policy->governor->governor(policy, CPUFREQ_GOV_STOP);
+    cpufreq_governor_dbs()
+     case CPUFREQ_GOV_STOP:
+      mutex_destroy(&cpu_cdbs->timer_mutex)
+      cpu_cdbs->cur_policy = NULL;
+  <PREEMPT>
+store()
+ __cpufreq_set_policy()
+  __cpufreq_governor(policy, CPUFREQ_GOV_LIMITS);
+    policy->governor->governor(policy, CPUFREQ_GOV_LIMITS);
+     case CPUFREQ_GOV_LIMITS:
+      mutex_lock(&cpu_cdbs->timer_mutex); <-- Warning (destroyed mutex)
+       if (policy->max < cpu_cdbs->cur_policy->cur) <- cur_policy == NULL
+
+And so store() will eventually result in a crash if cur_policy is
+NULL at this point.
+
+Introduce an additional variable which would guarantee serialization
+here.
+
+Reported-by: Stephen Boyd <sboyd@codeaurora.org>
+Signed-off-by: Viresh Kumar <viresh.kumar@linaro.org>
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Cc: Mark Brown <broonie@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/cpufreq/cpufreq.c |    9 +++++++--
+ include/linux/cpufreq.h   |    1 +
+ 2 files changed, 8 insertions(+), 2 deletions(-)
+
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@ -1566,12 +1566,14 @@ static int __cpufreq_governor(struct cpu
+ 						policy->cpu, event);
+ 
+ 	mutex_lock(&cpufreq_governor_lock);
+-	if ((!policy->governor_enabled && (event == CPUFREQ_GOV_STOP)) ||
+-	    (policy->governor_enabled && (event == CPUFREQ_GOV_START))) {
++	if (policy->governor_busy
++	    || (!policy->governor_enabled && (event == CPUFREQ_GOV_STOP))
++	    || (policy->governor_enabled && (event == CPUFREQ_GOV_START))) {
+ 		mutex_unlock(&cpufreq_governor_lock);
+ 		return -EBUSY;
+ 	}
+ 
++	policy->governor_busy = true;
+ 	if (event == CPUFREQ_GOV_STOP)
+ 		policy->governor_enabled = false;
+ 	else if (event == CPUFREQ_GOV_START)
+@@ -1603,6 +1605,9 @@ static int __cpufreq_governor(struct cpu
+ 	if ((event == CPUFREQ_GOV_STOP) && !ret)
+ 		module_put(policy->governor->owner);
+ 
++	mutex_lock(&cpufreq_governor_lock);
++	policy->governor_busy = false;
++	mutex_unlock(&cpufreq_governor_lock);
+ 	return ret;
+ }
+ 
+--- a/include/linux/cpufreq.h
++++ b/include/linux/cpufreq.h
+@@ -108,6 +108,7 @@ struct cpufreq_policy {
+ 	struct cpufreq_governor	*governor; /* see below */
+ 	void			*governor_data;
+ 	bool			governor_enabled; /* governor start/stop flag */
++	bool			governor_busy;
+ 
+ 	struct work_struct	update; /* if update_policy() needs to be
+ 					 * called, but you're in IRQ context */
