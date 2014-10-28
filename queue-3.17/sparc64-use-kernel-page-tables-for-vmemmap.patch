@@ -1,0 +1,166 @@
+From foo@baz Tue Oct 28 11:21:07 CST 2014
+From: "David S. Miller" <davem@davemloft.net>
+Date: Wed, 24 Sep 2014 21:20:14 -0700
+Subject: sparc64: Use kernel page tables for vmemmap.
+
+From: "David S. Miller" <davem@davemloft.net>
+
+[ Upstream commit c06240c7f5c39c83dfd7849c0770775562441b96 ]
+
+For sparse memory configurations, the vmemmap array behaves terribly
+and it takes up an inordinate amount of space in the BSS section of
+the kernel image unconditionally.
+
+Just build huge PMDs and look them up just like we do for TLB misses
+in the vmalloc area.
+
+Kernel BSS shrinks by about 2MB.
+
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Bob Picco <bob.picco@oracle.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/sparc/kernel/ktlb.S |    9 +----
+ arch/sparc/mm/init_64.c  |   72 ++++++++++++++++++++++-------------------------
+ arch/sparc/mm/init_64.h  |   11 -------
+ 3 files changed, 36 insertions(+), 56 deletions(-)
+
+--- a/arch/sparc/kernel/ktlb.S
++++ b/arch/sparc/kernel/ktlb.S
+@@ -186,13 +186,8 @@ kvmap_dtlb_load:
+ 
+ #ifdef CONFIG_SPARSEMEM_VMEMMAP
+ kvmap_vmemmap:
+-	sub		%g4, %g5, %g5
+-	srlx		%g5, ILOG2_4MB, %g5
+-	sethi		%hi(vmemmap_table), %g1
+-	sllx		%g5, 3, %g5
+-	or		%g1, %lo(vmemmap_table), %g1
+-	ba,pt		%xcc, kvmap_dtlb_load
+-	 ldx		[%g1 + %g5], %g5
++	KERN_PGTABLE_WALK(%g4, %g5, %g2, kvmap_dtlb_longpath)
++	ba,a,pt		%xcc, kvmap_dtlb_load
+ #endif
+ 
+ kvmap_dtlb_nonlinear:
+--- a/arch/sparc/mm/init_64.c
++++ b/arch/sparc/mm/init_64.c
+@@ -2261,18 +2261,9 @@ unsigned long _PAGE_CACHE __read_mostly;
+ EXPORT_SYMBOL(_PAGE_CACHE);
+ 
+ #ifdef CONFIG_SPARSEMEM_VMEMMAP
+-unsigned long vmemmap_table[VMEMMAP_SIZE];
+-
+-static long __meminitdata addr_start, addr_end;
+-static int __meminitdata node_start;
+-
+ int __meminit vmemmap_populate(unsigned long vstart, unsigned long vend,
+ 			       int node)
+ {
+-	unsigned long phys_start = (vstart - VMEMMAP_BASE);
+-	unsigned long phys_end = (vend - VMEMMAP_BASE);
+-	unsigned long addr = phys_start & VMEMMAP_CHUNK_MASK;
+-	unsigned long end = VMEMMAP_ALIGN(phys_end);
+ 	unsigned long pte_base;
+ 
+ 	pte_base = (_PAGE_VALID | _PAGE_SZ4MB_4U |
+@@ -2283,47 +2274,52 @@ int __meminit vmemmap_populate(unsigned
+ 			    _PAGE_CP_4V | _PAGE_CV_4V |
+ 			    _PAGE_P_4V | _PAGE_W_4V);
+ 
+-	for (; addr < end; addr += VMEMMAP_CHUNK) {
+-		unsigned long *vmem_pp =
+-			vmemmap_table + (addr >> VMEMMAP_CHUNK_SHIFT);
+-		void *block;
++	pte_base |= _PAGE_PMD_HUGE;
+ 
+-		if (!(*vmem_pp & _PAGE_VALID)) {
+-			block = vmemmap_alloc_block(1UL << ILOG2_4MB, node);
+-			if (!block)
++	vstart = vstart & PMD_MASK;
++	vend = ALIGN(vend, PMD_SIZE);
++	for (; vstart < vend; vstart += PMD_SIZE) {
++		pgd_t *pgd = pgd_offset_k(vstart);
++		unsigned long pte;
++		pud_t *pud;
++		pmd_t *pmd;
++
++		if (pgd_none(*pgd)) {
++			pud_t *new = vmemmap_alloc_block(PAGE_SIZE, node);
++
++			if (!new)
+ 				return -ENOMEM;
++			pgd_populate(&init_mm, pgd, new);
++		}
+ 
+-			*vmem_pp = pte_base | __pa(block);
++		pud = pud_offset(pgd, vstart);
++		if (pud_none(*pud)) {
++			pmd_t *new = vmemmap_alloc_block(PAGE_SIZE, node);
+ 
+-			/* check to see if we have contiguous blocks */
+-			if (addr_end != addr || node_start != node) {
+-				if (addr_start)
+-					printk(KERN_DEBUG " [%lx-%lx] on node %d\n",
+-					       addr_start, addr_end-1, node_start);
+-				addr_start = addr;
+-				node_start = node;
+-			}
+-			addr_end = addr + VMEMMAP_CHUNK;
++			if (!new)
++				return -ENOMEM;
++			pud_populate(&init_mm, pud, new);
+ 		}
+-	}
+-	return 0;
+-}
+ 
+-void __meminit vmemmap_populate_print_last(void)
+-{
+-	if (addr_start) {
+-		printk(KERN_DEBUG " [%lx-%lx] on node %d\n",
+-		       addr_start, addr_end-1, node_start);
+-		addr_start = 0;
+-		addr_end = 0;
+-		node_start = 0;
++		pmd = pmd_offset(pud, vstart);
++
++		pte = pmd_val(*pmd);
++		if (!(pte & _PAGE_VALID)) {
++			void *block = vmemmap_alloc_block(PMD_SIZE, node);
++
++			if (!block)
++				return -ENOMEM;
++
++			pmd_val(*pmd) = pte_base | __pa(block);
++		}
+ 	}
++
++	return 0;
+ }
+ 
+ void vmemmap_free(unsigned long start, unsigned long end)
+ {
+ }
+-
+ #endif /* CONFIG_SPARSEMEM_VMEMMAP */
+ 
+ static void prot_init_common(unsigned long page_none,
+--- a/arch/sparc/mm/init_64.h
++++ b/arch/sparc/mm/init_64.h
+@@ -31,15 +31,4 @@ extern unsigned long kern_locked_tte_dat
+ 
+ void prom_world(int enter);
+ 
+-#ifdef CONFIG_SPARSEMEM_VMEMMAP
+-#define VMEMMAP_CHUNK_SHIFT	22
+-#define VMEMMAP_CHUNK		(1UL << VMEMMAP_CHUNK_SHIFT)
+-#define VMEMMAP_CHUNK_MASK	~(VMEMMAP_CHUNK - 1UL)
+-#define VMEMMAP_ALIGN(x)	(((x)+VMEMMAP_CHUNK-1UL)&VMEMMAP_CHUNK_MASK)
+-
+-#define VMEMMAP_SIZE	((((1UL << MAX_PHYSADDR_BITS) >> PAGE_SHIFT) * \
+-			  sizeof(struct page)) >> VMEMMAP_CHUNK_SHIFT)
+-extern unsigned long vmemmap_table[VMEMMAP_SIZE];
+-#endif
+-
+ #endif /* _SPARC64_MM_INIT_H */
