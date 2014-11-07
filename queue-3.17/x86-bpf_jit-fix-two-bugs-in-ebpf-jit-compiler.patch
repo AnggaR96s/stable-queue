@@ -1,0 +1,121 @@
+From foo@baz Fri Nov  7 11:36:50 PST 2014
+From: Alexei Starovoitov <ast@plumgrid.com>
+Date: Fri, 10 Oct 2014 20:30:23 -0700
+Subject: x86: bpf_jit: fix two bugs in eBPF JIT compiler
+
+From: Alexei Starovoitov <ast@plumgrid.com>
+
+[ Upstream commit e0ee9c12157dc74e49e4731e0d07512e7d1ceb95 ]
+
+1.
+JIT compiler using multi-pass approach to converge to final image size,
+since x86 instructions are variable length. It starts with large
+gaps between instructions (so some jumps may use imm32 instead of imm8)
+and iterates until total program size is the same as in previous pass.
+This algorithm works only if program size is strictly decreasing.
+Programs that use LD_ABS insn need additional code in prologue, but it
+was not emitted during 1st pass, so there was a chance that 2nd pass would
+adjust imm32->imm8 jump offsets to the same number of bytes as increase in
+prologue, which may cause algorithm to erroneously decide that size converged.
+Fix it by always emitting largest prologue in the first pass which
+is detected by oldproglen==0 check.
+Also change error check condition 'proglen != oldproglen' to fail gracefully.
+
+2.
+while staring at the code realized that 64-byte buffer may not be enough
+when 1st insn is large, so increase it to 128 to avoid buffer overflow
+(theoretical maximum size of prologue+div is 109) and add runtime check.
+
+Fixes: 622582786c9e ("net: filter: x86: internal BPF JIT")
+Reported-by: Darrick J. Wong <darrick.wong@oracle.com>
+Signed-off-by: Alexei Starovoitov <ast@plumgrid.com>
+Tested-by: Darrick J. Wong <darrick.wong@oracle.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/x86/net/bpf_jit_comp.c |   25 +++++++++++++++++++------
+ 1 file changed, 19 insertions(+), 6 deletions(-)
+
+--- a/arch/x86/net/bpf_jit_comp.c
++++ b/arch/x86/net/bpf_jit_comp.c
+@@ -211,12 +211,17 @@ struct jit_context {
+ 	bool seen_ld_abs;
+ };
+ 
++/* maximum number of bytes emitted while JITing one eBPF insn */
++#define BPF_MAX_INSN_SIZE	128
++#define BPF_INSN_SAFETY		64
++
+ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image,
+ 		  int oldproglen, struct jit_context *ctx)
+ {
+ 	struct bpf_insn *insn = bpf_prog->insnsi;
+ 	int insn_cnt = bpf_prog->len;
+-	u8 temp[64];
++	bool seen_ld_abs = ctx->seen_ld_abs | (oldproglen == 0);
++	u8 temp[BPF_MAX_INSN_SIZE + BPF_INSN_SAFETY];
+ 	int i;
+ 	int proglen = 0;
+ 	u8 *prog = temp;
+@@ -254,7 +259,7 @@ static int do_jit(struct bpf_prog *bpf_p
+ 	EMIT2(0x31, 0xc0); /* xor eax, eax */
+ 	EMIT3(0x4D, 0x31, 0xED); /* xor r13, r13 */
+ 
+-	if (ctx->seen_ld_abs) {
++	if (seen_ld_abs) {
+ 		/* r9d : skb->len - skb->data_len (headlen)
+ 		 * r10 : skb->data
+ 		 */
+@@ -655,7 +660,7 @@ xadd:			if (is_imm8(insn->off))
+ 		case BPF_JMP | BPF_CALL:
+ 			func = (u8 *) __bpf_call_base + imm32;
+ 			jmp_offset = func - (image + addrs[i]);
+-			if (ctx->seen_ld_abs) {
++			if (seen_ld_abs) {
+ 				EMIT2(0x41, 0x52); /* push %r10 */
+ 				EMIT2(0x41, 0x51); /* push %r9 */
+ 				/* need to adjust jmp offset, since
+@@ -669,7 +674,7 @@ xadd:			if (is_imm8(insn->off))
+ 				return -EINVAL;
+ 			}
+ 			EMIT1_off32(0xE8, jmp_offset);
+-			if (ctx->seen_ld_abs) {
++			if (seen_ld_abs) {
+ 				EMIT2(0x41, 0x59); /* pop %r9 */
+ 				EMIT2(0x41, 0x5A); /* pop %r10 */
+ 			}
+@@ -774,7 +779,8 @@ emit_jmp:
+ 			goto common_load;
+ 		case BPF_LD | BPF_ABS | BPF_W:
+ 			func = CHOOSE_LOAD_FUNC(imm32, sk_load_word);
+-common_load:		ctx->seen_ld_abs = true;
++common_load:
++			ctx->seen_ld_abs = seen_ld_abs = true;
+ 			jmp_offset = func - (image + addrs[i]);
+ 			if (!func || !is_simm32(jmp_offset)) {
+ 				pr_err("unsupported bpf func %d addr %p image %p\n",
+@@ -848,6 +854,11 @@ common_load:		ctx->seen_ld_abs = true;
+ 		}
+ 
+ 		ilen = prog - temp;
++		if (ilen > BPF_MAX_INSN_SIZE) {
++			pr_err("bpf_jit_compile fatal insn size error\n");
++			return -EFAULT;
++		}
++
+ 		if (image) {
+ 			if (unlikely(proglen + ilen > oldproglen)) {
+ 				pr_err("bpf_jit_compile fatal error\n");
+@@ -904,9 +915,11 @@ void bpf_int_jit_compile(struct bpf_prog
+ 			goto out;
+ 		}
+ 		if (image) {
+-			if (proglen != oldproglen)
++			if (proglen != oldproglen) {
+ 				pr_err("bpf_jit: proglen=%d != oldproglen=%d\n",
+ 				       proglen, oldproglen);
++				goto out;
++			}
+ 			break;
+ 		}
+ 		if (proglen == oldproglen) {
