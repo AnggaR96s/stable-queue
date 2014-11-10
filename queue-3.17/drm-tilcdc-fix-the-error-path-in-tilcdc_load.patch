@@ -1,0 +1,165 @@
+From b478e336b3e75505707a11e78ef8b964ef0a03af Mon Sep 17 00:00:00 2001
+From: Ezequiel Garcia <ezequiel@vanguardiasur.com.ar>
+Date: Tue, 2 Sep 2014 09:51:15 -0300
+Subject: drm/tilcdc: Fix the error path in tilcdc_load()
+
+From: Ezequiel Garcia <ezequiel@vanguardiasur.com.ar>
+
+commit b478e336b3e75505707a11e78ef8b964ef0a03af upstream.
+
+The current error path calls tilcdc_unload() in case of an error to release
+the resources. However, this is wrong because not all resources have been
+allocated by the time an error occurs in tilcdc_load().
+
+To fix it, this commit adds proper labels to bail out at the different
+stages in the load function, and release only the resources actually allocated.
+
+Tested-by: Darren Etheridge <detheridge@ti.com>
+Tested-by: Johannes Pointner <johannes.pointner@br-automation.com>
+Signed-off-by: Ezequiel Garcia <ezequiel@vanguardiasur.com.ar>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Fixes: 3a49012224ca ("drm/tilcdc: panel: fix leak when unloading the module")
+Signed-off-by: Matwey V. Kornilov <matwey.kornilov@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/gpu/drm/tilcdc/tilcdc_drv.c |   60 ++++++++++++++++++++++++++++++------
+ 1 file changed, 50 insertions(+), 10 deletions(-)
+
+--- a/drivers/gpu/drm/tilcdc/tilcdc_drv.c
++++ b/drivers/gpu/drm/tilcdc/tilcdc_drv.c
+@@ -84,6 +84,7 @@ static int modeset_init(struct drm_devic
+ 	if ((priv->num_encoders == 0) || (priv->num_connectors == 0)) {
+ 		/* oh nos! */
+ 		dev_err(dev->dev, "no encoders/connectors found\n");
++		drm_mode_config_cleanup(dev);
+ 		return -ENXIO;
+ 	}
+ 
+@@ -172,33 +173,37 @@ static int tilcdc_load(struct drm_device
+ 	dev->dev_private = priv;
+ 
+ 	priv->wq = alloc_ordered_workqueue("tilcdc", 0);
++	if (!priv->wq) {
++		ret = -ENOMEM;
++		goto fail_free_priv;
++	}
+ 
+ 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+ 	if (!res) {
+ 		dev_err(dev->dev, "failed to get memory resource\n");
+ 		ret = -EINVAL;
+-		goto fail;
++		goto fail_free_wq;
+ 	}
+ 
+ 	priv->mmio = ioremap_nocache(res->start, resource_size(res));
+ 	if (!priv->mmio) {
+ 		dev_err(dev->dev, "failed to ioremap\n");
+ 		ret = -ENOMEM;
+-		goto fail;
++		goto fail_free_wq;
+ 	}
+ 
+ 	priv->clk = clk_get(dev->dev, "fck");
+ 	if (IS_ERR(priv->clk)) {
+ 		dev_err(dev->dev, "failed to get functional clock\n");
+ 		ret = -ENODEV;
+-		goto fail;
++		goto fail_iounmap;
+ 	}
+ 
+ 	priv->disp_clk = clk_get(dev->dev, "dpll_disp_ck");
+ 	if (IS_ERR(priv->clk)) {
+ 		dev_err(dev->dev, "failed to get display clock\n");
+ 		ret = -ENODEV;
+-		goto fail;
++		goto fail_put_clk;
+ 	}
+ 
+ #ifdef CONFIG_CPU_FREQ
+@@ -208,7 +213,7 @@ static int tilcdc_load(struct drm_device
+ 			CPUFREQ_TRANSITION_NOTIFIER);
+ 	if (ret) {
+ 		dev_err(dev->dev, "failed to register cpufreq notifier\n");
+-		goto fail;
++		goto fail_put_disp_clk;
+ 	}
+ #endif
+ 
+@@ -253,13 +258,13 @@ static int tilcdc_load(struct drm_device
+ 	ret = modeset_init(dev);
+ 	if (ret < 0) {
+ 		dev_err(dev->dev, "failed to initialize mode setting\n");
+-		goto fail;
++		goto fail_cpufreq_unregister;
+ 	}
+ 
+ 	ret = drm_vblank_init(dev, 1);
+ 	if (ret < 0) {
+ 		dev_err(dev->dev, "failed to initialize vblank\n");
+-		goto fail;
++		goto fail_mode_config_cleanup;
+ 	}
+ 
+ 	pm_runtime_get_sync(dev->dev);
+@@ -267,7 +272,7 @@ static int tilcdc_load(struct drm_device
+ 	pm_runtime_put_sync(dev->dev);
+ 	if (ret < 0) {
+ 		dev_err(dev->dev, "failed to install IRQ handler\n");
+-		goto fail;
++		goto fail_vblank_cleanup;
+ 	}
+ 
+ 	platform_set_drvdata(pdev, dev);
+@@ -283,13 +288,48 @@ static int tilcdc_load(struct drm_device
+ 	priv->fbdev = drm_fbdev_cma_init(dev, bpp,
+ 			dev->mode_config.num_crtc,
+ 			dev->mode_config.num_connector);
++	if (IS_ERR(priv->fbdev)) {
++		ret = PTR_ERR(priv->fbdev);
++		goto fail_irq_uninstall;
++	}
+ 
+ 	drm_kms_helper_poll_init(dev);
+ 
+ 	return 0;
+ 
+-fail:
+-	tilcdc_unload(dev);
++fail_irq_uninstall:
++	pm_runtime_get_sync(dev->dev);
++	drm_irq_uninstall(dev);
++	pm_runtime_put_sync(dev->dev);
++
++fail_vblank_cleanup:
++	drm_vblank_cleanup(dev);
++
++fail_mode_config_cleanup:
++	drm_mode_config_cleanup(dev);
++
++fail_cpufreq_unregister:
++	pm_runtime_disable(dev->dev);
++#ifdef CONFIG_CPU_FREQ
++	cpufreq_unregister_notifier(&priv->freq_transition,
++			CPUFREQ_TRANSITION_NOTIFIER);
++fail_put_disp_clk:
++	clk_put(priv->disp_clk);
++#endif
++
++fail_put_clk:
++	clk_put(priv->clk);
++
++fail_iounmap:
++	iounmap(priv->mmio);
++
++fail_free_wq:
++	flush_workqueue(priv->wq);
++	destroy_workqueue(priv->wq);
++
++fail_free_priv:
++	dev->dev_private = NULL;
++	kfree(priv);
+ 	return ret;
+ }
+ 
