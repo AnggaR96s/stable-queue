@@ -1,0 +1,217 @@
+From 519e52473ebe9db5cdef44670d5a97f1fd53d721 Mon Sep 17 00:00:00 2001
+From: Johannes Weiner <hannes@cmpxchg.org>
+Date: Thu, 12 Sep 2013 15:13:42 -0700
+Subject: mm: memcg: enable memcg OOM killer only for user faults
+
+From: Johannes Weiner <hannes@cmpxchg.org>
+
+commit 519e52473ebe9db5cdef44670d5a97f1fd53d721 upstream.
+
+System calls and kernel faults (uaccess, gup) can handle an out of memory
+situation gracefully and just return -ENOMEM.
+
+Enable the memcg OOM killer only for user faults, where it's really the
+only option available.
+
+Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+Acked-by: Michal Hocko <mhocko@suse.cz>
+Cc: David Rientjes <rientjes@google.com>
+Cc: KAMEZAWA Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
+Cc: azurIt <azurit@pobox.sk>
+Cc: KOSAKI Motohiro <kosaki.motohiro@jp.fujitsu.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ include/linux/memcontrol.h |   44 ++++++++++++++++++++++++++++++++++++++++++++
+ include/linux/sched.h      |    3 +++
+ mm/filemap.c               |   11 ++++++++++-
+ mm/memcontrol.c            |    2 +-
+ mm/memory.c                |   40 ++++++++++++++++++++++++++++++----------
+ 5 files changed, 88 insertions(+), 12 deletions(-)
+
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -124,6 +124,37 @@ extern void mem_cgroup_print_oom_info(st
+ extern void mem_cgroup_replace_page_cache(struct page *oldpage,
+ 					struct page *newpage);
+ 
++/**
++ * mem_cgroup_toggle_oom - toggle the memcg OOM killer for the current task
++ * @new: true to enable, false to disable
++ *
++ * Toggle whether a failed memcg charge should invoke the OOM killer
++ * or just return -ENOMEM.  Returns the previous toggle state.
++ */
++static inline bool mem_cgroup_toggle_oom(bool new)
++{
++	bool old;
++
++	old = current->memcg_oom.may_oom;
++	current->memcg_oom.may_oom = new;
++
++	return old;
++}
++
++static inline void mem_cgroup_enable_oom(void)
++{
++	bool old = mem_cgroup_toggle_oom(true);
++
++	WARN_ON(old == true);
++}
++
++static inline void mem_cgroup_disable_oom(void)
++{
++	bool old = mem_cgroup_toggle_oom(false);
++
++	WARN_ON(old == false);
++}
++
+ #ifdef CONFIG_MEMCG_SWAP
+ extern int do_swap_account;
+ #endif
+@@ -347,6 +378,19 @@ static inline void mem_cgroup_end_update
+ {
+ }
+ 
++static inline bool mem_cgroup_toggle_oom(bool new)
++{
++	return false;
++}
++
++static inline void mem_cgroup_enable_oom(void)
++{
++}
++
++static inline void mem_cgroup_disable_oom(void)
++{
++}
++
+ static inline void mem_cgroup_inc_page_stat(struct page *page,
+ 					    enum mem_cgroup_page_stat_item idx)
+ {
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1411,6 +1411,9 @@ struct task_struct {
+ 		unsigned long memsw_nr_pages; /* uncharged mem+swap usage */
+ 	} memcg_batch;
+ 	unsigned int memcg_kmem_skip_account;
++	struct memcg_oom_info {
++		unsigned int may_oom:1;
++	} memcg_oom;
+ #endif
+ #ifdef CONFIG_HAVE_HW_BREAKPOINT
+ 	atomic_t ptrace_bp_refcnt;
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -1614,6 +1614,7 @@ int filemap_fault(struct vm_area_struct
+ 	struct inode *inode = mapping->host;
+ 	pgoff_t offset = vmf->pgoff;
+ 	struct page *page;
++	bool memcg_oom;
+ 	pgoff_t size;
+ 	int ret = 0;
+ 
+@@ -1622,7 +1623,11 @@ int filemap_fault(struct vm_area_struct
+ 		return VM_FAULT_SIGBUS;
+ 
+ 	/*
+-	 * Do we have something in the page cache already?
++	 * Do we have something in the page cache already?  Either
++	 * way, try readahead, but disable the memcg OOM killer for it
++	 * as readahead is optional and no errors are propagated up
++	 * the fault stack.  The OOM killer is enabled while trying to
++	 * instantiate the faulting page individually below.
+ 	 */
+ 	page = find_get_page(mapping, offset);
+ 	if (likely(page) && !(vmf->flags & FAULT_FLAG_TRIED)) {
+@@ -1630,10 +1635,14 @@ int filemap_fault(struct vm_area_struct
+ 		 * We found the page, so try async readahead before
+ 		 * waiting for the lock.
+ 		 */
++		memcg_oom = mem_cgroup_toggle_oom(false);
+ 		do_async_mmap_readahead(vma, ra, file, page, offset);
++		mem_cgroup_toggle_oom(memcg_oom);
+ 	} else if (!page) {
+ 		/* No page in the page cache at all */
++		memcg_oom = mem_cgroup_toggle_oom(false);
+ 		do_sync_mmap_readahead(vma, ra, file, offset);
++		mem_cgroup_toggle_oom(memcg_oom);
+ 		count_vm_event(PGMAJFAULT);
+ 		mem_cgroup_count_vm_event(vma->vm_mm, PGMAJFAULT);
+ 		ret = VM_FAULT_MAJOR;
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -2613,7 +2613,7 @@ static int mem_cgroup_do_charge(struct m
+ 		return CHARGE_RETRY;
+ 
+ 	/* If we don't need to call oom-killer at el, return immediately */
+-	if (!oom_check)
++	if (!oom_check || !current->memcg_oom.may_oom)
+ 		return CHARGE_NOMEM;
+ 	/* check OOM */
+ 	if (!mem_cgroup_handle_oom(mem_over_limit, gfp_mask, get_order(csize)))
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -3754,22 +3754,14 @@ unlock:
+ /*
+  * By the time we get here, we already hold the mm semaphore
+  */
+-int handle_mm_fault(struct mm_struct *mm, struct vm_area_struct *vma,
+-		unsigned long address, unsigned int flags)
++static int __handle_mm_fault(struct mm_struct *mm, struct vm_area_struct *vma,
++			     unsigned long address, unsigned int flags)
+ {
+ 	pgd_t *pgd;
+ 	pud_t *pud;
+ 	pmd_t *pmd;
+ 	pte_t *pte;
+ 
+-	__set_current_state(TASK_RUNNING);
+-
+-	count_vm_event(PGFAULT);
+-	mem_cgroup_count_vm_event(mm, PGFAULT);
+-
+-	/* do counter updates before entering really critical section. */
+-	check_sync_rss_stat(current);
+-
+ 	if (unlikely(is_vm_hugetlb_page(vma)))
+ 		return hugetlb_fault(mm, vma, address, flags);
+ 
+@@ -3850,6 +3842,34 @@ retry:
+ 	return handle_pte_fault(mm, vma, address, pte, pmd, flags);
+ }
+ 
++int handle_mm_fault(struct mm_struct *mm, struct vm_area_struct *vma,
++		    unsigned long address, unsigned int flags)
++{
++	int ret;
++
++	__set_current_state(TASK_RUNNING);
++
++	count_vm_event(PGFAULT);
++	mem_cgroup_count_vm_event(mm, PGFAULT);
++
++	/* do counter updates before entering really critical section. */
++	check_sync_rss_stat(current);
++
++	/*
++	 * Enable the memcg OOM handling for faults triggered in user
++	 * space.  Kernel faults are handled more gracefully.
++	 */
++	if (flags & FAULT_FLAG_USER)
++		mem_cgroup_enable_oom();
++
++	ret = __handle_mm_fault(mm, vma, address, flags);
++
++	if (flags & FAULT_FLAG_USER)
++		mem_cgroup_disable_oom();
++
++	return ret;
++}
++
+ #ifndef __PAGETABLE_PUD_FOLDED
+ /*
+  * Allocate page upper directory.
