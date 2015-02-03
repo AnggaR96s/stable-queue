@@ -1,0 +1,139 @@
+From nab@linux-iscsi.org  Tue Feb  3 15:08:43 2015
+From: "Nicholas A. Bellinger" <nab@linux-iscsi.org>
+Date: Fri, 30 Jan 2015 22:17:30 +0000
+Subject: iser-target: Fix implicit termination of connections
+To: target-devel <target-devel@vger.kernel.org>
+Cc: Greg-KH <gregkh@linuxfoundation.org>, stable <stable@vger.kernel.org>, Sagi Grimberg <sagig@mellanox.com>
+Message-ID: <1422656251-29468-12-git-send-email-nab@linux-iscsi.org>
+
+
+From: Sagi Grimberg <sagig@mellanox.com>
+
+commit b02efbfc9a051b41e71fe8f94ddf967260e024a6 upstream.
+
+In situations such as bond failover, The new session establishment
+implicitly invokes the termination of the old connection.
+
+So, we don't want to wait for the old connection wait_conn to completely
+terminate before we accept the new connection and post a login response.
+
+The solution is to deffer the comp_wait completion and the conn_put to
+a work so wait_conn will effectively be non-blocking (flush errors are
+assumed to come very fast).
+
+We allocate isert_release_wq with WQ_UNBOUND and WQ_UNBOUND_MAX_ACTIVE
+to spread the concurrency of release works.
+
+Reported-by: Slava Shwartsman <valyushash@gmail.com>
+Signed-off-by: Sagi Grimberg <sagig@mellanox.com>
+Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/infiniband/ulp/isert/ib_isert.c |   45 ++++++++++++++++++++++++--------
+ drivers/infiniband/ulp/isert/ib_isert.h |    1 
+ 2 files changed, 36 insertions(+), 10 deletions(-)
+
+--- a/drivers/infiniband/ulp/isert/ib_isert.c
++++ b/drivers/infiniband/ulp/isert/ib_isert.c
+@@ -40,6 +40,7 @@ static DEFINE_MUTEX(device_list_mutex);
+ static LIST_HEAD(device_list);
+ static struct workqueue_struct *isert_rx_wq;
+ static struct workqueue_struct *isert_comp_wq;
++static struct workqueue_struct *isert_release_wq;
+ static struct kmem_cache *isert_cmd_cache;
+ 
+ static int
+@@ -2379,6 +2380,24 @@ isert_free_np(struct iscsi_np *np)
+ 	kfree(isert_np);
+ }
+ 
++static void isert_release_work(struct work_struct *work)
++{
++	struct isert_conn *isert_conn = container_of(work,
++						     struct isert_conn,
++						     release_work);
++
++	pr_info("Starting release conn %p\n", isert_conn);
++
++	wait_for_completion(&isert_conn->conn_wait);
++
++	mutex_lock(&isert_conn->conn_mutex);
++	isert_conn->state = ISER_CONN_DOWN;
++	mutex_unlock(&isert_conn->conn_mutex);
++
++	pr_info("Destroying conn %p\n", isert_conn);
++	isert_put_conn(isert_conn);
++}
++
+ static void isert_wait_conn(struct iscsi_conn *conn)
+ {
+ 	struct isert_conn *isert_conn = conn->context;
+@@ -2398,14 +2417,9 @@ static void isert_wait_conn(struct iscsi
+ 	mutex_unlock(&isert_conn->conn_mutex);
+ 
+ 	wait_for_completion(&isert_conn->conn_wait_comp_err);
+-	wait_for_completion(&isert_conn->conn_wait);
+-
+-	mutex_lock(&isert_conn->conn_mutex);
+-	isert_conn->state = ISER_CONN_DOWN;
+-	mutex_unlock(&isert_conn->conn_mutex);
+ 
+-	pr_info("Destroying conn %p\n", isert_conn);
+-	isert_put_conn(isert_conn);
++	INIT_WORK(&isert_conn->release_work, isert_release_work);
++	queue_work(isert_release_wq, &isert_conn->release_work);
+ }
+ 
+ static void isert_free_conn(struct iscsi_conn *conn)
+@@ -2451,20 +2465,30 @@ static int __init isert_init(void)
+ 		goto destroy_rx_wq;
+ 	}
+ 
++	isert_release_wq = alloc_workqueue("isert_release_wq", WQ_UNBOUND,
++					WQ_UNBOUND_MAX_ACTIVE);
++	if (!isert_release_wq) {
++		pr_err("Unable to allocate isert_release_wq\n");
++		ret = -ENOMEM;
++		goto destroy_comp_wq;
++	}
++
+ 	isert_cmd_cache = kmem_cache_create("isert_cmd_cache",
+ 			sizeof(struct isert_cmd), __alignof__(struct isert_cmd),
+ 			0, NULL);
+ 	if (!isert_cmd_cache) {
+ 		pr_err("Unable to create isert_cmd_cache\n");
+ 		ret = -ENOMEM;
+-		goto destroy_tx_cq;
++		goto destroy_release_wq;
+ 	}
+ 
+ 	iscsit_register_transport(&iser_target_transport);
+-	pr_debug("iSER_TARGET[0] - Loaded iser_target_transport\n");
++	pr_info("iSER_TARGET[0] - Loaded iser_target_transport\n");
+ 	return 0;
+ 
+-destroy_tx_cq:
++destroy_release_wq:
++	destroy_workqueue(isert_release_wq);
++destroy_comp_wq:
+ 	destroy_workqueue(isert_comp_wq);
+ destroy_rx_wq:
+ 	destroy_workqueue(isert_rx_wq);
+@@ -2475,6 +2499,7 @@ static void __exit isert_exit(void)
+ {
+ 	flush_scheduled_work();
+ 	kmem_cache_destroy(isert_cmd_cache);
++	destroy_workqueue(isert_release_wq);
+ 	destroy_workqueue(isert_comp_wq);
+ 	destroy_workqueue(isert_rx_wq);
+ 	iscsit_unregister_transport(&iser_target_transport);
+--- a/drivers/infiniband/ulp/isert/ib_isert.h
++++ b/drivers/infiniband/ulp/isert/ib_isert.h
+@@ -107,6 +107,7 @@ struct isert_conn {
+ 	struct completion	conn_wait;
+ 	struct completion	conn_wait_comp_err;
+ 	struct kref		conn_kref;
++	struct work_struct	release_work;
+ };
+ 
+ #define ISERT_MAX_CQ 64
