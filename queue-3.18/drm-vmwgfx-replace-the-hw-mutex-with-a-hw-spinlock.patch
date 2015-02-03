@@ -1,0 +1,523 @@
+From 496eb6fd2c3fd13f4b914e537598e5c86ce4f52a Mon Sep 17 00:00:00 2001
+From: Thomas Hellstrom <thellstrom@vmware.com>
+Date: Wed, 14 Jan 2015 02:33:39 -0800
+Subject: drm/vmwgfx: Replace the hw mutex with a hw spinlock
+
+From: Thomas Hellstrom <thellstrom@vmware.com>
+
+commit 496eb6fd2c3fd13f4b914e537598e5c86ce4f52a upstream.
+
+Fixes a case where we call vmw_fifo_idle() from within a wait function with
+task state !TASK_RUNNING, which is illegal.
+
+In addition, make the locking fine-grained, so that it is performed once
+for every read- and write operation. This is of course more costly, but we
+don't perform much register access in the timing critical paths anyway. Instead
+we have the extra benefit of being sure that we don't forget the hw lock around
+register accesses. I think currently the kms code was quite buggy w r t this.
+
+This fixes Red Hat Bugzilla Bug 1180796
+
+Signed-off-by: Thomas Hellstrom <thellstrom@vmware.com>
+Reviewed-by: Jakob Bornecrantz <jakob@vmware.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/gpu/drm/vmwgfx/vmwgfx_drv.c   |   28 ++++----------------------
+ drivers/gpu/drm/vmwgfx/vmwgfx_drv.h   |   25 +++++++++++++++++++----
+ drivers/gpu/drm/vmwgfx/vmwgfx_fence.c |   18 +----------------
+ drivers/gpu/drm/vmwgfx/vmwgfx_fifo.c  |   36 ++++++++++++++--------------------
+ drivers/gpu/drm/vmwgfx/vmwgfx_ioctl.c |    8 +++----
+ drivers/gpu/drm/vmwgfx/vmwgfx_irq.c   |   25 ++++++++---------------
+ drivers/gpu/drm/vmwgfx/vmwgfx_kms.c   |    2 -
+ 7 files changed, 56 insertions(+), 86 deletions(-)
+
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
+@@ -406,11 +406,9 @@ int vmw_3d_resource_inc(struct vmw_priva
+ 		if (unlikely(ret != 0))
+ 			--dev_priv->num_3d_resources;
+ 	} else if (unhide_svga) {
+-		mutex_lock(&dev_priv->hw_mutex);
+ 		vmw_write(dev_priv, SVGA_REG_ENABLE,
+ 			  vmw_read(dev_priv, SVGA_REG_ENABLE) &
+ 			  ~SVGA_REG_ENABLE_HIDE);
+-		mutex_unlock(&dev_priv->hw_mutex);
+ 	}
+ 
+ 	mutex_unlock(&dev_priv->release_mutex);
+@@ -433,13 +431,10 @@ void vmw_3d_resource_dec(struct vmw_priv
+ 	mutex_lock(&dev_priv->release_mutex);
+ 	if (unlikely(--dev_priv->num_3d_resources == 0))
+ 		vmw_release_device(dev_priv);
+-	else if (hide_svga) {
+-		mutex_lock(&dev_priv->hw_mutex);
++	else if (hide_svga)
+ 		vmw_write(dev_priv, SVGA_REG_ENABLE,
+ 			  vmw_read(dev_priv, SVGA_REG_ENABLE) |
+ 			  SVGA_REG_ENABLE_HIDE);
+-		mutex_unlock(&dev_priv->hw_mutex);
+-	}
+ 
+ 	n3d = (int32_t) dev_priv->num_3d_resources;
+ 	mutex_unlock(&dev_priv->release_mutex);
+@@ -600,12 +595,14 @@ static int vmw_driver_load(struct drm_de
+ 	dev_priv->dev = dev;
+ 	dev_priv->vmw_chipset = chipset;
+ 	dev_priv->last_read_seqno = (uint32_t) -100;
+-	mutex_init(&dev_priv->hw_mutex);
+ 	mutex_init(&dev_priv->cmdbuf_mutex);
+ 	mutex_init(&dev_priv->release_mutex);
+ 	mutex_init(&dev_priv->binding_mutex);
+ 	rwlock_init(&dev_priv->resource_lock);
+ 	ttm_lock_init(&dev_priv->reservation_sem);
++	spin_lock_init(&dev_priv->hw_lock);
++	spin_lock_init(&dev_priv->waiter_lock);
++	spin_lock_init(&dev_priv->cap_lock);
+ 
+ 	for (i = vmw_res_context; i < vmw_res_max; ++i) {
+ 		idr_init(&dev_priv->res_idr[i]);
+@@ -626,14 +623,11 @@ static int vmw_driver_load(struct drm_de
+ 
+ 	dev_priv->enable_fb = enable_fbdev;
+ 
+-	mutex_lock(&dev_priv->hw_mutex);
+-
+ 	vmw_write(dev_priv, SVGA_REG_ID, SVGA_ID_2);
+ 	svga_id = vmw_read(dev_priv, SVGA_REG_ID);
+ 	if (svga_id != SVGA_ID_2) {
+ 		ret = -ENOSYS;
+ 		DRM_ERROR("Unsupported SVGA ID 0x%x\n", svga_id);
+-		mutex_unlock(&dev_priv->hw_mutex);
+ 		goto out_err0;
+ 	}
+ 
+@@ -683,10 +677,8 @@ static int vmw_driver_load(struct drm_de
+ 		dev_priv->prim_bb_mem = dev_priv->vram_size;
+ 
+ 	ret = vmw_dma_masks(dev_priv);
+-	if (unlikely(ret != 0)) {
+-		mutex_unlock(&dev_priv->hw_mutex);
++	if (unlikely(ret != 0))
+ 		goto out_err0;
+-	}
+ 
+ 	/*
+ 	 * Limit back buffer size to VRAM size.  Remove this once
+@@ -695,8 +687,6 @@ static int vmw_driver_load(struct drm_de
+ 	if (dev_priv->prim_bb_mem > dev_priv->vram_size)
+ 		dev_priv->prim_bb_mem = dev_priv->vram_size;
+ 
+-	mutex_unlock(&dev_priv->hw_mutex);
+-
+ 	vmw_print_capabilities(dev_priv->capabilities);
+ 
+ 	if (dev_priv->capabilities & SVGA_CAP_GMR2) {
+@@ -1161,9 +1151,7 @@ static int vmw_master_set(struct drm_dev
+ 		if (unlikely(ret != 0))
+ 			return ret;
+ 		vmw_kms_save_vga(dev_priv);
+-		mutex_lock(&dev_priv->hw_mutex);
+ 		vmw_write(dev_priv, SVGA_REG_TRACES, 0);
+-		mutex_unlock(&dev_priv->hw_mutex);
+ 	}
+ 
+ 	if (active) {
+@@ -1197,9 +1185,7 @@ out_no_active_lock:
+ 	if (!dev_priv->enable_fb) {
+ 		vmw_kms_restore_vga(dev_priv);
+ 		vmw_3d_resource_dec(dev_priv, true);
+-		mutex_lock(&dev_priv->hw_mutex);
+ 		vmw_write(dev_priv, SVGA_REG_TRACES, 1);
+-		mutex_unlock(&dev_priv->hw_mutex);
+ 	}
+ 	return ret;
+ }
+@@ -1234,9 +1220,7 @@ static void vmw_master_drop(struct drm_d
+ 			DRM_ERROR("Unable to clean VRAM on master drop.\n");
+ 		vmw_kms_restore_vga(dev_priv);
+ 		vmw_3d_resource_dec(dev_priv, true);
+-		mutex_lock(&dev_priv->hw_mutex);
+ 		vmw_write(dev_priv, SVGA_REG_TRACES, 1);
+-		mutex_unlock(&dev_priv->hw_mutex);
+ 	}
+ 
+ 	dev_priv->active_master = &dev_priv->fbdev_master;
+@@ -1368,10 +1352,8 @@ static void vmw_pm_complete(struct devic
+ 	struct drm_device *dev = pci_get_drvdata(pdev);
+ 	struct vmw_private *dev_priv = vmw_priv(dev);
+ 
+-	mutex_lock(&dev_priv->hw_mutex);
+ 	vmw_write(dev_priv, SVGA_REG_ID, SVGA_ID_2);
+ 	(void) vmw_read(dev_priv, SVGA_REG_ID);
+-	mutex_unlock(&dev_priv->hw_mutex);
+ 
+ 	/**
+ 	 * Reclaim 3d reference held by fbdev and potentially
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h
+@@ -399,7 +399,8 @@ struct vmw_private {
+ 	uint32_t memory_size;
+ 	bool has_gmr;
+ 	bool has_mob;
+-	struct mutex hw_mutex;
++	spinlock_t hw_lock;
++	spinlock_t cap_lock;
+ 
+ 	/*
+ 	 * VGA registers.
+@@ -449,8 +450,9 @@ struct vmw_private {
+ 	atomic_t marker_seq;
+ 	wait_queue_head_t fence_queue;
+ 	wait_queue_head_t fifo_queue;
+-	int fence_queue_waiters; /* Protected by hw_mutex */
+-	int goal_queue_waiters; /* Protected by hw_mutex */
++	spinlock_t waiter_lock;
++	int fence_queue_waiters; /* Protected by waiter_lock */
++	int goal_queue_waiters; /* Protected by waiter_lock */
+ 	atomic_t fifo_queue_waiters;
+ 	uint32_t last_read_seqno;
+ 	spinlock_t irq_lock;
+@@ -553,20 +555,35 @@ static inline struct vmw_master *vmw_mas
+ 	return (struct vmw_master *) master->driver_priv;
+ }
+ 
++/*
++ * The locking here is fine-grained, so that it is performed once
++ * for every read- and write operation. This is of course costly, but we
++ * don't perform much register access in the timing critical paths anyway.
++ * Instead we have the extra benefit of being sure that we don't forget
++ * the hw lock around register accesses.
++ */
+ static inline void vmw_write(struct vmw_private *dev_priv,
+ 			     unsigned int offset, uint32_t value)
+ {
++	unsigned long irq_flags;
++
++	spin_lock_irqsave(&dev_priv->hw_lock, irq_flags);
+ 	outl(offset, dev_priv->io_start + VMWGFX_INDEX_PORT);
+ 	outl(value, dev_priv->io_start + VMWGFX_VALUE_PORT);
++	spin_unlock_irqrestore(&dev_priv->hw_lock, irq_flags);
+ }
+ 
+ static inline uint32_t vmw_read(struct vmw_private *dev_priv,
+ 				unsigned int offset)
+ {
+-	uint32_t val;
++	unsigned long irq_flags;
++	u32 val;
+ 
++	spin_lock_irqsave(&dev_priv->hw_lock, irq_flags);
+ 	outl(offset, dev_priv->io_start + VMWGFX_INDEX_PORT);
+ 	val = inl(dev_priv->io_start + VMWGFX_VALUE_PORT);
++	spin_unlock_irqrestore(&dev_priv->hw_lock, irq_flags);
++
+ 	return val;
+ }
+ 
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_fence.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_fence.c
+@@ -35,7 +35,7 @@ struct vmw_fence_manager {
+ 	struct vmw_private *dev_priv;
+ 	spinlock_t lock;
+ 	struct list_head fence_list;
+-	struct work_struct work, ping_work;
++	struct work_struct work;
+ 	u32 user_fence_size;
+ 	u32 fence_size;
+ 	u32 event_fence_action_size;
+@@ -134,14 +134,6 @@ static const char *vmw_fence_get_timelin
+ 	return "svga";
+ }
+ 
+-static void vmw_fence_ping_func(struct work_struct *work)
+-{
+-	struct vmw_fence_manager *fman =
+-		container_of(work, struct vmw_fence_manager, ping_work);
+-
+-	vmw_fifo_ping_host(fman->dev_priv, SVGA_SYNC_GENERIC);
+-}
+-
+ static bool vmw_fence_enable_signaling(struct fence *f)
+ {
+ 	struct vmw_fence_obj *fence =
+@@ -155,11 +147,7 @@ static bool vmw_fence_enable_signaling(s
+ 	if (seqno - fence->base.seqno < VMW_FENCE_WRAP)
+ 		return false;
+ 
+-	if (mutex_trylock(&dev_priv->hw_mutex)) {
+-		vmw_fifo_ping_host_locked(dev_priv, SVGA_SYNC_GENERIC);
+-		mutex_unlock(&dev_priv->hw_mutex);
+-	} else
+-		schedule_work(&fman->ping_work);
++	vmw_fifo_ping_host(dev_priv, SVGA_SYNC_GENERIC);
+ 
+ 	return true;
+ }
+@@ -305,7 +293,6 @@ struct vmw_fence_manager *vmw_fence_mana
+ 	INIT_LIST_HEAD(&fman->fence_list);
+ 	INIT_LIST_HEAD(&fman->cleanup_list);
+ 	INIT_WORK(&fman->work, &vmw_fence_work_func);
+-	INIT_WORK(&fman->ping_work, &vmw_fence_ping_func);
+ 	fman->fifo_down = true;
+ 	fman->user_fence_size = ttm_round_pot(sizeof(struct vmw_user_fence));
+ 	fman->fence_size = ttm_round_pot(sizeof(struct vmw_fence_obj));
+@@ -323,7 +310,6 @@ void vmw_fence_manager_takedown(struct v
+ 	bool lists_empty;
+ 
+ 	(void) cancel_work_sync(&fman->work);
+-	(void) cancel_work_sync(&fman->ping_work);
+ 
+ 	spin_lock_irqsave(&fman->lock, irq_flags);
+ 	lists_empty = list_empty(&fman->fence_list) &&
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_fifo.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_fifo.c
+@@ -44,10 +44,10 @@ bool vmw_fifo_have_3d(struct vmw_private
+ 		if (!dev_priv->has_mob)
+ 			return false;
+ 
+-		mutex_lock(&dev_priv->hw_mutex);
++		spin_lock(&dev_priv->cap_lock);
+ 		vmw_write(dev_priv, SVGA_REG_DEV_CAP, SVGA3D_DEVCAP_3D);
+ 		result = vmw_read(dev_priv, SVGA_REG_DEV_CAP);
+-		mutex_unlock(&dev_priv->hw_mutex);
++		spin_unlock(&dev_priv->cap_lock);
+ 
+ 		return (result != 0);
+ 	}
+@@ -120,7 +120,6 @@ int vmw_fifo_init(struct vmw_private *de
+ 	DRM_INFO("height %d\n", vmw_read(dev_priv, SVGA_REG_HEIGHT));
+ 	DRM_INFO("bpp %d\n", vmw_read(dev_priv, SVGA_REG_BITS_PER_PIXEL));
+ 
+-	mutex_lock(&dev_priv->hw_mutex);
+ 	dev_priv->enable_state = vmw_read(dev_priv, SVGA_REG_ENABLE);
+ 	dev_priv->config_done_state = vmw_read(dev_priv, SVGA_REG_CONFIG_DONE);
+ 	dev_priv->traces_state = vmw_read(dev_priv, SVGA_REG_TRACES);
+@@ -143,7 +142,6 @@ int vmw_fifo_init(struct vmw_private *de
+ 	mb();
+ 
+ 	vmw_write(dev_priv, SVGA_REG_CONFIG_DONE, 1);
+-	mutex_unlock(&dev_priv->hw_mutex);
+ 
+ 	max = ioread32(fifo_mem + SVGA_FIFO_MAX);
+ 	min = ioread32(fifo_mem  + SVGA_FIFO_MIN);
+@@ -160,31 +158,28 @@ int vmw_fifo_init(struct vmw_private *de
+ 	return vmw_fifo_send_fence(dev_priv, &dummy);
+ }
+ 
+-void vmw_fifo_ping_host_locked(struct vmw_private *dev_priv, uint32_t reason)
++void vmw_fifo_ping_host(struct vmw_private *dev_priv, uint32_t reason)
+ {
+ 	__le32 __iomem *fifo_mem = dev_priv->mmio_virt;
++	static DEFINE_SPINLOCK(ping_lock);
++	unsigned long irq_flags;
+ 
++	/*
++	 * The ping_lock is needed because we don't have an atomic
++	 * test-and-set of the SVGA_FIFO_BUSY register.
++	 */
++	spin_lock_irqsave(&ping_lock, irq_flags);
+ 	if (unlikely(ioread32(fifo_mem + SVGA_FIFO_BUSY) == 0)) {
+ 		iowrite32(1, fifo_mem + SVGA_FIFO_BUSY);
+ 		vmw_write(dev_priv, SVGA_REG_SYNC, reason);
+ 	}
+-}
+-
+-void vmw_fifo_ping_host(struct vmw_private *dev_priv, uint32_t reason)
+-{
+-	mutex_lock(&dev_priv->hw_mutex);
+-
+-	vmw_fifo_ping_host_locked(dev_priv, reason);
+-
+-	mutex_unlock(&dev_priv->hw_mutex);
++	spin_unlock_irqrestore(&ping_lock, irq_flags);
+ }
+ 
+ void vmw_fifo_release(struct vmw_private *dev_priv, struct vmw_fifo_state *fifo)
+ {
+ 	__le32 __iomem *fifo_mem = dev_priv->mmio_virt;
+ 
+-	mutex_lock(&dev_priv->hw_mutex);
+-
+ 	vmw_write(dev_priv, SVGA_REG_SYNC, SVGA_SYNC_GENERIC);
+ 	while (vmw_read(dev_priv, SVGA_REG_BUSY) != 0)
+ 		;
+@@ -198,7 +193,6 @@ void vmw_fifo_release(struct vmw_private
+ 	vmw_write(dev_priv, SVGA_REG_TRACES,
+ 		  dev_priv->traces_state);
+ 
+-	mutex_unlock(&dev_priv->hw_mutex);
+ 	vmw_marker_queue_takedown(&fifo->marker_queue);
+ 
+ 	if (likely(fifo->static_buffer != NULL)) {
+@@ -271,7 +265,7 @@ static int vmw_fifo_wait(struct vmw_priv
+ 		return vmw_fifo_wait_noirq(dev_priv, bytes,
+ 					   interruptible, timeout);
+ 
+-	mutex_lock(&dev_priv->hw_mutex);
++	spin_lock(&dev_priv->waiter_lock);
+ 	if (atomic_add_return(1, &dev_priv->fifo_queue_waiters) > 0) {
+ 		spin_lock_irqsave(&dev_priv->irq_lock, irq_flags);
+ 		outl(SVGA_IRQFLAG_FIFO_PROGRESS,
+@@ -280,7 +274,7 @@ static int vmw_fifo_wait(struct vmw_priv
+ 		vmw_write(dev_priv, SVGA_REG_IRQMASK, dev_priv->irq_mask);
+ 		spin_unlock_irqrestore(&dev_priv->irq_lock, irq_flags);
+ 	}
+-	mutex_unlock(&dev_priv->hw_mutex);
++	spin_unlock(&dev_priv->waiter_lock);
+ 
+ 	if (interruptible)
+ 		ret = wait_event_interruptible_timeout
+@@ -296,14 +290,14 @@ static int vmw_fifo_wait(struct vmw_priv
+ 	else if (likely(ret > 0))
+ 		ret = 0;
+ 
+-	mutex_lock(&dev_priv->hw_mutex);
++	spin_lock(&dev_priv->waiter_lock);
+ 	if (atomic_dec_and_test(&dev_priv->fifo_queue_waiters)) {
+ 		spin_lock_irqsave(&dev_priv->irq_lock, irq_flags);
+ 		dev_priv->irq_mask &= ~SVGA_IRQFLAG_FIFO_PROGRESS;
+ 		vmw_write(dev_priv, SVGA_REG_IRQMASK, dev_priv->irq_mask);
+ 		spin_unlock_irqrestore(&dev_priv->irq_lock, irq_flags);
+ 	}
+-	mutex_unlock(&dev_priv->hw_mutex);
++	spin_unlock(&dev_priv->waiter_lock);
+ 
+ 	return ret;
+ }
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_ioctl.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_ioctl.c
+@@ -135,13 +135,13 @@ static int vmw_fill_compat_cap(struct vm
+ 		(pair_offset + max_size * sizeof(SVGA3dCapPair)) / sizeof(u32);
+ 	compat_cap->header.type = SVGA3DCAPS_RECORD_DEVCAPS;
+ 
+-	mutex_lock(&dev_priv->hw_mutex);
++	spin_lock(&dev_priv->cap_lock);
+ 	for (i = 0; i < max_size; ++i) {
+ 		vmw_write(dev_priv, SVGA_REG_DEV_CAP, i);
+ 		compat_cap->pairs[i][0] = i;
+ 		compat_cap->pairs[i][1] = vmw_read(dev_priv, SVGA_REG_DEV_CAP);
+ 	}
+-	mutex_unlock(&dev_priv->hw_mutex);
++	spin_unlock(&dev_priv->cap_lock);
+ 
+ 	return 0;
+ }
+@@ -191,12 +191,12 @@ int vmw_get_cap_3d_ioctl(struct drm_devi
+ 		if (num > SVGA3D_DEVCAP_MAX)
+ 			num = SVGA3D_DEVCAP_MAX;
+ 
+-		mutex_lock(&dev_priv->hw_mutex);
++		spin_lock(&dev_priv->cap_lock);
+ 		for (i = 0; i < num; ++i) {
+ 			vmw_write(dev_priv, SVGA_REG_DEV_CAP, i);
+ 			*bounce32++ = vmw_read(dev_priv, SVGA_REG_DEV_CAP);
+ 		}
+-		mutex_unlock(&dev_priv->hw_mutex);
++		spin_unlock(&dev_priv->cap_lock);
+ 	} else if (gb_objects) {
+ 		ret = vmw_fill_compat_cap(dev_priv, bounce, size);
+ 		if (unlikely(ret != 0))
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_irq.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_irq.c
+@@ -62,13 +62,8 @@ irqreturn_t vmw_irq_handler(int irq, voi
+ 
+ static bool vmw_fifo_idle(struct vmw_private *dev_priv, uint32_t seqno)
+ {
+-	uint32_t busy;
+ 
+-	mutex_lock(&dev_priv->hw_mutex);
+-	busy = vmw_read(dev_priv, SVGA_REG_BUSY);
+-	mutex_unlock(&dev_priv->hw_mutex);
+-
+-	return (busy == 0);
++	return (vmw_read(dev_priv, SVGA_REG_BUSY) == 0);
+ }
+ 
+ void vmw_update_seqno(struct vmw_private *dev_priv,
+@@ -184,7 +179,7 @@ int vmw_fallback_wait(struct vmw_private
+ 
+ void vmw_seqno_waiter_add(struct vmw_private *dev_priv)
+ {
+-	mutex_lock(&dev_priv->hw_mutex);
++	spin_lock(&dev_priv->waiter_lock);
+ 	if (dev_priv->fence_queue_waiters++ == 0) {
+ 		unsigned long irq_flags;
+ 
+@@ -195,12 +190,12 @@ void vmw_seqno_waiter_add(struct vmw_pri
+ 		vmw_write(dev_priv, SVGA_REG_IRQMASK, dev_priv->irq_mask);
+ 		spin_unlock_irqrestore(&dev_priv->irq_lock, irq_flags);
+ 	}
+-	mutex_unlock(&dev_priv->hw_mutex);
++	spin_unlock(&dev_priv->waiter_lock);
+ }
+ 
+ void vmw_seqno_waiter_remove(struct vmw_private *dev_priv)
+ {
+-	mutex_lock(&dev_priv->hw_mutex);
++	spin_lock(&dev_priv->waiter_lock);
+ 	if (--dev_priv->fence_queue_waiters == 0) {
+ 		unsigned long irq_flags;
+ 
+@@ -209,13 +204,13 @@ void vmw_seqno_waiter_remove(struct vmw_
+ 		vmw_write(dev_priv, SVGA_REG_IRQMASK, dev_priv->irq_mask);
+ 		spin_unlock_irqrestore(&dev_priv->irq_lock, irq_flags);
+ 	}
+-	mutex_unlock(&dev_priv->hw_mutex);
++	spin_unlock(&dev_priv->waiter_lock);
+ }
+ 
+ 
+ void vmw_goal_waiter_add(struct vmw_private *dev_priv)
+ {
+-	mutex_lock(&dev_priv->hw_mutex);
++	spin_lock(&dev_priv->waiter_lock);
+ 	if (dev_priv->goal_queue_waiters++ == 0) {
+ 		unsigned long irq_flags;
+ 
+@@ -226,12 +221,12 @@ void vmw_goal_waiter_add(struct vmw_priv
+ 		vmw_write(dev_priv, SVGA_REG_IRQMASK, dev_priv->irq_mask);
+ 		spin_unlock_irqrestore(&dev_priv->irq_lock, irq_flags);
+ 	}
+-	mutex_unlock(&dev_priv->hw_mutex);
++	spin_unlock(&dev_priv->waiter_lock);
+ }
+ 
+ void vmw_goal_waiter_remove(struct vmw_private *dev_priv)
+ {
+-	mutex_lock(&dev_priv->hw_mutex);
++	spin_lock(&dev_priv->waiter_lock);
+ 	if (--dev_priv->goal_queue_waiters == 0) {
+ 		unsigned long irq_flags;
+ 
+@@ -240,7 +235,7 @@ void vmw_goal_waiter_remove(struct vmw_p
+ 		vmw_write(dev_priv, SVGA_REG_IRQMASK, dev_priv->irq_mask);
+ 		spin_unlock_irqrestore(&dev_priv->irq_lock, irq_flags);
+ 	}
+-	mutex_unlock(&dev_priv->hw_mutex);
++	spin_unlock(&dev_priv->waiter_lock);
+ }
+ 
+ int vmw_wait_seqno(struct vmw_private *dev_priv,
+@@ -315,9 +310,7 @@ void vmw_irq_uninstall(struct drm_device
+ 	if (!(dev_priv->capabilities & SVGA_CAP_IRQMASK))
+ 		return;
+ 
+-	mutex_lock(&dev_priv->hw_mutex);
+ 	vmw_write(dev_priv, SVGA_REG_IRQMASK, 0);
+-	mutex_unlock(&dev_priv->hw_mutex);
+ 
+ 	status = inl(dev_priv->io_start + VMWGFX_IRQSTATUS_PORT);
+ 	outl(status, dev_priv->io_start + VMWGFX_IRQSTATUS_PORT);
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
+@@ -1828,9 +1828,7 @@ vmw_du_connector_detect(struct drm_conne
+ 	struct vmw_private *dev_priv = vmw_priv(dev);
+ 	struct vmw_display_unit *du = vmw_connector_to_du(connector);
+ 
+-	mutex_lock(&dev_priv->hw_mutex);
+ 	num_displays = vmw_read(dev_priv, SVGA_REG_NUM_DISPLAYS);
+-	mutex_unlock(&dev_priv->hw_mutex);
+ 
+ 	return ((vmw_connector_to_du(connector)->unit < num_displays &&
+ 		 du->pref_active) ?
