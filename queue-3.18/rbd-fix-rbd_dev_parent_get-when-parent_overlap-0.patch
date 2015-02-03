@@ -1,0 +1,94 @@
+From ae43e9d05eb4bd324155292f889fbd001c4faea8 Mon Sep 17 00:00:00 2001
+From: Ilya Dryomov <idryomov@redhat.com>
+Date: Mon, 19 Jan 2015 18:13:43 +0300
+Subject: rbd: fix rbd_dev_parent_get() when parent_overlap == 0
+
+From: Ilya Dryomov <idryomov@redhat.com>
+
+commit ae43e9d05eb4bd324155292f889fbd001c4faea8 upstream.
+
+The comment for rbd_dev_parent_get() said
+
+    * We must get the reference before checking for the overlap to
+    * coordinate properly with zeroing the parent overlap in
+    * rbd_dev_v2_parent_info() when an image gets flattened.  We
+    * drop it again if there is no overlap.
+
+but the "drop it again if there is no overlap" part was missing from
+the implementation.  This lead to absurd parent_ref values for images
+with parent_overlap == 0, as parent_ref was incremented for each
+img_request and virtually never decremented.
+
+Fix this by leveraging the fact that refresh path calls
+rbd_dev_v2_parent_info() under header_rwsem and use it for read in
+rbd_dev_parent_get(), instead of messing around with atomics.  Get rid
+of barriers in rbd_dev_v2_parent_info() while at it - I don't see what
+they'd pair with now and I suspect we are in a pretty miserable
+situation as far as proper locking goes regardless.
+
+Signed-off-by: Ilya Dryomov <idryomov@redhat.com>
+Reviewed-by: Josh Durgin <jdurgin@redhat.com>
+Reviewed-by: Alex Elder <elder@linaro.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/block/rbd.c |   20 ++++++--------------
+ 1 file changed, 6 insertions(+), 14 deletions(-)
+
+--- a/drivers/block/rbd.c
++++ b/drivers/block/rbd.c
+@@ -2098,32 +2098,26 @@ static void rbd_dev_parent_put(struct rb
+  * If an image has a non-zero parent overlap, get a reference to its
+  * parent.
+  *
+- * We must get the reference before checking for the overlap to
+- * coordinate properly with zeroing the parent overlap in
+- * rbd_dev_v2_parent_info() when an image gets flattened.  We
+- * drop it again if there is no overlap.
+- *
+  * Returns true if the rbd device has a parent with a non-zero
+  * overlap and a reference for it was successfully taken, or
+  * false otherwise.
+  */
+ static bool rbd_dev_parent_get(struct rbd_device *rbd_dev)
+ {
+-	int counter;
++	int counter = 0;
+ 
+ 	if (!rbd_dev->parent_spec)
+ 		return false;
+ 
+-	counter = atomic_inc_return_safe(&rbd_dev->parent_ref);
+-	if (counter > 0 && rbd_dev->parent_overlap)
+-		return true;
+-
+-	/* Image was flattened, but parent is not yet torn down */
++	down_read(&rbd_dev->header_rwsem);
++	if (rbd_dev->parent_overlap)
++		counter = atomic_inc_return_safe(&rbd_dev->parent_ref);
++	up_read(&rbd_dev->header_rwsem);
+ 
+ 	if (counter < 0)
+ 		rbd_warn(rbd_dev, "parent reference overflow");
+ 
+-	return false;
++	return counter > 0;
+ }
+ 
+ /*
+@@ -4236,7 +4230,6 @@ static int rbd_dev_v2_parent_info(struct
+ 		 */
+ 		if (rbd_dev->parent_overlap) {
+ 			rbd_dev->parent_overlap = 0;
+-			smp_mb();
+ 			rbd_dev_parent_put(rbd_dev);
+ 			pr_info("%s: clone image has been flattened\n",
+ 				rbd_dev->disk->disk_name);
+@@ -4282,7 +4275,6 @@ static int rbd_dev_v2_parent_info(struct
+ 	 * treat it specially.
+ 	 */
+ 	rbd_dev->parent_overlap = overlap;
+-	smp_mb();
+ 	if (!overlap) {
+ 
+ 		/* A null parent_spec indicates it's the initial probe */

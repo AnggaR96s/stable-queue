@@ -1,0 +1,148 @@
+From 34e81ad5f0b60007c95995eb7803da7e00c6c611 Mon Sep 17 00:00:00 2001
+From: Paul Osmialowski <p.osmialowsk@samsung.com>
+Date: Mon, 19 Jan 2015 17:03:33 +0100
+Subject: i2c: s3c2410: fix ABBA deadlock by keeping clock prepared
+
+From: Paul Osmialowski <p.osmialowsk@samsung.com>
+
+commit 34e81ad5f0b60007c95995eb7803da7e00c6c611 upstream.
+
+This patch solves deadlock between clock prepare mutex and regmap mutex reported
+by Tomasz Figa in [1] by implementing solution from [2]: "always leave the clock
+of the i2c controller in a prepared state".
+
+[1] https://lkml.org/lkml/2014/7/2/171
+[2] https://lkml.org/lkml/2014/7/2/207
+
+On each i2c transfer handled by s3c24xx_i2c_xfer(), clk_prepare_enable() was
+called, which calls clk_prepare() then clk_enable(). clk_prepare() takes
+prepare_lock mutex before proceeding. Note that i2c transfer functions are
+invoked from many places in kernel, typically with some other additional lock
+held.
+
+It may happen that function on CPU1 (e.g. regmap_update_bits()) has taken a
+mutex (i.e. regmap lock mutex) then it attempts i2c communication in order to
+proceed (so it needs to obtain clock related prepare_lock mutex during transfer
+preparation stage due to clk_prepare() call). At the same time other task on
+CPU0 wants to operate on clock (e.g. to (un)prepare clock for some other reason)
+so it has taken prepare_lock mutex.
+
+CPU0:                        CPU1:
+clk_disable_unused()         regulator_disable()
+  clk_prepare_lock()           map->lock(map->lock_arg)
+  regmap_read()                s3c24xx_i2c_xfer()
+    map->lock(map->lock_arg)     clk_prepare_lock()
+
+Implemented solution from [2] leaves i2c clock prepared. Preparation is done in
+s3c24xx_i2c_probe() function. Without this patch, it is immediately unprepared
+by clk_disable_unprepare() call. I've replaced this call with clk_disable() and
+I've added clk_unprepare() call in s3c24xx_i2c_remove().
+
+The s3c24xx_i2c_xfer() function now uses clk_enable() instead of
+clk_prepare_enable() (and clk_disable() instead of clk_unprepare_disable()).
+
+Signed-off-by: Paul Osmialowski <p.osmialowsk@samsung.com>
+Reviewed-by: Krzysztof Kozlowski <k.kozlowski@samsung.com>
+Signed-off-by: Wolfram Sang <wsa@the-dreams.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/i2c/busses/i2c-s3c2410.c |   23 +++++++++++++++++------
+ 1 file changed, 17 insertions(+), 6 deletions(-)
+
+--- a/drivers/i2c/busses/i2c-s3c2410.c
++++ b/drivers/i2c/busses/i2c-s3c2410.c
+@@ -778,14 +778,16 @@ static int s3c24xx_i2c_xfer(struct i2c_a
+ 	int ret;
+ 
+ 	pm_runtime_get_sync(&adap->dev);
+-	clk_prepare_enable(i2c->clk);
++	ret = clk_enable(i2c->clk);
++	if (ret)
++		return ret;
+ 
+ 	for (retry = 0; retry < adap->retries; retry++) {
+ 
+ 		ret = s3c24xx_i2c_doxfer(i2c, msgs, num);
+ 
+ 		if (ret != -EAGAIN) {
+-			clk_disable_unprepare(i2c->clk);
++			clk_disable(i2c->clk);
+ 			pm_runtime_put(&adap->dev);
+ 			return ret;
+ 		}
+@@ -795,7 +797,7 @@ static int s3c24xx_i2c_xfer(struct i2c_a
+ 		udelay(100);
+ 	}
+ 
+-	clk_disable_unprepare(i2c->clk);
++	clk_disable(i2c->clk);
+ 	pm_runtime_put(&adap->dev);
+ 	return -EREMOTEIO;
+ }
+@@ -1174,7 +1176,7 @@ static int s3c24xx_i2c_probe(struct plat
+ 
+ 	clk_prepare_enable(i2c->clk);
+ 	ret = s3c24xx_i2c_init(i2c);
+-	clk_disable_unprepare(i2c->clk);
++	clk_disable(i2c->clk);
+ 	if (ret != 0) {
+ 		dev_err(&pdev->dev, "I2C controller init failed\n");
+ 		return ret;
+@@ -1187,6 +1189,7 @@ static int s3c24xx_i2c_probe(struct plat
+ 		i2c->irq = ret = platform_get_irq(pdev, 0);
+ 		if (ret <= 0) {
+ 			dev_err(&pdev->dev, "cannot find IRQ\n");
++			clk_unprepare(i2c->clk);
+ 			return ret;
+ 		}
+ 
+@@ -1195,6 +1198,7 @@ static int s3c24xx_i2c_probe(struct plat
+ 
+ 		if (ret != 0) {
+ 			dev_err(&pdev->dev, "cannot claim IRQ %d\n", i2c->irq);
++			clk_unprepare(i2c->clk);
+ 			return ret;
+ 		}
+ 	}
+@@ -1202,6 +1206,7 @@ static int s3c24xx_i2c_probe(struct plat
+ 	ret = s3c24xx_i2c_register_cpufreq(i2c);
+ 	if (ret < 0) {
+ 		dev_err(&pdev->dev, "failed to register cpufreq notifier\n");
++		clk_unprepare(i2c->clk);
+ 		return ret;
+ 	}
+ 
+@@ -1218,6 +1223,7 @@ static int s3c24xx_i2c_probe(struct plat
+ 	if (ret < 0) {
+ 		dev_err(&pdev->dev, "failed to add bus to i2c core\n");
+ 		s3c24xx_i2c_deregister_cpufreq(i2c);
++		clk_unprepare(i2c->clk);
+ 		return ret;
+ 	}
+ 
+@@ -1239,6 +1245,8 @@ static int s3c24xx_i2c_remove(struct pla
+ {
+ 	struct s3c24xx_i2c *i2c = platform_get_drvdata(pdev);
+ 
++	clk_unprepare(i2c->clk);
++
+ 	pm_runtime_disable(&i2c->adap.dev);
+ 	pm_runtime_disable(&pdev->dev);
+ 
+@@ -1267,10 +1275,13 @@ static int s3c24xx_i2c_resume_noirq(stru
+ {
+ 	struct platform_device *pdev = to_platform_device(dev);
+ 	struct s3c24xx_i2c *i2c = platform_get_drvdata(pdev);
++	int ret;
+ 
+-	clk_prepare_enable(i2c->clk);
++	ret = clk_enable(i2c->clk);
++	if (ret)
++		return ret;
+ 	s3c24xx_i2c_init(i2c);
+-	clk_disable_unprepare(i2c->clk);
++	clk_disable(i2c->clk);
+ 	i2c->suspended = 0;
+ 
+ 	return 0;
