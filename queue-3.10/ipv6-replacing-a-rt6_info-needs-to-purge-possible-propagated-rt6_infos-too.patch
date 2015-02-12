@@ -1,0 +1,115 @@
+From foo@baz Thu Feb 12 09:26:20 HKT 2015
+From: Hannes Frederic Sowa <hannes@stressinduktion.org>
+Date: Mon, 26 Jan 2015 15:11:17 +0100
+Subject: ipv6: replacing a rt6_info needs to purge possible propagated rt6_infos too
+
+From: Hannes Frederic Sowa <hannes@stressinduktion.org>
+
+[ Upstream commit 6e9e16e6143b725662e47026a1d0f270721cdd24 ]
+
+Lubomir Rintel reported that during replacing a route the interface
+reference counter isn't correctly decremented.
+
+To quote bug <https://bugzilla.kernel.org/show_bug.cgi?id=91941>:
+| [root@rhel7-5 lkundrak]# sh -x lal
+| + ip link add dev0 type dummy
+| + ip link set dev0 up
+| + ip link add dev1 type dummy
+| + ip link set dev1 up
+| + ip addr add 2001:db8:8086::2/64 dev dev0
+| + ip route add 2001:db8:8086::/48 dev dev0 proto static metric 20
+| + ip route add 2001:db8:8088::/48 dev dev1 proto static metric 10
+| + ip route replace 2001:db8:8086::/48 dev dev1 proto static metric 20
+| + ip link del dev0 type dummy
+| Message from syslogd@rhel7-5 at Jan 23 10:54:41 ...
+|  kernel:unregister_netdevice: waiting for dev0 to become free. Usage count = 2
+|
+| Message from syslogd@rhel7-5 at Jan 23 10:54:51 ...
+|  kernel:unregister_netdevice: waiting for dev0 to become free. Usage count = 2
+
+During replacement of a rt6_info we must walk all parent nodes and check
+if the to be replaced rt6_info got propagated. If so, replace it with
+an alive one.
+
+Fixes: 4a287eba2de3957 ("IPv6 routing, NLM_F_* flag support: REPLACE and EXCL flags support, warn about missing CREATE flag")
+Reported-by: Lubomir Rintel <lkundrak@v3.sk>
+Signed-off-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+Tested-by: Lubomir Rintel <lkundrak@v3.sk>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/ipv6/ip6_fib.c |   45 ++++++++++++++++++++++++++-------------------
+ 1 file changed, 26 insertions(+), 19 deletions(-)
+
+--- a/net/ipv6/ip6_fib.c
++++ b/net/ipv6/ip6_fib.c
+@@ -638,6 +638,29 @@ static inline bool rt6_qualify_for_ecmp(
+ 	       RTF_GATEWAY;
+ }
+ 
++static void fib6_purge_rt(struct rt6_info *rt, struct fib6_node *fn,
++			  struct net *net)
++{
++	if (atomic_read(&rt->rt6i_ref) != 1) {
++		/* This route is used as dummy address holder in some split
++		 * nodes. It is not leaked, but it still holds other resources,
++		 * which must be released in time. So, scan ascendant nodes
++		 * and replace dummy references to this route with references
++		 * to still alive ones.
++		 */
++		while (fn) {
++			if (!(fn->fn_flags & RTN_RTINFO) && fn->leaf == rt) {
++				fn->leaf = fib6_find_prefix(net, fn);
++				atomic_inc(&fn->leaf->rt6i_ref);
++				rt6_release(rt);
++			}
++			fn = fn->parent;
++		}
++		/* No more references are possible at this point. */
++		BUG_ON(atomic_read(&rt->rt6i_ref) != 1);
++	}
++}
++
+ /*
+  *	Insert routing information in a node.
+  */
+@@ -775,11 +798,12 @@ add:
+ 		rt->dst.rt6_next = iter->dst.rt6_next;
+ 		atomic_inc(&rt->rt6i_ref);
+ 		inet6_rt_notify(RTM_NEWROUTE, rt, info);
+-		rt6_release(iter);
+ 		if (!(fn->fn_flags & RTN_RTINFO)) {
+ 			info->nl_net->ipv6.rt6_stats->fib_route_nodes++;
+ 			fn->fn_flags |= RTN_RTINFO;
+ 		}
++		fib6_purge_rt(iter, fn, info->nl_net);
++		rt6_release(iter);
+ 	}
+ 
+ 	return 0;
+@@ -1284,24 +1308,7 @@ static void fib6_del_route(struct fib6_n
+ 		fn = fib6_repair_tree(net, fn);
+ 	}
+ 
+-	if (atomic_read(&rt->rt6i_ref) != 1) {
+-		/* This route is used as dummy address holder in some split
+-		 * nodes. It is not leaked, but it still holds other resources,
+-		 * which must be released in time. So, scan ascendant nodes
+-		 * and replace dummy references to this route with references
+-		 * to still alive ones.
+-		 */
+-		while (fn) {
+-			if (!(fn->fn_flags & RTN_RTINFO) && fn->leaf == rt) {
+-				fn->leaf = fib6_find_prefix(net, fn);
+-				atomic_inc(&fn->leaf->rt6i_ref);
+-				rt6_release(rt);
+-			}
+-			fn = fn->parent;
+-		}
+-		/* No more references are possible at this point. */
+-		BUG_ON(atomic_read(&rt->rt6i_ref) != 1);
+-	}
++	fib6_purge_rt(rt, fn, net);
+ 
+ 	inet6_rt_notify(RTM_DELROUTE, rt, info);
+ 	rt6_release(rt);
