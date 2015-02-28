@@ -1,0 +1,128 @@
+From 6ffae8c06fab058d6c3f8ecb7f921327721034e7 Mon Sep 17 00:00:00 2001
+From: Viresh Kumar <viresh.kumar@linaro.org>
+Date: Sat, 31 Jan 2015 06:02:44 +0530
+Subject: cpufreq: Set cpufreq_cpu_data to NULL before putting kobject
+
+From: Viresh Kumar <viresh.kumar@linaro.org>
+
+commit 6ffae8c06fab058d6c3f8ecb7f921327721034e7 upstream.
+
+In __cpufreq_remove_dev_finish(), per-cpu 'cpufreq_cpu_data' needs
+to be cleared before calling kobject_put(&policy->kobj) and under
+cpufreq_driver_lock. Otherwise, if someone else calls cpufreq_cpu_get()
+in parallel with it, they can obtain a non-NULL policy from that after
+kobject_put(&policy->kobj) was executed.
+
+Consider this case:
+
+Thread A				Thread B
+cpufreq_cpu_get()
+  acquire cpufreq_driver_lock
+  read-per-cpu cpufreq_cpu_data
+					kobject_put(&policy->kobj);
+  kobject_get(&policy->kobj);
+					...
+					per_cpu(&cpufreq_cpu_data, cpu) = NULL
+
+And this will result in a warning like this one:
+
+ ------------[ cut here ]------------
+ WARNING: CPU: 0 PID: 4 at include/linux/kref.h:47
+ kobject_get+0x41/0x50()
+ Modules linked in: acpi_cpufreq(+) nfsd auth_rpcgss nfs_acl
+ lockd grace sunrpc xfs libcrc32c sd_mod ixgbe igb mdio ahci hwmon
+ ...
+ Call Trace:
+  [<ffffffff81661b14>] dump_stack+0x46/0x58
+  [<ffffffff81072b61>] warn_slowpath_common+0x81/0xa0
+  [<ffffffff81072c7a>] warn_slowpath_null+0x1a/0x20
+  [<ffffffff812e16d1>] kobject_get+0x41/0x50
+  [<ffffffff815262a5>] cpufreq_cpu_get+0x75/0xc0
+  [<ffffffff81527c3e>] cpufreq_update_policy+0x2e/0x1f0
+  [<ffffffff810b8cb2>] ? up+0x32/0x50
+  [<ffffffff81381aa9>] ? acpi_ns_get_node+0xcb/0xf2
+  [<ffffffff81381efd>] ? acpi_evaluate_object+0x22c/0x252
+  [<ffffffff813824f6>] ? acpi_get_handle+0x95/0xc0
+  [<ffffffff81360967>] ? acpi_has_method+0x25/0x40
+  [<ffffffff81391e08>] acpi_processor_ppc_has_changed+0x77/0x82
+  [<ffffffff81089566>] ? move_linked_works+0x66/0x90
+  [<ffffffff8138e8ed>] acpi_processor_notify+0x58/0xe7
+  [<ffffffff8137410c>] acpi_ev_notify_dispatch+0x44/0x5c
+  [<ffffffff8135f293>] acpi_os_execute_deferred+0x15/0x22
+  [<ffffffff8108c910>] process_one_work+0x160/0x410
+  [<ffffffff8108d05b>] worker_thread+0x11b/0x520
+  [<ffffffff8108cf40>] ? rescuer_thread+0x380/0x380
+  [<ffffffff81092421>] kthread+0xe1/0x100
+  [<ffffffff81092340>] ? kthread_create_on_node+0x1b0/0x1b0
+  [<ffffffff81669ebc>] ret_from_fork+0x7c/0xb0
+  [<ffffffff81092340>] ? kthread_create_on_node+0x1b0/0x1b0
+ ---[ end trace 89e66eb9795efdf7 ]---
+
+The actual code flow is as follows:
+
+ Thread A: Workqueue: kacpi_notify
+
+ acpi_processor_notify()
+   acpi_processor_ppc_has_changed()
+         cpufreq_update_policy()
+           cpufreq_cpu_get()
+             kobject_get()
+
+ Thread B: xenbus_thread()
+
+ xenbus_thread()
+   msg->u.watch.handle->callback()
+     handle_vcpu_hotplug_event()
+       vcpu_hotplug()
+         cpu_down()
+           __cpu_notify(CPU_POST_DEAD..)
+             cpufreq_cpu_callback()
+               __cpufreq_remove_dev_finish()
+                 cpufreq_policy_put_kobj()
+                   kobject_put()
+
+cpufreq_cpu_get() gets the policy from per-cpu variable cpufreq_cpu_data
+under cpufreq_driver_lock, and once it gets a valid policy it expects it
+to not be freed until cpufreq_cpu_put() is called.
+
+But the race happens when another thread puts the kobject first and updates
+cpufreq_cpu_data before or later. And so the first thread gets a valid policy
+structure and before it does kobject_get() on it, the second one has already
+done kobject_put().
+
+Fix this by setting cpufreq_cpu_data to NULL before putting the kobject and that
+too under locks.
+
+Reported-by: Ethan Zhao <ethan.zhao@oracle.com>
+Reported-by: Santosh Shilimkar <santosh.shilimkar@oracle.com>
+Signed-off-by: Viresh Kumar <viresh.kumar@linaro.org>
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/cpufreq/cpufreq.c |    6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@ -1416,9 +1416,10 @@ static int __cpufreq_remove_dev_finish(s
+ 	unsigned long flags;
+ 	struct cpufreq_policy *policy;
+ 
+-	read_lock_irqsave(&cpufreq_driver_lock, flags);
++	write_lock_irqsave(&cpufreq_driver_lock, flags);
+ 	policy = per_cpu(cpufreq_cpu_data, cpu);
+-	read_unlock_irqrestore(&cpufreq_driver_lock, flags);
++	per_cpu(cpufreq_cpu_data, cpu) = NULL;
++	write_unlock_irqrestore(&cpufreq_driver_lock, flags);
+ 
+ 	if (!policy) {
+ 		pr_debug("%s: No cpu_data found\n", __func__);
+@@ -1473,7 +1474,6 @@ static int __cpufreq_remove_dev_finish(s
+ 		}
+ 	}
+ 
+-	per_cpu(cpufreq_cpu_data, cpu) = NULL;
+ 	return 0;
+ }
+ 
