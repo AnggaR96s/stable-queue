@@ -1,0 +1,245 @@
+From 04f81f0154e4bf002be6f4d85668ce1257efa4d9 Mon Sep 17 00:00:00 2001
+From: Paul Moore <pmoore@redhat.com>
+Date: Wed, 11 Feb 2015 14:46:37 -0500
+Subject: cipso: don't use IPCB() to locate the CIPSO IP option
+
+From: Paul Moore <pmoore@redhat.com>
+
+commit 04f81f0154e4bf002be6f4d85668ce1257efa4d9 upstream.
+
+Using the IPCB() macro to get the IPv4 options is convenient, but
+unfortunately NetLabel often needs to examine the CIPSO option outside
+of the scope of the IP layer in the stack.  While historically IPCB()
+worked above the IP layer, due to the inclusion of the inet_skb_param
+struct at the head of the {tcp,udp}_skb_cb structs, recent commit
+971f10ec ("tcp: better TCP_SKB_CB layout to reduce cache line misses")
+reordered the tcp_skb_cb struct and invalidated this IPCB() trick.
+
+This patch fixes the problem by creating a new function,
+cipso_v4_optptr(), which locates the CIPSO option inside the IP header
+without calling IPCB().  Unfortunately, this isn't as fast as a simple
+lookup so some additional tweaks were made to limit the use of this
+new function.
+
+Reported-by: Casey Schaufler <casey@schaufler-ca.com>
+Signed-off-by: Paul Moore <pmoore@redhat.com>
+Tested-by: Casey Schaufler <casey@schaufler-ca.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ include/net/cipso_ipv4.h     |   25 +++++++++++++--------
+ net/ipv4/cipso_ipv4.c        |   51 +++++++++++++++++++++++++------------------
+ net/netlabel/netlabel_kapi.c |   15 ++++++++----
+ 3 files changed, 56 insertions(+), 35 deletions(-)
+
+--- a/include/net/cipso_ipv4.h
++++ b/include/net/cipso_ipv4.h
+@@ -121,13 +121,6 @@ extern int cipso_v4_rbm_strictvalid;
+ #endif
+ 
+ /*
+- * Helper Functions
+- */
+-
+-#define CIPSO_V4_OPTEXIST(x) (IPCB(x)->opt.cipso != 0)
+-#define CIPSO_V4_OPTPTR(x) (skb_network_header(x) + IPCB(x)->opt.cipso)
+-
+-/*
+  * DOI List Functions
+  */
+ 
+@@ -190,7 +183,7 @@ static inline int cipso_v4_doi_domhsh_re
+ 
+ #ifdef CONFIG_NETLABEL
+ void cipso_v4_cache_invalidate(void);
+-int cipso_v4_cache_add(const struct sk_buff *skb,
++int cipso_v4_cache_add(const unsigned char *cipso_ptr,
+ 		       const struct netlbl_lsm_secattr *secattr);
+ #else
+ static inline void cipso_v4_cache_invalidate(void)
+@@ -198,7 +191,7 @@ static inline void cipso_v4_cache_invali
+ 	return;
+ }
+ 
+-static inline int cipso_v4_cache_add(const struct sk_buff *skb,
++static inline int cipso_v4_cache_add(const unsigned char *cipso_ptr,
+ 				     const struct netlbl_lsm_secattr *secattr)
+ {
+ 	return 0;
+@@ -211,6 +204,8 @@ static inline int cipso_v4_cache_add(con
+ 
+ #ifdef CONFIG_NETLABEL
+ void cipso_v4_error(struct sk_buff *skb, int error, u32 gateway);
++int cipso_v4_getattr(const unsigned char *cipso,
++		     struct netlbl_lsm_secattr *secattr);
+ int cipso_v4_sock_setattr(struct sock *sk,
+ 			  const struct cipso_v4_doi *doi_def,
+ 			  const struct netlbl_lsm_secattr *secattr);
+@@ -226,6 +221,7 @@ int cipso_v4_skbuff_setattr(struct sk_bu
+ int cipso_v4_skbuff_delattr(struct sk_buff *skb);
+ int cipso_v4_skbuff_getattr(const struct sk_buff *skb,
+ 			    struct netlbl_lsm_secattr *secattr);
++unsigned char *cipso_v4_optptr(const struct sk_buff *skb);
+ int cipso_v4_validate(const struct sk_buff *skb, unsigned char **option);
+ #else
+ static inline void cipso_v4_error(struct sk_buff *skb,
+@@ -235,6 +231,12 @@ static inline void cipso_v4_error(struct
+ 	return;
+ }
+ 
++static inline int cipso_v4_getattr(const unsigned char *cipso,
++				   struct netlbl_lsm_secattr *secattr)
++{
++	return -ENOSYS;
++}
++
+ static inline int cipso_v4_sock_setattr(struct sock *sk,
+ 				      const struct cipso_v4_doi *doi_def,
+ 				      const struct netlbl_lsm_secattr *secattr)
+@@ -282,6 +284,11 @@ static inline int cipso_v4_skbuff_getatt
+ 	return -ENOSYS;
+ }
+ 
++static inline unsigned char *cipso_v4_optptr(const struct sk_buff *skb)
++{
++	return NULL;
++}
++
+ static inline int cipso_v4_validate(const struct sk_buff *skb,
+ 				    unsigned char **option)
+ {
+--- a/net/ipv4/cipso_ipv4.c
++++ b/net/ipv4/cipso_ipv4.c
+@@ -378,20 +378,18 @@ static int cipso_v4_cache_check(const un
+  * negative values on failure.
+  *
+  */
+-int cipso_v4_cache_add(const struct sk_buff *skb,
++int cipso_v4_cache_add(const unsigned char *cipso_ptr,
+ 		       const struct netlbl_lsm_secattr *secattr)
+ {
+ 	int ret_val = -EPERM;
+ 	u32 bkt;
+ 	struct cipso_v4_map_cache_entry *entry = NULL;
+ 	struct cipso_v4_map_cache_entry *old_entry = NULL;
+-	unsigned char *cipso_ptr;
+ 	u32 cipso_ptr_len;
+ 
+ 	if (!cipso_v4_cache_enabled || cipso_v4_cache_bucketsize <= 0)
+ 		return 0;
+ 
+-	cipso_ptr = CIPSO_V4_OPTPTR(skb);
+ 	cipso_ptr_len = cipso_ptr[1];
+ 
+ 	entry = kzalloc(sizeof(*entry), GFP_ATOMIC);
+@@ -1579,6 +1577,33 @@ static int cipso_v4_parsetag_loc(const s
+ }
+ 
+ /**
++ * cipso_v4_optptr - Find the CIPSO option in the packet
++ * @skb: the packet
++ *
++ * Description:
++ * Parse the packet's IP header looking for a CIPSO option.  Returns a pointer
++ * to the start of the CIPSO option on success, NULL if one if not found.
++ *
++ */
++unsigned char *cipso_v4_optptr(const struct sk_buff *skb)
++{
++	const struct iphdr *iph = ip_hdr(skb);
++	unsigned char *optptr = (unsigned char *)&(ip_hdr(skb)[1]);
++	int optlen;
++	int taglen;
++
++	for (optlen = iph->ihl*4 - sizeof(struct iphdr); optlen > 0; ) {
++		if (optptr[0] == IPOPT_CIPSO)
++			return optptr;
++		taglen = optptr[1];
++		optlen -= taglen;
++		optptr += taglen;
++	}
++
++	return NULL;
++}
++
++/**
+  * cipso_v4_validate - Validate a CIPSO option
+  * @option: the start of the option, on error it is set to point to the error
+  *
+@@ -2119,8 +2144,8 @@ void cipso_v4_req_delattr(struct request
+  * on success and negative values on failure.
+  *
+  */
+-static int cipso_v4_getattr(const unsigned char *cipso,
+-			    struct netlbl_lsm_secattr *secattr)
++int cipso_v4_getattr(const unsigned char *cipso,
++		     struct netlbl_lsm_secattr *secattr)
+ {
+ 	int ret_val = -ENOMSG;
+ 	u32 doi;
+@@ -2305,22 +2330,6 @@ int cipso_v4_skbuff_delattr(struct sk_bu
+ 	return 0;
+ }
+ 
+-/**
+- * cipso_v4_skbuff_getattr - Get the security attributes from the CIPSO option
+- * @skb: the packet
+- * @secattr: the security attributes
+- *
+- * Description:
+- * Parse the given packet's CIPSO option and return the security attributes.
+- * Returns zero on success and negative values on failure.
+- *
+- */
+-int cipso_v4_skbuff_getattr(const struct sk_buff *skb,
+-			    struct netlbl_lsm_secattr *secattr)
+-{
+-	return cipso_v4_getattr(CIPSO_V4_OPTPTR(skb), secattr);
+-}
+-
+ /*
+  * Setup Functions
+  */
+--- a/net/netlabel/netlabel_kapi.c
++++ b/net/netlabel/netlabel_kapi.c
+@@ -1065,10 +1065,12 @@ int netlbl_skbuff_getattr(const struct s
+ 			  u16 family,
+ 			  struct netlbl_lsm_secattr *secattr)
+ {
++	unsigned char *ptr;
++
+ 	switch (family) {
+ 	case AF_INET:
+-		if (CIPSO_V4_OPTEXIST(skb) &&
+-		    cipso_v4_skbuff_getattr(skb, secattr) == 0)
++		ptr = cipso_v4_optptr(skb);
++		if (ptr && cipso_v4_getattr(ptr, secattr) == 0)
+ 			return 0;
+ 		break;
+ #if IS_ENABLED(CONFIG_IPV6)
+@@ -1094,7 +1096,7 @@ int netlbl_skbuff_getattr(const struct s
+  */
+ void netlbl_skbuff_err(struct sk_buff *skb, int error, int gateway)
+ {
+-	if (CIPSO_V4_OPTEXIST(skb))
++	if (cipso_v4_optptr(skb))
+ 		cipso_v4_error(skb, error, gateway);
+ }
+ 
+@@ -1126,11 +1128,14 @@ void netlbl_cache_invalidate(void)
+ int netlbl_cache_add(const struct sk_buff *skb,
+ 		     const struct netlbl_lsm_secattr *secattr)
+ {
++	unsigned char *ptr;
++
+ 	if ((secattr->flags & NETLBL_SECATTR_CACHE) == 0)
+ 		return -ENOMSG;
+ 
+-	if (CIPSO_V4_OPTEXIST(skb))
+-		return cipso_v4_cache_add(skb, secattr);
++	ptr = cipso_v4_optptr(skb);
++	if (ptr)
++		return cipso_v4_cache_add(ptr, secattr);
+ 
+ 	return -ENOMSG;
+ }
