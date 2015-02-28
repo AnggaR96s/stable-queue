@@ -1,0 +1,77 @@
+From 05fbf357d94152171bc50f8a369390f1f16efd89 Mon Sep 17 00:00:00 2001
+From: Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+Date: Wed, 11 Feb 2015 15:27:31 -0800
+Subject: proc/pagemap: walk page tables under pte lock
+
+From: Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+
+commit 05fbf357d94152171bc50f8a369390f1f16efd89 upstream.
+
+Lockless access to pte in pagemap_pte_range() might race with page
+migration and trigger BUG_ON(!PageLocked()) in migration_entry_to_page():
+
+CPU A (pagemap)                           CPU B (migration)
+                                          lock_page()
+                                          try_to_unmap(page, TTU_MIGRATION...)
+                                               make_migration_entry()
+                                               set_pte_at()
+<read *pte>
+pte_to_pagemap_entry()
+                                          remove_migration_ptes()
+                                          unlock_page()
+    if(is_migration_entry())
+        migration_entry_to_page()
+            BUG_ON(!PageLocked(page))
+
+Also lockless read might be non-atomic if pte is larger than wordsize.
+Other pte walkers (smaps, numa_maps, clear_refs) already lock ptes.
+
+Fixes: 052fb0d635df ("proc: report file/anon bit in /proc/pid/pagemap")
+Signed-off-by: Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+Reported-by: Andrey Ryabinin <a.ryabinin@samsung.com>
+Reviewed-by: Cyrill Gorcunov <gorcunov@openvz.org>
+Acked-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/proc/task_mmu.c |   14 +++++++++-----
+ 1 file changed, 9 insertions(+), 5 deletions(-)
+
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -1069,7 +1069,7 @@ static int pagemap_pte_range(pmd_t *pmd,
+ 	struct vm_area_struct *vma;
+ 	struct pagemapread *pm = walk->private;
+ 	spinlock_t *ptl;
+-	pte_t *pte;
++	pte_t *pte, *orig_pte;
+ 	int err = 0;
+ 
+ 	/* find the first VMA at or above 'addr' */
+@@ -1130,15 +1130,19 @@ static int pagemap_pte_range(pmd_t *pmd,
+ 		BUG_ON(is_vm_hugetlb_page(vma));
+ 
+ 		/* Addresses in the VMA. */
+-		for (; addr < min(end, vma->vm_end); addr += PAGE_SIZE) {
++		orig_pte = pte = pte_offset_map_lock(walk->mm, pmd, addr, &ptl);
++		for (; addr < min(end, vma->vm_end); pte++, addr += PAGE_SIZE) {
+ 			pagemap_entry_t pme;
+-			pte = pte_offset_map(pmd, addr);
++
+ 			pte_to_pagemap_entry(&pme, pm, vma, addr, *pte);
+-			pte_unmap(pte);
+ 			err = add_to_pagemap(addr, &pme, pm);
+ 			if (err)
+-				return err;
++				break;
+ 		}
++		pte_unmap_unlock(orig_pte, ptl);
++
++		if (err)
++			return err;
+ 
+ 		if (addr == end)
+ 			break;
