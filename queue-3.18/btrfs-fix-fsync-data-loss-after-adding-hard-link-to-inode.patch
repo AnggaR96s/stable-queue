@@ -1,0 +1,300 @@
+From 1a4bcf470c886b955adf36486f4c86f2441d85cb Mon Sep 17 00:00:00 2001
+From: Filipe Manana <fdmanana@suse.com>
+Date: Fri, 13 Feb 2015 12:30:56 +0000
+Subject: Btrfs: fix fsync data loss after adding hard link to inode
+
+From: Filipe Manana <fdmanana@suse.com>
+
+commit 1a4bcf470c886b955adf36486f4c86f2441d85cb upstream.
+
+We have a scenario where after the fsync log replay we can lose file data
+that had been previously fsync'ed if we added an hard link for our inode
+and after that we sync'ed the fsync log (for example by fsync'ing some
+other file or directory).
+
+This is because when adding an hard link we updated the inode item in the
+log tree with an i_size value of 0. At that point the new inode item was
+in memory only and a subsequent fsync log replay would not make us lose
+the file data. However if after adding the hard link we sync the log tree
+to disk, by fsync'ing some other file or directory for example, we ended
+up losing the file data after log replay, because the inode item in the
+persisted log tree had an an i_size of zero.
+
+This is easy to reproduce, and the following excerpt from my test for
+xfstests shows this:
+
+  _scratch_mkfs >> $seqres.full 2>&1
+  _init_flakey
+  _mount_flakey
+
+  # Create one file with data and fsync it.
+  # This made the btrfs fsync log persist the data and the inode metadata with
+  # a correct inode->i_size (4096 bytes).
+  $XFS_IO_PROG -f -c "pwrite -S 0xaa -b 4K 0 4K" -c "fsync" \
+       $SCRATCH_MNT/foo | _filter_xfs_io
+
+  # Now add one hard link to our file. This made the btrfs code update the fsync
+  # log, in memory only, with an inode metadata having a size of 0.
+  ln $SCRATCH_MNT/foo $SCRATCH_MNT/foo_link
+
+  # Now force persistence of the fsync log to disk, for example, by fsyncing some
+  # other file.
+  touch $SCRATCH_MNT/bar
+  $XFS_IO_PROG -c "fsync" $SCRATCH_MNT/bar
+
+  # Before a power loss or crash, we could read the 4Kb of data from our file as
+  # expected.
+  echo "File content before:"
+  od -t x1 $SCRATCH_MNT/foo
+
+  # Simulate a crash/power loss.
+  _load_flakey_table $FLAKEY_DROP_WRITES
+  _unmount_flakey
+
+  _load_flakey_table $FLAKEY_ALLOW_WRITES
+  _mount_flakey
+
+  # After the fsync log replay, because the fsync log had a value of 0 for our
+  # inode's i_size, we couldn't read anymore the 4Kb of data that we previously
+  # wrote and fsync'ed. The size of the file became 0 after the fsync log replay.
+  echo "File content after:"
+  od -t x1 $SCRATCH_MNT/foo
+
+Another alternative test, that doesn't need to fsync an inode in the same
+transaction it was created, is:
+
+  _scratch_mkfs >> $seqres.full 2>&1
+  _init_flakey
+  _mount_flakey
+
+  # Create our test file with some data.
+  $XFS_IO_PROG -f -c "pwrite -S 0xaa -b 8K 0 8K" \
+       $SCRATCH_MNT/foo | _filter_xfs_io
+
+  # Make sure the file is durably persisted.
+  sync
+
+  # Append some data to our file, to increase its size.
+  $XFS_IO_PROG -f -c "pwrite -S 0xcc -b 4K 8K 4K" \
+       $SCRATCH_MNT/foo | _filter_xfs_io
+
+  # Fsync the file, so from this point on if a crash/power failure happens, our
+  # new data is guaranteed to be there next time the fs is mounted.
+  $XFS_IO_PROG -c "fsync" $SCRATCH_MNT/foo
+
+  # Add one hard link to our file. This made btrfs write into the in memory fsync
+  # log a special inode with generation 0 and an i_size of 0 too. Note that this
+  # didn't update the inode in the fsync log on disk.
+  ln $SCRATCH_MNT/foo $SCRATCH_MNT/foo_link
+
+  # Now make sure the in memory fsync log is durably persisted.
+  # Creating and fsync'ing another file will do it.
+  touch $SCRATCH_MNT/bar
+  $XFS_IO_PROG -c "fsync" $SCRATCH_MNT/bar
+
+  # As expected, before the crash/power failure, we should be able to read the
+  # 12Kb of file data.
+  echo "File content before:"
+  od -t x1 $SCRATCH_MNT/foo
+
+  # Simulate a crash/power loss.
+  _load_flakey_table $FLAKEY_DROP_WRITES
+  _unmount_flakey
+
+  _load_flakey_table $FLAKEY_ALLOW_WRITES
+  _mount_flakey
+
+  # After mounting the fs again, the fsync log was replayed.
+  # The btrfs fsync log replay code didn't update the i_size of the persisted
+  # inode because the inode item in the log had a special generation with a
+  # value of 0 (and it couldn't know the correct i_size, since that inode item
+  # had a 0 i_size too). This made the last 4Kb of file data inaccessible and
+  # effectively lost.
+  echo "File content after:"
+  od -t x1 $SCRATCH_MNT/foo
+
+This isn't a new issue/regression. This problem has been around since the
+log tree code was added in 2008:
+
+  Btrfs: Add a write ahead tree log to optimize synchronous operations
+  (commit e02119d5a7b4396c5a872582fddc8bd6d305a70a)
+
+Test cases for xfstests follow soon.
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: Chris Mason <clm@fb.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/btrfs/tree-log.c |   82 ++++++++++++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 73 insertions(+), 9 deletions(-)
+
+--- a/fs/btrfs/tree-log.c
++++ b/fs/btrfs/tree-log.c
+@@ -488,8 +488,20 @@ insert:
+ 		src_item = (struct btrfs_inode_item *)src_ptr;
+ 		dst_item = (struct btrfs_inode_item *)dst_ptr;
+ 
+-		if (btrfs_inode_generation(eb, src_item) == 0)
++		if (btrfs_inode_generation(eb, src_item) == 0) {
++			struct extent_buffer *dst_eb = path->nodes[0];
++
++			if (S_ISREG(btrfs_inode_mode(eb, src_item)) &&
++			    S_ISREG(btrfs_inode_mode(dst_eb, dst_item))) {
++				struct btrfs_map_token token;
++				u64 ino_size = btrfs_inode_size(eb, src_item);
++
++				btrfs_init_map_token(&token);
++				btrfs_set_token_inode_size(dst_eb, dst_item,
++							   ino_size, &token);
++			}
+ 			goto no_copy;
++		}
+ 
+ 		if (overwrite_root &&
+ 		    S_ISDIR(btrfs_inode_mode(eb, src_item)) &&
+@@ -3218,7 +3230,8 @@ static int drop_objectid_items(struct bt
+ static void fill_inode_item(struct btrfs_trans_handle *trans,
+ 			    struct extent_buffer *leaf,
+ 			    struct btrfs_inode_item *item,
+-			    struct inode *inode, int log_inode_only)
++			    struct inode *inode, int log_inode_only,
++			    u64 logged_isize)
+ {
+ 	struct btrfs_map_token token;
+ 
+@@ -3231,7 +3244,7 @@ static void fill_inode_item(struct btrfs
+ 		 * to say 'update this inode with these values'
+ 		 */
+ 		btrfs_set_token_inode_generation(leaf, item, 0, &token);
+-		btrfs_set_token_inode_size(leaf, item, 0, &token);
++		btrfs_set_token_inode_size(leaf, item, logged_isize, &token);
+ 	} else {
+ 		btrfs_set_token_inode_generation(leaf, item,
+ 						 BTRFS_I(inode)->generation,
+@@ -3283,7 +3296,7 @@ static int log_inode_item(struct btrfs_t
+ 		return ret;
+ 	inode_item = btrfs_item_ptr(path->nodes[0], path->slots[0],
+ 				    struct btrfs_inode_item);
+-	fill_inode_item(trans, path->nodes[0], inode_item, inode, 0);
++	fill_inode_item(trans, path->nodes[0], inode_item, inode, 0, 0);
+ 	btrfs_release_path(path);
+ 	return 0;
+ }
+@@ -3292,7 +3305,8 @@ static noinline int copy_items(struct bt
+ 			       struct inode *inode,
+ 			       struct btrfs_path *dst_path,
+ 			       struct btrfs_path *src_path, u64 *last_extent,
+-			       int start_slot, int nr, int inode_only)
++			       int start_slot, int nr, int inode_only,
++			       u64 logged_isize)
+ {
+ 	unsigned long src_offset;
+ 	unsigned long dst_offset;
+@@ -3349,7 +3363,8 @@ static noinline int copy_items(struct bt
+ 						    dst_path->slots[0],
+ 						    struct btrfs_inode_item);
+ 			fill_inode_item(trans, dst_path->nodes[0], inode_item,
+-					inode, inode_only == LOG_INODE_EXISTS);
++					inode, inode_only == LOG_INODE_EXISTS,
++					logged_isize);
+ 		} else {
+ 			copy_extent_buffer(dst_path->nodes[0], src, dst_offset,
+ 					   src_offset, ins_sizes[i]);
+@@ -3895,6 +3910,33 @@ process:
+ 	return ret;
+ }
+ 
++static int logged_inode_size(struct btrfs_root *log, struct inode *inode,
++			     struct btrfs_path *path, u64 *size_ret)
++{
++	struct btrfs_key key;
++	int ret;
++
++	key.objectid = btrfs_ino(inode);
++	key.type = BTRFS_INODE_ITEM_KEY;
++	key.offset = 0;
++
++	ret = btrfs_search_slot(NULL, log, &key, path, 0, 0);
++	if (ret < 0) {
++		return ret;
++	} else if (ret > 0) {
++		*size_ret = i_size_read(inode);
++	} else {
++		struct btrfs_inode_item *item;
++
++		item = btrfs_item_ptr(path->nodes[0], path->slots[0],
++				      struct btrfs_inode_item);
++		*size_ret = btrfs_inode_size(path->nodes[0], item);
++	}
++
++	btrfs_release_path(path);
++	return 0;
++}
++
+ /* log a single inode in the tree log.
+  * At least one parent directory for this inode must exist in the tree
+  * or be logged already.
+@@ -3932,6 +3974,7 @@ static int btrfs_log_inode(struct btrfs_
+ 	bool fast_search = false;
+ 	u64 ino = btrfs_ino(inode);
+ 	struct extent_map_tree *em_tree = &BTRFS_I(inode)->extent_tree;
++	u64 logged_isize = 0;
+ 
+ 	path = btrfs_alloc_path();
+ 	if (!path)
+@@ -3985,6 +4028,25 @@ static int btrfs_log_inode(struct btrfs_
+ 			max_key_type = BTRFS_XATTR_ITEM_KEY;
+ 		ret = drop_objectid_items(trans, log, path, ino, max_key_type);
+ 	} else {
++		if (inode_only == LOG_INODE_EXISTS) {
++			/*
++			 * Make sure the new inode item we write to the log has
++			 * the same isize as the current one (if it exists).
++			 * This is necessary to prevent data loss after log
++			 * replay, and also to prevent doing a wrong expanding
++			 * truncate - for e.g. create file, write 4K into offset
++			 * 0, fsync, write 4K into offset 4096, add hard link,
++			 * fsync some other file (to sync log), power fail - if
++			 * we use the inode's current i_size, after log replay
++			 * we get a 8Kb file, with the last 4Kb extent as a hole
++			 * (zeroes), as if an expanding truncate happened,
++			 * instead of getting a file of 4Kb only.
++			 */
++			err = logged_inode_size(log, inode, path,
++						&logged_isize);
++			if (err)
++				goto out_unlock;
++		}
+ 		if (test_and_clear_bit(BTRFS_INODE_NEEDS_FULL_SYNC,
+ 				       &BTRFS_I(inode)->runtime_flags)) {
+ 			clear_bit(BTRFS_INODE_COPY_EVERYTHING,
+@@ -4040,7 +4102,8 @@ again:
+ 		}
+ 
+ 		ret = copy_items(trans, inode, dst_path, path, &last_extent,
+-				 ins_start_slot, ins_nr, inode_only);
++				 ins_start_slot, ins_nr, inode_only,
++				 logged_isize);
+ 		if (ret < 0) {
+ 			err = ret;
+ 			goto out_unlock;
+@@ -4064,7 +4127,7 @@ next_slot:
+ 		if (ins_nr) {
+ 			ret = copy_items(trans, inode, dst_path, path,
+ 					 &last_extent, ins_start_slot,
+-					 ins_nr, inode_only);
++					 ins_nr, inode_only, logged_isize);
+ 			if (ret < 0) {
+ 				err = ret;
+ 				goto out_unlock;
+@@ -4085,7 +4148,8 @@ next_slot:
+ 	}
+ 	if (ins_nr) {
+ 		ret = copy_items(trans, inode, dst_path, path, &last_extent,
+-				 ins_start_slot, ins_nr, inode_only);
++				 ins_start_slot, ins_nr, inode_only,
++				 logged_isize);
+ 		if (ret < 0) {
+ 			err = ret;
+ 			goto out_unlock;
