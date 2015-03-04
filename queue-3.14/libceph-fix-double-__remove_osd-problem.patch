@@ -1,0 +1,118 @@
+From 7eb71e0351fbb1b242ae70abb7bb17107fe2f792 Mon Sep 17 00:00:00 2001
+From: Ilya Dryomov <idryomov@gmail.com>
+Date: Tue, 17 Feb 2015 19:37:15 +0300
+Subject: libceph: fix double __remove_osd() problem
+
+From: Ilya Dryomov <idryomov@gmail.com>
+
+commit 7eb71e0351fbb1b242ae70abb7bb17107fe2f792 upstream.
+
+It turns out it's possible to get __remove_osd() called twice on the
+same OSD.  That doesn't sit well with rb_erase() - depending on the
+shape of the tree we can get a NULL dereference, a soft lockup or
+a random crash at some point in the future as we end up touching freed
+memory.  One scenario that I was able to reproduce is as follows:
+
+            <osd3 is idle, on the osd lru list>
+<con reset - osd3>
+con_fault_finish()
+  osd_reset()
+                              <osdmap - osd3 down>
+                              ceph_osdc_handle_map()
+                                <takes map_sem>
+                                kick_requests()
+                                  <takes request_mutex>
+                                  reset_changed_osds()
+                                    __reset_osd()
+                                      __remove_osd()
+                                  <releases request_mutex>
+                                <releases map_sem>
+    <takes map_sem>
+    <takes request_mutex>
+    __kick_osd_requests()
+      __reset_osd()
+        __remove_osd() <-- !!!
+
+A case can be made that osd refcounting is imperfect and reworking it
+would be a proper resolution, but for now Sage and I decided to fix
+this by adding a safe guard around __remove_osd().
+
+Fixes: http://tracker.ceph.com/issues/8087
+
+Cc: Sage Weil <sage@redhat.com>
+Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+Reviewed-by: Sage Weil <sage@redhat.com>
+Reviewed-by: Alex Elder <elder@linaro.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ net/ceph/osd_client.c |   26 ++++++++++++++++++--------
+ 1 file changed, 18 insertions(+), 8 deletions(-)
+
+--- a/net/ceph/osd_client.c
++++ b/net/ceph/osd_client.c
+@@ -977,14 +977,24 @@ static void put_osd(struct ceph_osd *osd
+  */
+ static void __remove_osd(struct ceph_osd_client *osdc, struct ceph_osd *osd)
+ {
+-	dout("__remove_osd %p\n", osd);
++	dout("%s %p osd%d\n", __func__, osd, osd->o_osd);
+ 	WARN_ON(!list_empty(&osd->o_requests));
+ 	WARN_ON(!list_empty(&osd->o_linger_requests));
+ 
+-	rb_erase(&osd->o_node, &osdc->osds);
+ 	list_del_init(&osd->o_osd_lru);
+-	ceph_con_close(&osd->o_con);
+-	put_osd(osd);
++	rb_erase(&osd->o_node, &osdc->osds);
++	RB_CLEAR_NODE(&osd->o_node);
++}
++
++static void remove_osd(struct ceph_osd_client *osdc, struct ceph_osd *osd)
++{
++	dout("%s %p osd%d\n", __func__, osd, osd->o_osd);
++
++	if (!RB_EMPTY_NODE(&osd->o_node)) {
++		ceph_con_close(&osd->o_con);
++		__remove_osd(osdc, osd);
++		put_osd(osd);
++	}
+ }
+ 
+ static void remove_all_osds(struct ceph_osd_client *osdc)
+@@ -994,7 +1004,7 @@ static void remove_all_osds(struct ceph_
+ 	while (!RB_EMPTY_ROOT(&osdc->osds)) {
+ 		struct ceph_osd *osd = rb_entry(rb_first(&osdc->osds),
+ 						struct ceph_osd, o_node);
+-		__remove_osd(osdc, osd);
++		remove_osd(osdc, osd);
+ 	}
+ 	mutex_unlock(&osdc->request_mutex);
+ }
+@@ -1024,7 +1034,7 @@ static void remove_old_osds(struct ceph_
+ 	list_for_each_entry_safe(osd, nosd, &osdc->osd_lru, o_osd_lru) {
+ 		if (time_before(jiffies, osd->lru_ttl))
+ 			break;
+-		__remove_osd(osdc, osd);
++		remove_osd(osdc, osd);
+ 	}
+ 	mutex_unlock(&osdc->request_mutex);
+ }
+@@ -1039,8 +1049,7 @@ static int __reset_osd(struct ceph_osd_c
+ 	dout("__reset_osd %p osd%d\n", osd, osd->o_osd);
+ 	if (list_empty(&osd->o_requests) &&
+ 	    list_empty(&osd->o_linger_requests)) {
+-		__remove_osd(osdc, osd);
+-
++		remove_osd(osdc, osd);
+ 		return -ENODEV;
+ 	}
+ 
+@@ -1842,6 +1851,7 @@ static void reset_changed_osds(struct ce
+ {
+ 	struct rb_node *p, *n;
+ 
++	dout("%s %p\n", __func__, osdc);
+ 	for (p = rb_first(&osdc->osds); p; p = n) {
+ 		struct ceph_osd *osd = rb_entry(p, struct ceph_osd, o_node);
+ 
