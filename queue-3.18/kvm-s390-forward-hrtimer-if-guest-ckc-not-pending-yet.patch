@@ -1,0 +1,78 @@
+From 2d00f759427bb3ed963b60f570830e9eca7e1c69 Mon Sep 17 00:00:00 2001
+From: David Hildenbrand <dahi@linux.vnet.ibm.com>
+Date: Thu, 11 Dec 2014 10:18:01 +0100
+Subject: KVM: s390: forward hrtimer if guest ckc not pending yet
+
+From: David Hildenbrand <dahi@linux.vnet.ibm.com>
+
+commit 2d00f759427bb3ed963b60f570830e9eca7e1c69 upstream.
+
+Patch 0759d0681cae ("KVM: s390: cleanup handle_wait by reusing
+kvm_vcpu_block") changed the way pending guest clock comparator
+interrupts are detected. It was assumed that as soon as the hrtimer
+wakes up, the condition for the guest ckc is satisfied.
+
+This is however only true as long as adjclock() doesn't speed
+up the monotonic clock. Reason is that the hrtimer is based on
+CLOCK_MONOTONIC, the guest clock comparator detection is based
+on the raw TOD clock. If CLOCK_MONOTONIC runs faster than the
+TOD clock, the hrtimer wakes the target VCPU up too early and
+the target VCPU will not detect any pending interrupts, therefore
+going back to sleep. It will never be woken up again because the
+hrtimer has finished. The VCPU is stuck.
+
+As a quick fix, we have to forward the hrtimer until the guest
+clock comparator is really due, to guarantee properly timed wake
+ups.
+
+As the hrtimer callback might be triggered on another cpu, we
+have to make sure that the timer is really stopped and not currently
+executing the callback on another cpu. This can happen if the vcpu
+thread is scheduled onto another physical cpu, but the timer base
+is not migrated. So lets use hrtimer_cancel instead of try_to_cancel.
+
+A proper fix might be to introduce a RAW based hrtimer.
+
+Reported-by: Christian Borntraeger <borntraeger@de.ibm.com>
+Signed-off-by: David Hildenbrand <dahi@linux.vnet.ibm.com>
+Acked-by: Cornelia Huck <cornelia.huck@de.ibm.com>
+Signed-off-by: Christian Borntraeger <borntraeger@de.ibm.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ arch/s390/kvm/interrupt.c |   14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+--- a/arch/s390/kvm/interrupt.c
++++ b/arch/s390/kvm/interrupt.c
+@@ -613,7 +613,7 @@ no_timer:
+ 	__unset_cpu_idle(vcpu);
+ 	vcpu->srcu_idx = srcu_read_lock(&vcpu->kvm->srcu);
+ 
+-	hrtimer_try_to_cancel(&vcpu->arch.ckc_timer);
++	hrtimer_cancel(&vcpu->arch.ckc_timer);
+ 	return 0;
+ }
+ 
+@@ -633,10 +633,20 @@ void kvm_s390_vcpu_wakeup(struct kvm_vcp
+ enum hrtimer_restart kvm_s390_idle_wakeup(struct hrtimer *timer)
+ {
+ 	struct kvm_vcpu *vcpu;
++	u64 now, sltime;
+ 
+ 	vcpu = container_of(timer, struct kvm_vcpu, arch.ckc_timer);
+-	kvm_s390_vcpu_wakeup(vcpu);
++	now = get_tod_clock_fast() + vcpu->arch.sie_block->epoch;
++	sltime = tod_to_ns(vcpu->arch.sie_block->ckc - now);
+ 
++	/*
++	 * If the monotonic clock runs faster than the tod clock we might be
++	 * woken up too early and have to go back to sleep to avoid deadlocks.
++	 */
++	if (vcpu->arch.sie_block->ckc > now &&
++	    hrtimer_forward_now(timer, ns_to_ktime(sltime)))
++		return HRTIMER_RESTART;
++	kvm_s390_vcpu_wakeup(vcpu);
+ 	return HRTIMER_NORESTART;
+ }
+ 
