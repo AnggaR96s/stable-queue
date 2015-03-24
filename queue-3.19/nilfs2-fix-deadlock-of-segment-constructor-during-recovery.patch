@@ -1,0 +1,93 @@
+From 283ee1482f349d6c0c09dfb725db5880afc56813 Mon Sep 17 00:00:00 2001
+From: Ryusuke Konishi <konishi.ryusuke@lab.ntt.co.jp>
+Date: Thu, 12 Mar 2015 16:26:00 -0700
+Subject: nilfs2: fix deadlock of segment constructor during recovery
+
+From: Ryusuke Konishi <konishi.ryusuke@lab.ntt.co.jp>
+
+commit 283ee1482f349d6c0c09dfb725db5880afc56813 upstream.
+
+According to a report from Yuxuan Shui, nilfs2 in kernel 3.19 got stuck
+during recovery at mount time.  The code path that caused the deadlock was
+as follows:
+
+  nilfs_fill_super()
+    load_nilfs()
+      nilfs_salvage_orphan_logs()
+        * Do roll-forwarding, attach segment constructor for recovery,
+          and kick it.
+
+        nilfs_segctor_thread()
+          nilfs_segctor_thread_construct()
+           * A lock is held with nilfs_transaction_lock()
+             nilfs_segctor_do_construct()
+               nilfs_segctor_drop_written_files()
+                 iput()
+                   iput_final()
+                     write_inode_now()
+                       writeback_single_inode()
+                         __writeback_single_inode()
+                           do_writepages()
+                             nilfs_writepage()
+                               nilfs_construct_dsync_segment()
+                                 nilfs_transaction_lock() --> deadlock
+
+This can happen if commit 7ef3ff2fea8b ("nilfs2: fix deadlock of segment
+constructor over I_SYNC flag") is applied and roll-forward recovery was
+performed at mount time.  The roll-forward recovery can happen if datasync
+write is done and the file system crashes immediately after that.  For
+instance, we can reproduce the issue with the following steps:
+
+ < nilfs2 is mounted on /nilfs (device: /dev/sdb1) >
+ # dd if=/dev/zero of=/nilfs/test bs=4k count=1 && sync
+ # dd if=/dev/zero of=/nilfs/test conv=notrunc oflag=dsync bs=4k
+ count=1 && reboot -nfh
+ < the system will immediately reboot >
+ # mount -t nilfs2 /dev/sdb1 /nilfs
+
+The deadlock occurs because iput() can run segment constructor through
+writeback_single_inode() if MS_ACTIVE flag is not set on sb->s_flags.  The
+above commit changed segment constructor so that it calls iput()
+asynchronously for inodes with i_nlink == 0, but that change was
+imperfect.
+
+This fixes the another deadlock by deferring iput() in segment constructor
+even for the case that mount is not finished, that is, for the case that
+MS_ACTIVE flag is not set.
+
+Signed-off-by: Ryusuke Konishi <konishi.ryusuke@lab.ntt.co.jp>
+Reported-by: Yuxuan Shui <yshuiv7@gmail.com>
+Tested-by: Ryusuke Konishi <konishi.ryusuke@lab.ntt.co.jp>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/nilfs2/segment.c |    7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+--- a/fs/nilfs2/segment.c
++++ b/fs/nilfs2/segment.c
+@@ -1907,6 +1907,7 @@ static void nilfs_segctor_drop_written_f
+ 					     struct the_nilfs *nilfs)
+ {
+ 	struct nilfs_inode_info *ii, *n;
++	int during_mount = !(sci->sc_super->s_flags & MS_ACTIVE);
+ 	int defer_iput = false;
+ 
+ 	spin_lock(&nilfs->ns_inode_lock);
+@@ -1919,10 +1920,10 @@ static void nilfs_segctor_drop_written_f
+ 		brelse(ii->i_bh);
+ 		ii->i_bh = NULL;
+ 		list_del_init(&ii->i_dirty);
+-		if (!ii->vfs_inode.i_nlink) {
++		if (!ii->vfs_inode.i_nlink || during_mount) {
+ 			/*
+-			 * Defer calling iput() to avoid a deadlock
+-			 * over I_SYNC flag for inodes with i_nlink == 0
++			 * Defer calling iput() to avoid deadlocks if
++			 * i_nlink == 0 or mount is not yet finished.
+ 			 */
+ 			list_add_tail(&ii->i_dirty, &sci->sc_iput_queue);
+ 			defer_iput = true;
