@@ -1,0 +1,186 @@
+From 5885ebda878b47c4b4602d4b0410cb4b282af024 Mon Sep 17 00:00:00 2001
+From: Dave Chinner <dchinner@redhat.com>
+Date: Mon, 23 Feb 2015 22:37:08 +1100
+Subject: xfs: ensure truncate forces zeroed blocks to disk
+
+From: Dave Chinner <dchinner@redhat.com>
+
+commit 5885ebda878b47c4b4602d4b0410cb4b282af024 upstream.
+
+A new fsync vs power fail test in xfstests indicated that XFS can
+have unreliable data consistency when doing extending truncates that
+require block zeroing. The blocks beyond EOF get zeroed in memory,
+but we never force those changes to disk before we run the
+transaction that extends the file size and exposes those blocks to
+userspace. This can result in the blocks not being correctly zeroed
+after a crash.
+
+Because in-memory behaviour is correct, tools like fsx don't pick up
+any coherency problems - it's not until the filesystem is shutdown
+or the system crashes after writing the truncate transaction to the
+journal but before the zeroed data in the page cache is flushed that
+the issue is exposed.
+
+Fix this by also flushing the dirty data in memory region between
+the old size and new size when we've found blocks that need zeroing
+in the truncate process.
+
+Reported-by: Liu Bo <bo.li.liu@oracle.com>
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Signed-off-by: Dave Chinner <david@fromorbit.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+
+---
+ fs/xfs/xfs_file.c  |   14 ++++++++++----
+ fs/xfs/xfs_inode.h |    5 +++--
+ fs/xfs/xfs_iops.c  |   36 ++++++++++++++----------------------
+ 3 files changed, 27 insertions(+), 28 deletions(-)
+
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@ -360,7 +360,8 @@ STATIC int				/* error (positive) */
+ xfs_zero_last_block(
+ 	struct xfs_inode	*ip,
+ 	xfs_fsize_t		offset,
+-	xfs_fsize_t		isize)
++	xfs_fsize_t		isize,
++	bool			*did_zeroing)
+ {
+ 	struct xfs_mount	*mp = ip->i_mount;
+ 	xfs_fileoff_t		last_fsb = XFS_B_TO_FSBT(mp, isize);
+@@ -388,6 +389,7 @@ xfs_zero_last_block(
+ 	zero_len = mp->m_sb.sb_blocksize - zero_offset;
+ 	if (isize + zero_len > offset)
+ 		zero_len = offset - isize;
++	*did_zeroing = true;
+ 	return xfs_iozero(ip, isize, zero_len);
+ }
+ 
+@@ -406,7 +408,8 @@ int					/* error (positive) */
+ xfs_zero_eof(
+ 	struct xfs_inode	*ip,
+ 	xfs_off_t		offset,		/* starting I/O offset */
+-	xfs_fsize_t		isize)		/* current inode size */
++	xfs_fsize_t		isize,		/* current inode size */
++	bool			*did_zeroing)
+ {
+ 	struct xfs_mount	*mp = ip->i_mount;
+ 	xfs_fileoff_t		start_zero_fsb;
+@@ -428,7 +431,7 @@ xfs_zero_eof(
+ 	 * We only zero a part of that block so it is handled specially.
+ 	 */
+ 	if (XFS_B_FSB_OFFSET(mp, isize) != 0) {
+-		error = xfs_zero_last_block(ip, offset, isize);
++		error = xfs_zero_last_block(ip, offset, isize, did_zeroing);
+ 		if (error)
+ 			return error;
+ 	}
+@@ -488,6 +491,7 @@ xfs_zero_eof(
+ 		if (error)
+ 			return error;
+ 
++		*did_zeroing = true;
+ 		start_zero_fsb = imap.br_startoff + imap.br_blockcount;
+ 		ASSERT(start_zero_fsb <= (end_zero_fsb + 1));
+ 	}
+@@ -526,13 +530,15 @@ restart:
+ 	 * having to redo all checks before.
+ 	 */
+ 	if (*pos > i_size_read(inode)) {
++		bool	zero = false;
++
+ 		if (*iolock == XFS_IOLOCK_SHARED) {
+ 			xfs_rw_iunlock(ip, *iolock);
+ 			*iolock = XFS_IOLOCK_EXCL;
+ 			xfs_rw_ilock(ip, *iolock);
+ 			goto restart;
+ 		}
+-		error = xfs_zero_eof(ip, *pos, i_size_read(inode));
++		error = xfs_zero_eof(ip, *pos, i_size_read(inode), &zero);
+ 		if (error)
+ 			return error;
+ 	}
+--- a/fs/xfs/xfs_inode.h
++++ b/fs/xfs/xfs_inode.h
+@@ -377,8 +377,9 @@ int		xfs_droplink(struct xfs_trans *, st
+ int		xfs_bumplink(struct xfs_trans *, struct xfs_inode *);
+ 
+ /* from xfs_file.c */
+-int		xfs_zero_eof(struct xfs_inode *, xfs_off_t, xfs_fsize_t);
+-int		xfs_iozero(struct xfs_inode *, loff_t, size_t);
++int	xfs_zero_eof(struct xfs_inode *ip, xfs_off_t offset,
++		     xfs_fsize_t isize, bool *did_zeroing);
++int	xfs_iozero(struct xfs_inode *ip, loff_t pos, size_t count);
+ 
+ 
+ #define IHOLD(ip) \
+--- a/fs/xfs/xfs_iops.c
++++ b/fs/xfs/xfs_iops.c
+@@ -741,6 +741,7 @@ xfs_setattr_size(
+ 	int			error;
+ 	uint			lock_flags = 0;
+ 	uint			commit_flags = 0;
++	bool			did_zeroing = false;
+ 
+ 	trace_xfs_setattr(ip);
+ 
+@@ -784,20 +785,16 @@ xfs_setattr_size(
+ 		return error;
+ 
+ 	/*
+-	 * Now we can make the changes.  Before we join the inode to the
+-	 * transaction, take care of the part of the truncation that must be
+-	 * done without the inode lock.  This needs to be done before joining
+-	 * the inode to the transaction, because the inode cannot be unlocked
+-	 * once it is a part of the transaction.
++	 * File data changes must be complete before we start the transaction to
++	 * modify the inode.  This needs to be done before joining the inode to
++	 * the transaction because the inode cannot be unlocked once it is a
++	 * part of the transaction.
++	 *
++	 * Start with zeroing any data block beyond EOF that we may expose on
++	 * file extension.
+ 	 */
+ 	if (newsize > oldsize) {
+-		/*
+-		 * Do the first part of growing a file: zero any data in the
+-		 * last block that is beyond the old EOF.  We need to do this
+-		 * before the inode is joined to the transaction to modify
+-		 * i_size.
+-		 */
+-		error = xfs_zero_eof(ip, newsize, oldsize);
++		error = xfs_zero_eof(ip, newsize, oldsize, &did_zeroing);
+ 		if (error)
+ 			return error;
+ 	}
+@@ -807,23 +804,18 @@ xfs_setattr_size(
+ 	 * any previous writes that are beyond the on disk EOF and the new
+ 	 * EOF that have not been written out need to be written here.  If we
+ 	 * do not write the data out, we expose ourselves to the null files
+-	 * problem.
+-	 *
+-	 * Only flush from the on disk size to the smaller of the in memory
+-	 * file size or the new size as that's the range we really care about
+-	 * here and prevents waiting for other data not within the range we
+-	 * care about here.
++	 * problem. Note that this includes any block zeroing we did above;
++	 * otherwise those blocks may not be zeroed after a crash.
+ 	 */
+-	if (oldsize != ip->i_d.di_size && newsize > ip->i_d.di_size) {
++	if (newsize > ip->i_d.di_size &&
++	    (oldsize != ip->i_d.di_size || did_zeroing)) {
+ 		error = filemap_write_and_wait_range(VFS_I(ip)->i_mapping,
+ 						      ip->i_d.di_size, newsize);
+ 		if (error)
+ 			return error;
+ 	}
+ 
+-	/*
+-	 * Wait for all direct I/O to complete.
+-	 */
++	/* Now wait for all direct I/O to complete. */
+ 	inode_dio_wait(inode);
+ 
+ 	/*
