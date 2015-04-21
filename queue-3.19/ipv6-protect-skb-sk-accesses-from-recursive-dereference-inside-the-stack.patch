@@ -1,0 +1,160 @@
+From foo@baz Tue Apr 21 23:05:14 CEST 2015
+From: "hannes@stressinduktion.org" <hannes@stressinduktion.org>
+Date: Wed, 1 Apr 2015 17:07:44 +0200
+Subject: ipv6: protect skb->sk accesses from recursive dereference inside the stack
+
+From: "hannes@stressinduktion.org" <hannes@stressinduktion.org>
+
+[ Upstream commit f60e5990d9c1424af9dbca60a23ba2a1c7c1ce90 ]
+
+We should not consult skb->sk for output decisions in xmit recursion
+levels > 0 in the stack. Otherwise local socket settings could influence
+the result of e.g. tunnel encapsulation process.
+
+ipv6 does not conform with this in three places:
+
+1) ip6_fragment: we do consult ipv6_npinfo for frag_size
+
+2) sk_mc_loop in ipv6 uses skb->sk and checks if we should
+   loop the packet back to the local socket
+
+3) ip6_skb_dst_mtu could query the settings from the user socket and
+   force a wrong MTU
+
+Furthermore:
+In sk_mc_loop we could potentially land in WARN_ON(1) if we use a
+PF_PACKET socket ontop of an IPv6-backed vxlan device.
+
+Reuse xmit_recursion as we are currently only interested in protecting
+tunnel devices.
+
+Cc: Jiri Pirko <jiri@resnulli.us>
+Signed-off-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/linux/netdevice.h |    6 ++++++
+ include/net/ip.h          |   16 ----------------
+ include/net/ip6_route.h   |    3 ++-
+ include/net/sock.h        |    2 ++
+ net/core/dev.c            |    4 +++-
+ net/core/sock.c           |   19 +++++++++++++++++++
+ net/ipv6/ip6_output.c     |    3 ++-
+ 7 files changed, 34 insertions(+), 19 deletions(-)
+
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -2159,6 +2159,12 @@ void netdev_freemem(struct net_device *d
+ void synchronize_net(void);
+ int init_dummy_netdev(struct net_device *dev);
+ 
++DECLARE_PER_CPU(int, xmit_recursion);
++static inline int dev_recursion_level(void)
++{
++	return this_cpu_read(xmit_recursion);
++}
++
+ struct net_device *dev_get_by_index(struct net *net, int ifindex);
+ struct net_device *__dev_get_by_index(struct net *net, int ifindex);
+ struct net_device *dev_get_by_index_rcu(struct net *net, int ifindex);
+--- a/include/net/ip.h
++++ b/include/net/ip.h
+@@ -453,22 +453,6 @@ static __inline__ void inet_reset_saddr(
+ 
+ #endif
+ 
+-static inline int sk_mc_loop(struct sock *sk)
+-{
+-	if (!sk)
+-		return 1;
+-	switch (sk->sk_family) {
+-	case AF_INET:
+-		return inet_sk(sk)->mc_loop;
+-#if IS_ENABLED(CONFIG_IPV6)
+-	case AF_INET6:
+-		return inet6_sk(sk)->mc_loop;
+-#endif
+-	}
+-	WARN_ON(1);
+-	return 1;
+-}
+-
+ bool ip_call_ra_chain(struct sk_buff *skb);
+ 
+ /*
+--- a/include/net/ip6_route.h
++++ b/include/net/ip6_route.h
+@@ -174,7 +174,8 @@ int ip6_fragment(struct sk_buff *skb, in
+ 
+ static inline int ip6_skb_dst_mtu(struct sk_buff *skb)
+ {
+-	struct ipv6_pinfo *np = skb->sk ? inet6_sk(skb->sk) : NULL;
++	struct ipv6_pinfo *np = skb->sk && !dev_recursion_level() ?
++				inet6_sk(skb->sk) : NULL;
+ 
+ 	return (np && np->pmtudisc >= IPV6_PMTUDISC_PROBE) ?
+ 	       skb_dst(skb)->dev->mtu : dst_mtu(skb_dst(skb));
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@ -1812,6 +1812,8 @@ struct dst_entry *__sk_dst_check(struct
+ 
+ struct dst_entry *sk_dst_check(struct sock *sk, u32 cookie);
+ 
++bool sk_mc_loop(struct sock *sk);
++
+ static inline bool sk_can_gso(const struct sock *sk)
+ {
+ 	return net_gso_ok(sk->sk_route_caps, sk->sk_gso_type);
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -2821,7 +2821,9 @@ static void skb_update_prio(struct sk_bu
+ #define skb_update_prio(skb)
+ #endif
+ 
+-static DEFINE_PER_CPU(int, xmit_recursion);
++DEFINE_PER_CPU(int, xmit_recursion);
++EXPORT_SYMBOL(xmit_recursion);
++
+ #define RECURSION_LIMIT 10
+ 
+ /**
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@ -651,6 +651,25 @@ static inline void sock_valbool_flag(str
+ 		sock_reset_flag(sk, bit);
+ }
+ 
++bool sk_mc_loop(struct sock *sk)
++{
++	if (dev_recursion_level())
++		return false;
++	if (!sk)
++		return true;
++	switch (sk->sk_family) {
++	case AF_INET:
++		return inet_sk(sk)->mc_loop;
++#if IS_ENABLED(CONFIG_IPV6)
++	case AF_INET6:
++		return inet6_sk(sk)->mc_loop;
++#endif
++	}
++	WARN_ON(1);
++	return true;
++}
++EXPORT_SYMBOL(sk_mc_loop);
++
+ /*
+  *	This is meant for all protocols to use and covers goings on
+  *	at the socket level. Everything here is generic.
+--- a/net/ipv6/ip6_output.c
++++ b/net/ipv6/ip6_output.c
+@@ -541,7 +541,8 @@ int ip6_fragment(struct sk_buff *skb, in
+ {
+ 	struct sk_buff *frag;
+ 	struct rt6_info *rt = (struct rt6_info *)skb_dst(skb);
+-	struct ipv6_pinfo *np = skb->sk ? inet6_sk(skb->sk) : NULL;
++	struct ipv6_pinfo *np = skb->sk && !dev_recursion_level() ?
++				inet6_sk(skb->sk) : NULL;
+ 	struct ipv6hdr *tmp_hdr;
+ 	struct frag_hdr *fh;
+ 	unsigned int mtu, hlen, left, len;

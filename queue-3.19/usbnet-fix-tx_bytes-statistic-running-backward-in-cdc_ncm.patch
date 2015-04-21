@@ -1,0 +1,126 @@
+From foo@baz Tue Apr 21 23:05:14 CEST 2015
+From: Ben Hutchings <ben.hutchings@codethink.co.uk>
+Date: Wed, 25 Mar 2015 21:41:33 +0100
+Subject: usbnet: Fix tx_bytes statistic running backward in cdc_ncm
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+From: Ben Hutchings <ben.hutchings@codethink.co.uk>
+
+[ Upstream commit 7a1e890e2168e33fb62d84528e996b8b4b478fea ]
+
+cdc_ncm disagrees with usbnet about how much framing overhead should
+be counted in the tx_bytes statistics, and tries 'fix' this by
+decrementing tx_bytes on the transmit path.  But statistics must never
+be decremented except due to roll-over; this will thoroughly confuse
+user-space.  Also, tx_bytes is only incremented by usbnet in the
+completion path.
+
+Fix this by requiring drivers that set FLAG_MULTI_FRAME to set a
+tx_bytes delta along with the tx_packets count.
+
+Fixes: beeecd42c3b4 ("net: cdc_ncm/cdc_mbim: adding NCM protocol statistics")
+Signed-off-by: Ben Hutchings <ben.hutchings@codethink.co.uk>
+Signed-off-by: Bjørn Mork <bjorn@mork.no>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/usb/asix_common.c |    2 +-
+ drivers/net/usb/cdc_ncm.c     |    7 +++----
+ drivers/net/usb/sr9800.c      |    2 +-
+ drivers/net/usb/usbnet.c      |   16 +++++++++++++---
+ include/linux/usb/usbnet.h    |    6 ++++--
+ 5 files changed, 22 insertions(+), 11 deletions(-)
+
+--- a/drivers/net/usb/asix_common.c
++++ b/drivers/net/usb/asix_common.c
+@@ -189,7 +189,7 @@ struct sk_buff *asix_tx_fixup(struct usb
+ 		skb_put(skb, sizeof(padbytes));
+ 	}
+ 
+-	usbnet_set_skb_tx_stats(skb, 1);
++	usbnet_set_skb_tx_stats(skb, 1, 0);
+ 	return skb;
+ }
+ 
+--- a/drivers/net/usb/cdc_ncm.c
++++ b/drivers/net/usb/cdc_ncm.c
+@@ -1177,13 +1177,12 @@ cdc_ncm_fill_tx_frame(struct usbnet *dev
+ 	ctx->tx_overhead += skb_out->len - ctx->tx_curr_frame_payload;
+ 	ctx->tx_ntbs++;
+ 
+-	/* usbnet has already counted all the framing overhead.
++	/* usbnet will count all the framing overhead by default.
+ 	 * Adjust the stats so that the tx_bytes counter show real
+ 	 * payload data instead.
+ 	 */
+-	dev->net->stats.tx_bytes -= skb_out->len - ctx->tx_curr_frame_payload;
+-
+-	usbnet_set_skb_tx_stats(skb_out, n);
++	usbnet_set_skb_tx_stats(skb_out, n,
++				ctx->tx_curr_frame_payload - skb_out->len);
+ 
+ 	return skb_out;
+ 
+--- a/drivers/net/usb/sr9800.c
++++ b/drivers/net/usb/sr9800.c
+@@ -144,7 +144,7 @@ static struct sk_buff *sr_tx_fixup(struc
+ 		skb_put(skb, sizeof(padbytes));
+ 	}
+ 
+-	usbnet_set_skb_tx_stats(skb, 1);
++	usbnet_set_skb_tx_stats(skb, 1, 0);
+ 	return skb;
+ }
+ 
+--- a/drivers/net/usb/usbnet.c
++++ b/drivers/net/usb/usbnet.c
+@@ -1347,9 +1347,19 @@ netdev_tx_t usbnet_start_xmit (struct sk
+ 		} else
+ 			urb->transfer_flags |= URB_ZERO_PACKET;
+ 	}
+-	entry->length = urb->transfer_buffer_length = length;
+-	if (!(info->flags & FLAG_MULTI_PACKET))
+-		usbnet_set_skb_tx_stats(skb, 1);
++	urb->transfer_buffer_length = length;
++
++	if (info->flags & FLAG_MULTI_PACKET) {
++		/* Driver has set number of packets and a length delta.
++		 * Calculate the complete length and ensure that it's
++		 * positive.
++		 */
++		entry->length += length;
++		if (WARN_ON_ONCE(entry->length <= 0))
++			entry->length = length;
++	} else {
++		usbnet_set_skb_tx_stats(skb, 1, length);
++	}
+ 
+ 	spin_lock_irqsave(&dev->txq.lock, flags);
+ 	retval = usb_autopm_get_interface_async(dev->intf);
+--- a/include/linux/usb/usbnet.h
++++ b/include/linux/usb/usbnet.h
+@@ -227,7 +227,7 @@ struct skb_data {	/* skb->cb is one of t
+ 	struct urb		*urb;
+ 	struct usbnet		*dev;
+ 	enum skb_state		state;
+-	size_t			length;
++	long			length;
+ 	unsigned long		packets;
+ };
+ 
+@@ -235,11 +235,13 @@ struct skb_data {	/* skb->cb is one of t
+  * tx_fixup method before returning an skb.
+  */
+ static inline void
+-usbnet_set_skb_tx_stats(struct sk_buff *skb, unsigned long packets)
++usbnet_set_skb_tx_stats(struct sk_buff *skb,
++			unsigned long packets, long bytes_delta)
+ {
+ 	struct skb_data *entry = (struct skb_data *) skb->cb;
+ 
+ 	entry->packets = packets;
++	entry->length = bytes_delta;
+ }
+ 
+ extern int usbnet_open(struct net_device *net);
