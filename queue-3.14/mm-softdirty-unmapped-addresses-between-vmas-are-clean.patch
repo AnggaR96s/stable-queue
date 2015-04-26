@@ -1,0 +1,139 @@
+From 81d0fa623c5b8dbd5279d9713094b0f9b0a00fb4 Mon Sep 17 00:00:00 2001
+From: Peter Feiner <pfeiner@google.com>
+Date: Thu, 9 Oct 2014 15:28:32 -0700
+Subject: mm: softdirty: unmapped addresses between VMAs are clean
+
+From: Peter Feiner <pfeiner@google.com>
+
+commit 81d0fa623c5b8dbd5279d9713094b0f9b0a00fb4 upstream.
+
+If a /proc/pid/pagemap read spans a [VMA, an unmapped region, then a
+VM_SOFTDIRTY VMA], the virtual pages in the unmapped region are reported
+as softdirty.  Here's a program to demonstrate the bug:
+
+int main() {
+	const uint64_t PAGEMAP_SOFTDIRTY = 1ul << 55;
+	uint64_t pme[3];
+	int fd = open("/proc/self/pagemap", O_RDONLY);;
+	char *m = mmap(NULL, 3 * getpagesize(), PROT_READ,
+	               MAP_ANONYMOUS | MAP_SHARED, -1, 0);
+	munmap(m + getpagesize(), getpagesize());
+	pread(fd, pme, 24, (unsigned long) m / getpagesize() * 8);
+	assert(pme[0] & PAGEMAP_SOFTDIRTY);    /* passes */
+	assert(!(pme[1] & PAGEMAP_SOFTDIRTY)); /* fails */
+	assert(pme[2] & PAGEMAP_SOFTDIRTY);    /* passes */
+	return 0;
+}
+
+(Note that all pages in new VMAs are softdirty until cleared).
+
+Tested:
+	Used the program given above. I'm going to include this code in
+	a selftest in the future.
+
+[n-horiguchi@ah.jp.nec.com: prevent pagemap_pte_range() from overrunning]
+Signed-off-by: Peter Feiner <pfeiner@google.com>
+Cc: "Kirill A. Shutemov" <kirill@shutemov.name>
+Cc: Cyrill Gorcunov <gorcunov@openvz.org>
+Cc: Pavel Emelyanov <xemul@parallels.com>
+Cc: Jamie Liu <jamieliu@google.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+Signed-off-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/proc/task_mmu.c |   59 +++++++++++++++++++++++++++++++++++------------------
+ 1 file changed, 39 insertions(+), 20 deletions(-)
+
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -995,7 +995,6 @@ static int pagemap_pte_range(pmd_t *pmd,
+ 	spinlock_t *ptl;
+ 	pte_t *pte;
+ 	int err = 0;
+-	pagemap_entry_t pme = make_pme(PM_NOT_PRESENT(pm->v2));
+ 
+ 	/* find the first VMA at or above 'addr' */
+ 	vma = find_vma(walk->mm, addr);
+@@ -1009,6 +1008,7 @@ static int pagemap_pte_range(pmd_t *pmd,
+ 
+ 		for (; addr != end; addr += PAGE_SIZE) {
+ 			unsigned long offset;
++			pagemap_entry_t pme;
+ 
+ 			offset = (addr & ~PAGEMAP_WALK_MASK) >>
+ 					PAGE_SHIFT;
+@@ -1023,32 +1023,51 @@ static int pagemap_pte_range(pmd_t *pmd,
+ 
+ 	if (pmd_trans_unstable(pmd))
+ 		return 0;
+-	for (; addr != end; addr += PAGE_SIZE) {
+-		int flags2;
+ 
+-		/* check to see if we've left 'vma' behind
+-		 * and need a new, higher one */
+-		if (vma && (addr >= vma->vm_end)) {
+-			vma = find_vma(walk->mm, addr);
+-			if (vma && (vma->vm_flags & VM_SOFTDIRTY))
+-				flags2 = __PM_SOFT_DIRTY;
+-			else
+-				flags2 = 0;
+-			pme = make_pme(PM_NOT_PRESENT(pm->v2) | PM_STATUS2(pm->v2, flags2));
++	while (1) {
++		/* End of address space hole, which we mark as non-present. */
++		unsigned long hole_end;
++
++		if (vma)
++			hole_end = min(end, vma->vm_start);
++		else
++			hole_end = end;
++
++		for (; addr < hole_end; addr += PAGE_SIZE) {
++			pagemap_entry_t pme = make_pme(PM_NOT_PRESENT(pm->v2));
++
++			err = add_to_pagemap(addr, &pme, pm);
++			if (err)
++				return err;
+ 		}
+ 
+-		/* check that 'vma' actually covers this address,
+-		 * and that it isn't a huge page vma */
+-		if (vma && (vma->vm_start <= addr) &&
+-		    !is_vm_hugetlb_page(vma)) {
++		if (!vma || vma->vm_start >= end)
++			break;
++		/*
++		 * We can't possibly be in a hugetlb VMA. In general,
++		 * for a mm_walk with a pmd_entry and a hugetlb_entry,
++		 * the pmd_entry can only be called on addresses in a
++		 * hugetlb if the walk starts in a non-hugetlb VMA and
++		 * spans a hugepage VMA. Since pagemap_read walks are
++		 * PMD-sized and PMD-aligned, this will never be true.
++		 */
++		BUG_ON(is_vm_hugetlb_page(vma));
++
++		/* Addresses in the VMA. */
++		for (; addr < min(end, vma->vm_end); addr += PAGE_SIZE) {
++			pagemap_entry_t pme;
+ 			pte = pte_offset_map(pmd, addr);
+ 			pte_to_pagemap_entry(&pme, pm, vma, addr, *pte);
+-			/* unmap before userspace copy */
+ 			pte_unmap(pte);
++			err = add_to_pagemap(addr, &pme, pm);
++			if (err)
++				return err;
+ 		}
+-		err = add_to_pagemap(addr, &pme, pm);
+-		if (err)
+-			return err;
++
++		if (addr == end)
++			break;
++
++		vma = find_vma(walk->mm, addr);
+ 	}
+ 
+ 	cond_resched();
