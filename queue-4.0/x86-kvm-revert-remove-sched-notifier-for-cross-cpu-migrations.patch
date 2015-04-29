@@ -1,0 +1,205 @@
+From 0a4e6be9ca17c54817cf814b4b5aa60478c6df27 Mon Sep 17 00:00:00 2001
+From: Marcelo Tosatti <mtosatti@redhat.com>
+Date: Mon, 23 Mar 2015 20:21:51 -0300
+Subject: x86: kvm: Revert "remove sched notifier for cross-cpu migrations"
+
+From: Marcelo Tosatti <mtosatti@redhat.com>
+
+commit 0a4e6be9ca17c54817cf814b4b5aa60478c6df27 upstream.
+
+The following point:
+
+    2. per-CPU pvclock time info is updated if the
+       underlying CPU changes.
+
+Is not true anymore since "KVM: x86: update pvclock area conditionally,
+on cpu migration".
+
+Add task migration notification back.
+
+Problem noticed by Andy Lutomirski.
+
+Signed-off-by: Marcelo Tosatti <mtosatti@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ arch/x86/include/asm/pvclock.h |    1 
+ arch/x86/kernel/pvclock.c      |   44 +++++++++++++++++++++++++++++++++++++++++
+ arch/x86/vdso/vclock_gettime.c |   16 +++++++-------
+ include/linux/sched.h          |    8 +++++++
+ kernel/sched/core.c            |   15 +++++++++++++
+ 5 files changed, 76 insertions(+), 8 deletions(-)
+
+--- a/arch/x86/include/asm/pvclock.h
++++ b/arch/x86/include/asm/pvclock.h
+@@ -95,6 +95,7 @@ unsigned __pvclock_read_cycles(const str
+ 
+ struct pvclock_vsyscall_time_info {
+ 	struct pvclock_vcpu_time_info pvti;
++	u32 migrate_count;
+ } __attribute__((__aligned__(SMP_CACHE_BYTES)));
+ 
+ #define PVTI_SIZE sizeof(struct pvclock_vsyscall_time_info)
+--- a/arch/x86/kernel/pvclock.c
++++ b/arch/x86/kernel/pvclock.c
+@@ -141,7 +141,46 @@ void pvclock_read_wallclock(struct pvclo
+ 	set_normalized_timespec(ts, now.tv_sec, now.tv_nsec);
+ }
+ 
++static struct pvclock_vsyscall_time_info *pvclock_vdso_info;
++
++static struct pvclock_vsyscall_time_info *
++pvclock_get_vsyscall_user_time_info(int cpu)
++{
++	if (!pvclock_vdso_info) {
++		BUG();
++		return NULL;
++	}
++
++	return &pvclock_vdso_info[cpu];
++}
++
++struct pvclock_vcpu_time_info *pvclock_get_vsyscall_time_info(int cpu)
++{
++	return &pvclock_get_vsyscall_user_time_info(cpu)->pvti;
++}
++
+ #ifdef CONFIG_X86_64
++static int pvclock_task_migrate(struct notifier_block *nb, unsigned long l,
++			        void *v)
++{
++	struct task_migration_notifier *mn = v;
++	struct pvclock_vsyscall_time_info *pvti;
++
++	pvti = pvclock_get_vsyscall_user_time_info(mn->from_cpu);
++
++	/* this is NULL when pvclock vsyscall is not initialized */
++	if (unlikely(pvti == NULL))
++		return NOTIFY_DONE;
++
++	pvti->migrate_count++;
++
++	return NOTIFY_DONE;
++}
++
++static struct notifier_block pvclock_migrate = {
++	.notifier_call = pvclock_task_migrate,
++};
++
+ /*
+  * Initialize the generic pvclock vsyscall state.  This will allocate
+  * a/some page(s) for the per-vcpu pvclock information, set up a
+@@ -155,12 +194,17 @@ int __init pvclock_init_vsyscall(struct
+ 
+ 	WARN_ON (size != PVCLOCK_VSYSCALL_NR_PAGES*PAGE_SIZE);
+ 
++	pvclock_vdso_info = i;
++
+ 	for (idx = 0; idx <= (PVCLOCK_FIXMAP_END-PVCLOCK_FIXMAP_BEGIN); idx++) {
+ 		__set_fixmap(PVCLOCK_FIXMAP_BEGIN + idx,
+ 			     __pa(i) + (idx*PAGE_SIZE),
+ 			     PAGE_KERNEL_VVAR);
+ 	}
+ 
++
++	register_task_migration_notifier(&pvclock_migrate);
++
+ 	return 0;
+ }
+ #endif
+--- a/arch/x86/vdso/vclock_gettime.c
++++ b/arch/x86/vdso/vclock_gettime.c
+@@ -82,18 +82,15 @@ static notrace cycle_t vread_pvclock(int
+ 	cycle_t ret;
+ 	u64 last;
+ 	u32 version;
++	u32 migrate_count;
+ 	u8 flags;
+ 	unsigned cpu, cpu1;
+ 
+ 
+ 	/*
+-	 * Note: hypervisor must guarantee that:
+-	 * 1. cpu ID number maps 1:1 to per-CPU pvclock time info.
+-	 * 2. that per-CPU pvclock time info is updated if the
+-	 *    underlying CPU changes.
+-	 * 3. that version is increased whenever underlying CPU
+-	 *    changes.
+-	 *
++	 * When looping to get a consistent (time-info, tsc) pair, we
++	 * also need to deal with the possibility we can switch vcpus,
++	 * so make sure we always re-fetch time-info for the current vcpu.
+ 	 */
+ 	do {
+ 		cpu = __getcpu() & VGETCPU_CPU_MASK;
+@@ -104,6 +101,8 @@ static notrace cycle_t vread_pvclock(int
+ 
+ 		pvti = get_pvti(cpu);
+ 
++		migrate_count = pvti->migrate_count;
++
+ 		version = __pvclock_read_cycles(&pvti->pvti, &ret, &flags);
+ 
+ 		/*
+@@ -115,7 +114,8 @@ static notrace cycle_t vread_pvclock(int
+ 		cpu1 = __getcpu() & VGETCPU_CPU_MASK;
+ 	} while (unlikely(cpu != cpu1 ||
+ 			  (pvti->pvti.version & 1) ||
+-			  pvti->pvti.version != version));
++			  pvti->pvti.version != version ||
++			  pvti->migrate_count != migrate_count));
+ 
+ 	if (unlikely(!(flags & PVCLOCK_TSC_STABLE_BIT)))
+ 		*mode = VCLOCK_NONE;
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -176,6 +176,14 @@ extern void get_iowait_load(unsigned lon
+ extern void calc_global_load(unsigned long ticks);
+ extern void update_cpu_load_nohz(void);
+ 
++/* Notifier for when a task gets migrated to a new CPU */
++struct task_migration_notifier {
++	struct task_struct *task;
++	int from_cpu;
++	int to_cpu;
++};
++extern void register_task_migration_notifier(struct notifier_block *n);
++
+ extern unsigned long get_parent_ip(unsigned long addr);
+ 
+ extern void dump_cpu_task(int cpu);
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -996,6 +996,13 @@ void check_preempt_curr(struct rq *rq, s
+ 		rq_clock_skip_update(rq, true);
+ }
+ 
++static ATOMIC_NOTIFIER_HEAD(task_migration_notifier);
++
++void register_task_migration_notifier(struct notifier_block *n)
++{
++	atomic_notifier_chain_register(&task_migration_notifier, n);
++}
++
+ #ifdef CONFIG_SMP
+ void set_task_cpu(struct task_struct *p, unsigned int new_cpu)
+ {
+@@ -1026,10 +1033,18 @@ void set_task_cpu(struct task_struct *p,
+ 	trace_sched_migrate_task(p, new_cpu);
+ 
+ 	if (task_cpu(p) != new_cpu) {
++		struct task_migration_notifier tmn;
++
+ 		if (p->sched_class->migrate_task_rq)
+ 			p->sched_class->migrate_task_rq(p, new_cpu);
+ 		p->se.nr_migrations++;
+ 		perf_sw_event_sched(PERF_COUNT_SW_CPU_MIGRATIONS, 1, 0);
++
++		tmn.task = p;
++		tmn.from_cpu = task_cpu(p);
++		tmn.to_cpu = new_cpu;
++
++		atomic_notifier_call_chain(&task_migration_notifier, 0, &tmn);
+ 	}
+ 
+ 	__set_task_cpu(p, new_cpu);
