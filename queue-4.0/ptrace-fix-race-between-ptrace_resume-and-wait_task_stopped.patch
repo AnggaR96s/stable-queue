@@ -1,0 +1,115 @@
+From b72c186999e689cb0b055ab1c7b3cd8fffbeb5ed Mon Sep 17 00:00:00 2001
+From: Oleg Nesterov <oleg@redhat.com>
+Date: Thu, 16 Apr 2015 12:47:29 -0700
+Subject: ptrace: fix race between ptrace_resume() and wait_task_stopped()
+
+From: Oleg Nesterov <oleg@redhat.com>
+
+commit b72c186999e689cb0b055ab1c7b3cd8fffbeb5ed upstream.
+
+ptrace_resume() is called when the tracee is still __TASK_TRACED.  We set
+tracee->exit_code and then wake_up_state() changes tracee->state.  If the
+tracer's sub-thread does wait() in between, task_stopped_code(ptrace => T)
+wrongly looks like another report from tracee.
+
+This confuses debugger, and since wait_task_stopped() clears ->exit_code
+the tracee can miss a signal.
+
+Test-case:
+
+	#include <stdio.h>
+	#include <unistd.h>
+	#include <sys/wait.h>
+	#include <sys/ptrace.h>
+	#include <pthread.h>
+	#include <assert.h>
+
+	int pid;
+
+	void *waiter(void *arg)
+	{
+		int stat;
+
+		for (;;) {
+			assert(pid == wait(&stat));
+			assert(WIFSTOPPED(stat));
+			if (WSTOPSIG(stat) == SIGHUP)
+				continue;
+
+			assert(WSTOPSIG(stat) == SIGCONT);
+			printf("ERR! extra/wrong report:%x\n", stat);
+		}
+	}
+
+	int main(void)
+	{
+		pthread_t thread;
+
+		pid = fork();
+		if (!pid) {
+			assert(ptrace(PTRACE_TRACEME, 0,0,0) == 0);
+			for (;;)
+				kill(getpid(), SIGHUP);
+		}
+
+		assert(pthread_create(&thread, NULL, waiter, NULL) == 0);
+
+		for (;;)
+			ptrace(PTRACE_CONT, pid, 0, SIGCONT);
+
+		return 0;
+	}
+
+Note for stable: the bug is very old, but without 9899d11f6544 "ptrace:
+ensure arch_ptrace/ptrace_request can never race with SIGKILL" the fix
+should use lock_task_sighand(child).
+
+Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+Reported-by: Pavel Labath <labath@google.com>
+Tested-by: Pavel Labath <labath@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ kernel/ptrace.c |   20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+--- a/kernel/ptrace.c
++++ b/kernel/ptrace.c
+@@ -697,6 +697,8 @@ static int ptrace_peek_siginfo(struct ta
+ static int ptrace_resume(struct task_struct *child, long request,
+ 			 unsigned long data)
+ {
++	bool need_siglock;
++
+ 	if (!valid_signal(data))
+ 		return -EIO;
+ 
+@@ -724,8 +726,26 @@ static int ptrace_resume(struct task_str
+ 		user_disable_single_step(child);
+ 	}
+ 
++	/*
++	 * Change ->exit_code and ->state under siglock to avoid the race
++	 * with wait_task_stopped() in between; a non-zero ->exit_code will
++	 * wrongly look like another report from tracee.
++	 *
++	 * Note that we need siglock even if ->exit_code == data and/or this
++	 * status was not reported yet, the new status must not be cleared by
++	 * wait_task_stopped() after resume.
++	 *
++	 * If data == 0 we do not care if wait_task_stopped() reports the old
++	 * status and clears the code too; this can't race with the tracee, it
++	 * takes siglock after resume.
++	 */
++	need_siglock = data && !thread_group_empty(current);
++	if (need_siglock)
++		spin_lock_irq(&child->sighand->siglock);
+ 	child->exit_code = data;
+ 	wake_up_state(child, __TASK_TRACED);
++	if (need_siglock)
++		spin_unlock_irq(&child->sighand->siglock);
+ 
+ 	return 0;
+ }
