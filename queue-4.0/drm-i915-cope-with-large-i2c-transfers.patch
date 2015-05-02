@@ -1,0 +1,145 @@
+From 9535c4757b881e06fae72a857485ad57c422b8d2 Mon Sep 17 00:00:00 2001
+From: Dmitry Torokhov <dmitry.torokhov@gmail.com>
+Date: Tue, 21 Apr 2015 09:49:11 -0700
+Subject: drm/i915: cope with large i2c transfers
+
+From: Dmitry Torokhov <dmitry.torokhov@gmail.com>
+
+commit 9535c4757b881e06fae72a857485ad57c422b8d2 upstream.
+
+The hardware, according to the specs, is limited to 256 byte transfers,
+and current driver has no protections in case users attempt to do larger
+transfers. The code will just stomp over status register and mayhem
+ensues.
+
+Let's split larger transfers into digestable chunks. Doing this allows
+Atmel MXT driver on Pixel 1 function properly (it hasn't since commit
+9d8dc3e529a19e427fd379118acd132520935c5d "Input: atmel_mxt_ts -
+implement T44 message handling" which tries to consume multiple
+touchscreen/touchpad reports in a single transaction).
+
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Dmitry Torokhov <dmitry.torokhov@gmail.com>
+Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/gpu/drm/i915/i915_reg.h  |    1 
+ drivers/gpu/drm/i915/intel_i2c.c |   66 +++++++++++++++++++++++++++++++++------
+ 2 files changed, 57 insertions(+), 10 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -1740,6 +1740,7 @@ enum punit_power_well {
+ #define   GMBUS_CYCLE_INDEX	(2<<25)
+ #define   GMBUS_CYCLE_STOP	(4<<25)
+ #define   GMBUS_BYTE_COUNT_SHIFT 16
++#define   GMBUS_BYTE_COUNT_MAX   256U
+ #define   GMBUS_SLAVE_INDEX_SHIFT 8
+ #define   GMBUS_SLAVE_ADDR_SHIFT 1
+ #define   GMBUS_SLAVE_READ	(1<<0)
+--- a/drivers/gpu/drm/i915/intel_i2c.c
++++ b/drivers/gpu/drm/i915/intel_i2c.c
+@@ -270,18 +270,17 @@ gmbus_wait_idle(struct drm_i915_private
+ }
+ 
+ static int
+-gmbus_xfer_read(struct drm_i915_private *dev_priv, struct i2c_msg *msg,
+-		u32 gmbus1_index)
++gmbus_xfer_read_chunk(struct drm_i915_private *dev_priv,
++		      unsigned short addr, u8 *buf, unsigned int len,
++		      u32 gmbus1_index)
+ {
+ 	int reg_offset = dev_priv->gpio_mmio_base;
+-	u16 len = msg->len;
+-	u8 *buf = msg->buf;
+ 
+ 	I915_WRITE(GMBUS1 + reg_offset,
+ 		   gmbus1_index |
+ 		   GMBUS_CYCLE_WAIT |
+ 		   (len << GMBUS_BYTE_COUNT_SHIFT) |
+-		   (msg->addr << GMBUS_SLAVE_ADDR_SHIFT) |
++		   (addr << GMBUS_SLAVE_ADDR_SHIFT) |
+ 		   GMBUS_SLAVE_READ | GMBUS_SW_RDY);
+ 	while (len) {
+ 		int ret;
+@@ -303,11 +302,35 @@ gmbus_xfer_read(struct drm_i915_private
+ }
+ 
+ static int
+-gmbus_xfer_write(struct drm_i915_private *dev_priv, struct i2c_msg *msg)
++gmbus_xfer_read(struct drm_i915_private *dev_priv, struct i2c_msg *msg,
++		u32 gmbus1_index)
+ {
+-	int reg_offset = dev_priv->gpio_mmio_base;
+-	u16 len = msg->len;
+ 	u8 *buf = msg->buf;
++	unsigned int rx_size = msg->len;
++	unsigned int len;
++	int ret;
++
++	do {
++		len = min(rx_size, GMBUS_BYTE_COUNT_MAX);
++
++		ret = gmbus_xfer_read_chunk(dev_priv, msg->addr,
++					    buf, len, gmbus1_index);
++		if (ret)
++			return ret;
++
++		rx_size -= len;
++		buf += len;
++	} while (rx_size != 0);
++
++	return 0;
++}
++
++static int
++gmbus_xfer_write_chunk(struct drm_i915_private *dev_priv,
++		       unsigned short addr, u8 *buf, unsigned int len)
++{
++	int reg_offset = dev_priv->gpio_mmio_base;
++	unsigned int chunk_size = len;
+ 	u32 val, loop;
+ 
+ 	val = loop = 0;
+@@ -319,8 +342,8 @@ gmbus_xfer_write(struct drm_i915_private
+ 	I915_WRITE(GMBUS3 + reg_offset, val);
+ 	I915_WRITE(GMBUS1 + reg_offset,
+ 		   GMBUS_CYCLE_WAIT |
+-		   (msg->len << GMBUS_BYTE_COUNT_SHIFT) |
+-		   (msg->addr << GMBUS_SLAVE_ADDR_SHIFT) |
++		   (chunk_size << GMBUS_BYTE_COUNT_SHIFT) |
++		   (addr << GMBUS_SLAVE_ADDR_SHIFT) |
+ 		   GMBUS_SLAVE_WRITE | GMBUS_SW_RDY);
+ 	while (len) {
+ 		int ret;
+@@ -337,6 +360,29 @@ gmbus_xfer_write(struct drm_i915_private
+ 		if (ret)
+ 			return ret;
+ 	}
++
++	return 0;
++}
++
++static int
++gmbus_xfer_write(struct drm_i915_private *dev_priv, struct i2c_msg *msg)
++{
++	u8 *buf = msg->buf;
++	unsigned int tx_size = msg->len;
++	unsigned int len;
++	int ret;
++
++	do {
++		len = min(tx_size, GMBUS_BYTE_COUNT_MAX);
++
++		ret = gmbus_xfer_write_chunk(dev_priv, msg->addr, buf, len);
++		if (ret)
++			return ret;
++
++		buf += len;
++		tx_size -= len;
++	} while (tx_size != 0);
++
+ 	return 0;
+ }
+ 
