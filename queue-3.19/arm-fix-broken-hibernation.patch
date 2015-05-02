@@ -1,0 +1,150 @@
+From 767bf7e7a1e82a81c59778348d156993d0a6175d Mon Sep 17 00:00:00 2001
+From: Russell King <rmk+kernel@arm.linux.org.uk>
+Date: Wed, 1 Apr 2015 16:20:39 +0100
+Subject: ARM: fix broken hibernation
+
+From: Russell King <rmk+kernel@arm.linux.org.uk>
+
+commit 767bf7e7a1e82a81c59778348d156993d0a6175d upstream.
+
+Normally, when a CPU wants to clear a cache line to zero in the external
+L2 cache, it would generate bus cycles to write each word as it would do
+with any other data access.
+
+However, a Cortex A9 connected to a L2C-310 has a specific feature where
+the CPU can detect this operation, and signal that it wants to zero an
+entire cache line.  This feature, known as Full Line of Zeros (FLZ),
+involves a non-standard AXI signalling mechanism which only the L2C-310
+can properly interpret.
+
+There are separate enable bits in both the L2C-310 and the Cortex A9 -
+the L2C-310 needs to be enabled and have the FLZ enable bit set in the
+auxiliary control register before the Cortex A9 has this feature
+enabled.
+
+Unfortunately, the suspend code was not respecting this - it's not
+obvious from the code:
+
+swsusp_arch_suspend()
+ cpu_suspend() /* saves the Cortex A9 auxiliary control register */
+  arch_save_image()
+  soft_restart() /* turns off FLZ in Cortex A9, and disables L2C */
+   cpu_resume() /* restores the Cortex A9 registers, inc auxcr */
+
+At this point, we end up with the L2C disabled, but the Cortex A9 with
+FLZ enabled - which means any memset() or zeroing of a full cache line
+will fail to take effect.
+
+A similar issue exists in the resume path, but it's slightly more
+complex:
+
+swsusp_arch_suspend()
+ cpu_suspend() /* saves the Cortex A9 auxiliary control register */
+  arch_save_image() /* image with A9 auxcr saved */
+...
+swsusp_arch_resume()
+ call_with_stack()
+  arch_restore_image() /* restores image with A9 auxcr saved above */
+  soft_restart() /* turns off FLZ in Cortex A9, and disables L2C */
+   cpu_resume() /* restores the Cortex A9 registers, inc auxcr */
+
+Again, here we end up with the L2C disabled, but Cortex A9 FLZ enabled.
+
+There's no need to turn off the L2C in either of these two paths; there
+are benefits from not doing so - for example, the page copies will be
+faster with the L2C enabled.
+
+Hence, fix this by providing a variant of soft_restart() which can be
+used without turning the L2 cache controller off, and use it in both
+of these paths to keep the L2C enabled across the respective resume
+transitions.
+
+Fixes: 8ef418c7178f ("ARM: l2c: trial at enabling some Cortex-A9 optimisations")
+Reported-by: Sean Cross <xobs@kosagi.com>
+Tested-by: Sean Cross <xobs@kosagi.com>
+Signed-off-by: Russell King <rmk+kernel@arm.linux.org.uk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ arch/arm/kernel/hibernate.c |    5 +++--
+ arch/arm/kernel/process.c   |   10 ++++++++--
+ arch/arm/kernel/reboot.h    |    6 ++++++
+ 3 files changed, 17 insertions(+), 4 deletions(-)
+
+--- a/arch/arm/kernel/hibernate.c
++++ b/arch/arm/kernel/hibernate.c
+@@ -22,6 +22,7 @@
+ #include <asm/suspend.h>
+ #include <asm/memory.h>
+ #include <asm/sections.h>
++#include "reboot.h"
+ 
+ int pfn_is_nosave(unsigned long pfn)
+ {
+@@ -61,7 +62,7 @@ static int notrace arch_save_image(unsig
+ 
+ 	ret = swsusp_save();
+ 	if (ret == 0)
+-		soft_restart(virt_to_phys(cpu_resume));
++		_soft_restart(virt_to_phys(cpu_resume), false);
+ 	return ret;
+ }
+ 
+@@ -86,7 +87,7 @@ static void notrace arch_restore_image(v
+ 	for (pbe = restore_pblist; pbe; pbe = pbe->next)
+ 		copy_page(pbe->orig_address, pbe->address);
+ 
+-	soft_restart(virt_to_phys(cpu_resume));
++	_soft_restart(virt_to_phys(cpu_resume), false);
+ }
+ 
+ static u64 resume_stack[PAGE_SIZE/2/sizeof(u64)] __nosavedata;
+--- a/arch/arm/kernel/process.c
++++ b/arch/arm/kernel/process.c
+@@ -41,6 +41,7 @@
+ #include <asm/system_misc.h>
+ #include <asm/mach/time.h>
+ #include <asm/tls.h>
++#include "reboot.h"
+ 
+ #ifdef CONFIG_CC_STACKPROTECTOR
+ #include <linux/stackprotector.h>
+@@ -95,7 +96,7 @@ static void __soft_restart(void *addr)
+ 	BUG();
+ }
+ 
+-void soft_restart(unsigned long addr)
++void _soft_restart(unsigned long addr, bool disable_l2)
+ {
+ 	u64 *stack = soft_restart_stack + ARRAY_SIZE(soft_restart_stack);
+ 
+@@ -104,7 +105,7 @@ void soft_restart(unsigned long addr)
+ 	local_fiq_disable();
+ 
+ 	/* Disable the L2 if we're the last man standing. */
+-	if (num_online_cpus() == 1)
++	if (disable_l2)
+ 		outer_disable();
+ 
+ 	/* Change to the new stack and continue with the reset. */
+@@ -114,6 +115,11 @@ void soft_restart(unsigned long addr)
+ 	BUG();
+ }
+ 
++void soft_restart(unsigned long addr)
++{
++	_soft_restart(addr, num_online_cpus() == 1);
++}
++
+ /*
+  * Function pointers to optional machine specific functions
+  */
+--- /dev/null
++++ b/arch/arm/kernel/reboot.h
+@@ -0,0 +1,6 @@
++#ifndef REBOOT_H
++#define REBOOT_H
++
++extern void _soft_restart(unsigned long addr, bool disable_l2);
++
++#endif
