@@ -1,0 +1,154 @@
+From 1c94e65c668f44d2c69ae7e7fc268ab3268fba3e Mon Sep 17 00:00:00 2001
+From: Takashi Iwai <tiwai@suse.de>
+Date: Tue, 28 Apr 2015 17:11:44 +0200
+Subject: ALSA: emux: Fix mutex deadlock in OSS emulation
+
+From: Takashi Iwai <tiwai@suse.de>
+
+commit 1c94e65c668f44d2c69ae7e7fc268ab3268fba3e upstream.
+
+The OSS emulation in synth-emux helper has a potential AB/BA deadlock
+at the simultaneous closing and opening:
+
+  close ->
+    snd_seq_release() ->
+      sne_seq_free_client() ->
+        snd_seq_delete_all_ports(): takes client->ports_mutex ->
+	  port_delete() ->
+	    snd_emux_unuse(): takes emux->register_mutex
+
+  open ->
+    snd_seq_oss_open() ->
+      snd_emux_open_seq_oss(): takes emux->register_mutex ->
+        snd_seq_event_port_attach() ->
+	  snd_seq_create_port(): takes client->ports_mutex
+
+This patch addresses the deadlock by reducing the rance taking
+emux->register_mutex in snd_emux_open_seq_oss().  The lock is needed
+for the refcount handling, so move it locally.  The calls in
+emux_seq.c are already with the mutex, thus they are replaced with the
+version without mutex lock/unlock.
+
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ sound/synth/emux/emux_oss.c |   11 +----------
+ sound/synth/emux/emux_seq.c |   27 +++++++++++++++++++++------
+ 2 files changed, 22 insertions(+), 16 deletions(-)
+
+--- a/sound/synth/emux/emux_oss.c
++++ b/sound/synth/emux/emux_oss.c
+@@ -118,12 +118,8 @@ snd_emux_open_seq_oss(struct snd_seq_oss
+ 	if (snd_BUG_ON(!arg || !emu))
+ 		return -ENXIO;
+ 
+-	mutex_lock(&emu->register_mutex);
+-
+-	if (!snd_emux_inc_count(emu)) {
+-		mutex_unlock(&emu->register_mutex);
++	if (!snd_emux_inc_count(emu))
+ 		return -EFAULT;
+-	}
+ 
+ 	memset(&callback, 0, sizeof(callback));
+ 	callback.owner = THIS_MODULE;
+@@ -135,7 +131,6 @@ snd_emux_open_seq_oss(struct snd_seq_oss
+ 	if (p == NULL) {
+ 		snd_printk(KERN_ERR "can't create port\n");
+ 		snd_emux_dec_count(emu);
+-		mutex_unlock(&emu->register_mutex);
+ 		return -ENOMEM;
+ 	}
+ 
+@@ -148,8 +143,6 @@ snd_emux_open_seq_oss(struct snd_seq_oss
+ 	reset_port_mode(p, arg->seq_mode);
+ 
+ 	snd_emux_reset_port(p);
+-
+-	mutex_unlock(&emu->register_mutex);
+ 	return 0;
+ }
+ 
+@@ -195,13 +188,11 @@ snd_emux_close_seq_oss(struct snd_seq_os
+ 	if (snd_BUG_ON(!emu))
+ 		return -ENXIO;
+ 
+-	mutex_lock(&emu->register_mutex);
+ 	snd_emux_sounds_off_all(p);
+ 	snd_soundfont_close_check(emu->sflist, SF_CLIENT_NO(p->chset.port));
+ 	snd_seq_event_port_detach(p->chset.client, p->chset.port);
+ 	snd_emux_dec_count(emu);
+ 
+-	mutex_unlock(&emu->register_mutex);
+ 	return 0;
+ }
+ 
+--- a/sound/synth/emux/emux_seq.c
++++ b/sound/synth/emux/emux_seq.c
+@@ -267,8 +267,8 @@ snd_emux_event_input(struct snd_seq_even
+ /*
+  * increment usage count
+  */
+-int
+-snd_emux_inc_count(struct snd_emux *emu)
++static int
++__snd_emux_inc_count(struct snd_emux *emu)
+ {
+ 	emu->used++;
+ 	if (!try_module_get(emu->ops.owner))
+@@ -282,12 +282,21 @@ snd_emux_inc_count(struct snd_emux *emu)
+ 	return 1;
+ }
+ 
++int snd_emux_inc_count(struct snd_emux *emu)
++{
++	int ret;
++
++	mutex_lock(&emu->register_mutex);
++	ret = __snd_emux_inc_count(emu);
++	mutex_unlock(&emu->register_mutex);
++	return ret;
++}
+ 
+ /*
+  * decrease usage count
+  */
+-void
+-snd_emux_dec_count(struct snd_emux *emu)
++static void
++__snd_emux_dec_count(struct snd_emux *emu)
+ {
+ 	module_put(emu->card->module);
+ 	emu->used--;
+@@ -296,6 +305,12 @@ snd_emux_dec_count(struct snd_emux *emu)
+ 	module_put(emu->ops.owner);
+ }
+ 
++void snd_emux_dec_count(struct snd_emux *emu)
++{
++	mutex_lock(&emu->register_mutex);
++	__snd_emux_dec_count(emu);
++	mutex_unlock(&emu->register_mutex);
++}
+ 
+ /*
+  * Routine that is called upon a first use of a particular port
+@@ -315,7 +330,7 @@ snd_emux_use(void *private_data, struct
+ 
+ 	mutex_lock(&emu->register_mutex);
+ 	snd_emux_init_port(p);
+-	snd_emux_inc_count(emu);
++	__snd_emux_inc_count(emu);
+ 	mutex_unlock(&emu->register_mutex);
+ 	return 0;
+ }
+@@ -338,7 +353,7 @@ snd_emux_unuse(void *private_data, struc
+ 
+ 	mutex_lock(&emu->register_mutex);
+ 	snd_emux_sounds_off_all(p);
+-	snd_emux_dec_count(emu);
++	__snd_emux_dec_count(emu);
+ 	mutex_unlock(&emu->register_mutex);
+ 	return 0;
+ }
