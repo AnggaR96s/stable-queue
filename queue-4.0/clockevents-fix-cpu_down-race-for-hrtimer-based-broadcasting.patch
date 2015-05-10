@@ -1,0 +1,150 @@
+From 345527b1edce8df719e0884500c76832a18211c3 Mon Sep 17 00:00:00 2001
+From: Preeti U Murthy <preeti@linux.vnet.ibm.com>
+Date: Mon, 30 Mar 2015 14:59:19 +0530
+Subject: clockevents: Fix cpu_down() race for hrtimer based broadcasting
+
+From: Preeti U Murthy <preeti@linux.vnet.ibm.com>
+
+commit 345527b1edce8df719e0884500c76832a18211c3 upstream.
+
+It was found when doing a hotplug stress test on POWER, that the
+machine either hit softlockups or rcu_sched stall warnings.  The
+issue was traced to commit:
+
+  7cba160ad789 ("powernv/cpuidle: Redesign idle states management")
+
+which exposed the cpu_down() race with hrtimer based broadcast mode:
+
+  5d1638acb9f6 ("tick: Introduce hrtimer based broadcast")
+
+The race is the following:
+
+Assume CPU1 is the CPU which holds the hrtimer broadcasting duty
+before it is taken down.
+
+	CPU0					CPU1
+
+	cpu_down()				take_cpu_down()
+						disable_interrupts()
+
+	cpu_die()
+
+	while (CPU1 != CPU_DEAD) {
+		msleep(100);
+		switch_to_idle();
+		stop_cpu_timer();
+		schedule_broadcast();
+	}
+
+	tick_cleanup_cpu_dead()
+		take_over_broadcast()
+
+So after CPU1 disabled interrupts it cannot handle the broadcast
+hrtimer anymore, so CPU0 will be stuck forever.
+
+Fix this by explicitly taking over broadcast duty before cpu_die().
+
+This is a temporary workaround. What we really want is a callback
+in the clockevent device which allows us to do that from the dying
+CPU by pushing the hrtimer onto a different cpu. That might involve
+an IPI and is definitely more complex than this immediate fix.
+
+Changelog was picked up from:
+
+    https://lkml.org/lkml/2015/2/16/213
+
+Suggested-by: Thomas Gleixner <tglx@linutronix.de>
+Tested-by: Nicolas Pitre <nico@linaro.org>
+Signed-off-by: Preeti U. Murthy <preeti@linux.vnet.ibm.com>
+Cc: linuxppc-dev@lists.ozlabs.org
+Cc: mpe@ellerman.id.au
+Cc: nicolas.pitre@linaro.org
+Cc: peterz@infradead.org
+Cc: rjw@rjwysocki.net
+Fixes: http://linuxppc.10917.n7.nabble.com/offlining-cpus-breakage-td88619.html
+Link: http://lkml.kernel.org/r/20150330092410.24979.59887.stgit@preeti.in.ibm.com
+[ Merged it to the latest timer tree, renamed the callback, tidied up the changelog. ]
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+
+Added a hunk that got missed in the previous post.
+Please add this to stable 3.19 and 4.0. The patch applies on both.
+
+ include/linux/tick.h         |    7 ++++++-
+ kernel/cpu.c                 |    2 ++
+ kernel/time/tick-broadcast.c |   19 +++++++++++--------
+ 3 files changed, 19 insertions(+), 9 deletions(-)
+
+--- a/include/linux/tick.h
++++ b/include/linux/tick.h
+@@ -100,8 +100,13 @@ extern struct cpumask *tick_get_broadcas
+ 
+ #  ifdef CONFIG_TICK_ONESHOT
+ extern struct cpumask *tick_get_broadcast_oneshot_mask(void);
+-#  endif
++extern void hotplug_cpu__broadcast_tick_pull(int dead_cpu);
++# else
++static inline void hotplug_cpu__broadcast_tick_pull(int dead_cpu) { }
++#  endif /* TICK_ONESHOT */
+ 
++# else
++static inline void hotplug_cpu__broadcast_tick_pull(int dead_cpu) { }
+ # endif /* BROADCAST */
+ 
+ # ifdef CONFIG_TICK_ONESHOT
+--- a/kernel/cpu.c
++++ b/kernel/cpu.c
+@@ -20,6 +20,7 @@
+ #include <linux/gfp.h>
+ #include <linux/suspend.h>
+ #include <linux/lockdep.h>
++#include <linux/tick.h>
+ #include <trace/events/power.h>
+ 
+ #include "smpboot.h"
+@@ -411,6 +412,7 @@ static int __ref _cpu_down(unsigned int
+ 	while (!idle_cpu(cpu))
+ 		cpu_relax();
+ 
++	hotplug_cpu__broadcast_tick_pull(cpu);
+ 	/* This actually kills the CPU. */
+ 	__cpu_die(cpu);
+ 
+--- a/kernel/time/tick-broadcast.c
++++ b/kernel/time/tick-broadcast.c
+@@ -669,14 +669,19 @@ static void broadcast_shutdown_local(str
+ 	clockevents_set_mode(dev, CLOCK_EVT_MODE_SHUTDOWN);
+ }
+ 
+-static void broadcast_move_bc(int deadcpu)
++void hotplug_cpu__broadcast_tick_pull(int deadcpu)
+ {
+-	struct clock_event_device *bc = tick_broadcast_device.evtdev;
++	struct clock_event_device *bc;
++	unsigned long flags;
++
++	raw_spin_lock_irqsave(&tick_broadcast_lock, flags);
++	bc = tick_broadcast_device.evtdev;
+ 
+-	if (!bc || !broadcast_needs_cpu(bc, deadcpu))
+-		return;
+-	/* This moves the broadcast assignment to this cpu */
+-	clockevents_program_event(bc, bc->next_event, 1);
++	if (bc && broadcast_needs_cpu(bc, deadcpu)) {
++		/* This moves the broadcast assignment to this CPU: */
++		clockevents_program_event(bc, bc->next_event, 1);
++	}
++	raw_spin_unlock_irqrestore(&tick_broadcast_lock, flags);
+ }
+ 
+ /*
+@@ -913,8 +918,6 @@ void tick_shutdown_broadcast_oneshot(uns
+ 	cpumask_clear_cpu(cpu, tick_broadcast_pending_mask);
+ 	cpumask_clear_cpu(cpu, tick_broadcast_force_mask);
+ 
+-	broadcast_move_bc(cpu);
+-
+ 	raw_spin_unlock_irqrestore(&tick_broadcast_lock, flags);
+ }
+ 
