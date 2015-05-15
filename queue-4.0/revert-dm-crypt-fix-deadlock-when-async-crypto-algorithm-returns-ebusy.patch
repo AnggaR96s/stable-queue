@@ -1,0 +1,117 @@
+From c0403ec0bb5a8c5b267fb7e16021bec0b17e4964 Mon Sep 17 00:00:00 2001
+From: Rabin Vincent <rabin.vincent@axis.com>
+Date: Tue, 5 May 2015 15:15:56 +0200
+Subject: Revert "dm crypt: fix deadlock when async crypto algorithm returns -EBUSY"
+
+From: Rabin Vincent <rabin.vincent@axis.com>
+
+commit c0403ec0bb5a8c5b267fb7e16021bec0b17e4964 upstream.
+
+This reverts Linux 4.1-rc1 commit 0618764cb25f6fa9fb31152995de42a8a0496475.
+
+The problem which that commit attempts to fix actually lies in the
+Freescale CAAM crypto driver not dm-crypt.
+
+dm-crypt uses CRYPTO_TFM_REQ_MAY_BACKLOG.  This means the the crypto
+driver should internally backlog requests which arrive when the queue is
+full and process them later.  Until the crypto hw's queue becomes full,
+the driver returns -EINPROGRESS.  When the crypto hw's queue if full,
+the driver returns -EBUSY, and if CRYPTO_TFM_REQ_MAY_BACKLOG is set, is
+expected to backlog the request and process it when the hardware has
+queue space.  At the point when the driver takes the request from the
+backlog and starts processing it, it calls the completion function with
+a status of -EINPROGRESS.  The completion function is called (for a
+second time, in the case of backlogged requests) with a status/err of 0
+when a request is done.
+
+Crypto drivers for hardware without hardware queueing use the helpers,
+crypto_init_queue(), crypto_enqueue_request(), crypto_dequeue_request()
+and crypto_get_backlog() helpers to implement this behaviour correctly,
+while others implement this behaviour without these helpers (ccp, for
+example).
+
+dm-crypt (before the patch that needs reverting) uses this API
+correctly.  It queues up as many requests as the hw queues will allow
+(i.e. as long as it gets back -EINPROGRESS from the request function).
+Then, when it sees at least one backlogged request (gets -EBUSY), it
+waits till that backlogged request is handled (completion gets called
+with -EINPROGRESS), and then continues.  The references to
+af_alg_wait_for_completion() and af_alg_complete() in that commit's
+commit message are irrelevant because those functions only handle one
+request at a time, unlink dm-crypt.
+
+The problem is that the Freescale CAAM driver, which that commit
+describes as having being tested with, fails to implement the
+backlogging behaviour correctly.  In cam_jr_enqueue(), if the hardware
+queue is full, it simply returns -EBUSY without backlogging the request.
+What the observed deadlock was is not described in the commit message
+but it is obviously the wait_for_completion() in crypto_convert() where
+dm-crypto would wait for the completion being called with -EINPROGRESS
+in the case of backlogged requests.  This completion will never be
+completed due to the bug in the CAAM driver.
+
+Commit 0618764cb25 incorrectly made dm-crypt wait for every request,
+even when the driver/hardware queues are not full, which means that
+dm-crypt will never see -EBUSY.  This means that that commit will cause
+a performance regression on all crypto drivers which implement the API
+correctly.
+
+Revert it.  Correct backlog handling should be implemented in the CAAM
+driver instead.
+
+Cc'ing stable purely because commit 0618764cb25 did.  If for some reason
+a stable@ kernel did pick up commit 0618764cb25 it should get reverted.
+
+Signed-off-by: Rabin Vincent <rabin.vincent@axis.com>
+Reviewed-by: Horia Geanta <horia.geanta@freescale.com>
+Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/md/dm-crypt.c |   12 ++++++------
+ 1 file changed, 6 insertions(+), 6 deletions(-)
+
+--- a/drivers/md/dm-crypt.c
++++ b/drivers/md/dm-crypt.c
+@@ -925,10 +925,11 @@ static int crypt_convert(struct crypt_co
+ 
+ 		switch (r) {
+ 		/* async */
+-		case -EINPROGRESS:
+ 		case -EBUSY:
+ 			wait_for_completion(&ctx->restart);
+ 			reinit_completion(&ctx->restart);
++			/* fall through*/
++		case -EINPROGRESS:
+ 			ctx->req = NULL;
+ 			ctx->cc_sector++;
+ 			continue;
+@@ -1345,8 +1346,10 @@ static void kcryptd_async_done(struct cr
+ 	struct dm_crypt_io *io = container_of(ctx, struct dm_crypt_io, ctx);
+ 	struct crypt_config *cc = io->cc;
+ 
+-	if (error == -EINPROGRESS)
++	if (error == -EINPROGRESS) {
++		complete(&ctx->restart);
+ 		return;
++	}
+ 
+ 	if (!error && cc->iv_gen_ops && cc->iv_gen_ops->post)
+ 		error = cc->iv_gen_ops->post(cc, iv_of_dmreq(cc, dmreq), dmreq);
+@@ -1357,15 +1360,12 @@ static void kcryptd_async_done(struct cr
+ 	crypt_free_req(cc, req_of_dmreq(cc, dmreq), io->base_bio);
+ 
+ 	if (!atomic_dec_and_test(&ctx->cc_pending))
+-		goto done;
++		return;
+ 
+ 	if (bio_data_dir(io->base_bio) == READ)
+ 		kcryptd_crypt_read_done(io);
+ 	else
+ 		kcryptd_crypt_write_io_submit(io, 1);
+-done:
+-	if (!completion_done(&ctx->restart))
+-		complete(&ctx->restart);
+ }
+ 
+ static void kcryptd_crypt(struct work_struct *work)
