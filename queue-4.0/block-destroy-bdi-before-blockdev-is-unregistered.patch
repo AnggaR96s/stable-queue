@@ -1,0 +1,111 @@
+From 6cd18e711dd8075da9d78cfc1239f912ff28968a Mon Sep 17 00:00:00 2001
+From: NeilBrown <neilb@suse.de>
+Date: Mon, 27 Apr 2015 14:12:22 +1000
+Subject: block: destroy bdi before blockdev is unregistered.
+
+From: NeilBrown <neilb@suse.de>
+
+commit 6cd18e711dd8075da9d78cfc1239f912ff28968a upstream.
+
+Because of the peculiar way that md devices are created (automatically
+when the device node is opened), a new device can be created and
+registered immediately after the
+	blk_unregister_region(disk_devt(disk), disk->minors);
+call in del_gendisk().
+
+Therefore it is important that all visible artifacts of the previous
+device are removed before this call.  In particular, the 'bdi'.
+
+Since:
+commit c4db59d31e39ea067c32163ac961e9c80198fd37
+Author: Christoph Hellwig <hch@lst.de>
+    fs: don't reassign dirty inodes to default_backing_dev_info
+
+moved the
+   device_unregister(bdi->dev);
+call from bdi_unregister() to bdi_destroy() it has been quite easy to
+lose a race and have a new (e.g.) "md127" be created after the
+blk_unregister_region() call and before bdi_destroy() is ultimately
+called by the final 'put_disk', which must come after del_gendisk().
+
+The new device finds that the bdi name is already registered in sysfs
+and complains
+
+> [ 9627.630029] WARNING: CPU: 18 PID: 3330 at fs/sysfs/dir.c:31 sysfs_warn_dup+0x5a/0x70()
+> [ 9627.630032] sysfs: cannot create duplicate filename '/devices/virtual/bdi/9:127'
+
+We can fix this by moving the bdi_destroy() call out of
+blk_release_queue() (which can happen very late when a refcount
+reaches zero) and into blk_cleanup_queue() - which happens exactly when the md
+device driver calls it.
+
+Then it is only necessary for md to call blk_cleanup_queue() before
+del_gendisk().  As loop.c devices are also created on demand by
+opening the device node, we make the same change there.
+
+Fixes: c4db59d31e39ea067c32163ac961e9c80198fd37
+Reported-by: Azat Khuzhin <a3at.mail@gmail.com>
+Cc: Christoph Hellwig <hch@lst.de>
+Signed-off-by: NeilBrown <neilb@suse.de>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Jens Axboe <axboe@fb.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ block/blk-core.c     |    2 ++
+ block/blk-sysfs.c    |    2 --
+ drivers/block/loop.c |    2 +-
+ drivers/md/md.c      |    4 ++--
+ 4 files changed, 5 insertions(+), 5 deletions(-)
+
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -552,6 +552,8 @@ void blk_cleanup_queue(struct request_qu
+ 		q->queue_lock = &q->__queue_lock;
+ 	spin_unlock_irq(lock);
+ 
++	bdi_destroy(&q->backing_dev_info);
++
+ 	/* @q is and will stay empty, shutdown and put */
+ 	blk_put_queue(q);
+ }
+--- a/block/blk-sysfs.c
++++ b/block/blk-sysfs.c
+@@ -522,8 +522,6 @@ static void blk_release_queue(struct kob
+ 
+ 	blk_trace_shutdown(q);
+ 
+-	bdi_destroy(&q->backing_dev_info);
+-
+ 	ida_simple_remove(&blk_queue_ida, q->id);
+ 	call_rcu(&q->rcu_head, blk_free_queue_rcu);
+ }
+--- a/drivers/block/loop.c
++++ b/drivers/block/loop.c
+@@ -1672,8 +1672,8 @@ out:
+ 
+ static void loop_remove(struct loop_device *lo)
+ {
+-	del_gendisk(lo->lo_disk);
+ 	blk_cleanup_queue(lo->lo_queue);
++	del_gendisk(lo->lo_disk);
+ 	blk_mq_free_tag_set(&lo->tag_set);
+ 	put_disk(lo->lo_disk);
+ 	kfree(lo);
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -4754,12 +4754,12 @@ static void md_free(struct kobject *ko)
+ 	if (mddev->sysfs_state)
+ 		sysfs_put(mddev->sysfs_state);
+ 
++	if (mddev->queue)
++		blk_cleanup_queue(mddev->queue);
+ 	if (mddev->gendisk) {
+ 		del_gendisk(mddev->gendisk);
+ 		put_disk(mddev->gendisk);
+ 	}
+-	if (mddev->queue)
+-		blk_cleanup_queue(mddev->queue);
+ 
+ 	kfree(mddev);
+ }
