@@ -1,0 +1,165 @@
+From 0be0226f07d14b153a5eedf2bb86e1eb7dcefab5 Mon Sep 17 00:00:00 2001
+From: Xiao Guangrong <guangrong.xiao@linux.intel.com>
+Date: Mon, 11 May 2015 22:55:21 +0800
+Subject: KVM: MMU: fix SMAP virtualization
+
+From: Xiao Guangrong <guangrong.xiao@linux.intel.com>
+
+commit 0be0226f07d14b153a5eedf2bb86e1eb7dcefab5 upstream.
+
+KVM may turn a user page to a kernel page when kernel writes a readonly
+user page if CR0.WP = 1. This shadow page entry will be reused after
+SMAP is enabled so that kernel is allowed to access this user page
+
+Fix it by setting SMAP && !CR0.WP into shadow page's role and reset mmu
+once CR4.SMAP is updated
+
+Signed-off-by: Xiao Guangrong <guangrong.xiao@linux.intel.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ Documentation/virtual/kvm/mmu.txt |   18 ++++++++++++++----
+ arch/x86/include/asm/kvm_host.h   |    1 +
+ arch/x86/kvm/mmu.c                |   16 ++++++++++++----
+ arch/x86/kvm/mmu.h                |    2 --
+ arch/x86/kvm/x86.c                |    8 +++-----
+ 5 files changed, 30 insertions(+), 15 deletions(-)
+
+--- a/Documentation/virtual/kvm/mmu.txt
++++ b/Documentation/virtual/kvm/mmu.txt
+@@ -169,6 +169,10 @@ Shadow pages contain the following infor
+     Contains the value of cr4.smep && !cr0.wp for which the page is valid
+     (pages for which this is true are different from other pages; see the
+     treatment of cr0.wp=0 below).
++  role.smap_andnot_wp:
++    Contains the value of cr4.smap && !cr0.wp for which the page is valid
++    (pages for which this is true are different from other pages; see the
++    treatment of cr0.wp=0 below).
+   gfn:
+     Either the guest page table containing the translations shadowed by this
+     page, or the base page frame for linear translations.  See role.direct.
+@@ -344,10 +348,16 @@ on fault type:
+ 
+ (user write faults generate a #PF)
+ 
+-In the first case there is an additional complication if CR4.SMEP is
+-enabled: since we've turned the page into a kernel page, the kernel may now
+-execute it.  We handle this by also setting spte.nx.  If we get a user
+-fetch or read fault, we'll change spte.u=1 and spte.nx=gpte.nx back.
++In the first case there are two additional complications:
++- if CR4.SMEP is enabled: since we've turned the page into a kernel page,
++  the kernel may now execute it.  We handle this by also setting spte.nx.
++  If we get a user fetch or read fault, we'll change spte.u=1 and
++  spte.nx=gpte.nx back.
++- if CR4.SMAP is disabled: since the page has been changed to a kernel
++  page, it can not be reused when CR4.SMAP is enabled. We set
++  CR4.SMAP && !CR0.WP into shadow page's role to avoid this case. Note,
++  here we do not care the case that CR4.SMAP is enabled since KVM will
++  directly inject #PF to guest due to failed permission check.
+ 
+ To prevent an spte that was converted into a kernel page with cr0.wp=0
+ from being written by the kernel after cr0.wp has changed to 1, we make
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -212,6 +212,7 @@ union kvm_mmu_page_role {
+ 		unsigned nxe:1;
+ 		unsigned cr0_wp:1;
+ 		unsigned smep_andnot_wp:1;
++		unsigned smap_andnot_wp:1;
+ 	};
+ };
+ 
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@ -3736,8 +3736,8 @@ static void reset_rsvds_bits_mask_ept(st
+ 	}
+ }
+ 
+-void update_permission_bitmask(struct kvm_vcpu *vcpu,
+-		struct kvm_mmu *mmu, bool ept)
++static void update_permission_bitmask(struct kvm_vcpu *vcpu,
++				      struct kvm_mmu *mmu, bool ept)
+ {
+ 	unsigned bit, byte, pfec;
+ 	u8 map;
+@@ -3918,6 +3918,7 @@ static void init_kvm_tdp_mmu(struct kvm_
+ void kvm_init_shadow_mmu(struct kvm_vcpu *vcpu)
+ {
+ 	bool smep = kvm_read_cr4_bits(vcpu, X86_CR4_SMEP);
++	bool smap = kvm_read_cr4_bits(vcpu, X86_CR4_SMAP);
+ 	struct kvm_mmu *context = &vcpu->arch.mmu;
+ 
+ 	MMU_WARN_ON(VALID_PAGE(context->root_hpa));
+@@ -3936,6 +3937,8 @@ void kvm_init_shadow_mmu(struct kvm_vcpu
+ 	context->base_role.cr0_wp  = is_write_protection(vcpu);
+ 	context->base_role.smep_andnot_wp
+ 		= smep && !is_write_protection(vcpu);
++	context->base_role.smap_andnot_wp
++		= smap && !is_write_protection(vcpu);
+ }
+ EXPORT_SYMBOL_GPL(kvm_init_shadow_mmu);
+ 
+@@ -4207,12 +4210,18 @@ void kvm_mmu_pte_write(struct kvm_vcpu *
+ 		       const u8 *new, int bytes)
+ {
+ 	gfn_t gfn = gpa >> PAGE_SHIFT;
+-	union kvm_mmu_page_role mask = { .word = 0 };
+ 	struct kvm_mmu_page *sp;
+ 	LIST_HEAD(invalid_list);
+ 	u64 entry, gentry, *spte;
+ 	int npte;
+ 	bool remote_flush, local_flush, zap_page;
++	union kvm_mmu_page_role mask = (union kvm_mmu_page_role) {
++		.cr0_wp = 1,
++		.cr4_pae = 1,
++		.nxe = 1,
++		.smep_andnot_wp = 1,
++		.smap_andnot_wp = 1,
++	};
+ 
+ 	/*
+ 	 * If we don't have indirect shadow pages, it means no page is
+@@ -4238,7 +4247,6 @@ void kvm_mmu_pte_write(struct kvm_vcpu *
+ 	++vcpu->kvm->stat.mmu_pte_write;
+ 	kvm_mmu_audit(vcpu, AUDIT_PRE_PTE_WRITE);
+ 
+-	mask.cr0_wp = mask.cr4_pae = mask.nxe = mask.smep_andnot_wp = 1;
+ 	for_each_gfn_indirect_valid_sp(vcpu->kvm, sp, gfn) {
+ 		if (detect_write_misaligned(sp, gpa, bytes) ||
+ 		      detect_write_flooding(sp)) {
+--- a/arch/x86/kvm/mmu.h
++++ b/arch/x86/kvm/mmu.h
+@@ -71,8 +71,6 @@ enum {
+ int handle_mmio_page_fault_common(struct kvm_vcpu *vcpu, u64 addr, bool direct);
+ void kvm_init_shadow_mmu(struct kvm_vcpu *vcpu);
+ void kvm_init_shadow_ept_mmu(struct kvm_vcpu *vcpu, bool execonly);
+-void update_permission_bitmask(struct kvm_vcpu *vcpu, struct kvm_mmu *mmu,
+-		bool ept);
+ 
+ static inline unsigned int kvm_mmu_available_pages(struct kvm *kvm)
+ {
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -702,8 +702,9 @@ EXPORT_SYMBOL_GPL(kvm_set_xcr);
+ int kvm_set_cr4(struct kvm_vcpu *vcpu, unsigned long cr4)
+ {
+ 	unsigned long old_cr4 = kvm_read_cr4(vcpu);
+-	unsigned long pdptr_bits = X86_CR4_PGE | X86_CR4_PSE |
+-				   X86_CR4_PAE | X86_CR4_SMEP;
++	unsigned long pdptr_bits = X86_CR4_PGE | X86_CR4_PSE | X86_CR4_PAE |
++				   X86_CR4_SMEP | X86_CR4_SMAP;
++
+ 	if (cr4 & CR4_RESERVED_BITS)
+ 		return 1;
+ 
+@@ -744,9 +745,6 @@ int kvm_set_cr4(struct kvm_vcpu *vcpu, u
+ 	    (!(cr4 & X86_CR4_PCIDE) && (old_cr4 & X86_CR4_PCIDE)))
+ 		kvm_mmu_reset_context(vcpu);
+ 
+-	if ((cr4 ^ old_cr4) & X86_CR4_SMAP)
+-		update_permission_bitmask(vcpu, vcpu->arch.walk_mmu, false);
+-
+ 	if ((cr4 ^ old_cr4) & X86_CR4_OSXSAVE)
+ 		kvm_update_cpuid(vcpu);
+ 
