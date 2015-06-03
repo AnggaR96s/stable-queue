@@ -1,0 +1,94 @@
+From b0494532214bdfbf241e94fabab5dd46f7b82631 Mon Sep 17 00:00:00 2001
+From: Ilya Dryomov <idryomov@gmail.com>
+Date: Mon, 11 May 2015 17:53:10 +0300
+Subject: libceph: request a new osdmap if lingering request maps to no osd
+
+From: Ilya Dryomov <idryomov@gmail.com>
+
+commit b0494532214bdfbf241e94fabab5dd46f7b82631 upstream.
+
+This commit does two things.  First, if there are any homeless
+lingering requests, we now request a new osdmap even if the osdmap that
+is being processed brought no changes, i.e. if a given lingering
+request turned homeless in one of the previous epochs and remained
+homeless in the current epoch.  Not doing so leaves us with a stale
+osdmap and as a result we may miss our window for reestablishing the
+watch and lose notifies.
+
+MON=1 OSD=1:
+
+    # cat linger-needmap.sh
+    #!/bin/bash
+    rbd create --size 1 test
+    DEV=$(rbd map test)
+    ceph osd out 0
+    rbd map dne/dne # obtain a new osdmap as a side effect (!)
+    sleep 1
+    ceph osd in 0
+    rbd resize --size 2 test
+    # rbd info test | grep size -> 2M
+    # blockdev --getsize $DEV -> 1M
+
+N.B.: Not obtaining a new osdmap in between "osd out" and "osd in"
+above is enough to make it miss that resize notify, but that is a
+bug^Wlimitation of ceph watch/notify v1.
+
+Second, homeless lingering requests are now kicked just like those
+lingering requests whose mapping has changed.  This is mainly to
+recognize that a homeless lingering request makes no sense and to
+preserve the invariant that a registered lingering request is not
+sitting on any of r_req_lru_item lists.  This spares us a WARN_ON,
+which commit ba9d114ec557 ("libceph: clear r_req_lru_item in
+__unregister_linger_request()") tried to fix the _wrong_ way.
+
+Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+Reviewed-by: Sage Weil <sage@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ net/ceph/osd_client.c |   31 ++++++++++++++++++++-----------
+ 1 file changed, 20 insertions(+), 11 deletions(-)
+
+--- a/net/ceph/osd_client.c
++++ b/net/ceph/osd_client.c
+@@ -2017,20 +2017,29 @@ static void kick_requests(struct ceph_os
+ 		err = __map_request(osdc, req,
+ 				    force_resend || force_resend_writes);
+ 		dout("__map_request returned %d\n", err);
+-		if (err == 0)
+-			continue;  /* no change and no osd was specified */
+ 		if (err < 0)
+ 			continue;  /* hrm! */
+-		if (req->r_osd == NULL) {
+-			dout("tid %llu maps to no valid osd\n", req->r_tid);
+-			needmap++;  /* request a newer map */
+-			continue;
+-		}
++		if (req->r_osd == NULL || err > 0) {
++			if (req->r_osd == NULL) {
++				dout("lingering %p tid %llu maps to no osd\n",
++				     req, req->r_tid);
++				/*
++				 * A homeless lingering request makes
++				 * no sense, as it's job is to keep
++				 * a particular OSD connection open.
++				 * Request a newer map and kick the
++				 * request, knowing that it won't be
++				 * resent until we actually get a map
++				 * that can tell us where to send it.
++				 */
++				needmap++;
++			}
+ 
+-		dout("kicking lingering %p tid %llu osd%d\n", req, req->r_tid,
+-		     req->r_osd ? req->r_osd->o_osd : -1);
+-		__register_request(osdc, req);
+-		__unregister_linger_request(osdc, req);
++			dout("kicking lingering %p tid %llu osd%d\n", req,
++			     req->r_tid, req->r_osd ? req->r_osd->o_osd : -1);
++			__register_request(osdc, req);
++			__unregister_linger_request(osdc, req);
++		}
+ 	}
+ 	reset_changed_osds(osdc);
+ 	mutex_unlock(&osdc->request_mutex);

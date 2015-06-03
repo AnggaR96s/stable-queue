@@ -1,0 +1,235 @@
+From 6dfe5a049f2d48582050339d2a6b6fda36dfd14c Mon Sep 17 00:00:00 2001
+From: Dave Chinner <dchinner@redhat.com>
+Date: Fri, 29 May 2015 07:40:08 +1000
+Subject: xfs: xfs_attr_inactive leaves inconsistent attr fork state behind
+
+From: Dave Chinner <dchinner@redhat.com>
+
+commit 6dfe5a049f2d48582050339d2a6b6fda36dfd14c upstream.
+
+xfs_attr_inactive() is supposed to clean up the attribute fork when
+the inode is being freed. While it removes attribute fork extents,
+it completely ignores attributes in local format, which means that
+there can still be active attributes on the inode after
+xfs_attr_inactive() has run.
+
+This leads to problems with concurrent inode writeback - the in-core
+inode attribute fork is removed without locking on the assumption
+that nothing will be attempting to access the attribute fork after a
+call to xfs_attr_inactive() because it isn't supposed to exist on
+disk any more.
+
+To fix this, make xfs_attr_inactive() completely remove all traces
+of the attribute fork from the inode, regardless of it's state.
+Further, also remove the in-core attribute fork structure safely so
+that there is nothing further that needs to be done by callers to
+clean up the attribute fork. This means we can remove the in-core
+and on-disk attribute forks atomically.
+
+Also, on error simply remove the in-memory attribute fork. There's
+nothing that can be done with it once we have failed to remove the
+on-disk attribute fork, so we may as well just blow it away here
+anyway.
+
+Reported-by: Waiman Long <waiman.long@hp.com>
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Signed-off-by: Dave Chinner <david@fromorbit.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/xfs/libxfs/xfs_attr_leaf.c |    8 ++--
+ fs/xfs/libxfs/xfs_attr_leaf.h |    2 -
+ fs/xfs/xfs_attr_inactive.c    |   83 ++++++++++++++++++++++++------------------
+ fs/xfs/xfs_inode.c            |   12 ++----
+ 4 files changed, 58 insertions(+), 47 deletions(-)
+
+--- a/fs/xfs/libxfs/xfs_attr_leaf.c
++++ b/fs/xfs/libxfs/xfs_attr_leaf.c
+@@ -498,8 +498,8 @@ xfs_attr_shortform_add(xfs_da_args_t *ar
+  * After the last attribute is removed revert to original inode format,
+  * making all literal area available to the data fork once more.
+  */
+-STATIC void
+-xfs_attr_fork_reset(
++void
++xfs_attr_fork_remove(
+ 	struct xfs_inode	*ip,
+ 	struct xfs_trans	*tp)
+ {
+@@ -565,7 +565,7 @@ xfs_attr_shortform_remove(xfs_da_args_t
+ 	    (mp->m_flags & XFS_MOUNT_ATTR2) &&
+ 	    (dp->i_d.di_format != XFS_DINODE_FMT_BTREE) &&
+ 	    !(args->op_flags & XFS_DA_OP_ADDNAME)) {
+-		xfs_attr_fork_reset(dp, args->trans);
++		xfs_attr_fork_remove(dp, args->trans);
+ 	} else {
+ 		xfs_idata_realloc(dp, -size, XFS_ATTR_FORK);
+ 		dp->i_d.di_forkoff = xfs_attr_shortform_bytesfit(dp, totsize);
+@@ -828,7 +828,7 @@ xfs_attr3_leaf_to_shortform(
+ 	if (forkoff == -1) {
+ 		ASSERT(dp->i_mount->m_flags & XFS_MOUNT_ATTR2);
+ 		ASSERT(dp->i_d.di_format != XFS_DINODE_FMT_BTREE);
+-		xfs_attr_fork_reset(dp, args->trans);
++		xfs_attr_fork_remove(dp, args->trans);
+ 		goto out;
+ 	}
+ 
+--- a/fs/xfs/libxfs/xfs_attr_leaf.h
++++ b/fs/xfs/libxfs/xfs_attr_leaf.h
+@@ -53,7 +53,7 @@ int	xfs_attr_shortform_remove(struct xfs
+ int	xfs_attr_shortform_list(struct xfs_attr_list_context *context);
+ int	xfs_attr_shortform_allfit(struct xfs_buf *bp, struct xfs_inode *dp);
+ int	xfs_attr_shortform_bytesfit(xfs_inode_t *dp, int bytes);
+-
++void	xfs_attr_fork_remove(struct xfs_inode *ip, struct xfs_trans *tp);
+ 
+ /*
+  * Internal routines when attribute fork size == XFS_LBSIZE(mp).
+--- a/fs/xfs/xfs_attr_inactive.c
++++ b/fs/xfs/xfs_attr_inactive.c
+@@ -379,23 +379,31 @@ xfs_attr3_root_inactive(
+ 	return error;
+ }
+ 
++/*
++ * xfs_attr_inactive kills all traces of an attribute fork on an inode. It
++ * removes both the on-disk and in-memory inode fork. Note that this also has to
++ * handle the condition of inodes without attributes but with an attribute fork
++ * configured, so we can't use xfs_inode_hasattr() here.
++ *
++ * The in-memory attribute fork is removed even on error.
++ */
+ int
+-xfs_attr_inactive(xfs_inode_t *dp)
++xfs_attr_inactive(
++	struct xfs_inode	*dp)
+ {
+-	xfs_trans_t *trans;
+-	xfs_mount_t *mp;
+-	int error;
++	struct xfs_trans	*trans;
++	struct xfs_mount	*mp;
++	int			cancel_flags = 0;
++	int			lock_mode = XFS_ILOCK_SHARED;
++	int			error = 0;
+ 
+ 	mp = dp->i_mount;
+ 	ASSERT(! XFS_NOT_DQATTACHED(mp, dp));
+ 
+-	xfs_ilock(dp, XFS_ILOCK_SHARED);
+-	if (!xfs_inode_hasattr(dp) ||
+-	    dp->i_d.di_aformat == XFS_DINODE_FMT_LOCAL) {
+-		xfs_iunlock(dp, XFS_ILOCK_SHARED);
+-		return 0;
+-	}
+-	xfs_iunlock(dp, XFS_ILOCK_SHARED);
++	xfs_ilock(dp, lock_mode);
++	if (!XFS_IFORK_Q(dp))
++		goto out_destroy_fork;
++	xfs_iunlock(dp, lock_mode);
+ 
+ 	/*
+ 	 * Start our first transaction of the day.
+@@ -407,13 +415,18 @@ xfs_attr_inactive(xfs_inode_t *dp)
+ 	 * the inode in every transaction to let it float upward through
+ 	 * the log.
+ 	 */
++	lock_mode = 0;
+ 	trans = xfs_trans_alloc(mp, XFS_TRANS_ATTRINVAL);
+ 	error = xfs_trans_reserve(trans, &M_RES(mp)->tr_attrinval, 0, 0);
+-	if (error) {
+-		xfs_trans_cancel(trans, 0);
+-		return error;
+-	}
+-	xfs_ilock(dp, XFS_ILOCK_EXCL);
++	if (error)
++		goto out_cancel;
++
++	lock_mode = XFS_ILOCK_EXCL;
++	cancel_flags = XFS_TRANS_RELEASE_LOG_RES | XFS_TRANS_ABORT;
++	xfs_ilock(dp, lock_mode);
++
++	if (!XFS_IFORK_Q(dp))
++		goto out_cancel;
+ 
+ 	/*
+ 	 * No need to make quota reservations here. We expect to release some
+@@ -421,29 +434,31 @@ xfs_attr_inactive(xfs_inode_t *dp)
+ 	 */
+ 	xfs_trans_ijoin(trans, dp, 0);
+ 
+-	/*
+-	 * Decide on what work routines to call based on the inode size.
+-	 */
+-	if (!xfs_inode_hasattr(dp) ||
+-	    dp->i_d.di_aformat == XFS_DINODE_FMT_LOCAL) {
+-		error = 0;
+-		goto out;
++	/* invalidate and truncate the attribute fork extents */
++	if (dp->i_d.di_aformat != XFS_DINODE_FMT_LOCAL) {
++		error = xfs_attr3_root_inactive(&trans, dp);
++		if (error)
++			goto out_cancel;
++
++		error = xfs_itruncate_extents(&trans, dp, XFS_ATTR_FORK, 0);
++		if (error)
++			goto out_cancel;
+ 	}
+-	error = xfs_attr3_root_inactive(&trans, dp);
+-	if (error)
+-		goto out;
+ 
+-	error = xfs_itruncate_extents(&trans, dp, XFS_ATTR_FORK, 0);
+-	if (error)
+-		goto out;
++	/* Reset the attribute fork - this also destroys the in-core fork */
++	xfs_attr_fork_remove(dp, trans);
+ 
+ 	error = xfs_trans_commit(trans, XFS_TRANS_RELEASE_LOG_RES);
+-	xfs_iunlock(dp, XFS_ILOCK_EXCL);
+-
++	xfs_iunlock(dp, lock_mode);
+ 	return error;
+ 
+-out:
+-	xfs_trans_cancel(trans, XFS_TRANS_RELEASE_LOG_RES|XFS_TRANS_ABORT);
+-	xfs_iunlock(dp, XFS_ILOCK_EXCL);
++out_cancel:
++	xfs_trans_cancel(trans, cancel_flags);
++out_destroy_fork:
++	/* kill the in-core attr fork before we drop the inode lock */
++	if (dp->i_afp)
++		xfs_idestroy_fork(dp, XFS_ATTR_FORK);
++	if (lock_mode)
++		xfs_iunlock(dp, lock_mode);
+ 	return error;
+ }
+--- a/fs/xfs/xfs_inode.c
++++ b/fs/xfs/xfs_inode.c
+@@ -1889,21 +1889,17 @@ xfs_inactive(
+ 	/*
+ 	 * If there are attributes associated with the file then blow them away
+ 	 * now.  The code calls a routine that recursively deconstructs the
+-	 * attribute fork.  We need to just commit the current transaction
+-	 * because we can't use it for xfs_attr_inactive().
++	 * attribute fork. If also blows away the in-core attribute fork.
+ 	 */
+-	if (ip->i_d.di_anextents > 0) {
+-		ASSERT(ip->i_d.di_forkoff != 0);
+-
++	if (XFS_IFORK_Q(ip)) {
+ 		error = xfs_attr_inactive(ip);
+ 		if (error)
+ 			return;
+ 	}
+ 
+-	if (ip->i_afp)
+-		xfs_idestroy_fork(ip, XFS_ATTR_FORK);
+-
++	ASSERT(!ip->i_afp);
+ 	ASSERT(ip->i_d.di_anextents == 0);
++	ASSERT(ip->i_d.di_forkoff == 0);
+ 
+ 	/*
+ 	 * Free the inode.
