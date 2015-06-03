@@ -1,0 +1,174 @@
+From 0782e63bc6fe7e2d3408d250df11d388b7799c6b Mon Sep 17 00:00:00 2001
+From: Thomas Gleixner <tglx@linutronix.de>
+Date: Tue, 5 May 2015 19:49:49 +0200
+Subject: sched: Handle priority boosted tasks proper in setscheduler()
+
+From: Thomas Gleixner <tglx@linutronix.de>
+
+commit 0782e63bc6fe7e2d3408d250df11d388b7799c6b upstream.
+
+Ronny reported that the following scenario is not handled correctly:
+
+	T1 (prio = 10)
+	   lock(rtmutex);
+
+	T2 (prio = 20)
+	   lock(rtmutex)
+	      boost T1
+
+	T1 (prio = 20)
+	   sys_set_scheduler(prio = 30)
+	   T1 prio = 30
+	   ....
+	   sys_set_scheduler(prio = 10)
+	   T1 prio = 30
+
+The last step is wrong as T1 should now be back at prio 20.
+
+Commit c365c292d059 ("sched: Consider pi boosting in setscheduler()")
+only handles the case where a boosted tasks tries to lower its
+priority.
+
+Fix it by taking the new effective priority into account for the
+decision whether a change of the priority is required.
+
+Reported-by: Ronny Meeus <ronny.meeus@gmail.com>
+Tested-by: Steven Rostedt <rostedt@goodmis.org>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Reviewed-by: Steven Rostedt <rostedt@goodmis.org>
+Cc: Borislav Petkov <bp@alien8.de>
+Cc: H. Peter Anvin <hpa@zytor.com>
+Cc: Mike Galbraith <umgwanakikbuti@gmail.com>
+Fixes: c365c292d059 ("sched: Consider pi boosting in setscheduler()")
+Link: http://lkml.kernel.org/r/alpine.DEB.2.11.1505051806060.4225@nanos
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ include/linux/sched/rt.h |    7 ++++---
+ kernel/locking/rtmutex.c |   12 +++++++-----
+ kernel/sched/core.c      |   26 ++++++++++++++------------
+ 3 files changed, 25 insertions(+), 20 deletions(-)
+
+--- a/include/linux/sched/rt.h
++++ b/include/linux/sched/rt.h
+@@ -18,7 +18,7 @@ static inline int rt_task(struct task_st
+ #ifdef CONFIG_RT_MUTEXES
+ extern int rt_mutex_getprio(struct task_struct *p);
+ extern void rt_mutex_setprio(struct task_struct *p, int prio);
+-extern int rt_mutex_check_prio(struct task_struct *task, int newprio);
++extern int rt_mutex_get_effective_prio(struct task_struct *task, int newprio);
+ extern struct task_struct *rt_mutex_get_top_task(struct task_struct *task);
+ extern void rt_mutex_adjust_pi(struct task_struct *p);
+ static inline bool tsk_is_pi_blocked(struct task_struct *tsk)
+@@ -31,9 +31,10 @@ static inline int rt_mutex_getprio(struc
+ 	return p->normal_prio;
+ }
+ 
+-static inline int rt_mutex_check_prio(struct task_struct *task, int newprio)
++static inline int rt_mutex_get_effective_prio(struct task_struct *task,
++					      int newprio)
+ {
+-	return 0;
++	return newprio;
+ }
+ 
+ static inline struct task_struct *rt_mutex_get_top_task(struct task_struct *task)
+--- a/kernel/locking/rtmutex.c
++++ b/kernel/locking/rtmutex.c
+@@ -265,15 +265,17 @@ struct task_struct *rt_mutex_get_top_tas
+ }
+ 
+ /*
+- * Called by sched_setscheduler() to check whether the priority change
+- * is overruled by a possible priority boosting.
++ * Called by sched_setscheduler() to get the priority which will be
++ * effective after the change.
+  */
+-int rt_mutex_check_prio(struct task_struct *task, int newprio)
++int rt_mutex_get_effective_prio(struct task_struct *task, int newprio)
+ {
+ 	if (!task_has_pi_waiters(task))
+-		return 0;
++		return newprio;
+ 
+-	return task_top_pi_waiter(task)->task->prio <= newprio;
++	if (task_top_pi_waiter(task)->task->prio <= newprio)
++		return task_top_pi_waiter(task)->task->prio;
++	return newprio;
+ }
+ 
+ /*
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -3295,15 +3295,18 @@ static void __setscheduler_params(struct
+ 
+ /* Actually do priority change: must hold pi & rq lock. */
+ static void __setscheduler(struct rq *rq, struct task_struct *p,
+-			   const struct sched_attr *attr)
++			   const struct sched_attr *attr, bool keep_boost)
+ {
+ 	__setscheduler_params(p, attr);
+ 
+ 	/*
+-	 * If we get here, there was no pi waiters boosting the
+-	 * task. It is safe to use the normal prio.
++	 * Keep a potential priority boosting if called from
++	 * sched_setscheduler().
+ 	 */
+-	p->prio = normal_prio(p);
++	if (keep_boost)
++		p->prio = rt_mutex_get_effective_prio(p, normal_prio(p));
++	else
++		p->prio = normal_prio(p);
+ 
+ 	if (dl_prio(p->prio))
+ 		p->sched_class = &dl_sched_class;
+@@ -3403,7 +3406,7 @@ static int __sched_setscheduler(struct t
+ 	int newprio = dl_policy(attr->sched_policy) ? MAX_DL_PRIO - 1 :
+ 		      MAX_RT_PRIO - 1 - attr->sched_priority;
+ 	int retval, oldprio, oldpolicy = -1, queued, running;
+-	int policy = attr->sched_policy;
++	int new_effective_prio, policy = attr->sched_policy;
+ 	unsigned long flags;
+ 	const struct sched_class *prev_class;
+ 	struct rq *rq;
+@@ -3585,15 +3588,14 @@ change:
+ 	oldprio = p->prio;
+ 
+ 	/*
+-	 * Special case for priority boosted tasks.
+-	 *
+-	 * If the new priority is lower or equal (user space view)
+-	 * than the current (boosted) priority, we just store the new
++	 * Take priority boosted tasks into account. If the new
++	 * effective priority is unchanged, we just store the new
+ 	 * normal parameters and do not touch the scheduler class and
+ 	 * the runqueue. This will be done when the task deboost
+ 	 * itself.
+ 	 */
+-	if (rt_mutex_check_prio(p, newprio)) {
++	new_effective_prio = rt_mutex_get_effective_prio(p, newprio);
++	if (new_effective_prio == oldprio) {
+ 		__setscheduler_params(p, attr);
+ 		task_rq_unlock(rq, p, &flags);
+ 		return 0;
+@@ -3607,7 +3609,7 @@ change:
+ 		put_prev_task(rq, p);
+ 
+ 	prev_class = p->sched_class;
+-	__setscheduler(rq, p, attr);
++	__setscheduler(rq, p, attr, true);
+ 
+ 	if (running)
+ 		p->sched_class->set_curr_task(rq);
+@@ -7357,7 +7359,7 @@ static void normalize_task(struct rq *rq
+ 	queued = task_on_rq_queued(p);
+ 	if (queued)
+ 		dequeue_task(rq, p, 0);
+-	__setscheduler(rq, p, &attr);
++	__setscheduler(rq, p, &attr, false);
+ 	if (queued) {
+ 		enqueue_task(rq, p, 0);
+ 		resched_curr(rq);
