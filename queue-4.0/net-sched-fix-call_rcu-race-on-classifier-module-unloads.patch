@@ -1,0 +1,99 @@
+From foo@baz Sat Jun 13 09:48:35 PDT 2015
+From: Daniel Borkmann <daniel@iogearbox.net>
+Date: Wed, 20 May 2015 17:13:33 +0200
+Subject: net: sched: fix call_rcu() race on classifier module unloads
+
+From: Daniel Borkmann <daniel@iogearbox.net>
+
+[ Upstream commit c78e1746d3ad7d548bdf3fe491898cc453911a49 ]
+
+Vijay reported that a loop as simple as ...
+
+  while true; do
+    tc qdisc add dev foo root handle 1: prio
+    tc filter add dev foo parent 1: u32 match u32 0 0  flowid 1
+    tc qdisc del dev foo root
+    rmmod cls_u32
+  done
+
+... will panic the kernel. Moreover, he bisected the change
+apparently introducing it to 78fd1d0ab072 ("netlink: Re-add
+locking to netlink_lookup() and seq walker").
+
+The removal of synchronize_net() from the netlink socket
+triggering the qdisc to be removed, seems to have uncovered
+an RCU resp. module reference count race from the tc API.
+Given that RCU conversion was done after e341694e3eb5 ("netlink:
+Convert netlink_lookup() to use RCU protected hash table")
+which added the synchronize_net() originally, occasion of
+hitting the bug was less likely (not impossible though):
+
+When qdiscs that i) support attaching classifiers and,
+ii) have at least one of them attached, get deleted, they
+invoke tcf_destroy_chain(), and thus call into ->destroy()
+handler from a classifier module.
+
+After RCU conversion, all classifier that have an internal
+prio list, unlink them and initiate freeing via call_rcu()
+deferral.
+
+Meanhile, tcf_destroy() releases already reference to the
+tp->ops->owner module before the queued RCU callback handler
+has been invoked.
+
+Subsequent rmmod on the classifier module is then not prevented
+since all module references are already dropped.
+
+By the time, the kernel invokes the RCU callback handler from
+the module, that function address is then invalid.
+
+One way to fix it would be to add an rcu_barrier() to
+unregister_tcf_proto_ops() to wait for all pending call_rcu()s
+to complete.
+
+synchronize_rcu() is not appropriate as under heavy RCU
+callback load, registered call_rcu()s could be deferred
+longer than a grace period. In case we don't have any pending
+call_rcu()s, the barrier is allowed to return immediately.
+
+Since we came here via unregister_tcf_proto_ops(), there
+are no users of a given classifier anymore. Further nested
+call_rcu()s pointing into the module space are not being
+done anywhere.
+
+Only cls_bpf_delete_prog() may schedule a work item, to
+unlock pages eventually, but that is not in the range/context
+of cls_bpf anymore.
+
+Fixes: 25d8c0d55f24 ("net: rcu-ify tcf_proto")
+Fixes: 9888faefe132 ("net: sched: cls_basic use RCU")
+Reported-by: Vijay Subramanian <subramanian.vijay@gmail.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Cc: John Fastabend <john.r.fastabend@intel.com>
+Cc: Eric Dumazet <edumazet@google.com>
+Cc: Thomas Graf <tgraf@suug.ch>
+Cc: Jamal Hadi Salim <jhs@mojatatu.com>
+Cc: Alexei Starovoitov <ast@plumgrid.com>
+Tested-by: Vijay Subramanian <subramanian.vijay@gmail.com>
+Acked-by: Alexei Starovoitov <ast@plumgrid.com>
+Acked-by: Eric Dumazet <edumazet@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/sched/cls_api.c |    5 +++++
+ 1 file changed, 5 insertions(+)
+
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@ -81,6 +81,11 @@ int unregister_tcf_proto_ops(struct tcf_
+ 	struct tcf_proto_ops *t;
+ 	int rc = -ENOENT;
+ 
++	/* Wait for outstanding call_rcu()s, if any, from a
++	 * tcf_proto_ops's destroy() handler.
++	 */
++	rcu_barrier();
++
+ 	write_lock(&cls_mod_lock);
+ 	list_for_each_entry(t, &tcf_proto_base, head) {
+ 		if (t == ops) {
