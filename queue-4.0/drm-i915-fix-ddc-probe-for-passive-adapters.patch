@@ -1,0 +1,124 @@
+From 3f5f1554ee715639e78d9be87623ee82772537e0 Mon Sep 17 00:00:00 2001
+From: Jani Nikula <jani.nikula@intel.com>
+Date: Tue, 2 Jun 2015 19:21:15 +0300
+Subject: drm/i915: Fix DDC probe for passive adapters
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+From: Jani Nikula <jani.nikula@intel.com>
+
+commit 3f5f1554ee715639e78d9be87623ee82772537e0 upstream.
+
+Passive DP->DVI/HDMI dongles on DP++ ports show up to the system as HDMI
+devices, as they do not have a sink device in them to respond to any AUX
+traffic. When probing these dongles over the DDC, sometimes they will
+NAK the first attempt even though the transaction is valid and they
+support the DDC protocol. The retry loop inside of
+drm_do_probe_ddc_edid() would normally catch this case and try the
+transaction again, resulting in success.
+
+That, however, was thwarted by the fix for [1]:
+
+commit 9292f37e1f5c79400254dca46f83313488093825
+Author: Eugeni Dodonov <eugeni.dodonov@intel.com>
+Date:   Thu Jan 5 09:34:28 2012 -0200
+
+    drm: give up on edid retries when i2c bus is not responding
+
+This added code to exit immediately if the return code from the
+i2c_transfer function was -ENXIO in order to reduce the amount of time
+spent in waiting for unresponsive or disconnected devices. That was
+possible because the underlying i2c bit banging algorithm had retries of
+its own (which, of course, were part of the reason for the bug the
+commit fixes).
+
+Since its introduction in
+
+commit f899fc64cda8569d0529452aafc0da31c042df2e
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Tue Jul 20 15:44:45 2010 -0700
+
+    drm/i915: use GMBUS to manage i2c links
+
+we've been flipping back and forth enabling the GMBUS transfers, but
+we've settled since then. The GMBUS implementation does not do any
+retries, however, bailing out of the drm_do_probe_ddc_edid() retry loop
+on first encounter of -ENXIO. This, combined with Eugeni's commit, broke
+the retry on -ENXIO.
+
+Retry GMBUS once on -ENXIO on first message to mitigate the issues with
+passive adapters.
+
+This patch is based on the work, and commit message, by Todd Previte
+<tprevite@gmail.com>.
+
+[1] https://bugs.freedesktop.org/show_bug.cgi?id=41059
+
+v2: Don't retry if using bit banging.
+
+v3: Move retry within gmbux_xfer, retry only on first message.
+
+v4: Initialize GMBUS0 on retry (Ville).
+
+v5: Take index reads into account (Ville).
+
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=85924
+Cc: Todd Previte <tprevite@gmail.com>
+Tested-by: Oliver Grafe <oliver.grafe@ge.com> (v2)
+Tested-by: Jim Bride <jim.bride@linux.intel.com>
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/gpu/drm/i915/intel_i2c.c |   20 +++++++++++++++++---
+ 1 file changed, 17 insertions(+), 3 deletions(-)
+
+--- a/drivers/gpu/drm/i915/intel_i2c.c
++++ b/drivers/gpu/drm/i915/intel_i2c.c
+@@ -435,7 +435,7 @@ gmbus_xfer(struct i2c_adapter *adapter,
+ 					       struct intel_gmbus,
+ 					       adapter);
+ 	struct drm_i915_private *dev_priv = bus->dev_priv;
+-	int i, reg_offset;
++	int i = 0, inc, try = 0, reg_offset;
+ 	int ret = 0;
+ 
+ 	intel_aux_display_runtime_get(dev_priv);
+@@ -448,12 +448,14 @@ gmbus_xfer(struct i2c_adapter *adapter,
+ 
+ 	reg_offset = dev_priv->gpio_mmio_base;
+ 
++retry:
+ 	I915_WRITE(GMBUS0 + reg_offset, bus->reg0);
+ 
+-	for (i = 0; i < num; i++) {
++	for (; i < num; i += inc) {
++		inc = 1;
+ 		if (gmbus_is_index_read(msgs, i, num)) {
+ 			ret = gmbus_xfer_index_read(dev_priv, &msgs[i]);
+-			i += 1;  /* set i to the index of the read xfer */
++			inc = 2; /* an index read is two msgs */
+ 		} else if (msgs[i].flags & I2C_M_RD) {
+ 			ret = gmbus_xfer_read(dev_priv, &msgs[i], 0);
+ 		} else {
+@@ -525,6 +527,18 @@ clear_err:
+ 			 adapter->name, msgs[i].addr,
+ 			 (msgs[i].flags & I2C_M_RD) ? 'r' : 'w', msgs[i].len);
+ 
++	/*
++	 * Passive adapters sometimes NAK the first probe. Retry the first
++	 * message once on -ENXIO for GMBUS transfers; the bit banging algorithm
++	 * has retries internally. See also the retry loop in
++	 * drm_do_probe_ddc_edid, which bails out on the first -ENXIO.
++	 */
++	if (ret == -ENXIO && i == 0 && try++ == 0) {
++		DRM_DEBUG_KMS("GMBUS [%s] NAK on first message, retry\n",
++			      adapter->name);
++		goto retry;
++	}
++
+ 	goto out;
+ 
+ timeout:
