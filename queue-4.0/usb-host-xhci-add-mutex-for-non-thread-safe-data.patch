@@ -1,0 +1,234 @@
+From a00918d0521df1c7a2ec9143142a3ea998c8526d Mon Sep 17 00:00:00 2001
+From: Chris Bainbridge <chris.bainbridge@gmail.com>
+Date: Tue, 19 May 2015 16:30:51 +0300
+Subject: usb: host: xhci: add mutex for non-thread-safe data
+
+From: Chris Bainbridge <chris.bainbridge@gmail.com>
+
+commit a00918d0521df1c7a2ec9143142a3ea998c8526d upstream.
+
+Regression in commit 638139eb95d2 ("usb: hub: allow to process more usb
+hub events in parallel")
+
+The regression resulted in intermittent failure to initialise a 10-port
+hub (with three internal VL812 4-port hub controllers) on boot, with a
+failure rate of around 8%, due to multiple race conditions when
+accessing addr_dev and slot_id in struct xhci_hcd.
+
+This regression also exposed a problem with xhci_setup_device, which
+"should be protected by the usb_address0_mutex" but no longer is due to
+
+commit 6fecd4f2a58c ("USB: separate usb_address0 mutexes for each bus")
+
+With separate buses (and locks) it is no longer the case that a single
+lock will protect xhci_setup_device from accesses by two parallel
+threads processing events on the two buses.
+
+Fix this by adding a mutex to protect addr_dev and slot_id in struct
+xhci_hcd, and by making the assignment of slot_id atomic.
+
+Fixes multiple boot errors:
+
+[ 0.583008] xhci_hcd 0000:00:14.0: Bad Slot ID 2
+[ 0.583009] xhci_hcd 0000:00:14.0: Could not allocate xHCI USB device data structures
+[ 0.583012] usb usb1-port3: couldn't allocate usb_device
+
+And:
+
+[ 0.637409] xhci_hcd 0000:00:14.0: Error while assigning device slot ID
+[ 0.637417] xhci_hcd 0000:00:14.0: Max number of devices this xHCI host supports is 32.
+[ 0.637421] usb usb1-port1: couldn't allocate usb_device
+
+And:
+
+[ 0.753372] xhci_hcd 0000:00:14.0: ERROR: unexpected setup context command completion code 0x0.
+[ 0.753373] usb 1-3: hub failed to enable device, error -22
+[ 0.753400] xhci_hcd 0000:00:14.0: Error while assigning device slot ID
+[ 0.753402] xhci_hcd 0000:00:14.0: Max number of devices this xHCI host supports is 32.
+[ 0.753403] usb usb1-port3: couldn't allocate usb_device
+
+And:
+
+[ 11.018386] usb 1-3: device descriptor read/all, error -110
+
+And:
+
+[ 5.753838] xhci_hcd 0000:00:14.0: Timeout while waiting for setup device command
+
+Tested with 200 reboots, resulting in no USB hub init related errors.
+
+Fixes: 638139eb95d2 ("usb: hub: allow to process more usb hub events in parallel")
+Link: https://lkml.kernel.org/g/CAP-bSRb=A0iEYobdGCLpwynS7pkxpt_9ZnwyZTPVAoy0Y=Zo3Q@mail.gmail.com
+Signed-off-by: Chris Bainbridge <chris.bainbridge@gmail.com>
+[changed git commit description style for checkpatch -Mathias]
+Signed-off-by: Mathias Nyman <mathias.nyman@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/usb/host/xhci.c |   49 +++++++++++++++++++++++++++++-------------------
+ drivers/usb/host/xhci.h |    2 +
+ 2 files changed, 32 insertions(+), 19 deletions(-)
+
+--- a/drivers/usb/host/xhci.c
++++ b/drivers/usb/host/xhci.c
+@@ -3682,18 +3682,21 @@ int xhci_alloc_dev(struct usb_hcd *hcd,
+ {
+ 	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
+ 	unsigned long flags;
+-	int ret;
++	int ret, slot_id;
+ 	struct xhci_command *command;
+ 
+ 	command = xhci_alloc_command(xhci, false, false, GFP_KERNEL);
+ 	if (!command)
+ 		return 0;
+ 
++	/* xhci->slot_id and xhci->addr_dev are not thread-safe */
++	mutex_lock(&xhci->mutex);
+ 	spin_lock_irqsave(&xhci->lock, flags);
+ 	command->completion = &xhci->addr_dev;
+ 	ret = xhci_queue_slot_control(xhci, command, TRB_ENABLE_SLOT, 0);
+ 	if (ret) {
+ 		spin_unlock_irqrestore(&xhci->lock, flags);
++		mutex_unlock(&xhci->mutex);
+ 		xhci_dbg(xhci, "FIXME: allocate a command ring segment\n");
+ 		kfree(command);
+ 		return 0;
+@@ -3702,8 +3705,10 @@ int xhci_alloc_dev(struct usb_hcd *hcd,
+ 	spin_unlock_irqrestore(&xhci->lock, flags);
+ 
+ 	wait_for_completion(command->completion);
++	slot_id = xhci->slot_id;
++	mutex_unlock(&xhci->mutex);
+ 
+-	if (!xhci->slot_id || command->status != COMP_SUCCESS) {
++	if (!slot_id || command->status != COMP_SUCCESS) {
+ 		xhci_err(xhci, "Error while assigning device slot ID\n");
+ 		xhci_err(xhci, "Max number of devices this xHCI host supports is %u.\n",
+ 				HCS_MAX_SLOTS(
+@@ -3728,11 +3733,11 @@ int xhci_alloc_dev(struct usb_hcd *hcd,
+ 	 * xhci_discover_or_reset_device(), which may be called as part of
+ 	 * mass storage driver error handling.
+ 	 */
+-	if (!xhci_alloc_virt_device(xhci, xhci->slot_id, udev, GFP_NOIO)) {
++	if (!xhci_alloc_virt_device(xhci, slot_id, udev, GFP_NOIO)) {
+ 		xhci_warn(xhci, "Could not allocate xHCI USB device data structures\n");
+ 		goto disable_slot;
+ 	}
+-	udev->slot_id = xhci->slot_id;
++	udev->slot_id = slot_id;
+ 
+ #ifndef CONFIG_USB_DEFAULT_PERSIST
+ 	/*
+@@ -3778,12 +3783,15 @@ static int xhci_setup_device(struct usb_
+ 	struct xhci_slot_ctx *slot_ctx;
+ 	struct xhci_input_control_ctx *ctrl_ctx;
+ 	u64 temp_64;
+-	struct xhci_command *command;
++	struct xhci_command *command = NULL;
++
++	mutex_lock(&xhci->mutex);
+ 
+ 	if (!udev->slot_id) {
+ 		xhci_dbg_trace(xhci, trace_xhci_dbg_address,
+ 				"Bad Slot ID %d", udev->slot_id);
+-		return -EINVAL;
++		ret = -EINVAL;
++		goto out;
+ 	}
+ 
+ 	virt_dev = xhci->devs[udev->slot_id];
+@@ -3796,7 +3804,8 @@ static int xhci_setup_device(struct usb_
+ 		 */
+ 		xhci_warn(xhci, "Virt dev invalid for slot_id 0x%x!\n",
+ 			udev->slot_id);
+-		return -EINVAL;
++		ret = -EINVAL;
++		goto out;
+ 	}
+ 
+ 	if (setup == SETUP_CONTEXT_ONLY) {
+@@ -3804,13 +3813,15 @@ static int xhci_setup_device(struct usb_
+ 		if (GET_SLOT_STATE(le32_to_cpu(slot_ctx->dev_state)) ==
+ 		    SLOT_STATE_DEFAULT) {
+ 			xhci_dbg(xhci, "Slot already in default state\n");
+-			return 0;
++			goto out;
+ 		}
+ 	}
+ 
+ 	command = xhci_alloc_command(xhci, false, false, GFP_KERNEL);
+-	if (!command)
+-		return -ENOMEM;
++	if (!command) {
++		ret = -ENOMEM;
++		goto out;
++	}
+ 
+ 	command->in_ctx = virt_dev->in_ctx;
+ 	command->completion = &xhci->addr_dev;
+@@ -3820,8 +3831,8 @@ static int xhci_setup_device(struct usb_
+ 	if (!ctrl_ctx) {
+ 		xhci_warn(xhci, "%s: Could not get input context, bad type.\n",
+ 				__func__);
+-		kfree(command);
+-		return -EINVAL;
++		ret = -EINVAL;
++		goto out;
+ 	}
+ 	/*
+ 	 * If this is the first Set Address since device plug-in or
+@@ -3848,8 +3859,7 @@ static int xhci_setup_device(struct usb_
+ 		spin_unlock_irqrestore(&xhci->lock, flags);
+ 		xhci_dbg_trace(xhci, trace_xhci_dbg_address,
+ 				"FIXME: allocate a command ring segment");
+-		kfree(command);
+-		return ret;
++		goto out;
+ 	}
+ 	xhci_ring_cmd_db(xhci);
+ 	spin_unlock_irqrestore(&xhci->lock, flags);
+@@ -3896,10 +3906,8 @@ static int xhci_setup_device(struct usb_
+ 		ret = -EINVAL;
+ 		break;
+ 	}
+-	if (ret) {
+-		kfree(command);
+-		return ret;
+-	}
++	if (ret)
++		goto out;
+ 	temp_64 = xhci_read_64(xhci, &xhci->op_regs->dcbaa_ptr);
+ 	xhci_dbg_trace(xhci, trace_xhci_dbg_address,
+ 			"Op regs DCBAA ptr = %#016llx", temp_64);
+@@ -3932,8 +3940,10 @@ static int xhci_setup_device(struct usb_
+ 	xhci_dbg_trace(xhci, trace_xhci_dbg_address,
+ 		       "Internal device address = %d",
+ 		       le32_to_cpu(slot_ctx->dev_state) & DEV_ADDR_MASK);
++out:
++	mutex_unlock(&xhci->mutex);
+ 	kfree(command);
+-	return 0;
++	return ret;
+ }
+ 
+ int xhci_address_device(struct usb_hcd *hcd, struct usb_device *udev)
+@@ -4855,6 +4865,7 @@ int xhci_gen_setup(struct usb_hcd *hcd,
+ 		return 0;
+ 	}
+ 
++	mutex_init(&xhci->mutex);
+ 	xhci->cap_regs = hcd->regs;
+ 	xhci->op_regs = hcd->regs +
+ 		HC_LENGTH(readl(&xhci->cap_regs->hc_capbase));
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@ -1497,6 +1497,8 @@ struct xhci_hcd {
+ 	struct list_head	lpm_failed_devs;
+ 
+ 	/* slot enabling and address device helpers */
++	/* these are not thread safe so use mutex */
++	struct mutex mutex;
+ 	struct completion	addr_dev;
+ 	int slot_id;
+ 	/* For USB 3.0 LPM enable/disable. */
