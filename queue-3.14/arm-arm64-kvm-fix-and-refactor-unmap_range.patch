@@ -1,0 +1,264 @@
+From 4f853a714bf16338ff5261128e6c7ae2569e9505 Mon Sep 17 00:00:00 2001
+From: Christoffer Dall <christoffer.dall@linaro.org>
+Date: Fri, 9 May 2014 23:31:31 +0200
+Subject: arm/arm64: KVM: Fix and refactor unmap_range
+
+From: Christoffer Dall <christoffer.dall@linaro.org>
+
+commit 4f853a714bf16338ff5261128e6c7ae2569e9505 upstream.
+
+unmap_range() was utterly broken, to quote Marc, and broke in all sorts
+of situations.  It was also quite complicated to follow and didn't
+follow the usual scheme of having a separate iterating function for each
+level of page tables.
+
+Address this by refactoring the code and introduce a pgd_clear()
+function.
+
+Reviewed-by: Jungseok Lee <jays.lee@samsung.com>
+Reviewed-by: Mario Smarduch <m.smarduch@samsung.com>
+Acked-by: Marc Zyngier <marc.zyngier@arm.com>
+Signed-off-by: Christoffer Dall <christoffer.dall@linaro.org>
+Signed-off-by: Shannon Zhao <shannon.zhao@linaro.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/arm/include/asm/kvm_mmu.h   |   12 +++
+ arch/arm/kvm/mmu.c               |  156 +++++++++++++++++++++------------------
+ arch/arm64/include/asm/kvm_mmu.h |   15 +++
+ 3 files changed, 111 insertions(+), 72 deletions(-)
+
+--- a/arch/arm/include/asm/kvm_mmu.h
++++ b/arch/arm/include/asm/kvm_mmu.h
+@@ -127,6 +127,18 @@ static inline void kvm_set_s2pmd_writabl
+ 	(__boundary - 1 < (end) - 1)? __boundary: (end);		\
+ })
+ 
++static inline bool kvm_page_empty(void *ptr)
++{
++	struct page *ptr_page = virt_to_page(ptr);
++	return page_count(ptr_page) == 1;
++}
++
++
++#define kvm_pte_table_empty(ptep) kvm_page_empty(ptep)
++#define kvm_pmd_table_empty(pmdp) kvm_page_empty(pmdp)
++#define kvm_pud_table_empty(pudp) (0)
++
++
+ struct kvm;
+ 
+ #define kvm_flush_dcache_to_poc(a,l)	__cpuc_flush_dcache_area((a), (l))
+--- a/arch/arm/kvm/mmu.c
++++ b/arch/arm/kvm/mmu.c
+@@ -90,103 +90,115 @@ static void *mmu_memory_cache_alloc(stru
+ 	return p;
+ }
+ 
+-static bool page_empty(void *ptr)
++static void clear_pgd_entry(struct kvm *kvm, pgd_t *pgd, phys_addr_t addr)
+ {
+-	struct page *ptr_page = virt_to_page(ptr);
+-	return page_count(ptr_page) == 1;
++	pud_t *pud_table __maybe_unused = pud_offset(pgd, 0);
++	pgd_clear(pgd);
++	kvm_tlb_flush_vmid_ipa(kvm, addr);
++	pud_free(NULL, pud_table);
++	put_page(virt_to_page(pgd));
+ }
+ 
+ static void clear_pud_entry(struct kvm *kvm, pud_t *pud, phys_addr_t addr)
+ {
+-	if (pud_huge(*pud)) {
+-		pud_clear(pud);
+-		kvm_tlb_flush_vmid_ipa(kvm, addr);
+-	} else {
+-		pmd_t *pmd_table = pmd_offset(pud, 0);
+-		pud_clear(pud);
+-		kvm_tlb_flush_vmid_ipa(kvm, addr);
+-		pmd_free(NULL, pmd_table);
+-	}
++	pmd_t *pmd_table = pmd_offset(pud, 0);
++	VM_BUG_ON(pud_huge(*pud));
++	pud_clear(pud);
++	kvm_tlb_flush_vmid_ipa(kvm, addr);
++	pmd_free(NULL, pmd_table);
+ 	put_page(virt_to_page(pud));
+ }
+ 
+ static void clear_pmd_entry(struct kvm *kvm, pmd_t *pmd, phys_addr_t addr)
+ {
+-	if (kvm_pmd_huge(*pmd)) {
+-		pmd_clear(pmd);
+-		kvm_tlb_flush_vmid_ipa(kvm, addr);
+-	} else {
+-		pte_t *pte_table = pte_offset_kernel(pmd, 0);
+-		pmd_clear(pmd);
+-		kvm_tlb_flush_vmid_ipa(kvm, addr);
+-		pte_free_kernel(NULL, pte_table);
+-	}
++	pte_t *pte_table = pte_offset_kernel(pmd, 0);
++	VM_BUG_ON(kvm_pmd_huge(*pmd));
++	pmd_clear(pmd);
++	kvm_tlb_flush_vmid_ipa(kvm, addr);
++	pte_free_kernel(NULL, pte_table);
+ 	put_page(virt_to_page(pmd));
+ }
+ 
+-static void clear_pte_entry(struct kvm *kvm, pte_t *pte, phys_addr_t addr)
++static void unmap_ptes(struct kvm *kvm, pmd_t *pmd,
++		      phys_addr_t addr, phys_addr_t end)
+ {
+-	if (pte_present(*pte)) {
+-		kvm_set_pte(pte, __pte(0));
+-		put_page(virt_to_page(pte));
+-		kvm_tlb_flush_vmid_ipa(kvm, addr);
++	phys_addr_t start_addr = addr;
++	pte_t *pte, *start_pte;
++
++	start_pte = pte = pte_offset_kernel(pmd, addr);
++	do {
++		if (!pte_none(*pte)) {
++			kvm_set_pte(pte, __pte(0));
++			put_page(virt_to_page(pte));
++			kvm_tlb_flush_vmid_ipa(kvm, addr);
++		}
++	} while (pte++, addr += PAGE_SIZE, addr != end);
++
++	if (kvm_pte_table_empty(start_pte))
++		clear_pmd_entry(kvm, pmd, start_addr);
+ 	}
+-}
+ 
+-static void unmap_range(struct kvm *kvm, pgd_t *pgdp,
+-			unsigned long long start, u64 size)
++static void unmap_pmds(struct kvm *kvm, pud_t *pud,
++		      phys_addr_t addr, phys_addr_t end)
+ {
+-	pgd_t *pgd;
+-	pud_t *pud;
+-	pmd_t *pmd;
+-	pte_t *pte;
+-	unsigned long long addr = start, end = start + size;
+-	u64 next;
+-
+-	while (addr < end) {
+-		pgd = pgdp + pgd_index(addr);
+-		pud = pud_offset(pgd, addr);
+-		if (pud_none(*pud)) {
+-			addr = kvm_pud_addr_end(addr, end);
+-			continue;
+-		}
++	phys_addr_t next, start_addr = addr;
++	pmd_t *pmd, *start_pmd;
+ 
+-		if (pud_huge(*pud)) {
+-			/*
+-			 * If we are dealing with a huge pud, just clear it and
+-			 * move on.
+-			 */
+-			clear_pud_entry(kvm, pud, addr);
+-			addr = kvm_pud_addr_end(addr, end);
+-			continue;
++	start_pmd = pmd = pmd_offset(pud, addr);
++	do {
++		next = kvm_pmd_addr_end(addr, end);
++		if (!pmd_none(*pmd)) {
++			if (kvm_pmd_huge(*pmd)) {
++				pmd_clear(pmd);
++				kvm_tlb_flush_vmid_ipa(kvm, addr);
++				put_page(virt_to_page(pmd));
++			} else {
++				unmap_ptes(kvm, pmd, addr, next);
++			}
+ 		}
++	} while (pmd++, addr = next, addr != end);
+ 
+-		pmd = pmd_offset(pud, addr);
+-		if (pmd_none(*pmd)) {
+-			addr = kvm_pmd_addr_end(addr, end);
+-			continue;
+-		}
++	if (kvm_pmd_table_empty(start_pmd))
++		clear_pud_entry(kvm, pud, start_addr);
++}
+ 
+-		if (!kvm_pmd_huge(*pmd)) {
+-			pte = pte_offset_kernel(pmd, addr);
+-			clear_pte_entry(kvm, pte, addr);
+-			next = addr + PAGE_SIZE;
+-		}
++static void unmap_puds(struct kvm *kvm, pgd_t *pgd,
++		      phys_addr_t addr, phys_addr_t end)
++{
++	phys_addr_t next, start_addr = addr;
++	pud_t *pud, *start_pud;
+ 
+-		/*
+-		 * If the pmd entry is to be cleared, walk back up the ladder
+-		 */
+-		if (kvm_pmd_huge(*pmd) || page_empty(pte)) {
+-			clear_pmd_entry(kvm, pmd, addr);
+-			next = kvm_pmd_addr_end(addr, end);
+-			if (page_empty(pmd) && !page_empty(pud)) {
+-				clear_pud_entry(kvm, pud, addr);
+-				next = kvm_pud_addr_end(addr, end);
++	start_pud = pud = pud_offset(pgd, addr);
++	do {
++		next = kvm_pud_addr_end(addr, end);
++		if (!pud_none(*pud)) {
++			if (pud_huge(*pud)) {
++				pud_clear(pud);
++				kvm_tlb_flush_vmid_ipa(kvm, addr);
++				put_page(virt_to_page(pud));
++			} else {
++				unmap_pmds(kvm, pud, addr, next);
+ 			}
+ 		}
++	} while (pud++, addr = next, addr != end);
+ 
+-		addr = next;
+-	}
++	if (kvm_pud_table_empty(start_pud))
++		clear_pgd_entry(kvm, pgd, start_addr);
++}
++
++
++static void unmap_range(struct kvm *kvm, pgd_t *pgdp,
++		       phys_addr_t start, u64 size)
++{
++	pgd_t *pgd;
++	phys_addr_t addr = start, end = start + size;
++	phys_addr_t next;
++
++	pgd = pgdp + pgd_index(addr);
++	do {
++		next = kvm_pgd_addr_end(addr, end);
++		unmap_puds(kvm, pgd, addr, next);
++	} while (pgd++, addr = next, addr != end);
+ }
+ 
+ static void stage2_flush_ptes(struct kvm *kvm, pmd_t *pmd,
+--- a/arch/arm64/include/asm/kvm_mmu.h
++++ b/arch/arm64/include/asm/kvm_mmu.h
+@@ -125,6 +125,21 @@ static inline void kvm_set_s2pmd_writabl
+ #define kvm_pud_addr_end(addr, end)	pud_addr_end(addr, end)
+ #define kvm_pmd_addr_end(addr, end)	pmd_addr_end(addr, end)
+ 
++static inline bool kvm_page_empty(void *ptr)
++{
++	struct page *ptr_page = virt_to_page(ptr);
++	return page_count(ptr_page) == 1;
++}
++
++#define kvm_pte_table_empty(ptep) kvm_page_empty(ptep)
++#ifndef CONFIG_ARM64_64K_PAGES
++#define kvm_pmd_table_empty(pmdp) kvm_page_empty(pmdp)
++#else
++#define kvm_pmd_table_empty(pmdp) (0)
++#endif
++#define kvm_pud_table_empty(pudp) (0)
++
++
+ struct kvm;
+ 
+ #define kvm_flush_dcache_to_poc(a,l)	__flush_dcache_area((a), (l))
