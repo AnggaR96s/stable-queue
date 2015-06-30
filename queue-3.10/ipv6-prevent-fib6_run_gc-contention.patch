@@ -1,0 +1,128 @@
+From 2ac3ac8f86f2fe065d746d9a9abaca867adec577 Mon Sep 17 00:00:00 2001
+From: Michal Kubeček <mkubecek@suse.cz>
+Date: Thu, 1 Aug 2013 10:04:14 +0200
+Subject: ipv6: prevent fib6_run_gc() contention
+
+From: Michal Kubeček <mkubecek@suse.cz>
+
+commit 2ac3ac8f86f2fe065d746d9a9abaca867adec577 upstream.
+
+On a high-traffic router with many processors and many IPv6 dst
+entries, soft lockup in fib6_run_gc() can occur when number of
+entries reaches gc_thresh.
+
+This happens because fib6_run_gc() uses fib6_gc_lock to allow
+only one thread to run the garbage collector but ip6_dst_gc()
+doesn't update net->ipv6.ip6_rt_last_gc until fib6_run_gc()
+returns. On a system with many entries, this can take some time
+so that in the meantime, other threads pass the tests in
+ip6_dst_gc() (ip6_rt_last_gc is still not updated) and wait for
+the lock. They then have to run the garbage collector one after
+another which blocks them for quite long.
+
+Resolve this by replacing special value ~0UL of expire parameter
+to fib6_run_gc() by explicit "force" parameter to choose between
+spin_lock_bh() and spin_trylock_bh() and call fib6_run_gc() with
+force=false if gc_thresh is reached but not max_size.
+
+Signed-off-by: Michal Kubecek <mkubecek@suse.cz>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Cc: Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ include/net/ip6_fib.h |    2 +-
+ net/ipv6/ip6_fib.c    |   19 ++++++++-----------
+ net/ipv6/ndisc.c      |    4 ++--
+ net/ipv6/route.c      |    4 ++--
+ 4 files changed, 13 insertions(+), 16 deletions(-)
+
+--- a/include/net/ip6_fib.h
++++ b/include/net/ip6_fib.h
+@@ -301,7 +301,7 @@ extern void			inet6_rt_notify(int event,
+ 						struct nl_info *info);
+ 
+ extern void			fib6_run_gc(unsigned long expires,
+-					    struct net *net);
++					    struct net *net, bool force);
+ 
+ extern void			fib6_gc_cleanup(void);
+ 
+--- a/net/ipv6/ip6_fib.c
++++ b/net/ipv6/ip6_fib.c
+@@ -1648,19 +1648,16 @@ static int fib6_age(struct rt6_info *rt,
+ 
+ static DEFINE_SPINLOCK(fib6_gc_lock);
+ 
+-void fib6_run_gc(unsigned long expires, struct net *net)
++void fib6_run_gc(unsigned long expires, struct net *net, bool force)
+ {
+-	if (expires != ~0UL) {
++	if (force) {
+ 		spin_lock_bh(&fib6_gc_lock);
+-		gc_args.timeout = expires ? (int)expires :
+-			net->ipv6.sysctl.ip6_rt_gc_interval;
+-	} else {
+-		if (!spin_trylock_bh(&fib6_gc_lock)) {
+-			mod_timer(&net->ipv6.ip6_fib_timer, jiffies + HZ);
+-			return;
+-		}
+-		gc_args.timeout = net->ipv6.sysctl.ip6_rt_gc_interval;
++	} else if (!spin_trylock_bh(&fib6_gc_lock)) {
++		mod_timer(&net->ipv6.ip6_fib_timer, jiffies + HZ);
++		return;
+ 	}
++	gc_args.timeout = expires ? (int)expires :
++			  net->ipv6.sysctl.ip6_rt_gc_interval;
+ 
+ 	gc_args.more = icmp6_dst_gc();
+ 
+@@ -1677,7 +1674,7 @@ void fib6_run_gc(unsigned long expires,
+ 
+ static void fib6_gc_timer_cb(unsigned long arg)
+ {
+-	fib6_run_gc(0, (struct net *)arg);
++	fib6_run_gc(0, (struct net *)arg, true);
+ }
+ 
+ static int __net_init fib6_net_init(struct net *net)
+--- a/net/ipv6/ndisc.c
++++ b/net/ipv6/ndisc.c
+@@ -1584,7 +1584,7 @@ static int ndisc_netdev_event(struct not
+ 	switch (event) {
+ 	case NETDEV_CHANGEADDR:
+ 		neigh_changeaddr(&nd_tbl, dev);
+-		fib6_run_gc(~0UL, net);
++		fib6_run_gc(0, net, false);
+ 		idev = in6_dev_get(dev);
+ 		if (!idev)
+ 			break;
+@@ -1594,7 +1594,7 @@ static int ndisc_netdev_event(struct not
+ 		break;
+ 	case NETDEV_DOWN:
+ 		neigh_ifdown(&nd_tbl, dev);
+-		fib6_run_gc(~0UL, net);
++		fib6_run_gc(0, net, false);
+ 		break;
+ 	case NETDEV_NOTIFY_PEERS:
+ 		ndisc_send_unsol_na(dev);
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@ -1349,7 +1349,7 @@ static int ip6_dst_gc(struct dst_ops *op
+ 		goto out;
+ 
+ 	net->ipv6.ip6_rt_gc_expire++;
+-	fib6_run_gc(net->ipv6.ip6_rt_gc_expire, net);
++	fib6_run_gc(net->ipv6.ip6_rt_gc_expire, net, entries > rt_max_size);
+ 	net->ipv6.ip6_rt_last_gc = now;
+ 	entries = dst_entries_get_slow(ops);
+ 	if (entries < ops->gc_thresh)
+@@ -2849,7 +2849,7 @@ int ipv6_sysctl_rtcache_flush(ctl_table
+ 	net = (struct net *)ctl->extra1;
+ 	delay = net->ipv6.sysctl.flush_delay;
+ 	proc_dointvec(ctl, write, buffer, lenp, ppos);
+-	fib6_run_gc(delay <= 0 ? ~0UL : (unsigned long)delay, net);
++	fib6_run_gc(delay <= 0 ? 0 : (unsigned long)delay, net, delay > 0);
+ 	return 0;
+ }
+ 
