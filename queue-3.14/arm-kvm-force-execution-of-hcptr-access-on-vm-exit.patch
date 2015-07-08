@@ -1,0 +1,113 @@
+From 85e84ba31039595995dae80b277378213602891b Mon Sep 17 00:00:00 2001
+From: Marc Zyngier <marc.zyngier@arm.com>
+Date: Mon, 16 Mar 2015 10:59:43 +0000
+Subject: arm: KVM: force execution of HCPTR access on VM exit
+
+From: Marc Zyngier <marc.zyngier@arm.com>
+
+commit 85e84ba31039595995dae80b277378213602891b upstream.
+
+On VM entry, we disable access to the VFP registers in order to
+perform a lazy save/restore of these registers.
+
+On VM exit, we restore access, test if we did enable them before,
+and save/restore the guest/host registers if necessary. In this
+sequence, the FPEXC register is always accessed, irrespective
+of the trapping configuration.
+
+If the guest didn't touch the VFP registers, then the HCPTR access
+has now enabled such access, but we're missing a barrier to ensure
+architectural execution of the new HCPTR configuration. If the HCPTR
+access has been delayed/reordered, the subsequent access to FPEXC
+will cause a trap, which we aren't prepared to handle at all.
+
+The same condition exists when trapping to enable VFP for the guest.
+
+The fix is to introduce a barrier after enabling VFP access. In the
+vmexit case, it can be relaxed to only takes place if the guest hasn't
+accessed its view of the VFP registers, making the access to FPEXC safe.
+
+The set_hcptr macro is modified to deal with both vmenter/vmexit and
+vmtrap operations, and now takes an optional label that is branched to
+when the guest hasn't touched the VFP registers.
+
+Reported-by: Vikram Sethi <vikrams@codeaurora.org>
+Signed-off-by: Marc Zyngier <marc.zyngier@arm.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ arch/arm/kvm/interrupts.S      |   10 ++++------
+ arch/arm/kvm/interrupts_head.S |   20 ++++++++++++++++++--
+ 2 files changed, 22 insertions(+), 8 deletions(-)
+
+--- a/arch/arm/kvm/interrupts.S
++++ b/arch/arm/kvm/interrupts.S
+@@ -159,13 +159,9 @@ __kvm_vcpu_return:
+ 	@ Don't trap coprocessor accesses for host kernel
+ 	set_hstr vmexit
+ 	set_hdcr vmexit
+-	set_hcptr vmexit, (HCPTR_TTA | HCPTR_TCP(10) | HCPTR_TCP(11))
++	set_hcptr vmexit, (HCPTR_TTA | HCPTR_TCP(10) | HCPTR_TCP(11)), after_vfp_restore
+ 
+ #ifdef CONFIG_VFPv3
+-	@ Save floating point registers we if let guest use them.
+-	tst	r2, #(HCPTR_TCP(10) | HCPTR_TCP(11))
+-	bne	after_vfp_restore
+-
+ 	@ Switch VFP/NEON hardware state to the host's
+ 	add	r7, vcpu, #VCPU_VFP_GUEST
+ 	store_vfp_state r7
+@@ -177,6 +173,8 @@ after_vfp_restore:
+ 	@ Restore FPEXC_EN which we clobbered on entry
+ 	pop	{r2}
+ 	VFPFMXR FPEXC, r2
++#else
++after_vfp_restore:
+ #endif
+ 
+ 	@ Reset Hyp-role
+@@ -467,7 +465,7 @@ switch_to_guest_vfp:
+ 	push	{r3-r7}
+ 
+ 	@ NEON/VFP used.  Turn on VFP access.
+-	set_hcptr vmexit, (HCPTR_TCP(10) | HCPTR_TCP(11))
++	set_hcptr vmtrap, (HCPTR_TCP(10) | HCPTR_TCP(11))
+ 
+ 	@ Switch VFP/NEON hardware state to the guest's
+ 	add	r7, r0, #VCPU_VFP_HOST
+--- a/arch/arm/kvm/interrupts_head.S
++++ b/arch/arm/kvm/interrupts_head.S
+@@ -578,8 +578,13 @@ vcpu	.req	r0		@ vcpu pointer always in r
+ .endm
+ 
+ /* Configures the HCPTR (Hyp Coprocessor Trap Register) on entry/return
+- * (hardware reset value is 0). Keep previous value in r2. */
+-.macro set_hcptr operation, mask
++ * (hardware reset value is 0). Keep previous value in r2.
++ * An ISB is emited on vmexit/vmtrap, but executed on vmexit only if
++ * VFP wasn't already enabled (always executed on vmtrap).
++ * If a label is specified with vmexit, it is branched to if VFP wasn't
++ * enabled.
++ */
++.macro set_hcptr operation, mask, label = none
+ 	mrc	p15, 4, r2, c1, c1, 2
+ 	ldr	r3, =\mask
+ 	.if \operation == vmentry
+@@ -588,6 +593,17 @@ vcpu	.req	r0		@ vcpu pointer always in r
+ 	bic	r3, r2, r3		@ Don't trap defined coproc-accesses
+ 	.endif
+ 	mcr	p15, 4, r3, c1, c1, 2
++	.if \operation != vmentry
++	.if \operation == vmexit
++	tst	r2, #(HCPTR_TCP(10) | HCPTR_TCP(11))
++	beq	1f
++	.endif
++	isb
++	.if \label != none
++	b	\label
++	.endif
++1:
++	.endif
+ .endm
+ 
+ /* Configures the HDCR (Hyp Debug Configuration Register) on entry/return
