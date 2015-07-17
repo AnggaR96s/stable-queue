@@ -1,0 +1,232 @@
+From 3dc196eae1db548f05e53e5875ff87b8ff79f249 Mon Sep 17 00:00:00 2001
+From: Alexander Usyskin <alexander.usyskin@intel.com>
+Date: Sat, 13 Jun 2015 08:51:17 +0300
+Subject: mei: me: wait for power gating exit confirmation
+
+From: Alexander Usyskin <alexander.usyskin@intel.com>
+
+commit 3dc196eae1db548f05e53e5875ff87b8ff79f249 upstream.
+
+Fix the hbm power gating state machine so it will wait till it receives
+confirmation interrupt for the PG_ISOLATION_EXIT message.
+
+In process of the suspend flow the devices first have to exit from the
+power gating state (runtime pm resume).
+If we do not handle the confirmation interrupt after sending
+PG_ISOLATION_EXIT message, we may receive it already after the suspend
+flow has changed the device state and interrupt will be interpreted as a
+spurious event, consequently link reset will be invoked which will
+prevent the device from completing the suspend flow
+
+kernel: [6603] mei_reset:136: mei_me 0000:00:16.0: powering down: end of reset
+kernel: [476] mei_me_irq_thread_handler:643: mei_me 0000:00:16.0: function called after ISR to handle the interrupt processing.
+kernel: mei_me 0000:00:16.0: FW not ready: resetting
+
+Cc: Gabriele Mazzotta <gabriele.mzt@gmail.com>
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=86241
+Link: https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=770397
+Tested-by: Gabriele Mazzotta <gabriele.mzt@gmail.com>
+Signed-off-by: Alexander Usyskin <alexander.usyskin@intel.com>
+Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/misc/mei/client.c  |    2 -
+ drivers/misc/mei/hw-me.c   |   59 +++++++++++++++++++++++++++++++++++++++++----
+ drivers/misc/mei/hw-txe.c  |   13 +++++++++
+ drivers/misc/mei/mei_dev.h |   11 ++++++++
+ 4 files changed, 80 insertions(+), 5 deletions(-)
+
+--- a/drivers/misc/mei/client.c
++++ b/drivers/misc/mei/client.c
+@@ -699,7 +699,7 @@ void mei_host_client_init(struct work_st
+ bool mei_hbuf_acquire(struct mei_device *dev)
+ {
+ 	if (mei_pg_state(dev) == MEI_PG_ON ||
+-	    dev->pg_event == MEI_PG_EVENT_WAIT) {
++	    mei_pg_in_transition(dev)) {
+ 		dev_dbg(dev->dev, "device is in pg\n");
+ 		return false;
+ 	}
+--- a/drivers/misc/mei/hw-me.c
++++ b/drivers/misc/mei/hw-me.c
+@@ -663,11 +663,27 @@ int mei_me_pg_exit_sync(struct mei_devic
+ 	mutex_lock(&dev->device_lock);
+ 
+ reply:
+-	if (dev->pg_event == MEI_PG_EVENT_RECEIVED)
+-		ret = mei_hbm_pg(dev, MEI_PG_ISOLATION_EXIT_RES_CMD);
++	if (dev->pg_event != MEI_PG_EVENT_RECEIVED) {
++		ret = -ETIME;
++		goto out;
++	}
++
++	dev->pg_event = MEI_PG_EVENT_INTR_WAIT;
++	ret = mei_hbm_pg(dev, MEI_PG_ISOLATION_EXIT_RES_CMD);
++	if (ret)
++		return ret;
++
++	mutex_unlock(&dev->device_lock);
++	wait_event_timeout(dev->wait_pg,
++		dev->pg_event == MEI_PG_EVENT_INTR_RECEIVED, timeout);
++	mutex_lock(&dev->device_lock);
++
++	if (dev->pg_event == MEI_PG_EVENT_INTR_RECEIVED)
++		ret = 0;
+ 	else
+ 		ret = -ETIME;
+ 
++out:
+ 	dev->pg_event = MEI_PG_EVENT_IDLE;
+ 	hw->pg_state = MEI_PG_OFF;
+ 
+@@ -675,6 +691,19 @@ reply:
+ }
+ 
+ /**
++ * mei_me_pg_in_transition - is device now in pg transition
++ *
++ * @dev: the device structure
++ *
++ * Return: true if in pg transition, false otherwise
++ */
++static bool mei_me_pg_in_transition(struct mei_device *dev)
++{
++	return dev->pg_event >= MEI_PG_EVENT_WAIT &&
++	       dev->pg_event <= MEI_PG_EVENT_INTR_WAIT;
++}
++
++/**
+  * mei_me_pg_is_enabled - detect if PG is supported by HW
+  *
+  * @dev: the device structure
+@@ -705,6 +734,24 @@ notsupported:
+ }
+ 
+ /**
++ * mei_me_pg_intr - perform pg processing in interrupt thread handler
++ *
++ * @dev: the device structure
++ */
++static void mei_me_pg_intr(struct mei_device *dev)
++{
++	struct mei_me_hw *hw = to_me_hw(dev);
++
++	if (dev->pg_event != MEI_PG_EVENT_INTR_WAIT)
++		return;
++
++	dev->pg_event = MEI_PG_EVENT_INTR_RECEIVED;
++	hw->pg_state = MEI_PG_OFF;
++	if (waitqueue_active(&dev->wait_pg))
++		wake_up(&dev->wait_pg);
++}
++
++/**
+  * mei_me_irq_quick_handler - The ISR of the MEI device
+  *
+  * @irq: The irq number
+@@ -761,6 +808,8 @@ irqreturn_t mei_me_irq_thread_handler(in
+ 		goto end;
+ 	}
+ 
++	mei_me_pg_intr(dev);
++
+ 	/*  check if we need to start the dev */
+ 	if (!mei_host_is_ready(dev)) {
+ 		if (mei_hw_is_ready(dev)) {
+@@ -797,9 +846,10 @@ irqreturn_t mei_me_irq_thread_handler(in
+ 	/*
+ 	 * During PG handshake only allowed write is the replay to the
+ 	 * PG exit message, so block calling write function
+-	 * if the pg state is not idle
++	 * if the pg event is in PG handshake
+ 	 */
+-	if (dev->pg_event == MEI_PG_EVENT_IDLE) {
++	if (dev->pg_event != MEI_PG_EVENT_WAIT &&
++	    dev->pg_event != MEI_PG_EVENT_RECEIVED) {
+ 		rets = mei_irq_write_handler(dev, &complete_list);
+ 		dev->hbuf_is_ready = mei_hbuf_is_ready(dev);
+ 	}
+@@ -824,6 +874,7 @@ static const struct mei_hw_ops mei_me_hw
+ 	.hw_config = mei_me_hw_config,
+ 	.hw_start = mei_me_hw_start,
+ 
++	.pg_in_transition = mei_me_pg_in_transition,
+ 	.pg_is_enabled = mei_me_pg_is_enabled,
+ 
+ 	.intr_clear = mei_me_intr_clear,
+--- a/drivers/misc/mei/hw-txe.c
++++ b/drivers/misc/mei/hw-txe.c
+@@ -302,6 +302,18 @@ int mei_txe_aliveness_set_sync(struct me
+ }
+ 
+ /**
++ * mei_txe_pg_in_transition - is device now in pg transition
++ *
++ * @dev: the device structure
++ *
++ * Return: true if in pg transition, false otherwise
++ */
++static bool mei_txe_pg_in_transition(struct mei_device *dev)
++{
++	return dev->pg_event == MEI_PG_EVENT_WAIT;
++}
++
++/**
+  * mei_txe_pg_is_enabled - detect if PG is supported by HW
+  *
+  * @dev: the device structure
+@@ -1138,6 +1150,7 @@ static const struct mei_hw_ops mei_txe_h
+ 	.hw_config = mei_txe_hw_config,
+ 	.hw_start = mei_txe_hw_start,
+ 
++	.pg_in_transition = mei_txe_pg_in_transition,
+ 	.pg_is_enabled = mei_txe_pg_is_enabled,
+ 
+ 	.intr_clear = mei_txe_intr_clear,
+--- a/drivers/misc/mei/mei_dev.h
++++ b/drivers/misc/mei/mei_dev.h
+@@ -271,6 +271,7 @@ struct mei_cl {
+ 
+  * @fw_status        : get fw status registers
+  * @pg_state         : power gating state of the device
++ * @pg_in_transition : is device now in pg transition
+  * @pg_is_enabled    : is power gating enabled
+ 
+  * @intr_clear       : clear pending interrupts
+@@ -300,6 +301,7 @@ struct mei_hw_ops {
+ 
+ 	int (*fw_status)(struct mei_device *dev, struct mei_fw_status *fw_sts);
+ 	enum mei_pg_state (*pg_state)(struct mei_device *dev);
++	bool (*pg_in_transition)(struct mei_device *dev);
+ 	bool (*pg_is_enabled)(struct mei_device *dev);
+ 
+ 	void (*intr_clear)(struct mei_device *dev);
+@@ -398,11 +400,15 @@ struct mei_cl_device {
+  * @MEI_PG_EVENT_IDLE: the driver is not in power gating transition
+  * @MEI_PG_EVENT_WAIT: the driver is waiting for a pg event to complete
+  * @MEI_PG_EVENT_RECEIVED: the driver received pg event
++ * @MEI_PG_EVENT_INTR_WAIT: the driver is waiting for a pg event interrupt
++ * @MEI_PG_EVENT_INTR_RECEIVED: the driver received pg event interrupt
+  */
+ enum mei_pg_event {
+ 	MEI_PG_EVENT_IDLE,
+ 	MEI_PG_EVENT_WAIT,
+ 	MEI_PG_EVENT_RECEIVED,
++	MEI_PG_EVENT_INTR_WAIT,
++	MEI_PG_EVENT_INTR_RECEIVED,
+ };
+ 
+ /**
+@@ -717,6 +723,11 @@ static inline enum mei_pg_state mei_pg_s
+ 	return dev->ops->pg_state(dev);
+ }
+ 
++static inline bool mei_pg_in_transition(struct mei_device *dev)
++{
++	return dev->ops->pg_in_transition(dev);
++}
++
+ static inline bool mei_pg_is_enabled(struct mei_device *dev)
+ {
+ 	return dev->ops->pg_is_enabled(dev);
