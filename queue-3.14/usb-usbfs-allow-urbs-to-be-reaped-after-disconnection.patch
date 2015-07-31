@@ -1,0 +1,192 @@
+From 3f2cee73b650921b2e214bf487b2061a1c266504 Mon Sep 17 00:00:00 2001
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Thu, 29 Jan 2015 11:29:13 -0500
+Subject: USB: usbfs: allow URBs to be reaped after disconnection
+
+From: Alan Stern <stern@rowland.harvard.edu>
+
+commit 3f2cee73b650921b2e214bf487b2061a1c266504 upstream.
+
+The usbfs API has a peculiar hole: Users are not allowed to reap their
+URBs after the device has been disconnected.  There doesn't seem to be
+any good reason for this; it is an ad-hoc inconsistency.
+
+The patch allows users to issue the USBDEVFS_REAPURB and
+USBDEVFS_REAPURBNDELAY ioctls (together with their 32-bit counterparts
+on 64-bit systems) even after the device is gone.  If no URBs are
+pending for a disconnected device then the ioctls will return -ENODEV
+rather than -EAGAIN, because obviously no new URBs will ever be able
+to complete.
+
+The patch also adds a new capability flag for
+USBDEVFS_GET_CAPABILITIES to indicate that the reap-after-disconnect
+feature is supported.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Tested-by: Chris Dickens <christopher.a.dickens@gmail.com>
+Acked-by: Hans de Goede <hdegoede@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/usb/core/devio.c          |   63 ++++++++++++++++++++++----------------
+ include/uapi/linux/usbdevice_fs.h |    3 +
+ 2 files changed, 39 insertions(+), 27 deletions(-)
+
+--- a/drivers/usb/core/devio.c
++++ b/drivers/usb/core/devio.c
+@@ -1591,7 +1591,7 @@ static struct async *reap_as(struct dev_
+ 	for (;;) {
+ 		__set_current_state(TASK_INTERRUPTIBLE);
+ 		as = async_getcompleted(ps);
+-		if (as)
++		if (as || !connected(ps))
+ 			break;
+ 		if (signal_pending(current))
+ 			break;
+@@ -1614,7 +1614,7 @@ static int proc_reapurb(struct dev_state
+ 	}
+ 	if (signal_pending(current))
+ 		return -EINTR;
+-	return -EIO;
++	return -ENODEV;
+ }
+ 
+ static int proc_reapurbnonblock(struct dev_state *ps, void __user *arg)
+@@ -1623,10 +1623,11 @@ static int proc_reapurbnonblock(struct d
+ 	struct async *as;
+ 
+ 	as = async_getcompleted(ps);
+-	retval = -EAGAIN;
+ 	if (as) {
+ 		retval = processcompl(as, (void __user * __user *)arg);
+ 		free_async(as);
++	} else {
++		retval = (connected(ps) ? -EAGAIN : -ENODEV);
+ 	}
+ 	return retval;
+ }
+@@ -1756,7 +1757,7 @@ static int proc_reapurb_compat(struct de
+ 	}
+ 	if (signal_pending(current))
+ 		return -EINTR;
+-	return -EIO;
++	return -ENODEV;
+ }
+ 
+ static int proc_reapurbnonblock_compat(struct dev_state *ps, void __user *arg)
+@@ -1764,11 +1765,12 @@ static int proc_reapurbnonblock_compat(s
+ 	int retval;
+ 	struct async *as;
+ 
+-	retval = -EAGAIN;
+ 	as = async_getcompleted(ps);
+ 	if (as) {
+ 		retval = processcompl_compat(as, (void __user * __user *)arg);
+ 		free_async(as);
++	} else {
++		retval = (connected(ps) ? -EAGAIN : -ENODEV);
+ 	}
+ 	return retval;
+ }
+@@ -1940,7 +1942,8 @@ static int proc_get_capabilities(struct
+ {
+ 	__u32 caps;
+ 
+-	caps = USBDEVFS_CAP_ZERO_PACKET | USBDEVFS_CAP_NO_PACKET_SIZE_LIM;
++	caps = USBDEVFS_CAP_ZERO_PACKET | USBDEVFS_CAP_NO_PACKET_SIZE_LIM |
++			USBDEVFS_CAP_REAP_AFTER_DISCONNECT;
+ 	if (!ps->dev->bus->no_stop_on_short)
+ 		caps |= USBDEVFS_CAP_BULK_CONTINUATION;
+ 	if (ps->dev->bus->sg_tablesize)
+@@ -2001,6 +2004,32 @@ static long usbdev_do_ioctl(struct file
+ 		return -EPERM;
+ 
+ 	usb_lock_device(dev);
++
++	/* Reap operations are allowed even after disconnection */
++	switch (cmd) {
++	case USBDEVFS_REAPURB:
++		snoop(&dev->dev, "%s: REAPURB\n", __func__);
++		ret = proc_reapurb(ps, p);
++		goto done;
++
++	case USBDEVFS_REAPURBNDELAY:
++		snoop(&dev->dev, "%s: REAPURBNDELAY\n", __func__);
++		ret = proc_reapurbnonblock(ps, p);
++		goto done;
++
++#ifdef CONFIG_COMPAT
++	case USBDEVFS_REAPURB32:
++		snoop(&dev->dev, "%s: REAPURB32\n", __func__);
++		ret = proc_reapurb_compat(ps, p);
++		goto done;
++
++	case USBDEVFS_REAPURBNDELAY32:
++		snoop(&dev->dev, "%s: REAPURBNDELAY32\n", __func__);
++		ret = proc_reapurbnonblock_compat(ps, p);
++		goto done;
++#endif
++	}
++
+ 	if (!connected(ps)) {
+ 		usb_unlock_device(dev);
+ 		return -ENODEV;
+@@ -2094,16 +2123,6 @@ static long usbdev_do_ioctl(struct file
+ 			inode->i_mtime = CURRENT_TIME;
+ 		break;
+ 
+-	case USBDEVFS_REAPURB32:
+-		snoop(&dev->dev, "%s: REAPURB32\n", __func__);
+-		ret = proc_reapurb_compat(ps, p);
+-		break;
+-
+-	case USBDEVFS_REAPURBNDELAY32:
+-		snoop(&dev->dev, "%s: REAPURBNDELAY32\n", __func__);
+-		ret = proc_reapurbnonblock_compat(ps, p);
+-		break;
+-
+ 	case USBDEVFS_IOCTL32:
+ 		snoop(&dev->dev, "%s: IOCTL32\n", __func__);
+ 		ret = proc_ioctl_compat(ps, ptr_to_compat(p));
+@@ -2115,16 +2134,6 @@ static long usbdev_do_ioctl(struct file
+ 		ret = proc_unlinkurb(ps, p);
+ 		break;
+ 
+-	case USBDEVFS_REAPURB:
+-		snoop(&dev->dev, "%s: REAPURB\n", __func__);
+-		ret = proc_reapurb(ps, p);
+-		break;
+-
+-	case USBDEVFS_REAPURBNDELAY:
+-		snoop(&dev->dev, "%s: REAPURBNDELAY\n", __func__);
+-		ret = proc_reapurbnonblock(ps, p);
+-		break;
+-
+ 	case USBDEVFS_DISCSIGNAL:
+ 		snoop(&dev->dev, "%s: DISCSIGNAL\n", __func__);
+ 		ret = proc_disconnectsignal(ps, p);
+@@ -2161,6 +2170,8 @@ static long usbdev_do_ioctl(struct file
+ 		ret = proc_disconnect_claim(ps, p);
+ 		break;
+ 	}
++
++ done:
+ 	usb_unlock_device(dev);
+ 	if (ret >= 0)
+ 		inode->i_atime = CURRENT_TIME;
+--- a/include/uapi/linux/usbdevice_fs.h
++++ b/include/uapi/linux/usbdevice_fs.h
+@@ -125,11 +125,12 @@ struct usbdevfs_hub_portinfo {
+ 	char port [127];	/* e.g. port 3 connects to device 27 */
+ };
+ 
+-/* Device capability flags */
++/* System and bus capability flags */
+ #define USBDEVFS_CAP_ZERO_PACKET		0x01
+ #define USBDEVFS_CAP_BULK_CONTINUATION		0x02
+ #define USBDEVFS_CAP_NO_PACKET_SIZE_LIM		0x04
+ #define USBDEVFS_CAP_BULK_SCATTER_GATHER	0x08
++#define USBDEVFS_CAP_REAP_AFTER_DISCONNECT	0x10
+ 
+ /* USBDEVFS_DISCONNECT_CLAIM flags & struct */
+ 
