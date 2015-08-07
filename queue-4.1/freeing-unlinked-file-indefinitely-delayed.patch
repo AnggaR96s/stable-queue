@@ -1,0 +1,107 @@
+From 75a6f82a0d10ef8f13cd8fe7212911a0252ab99e Mon Sep 17 00:00:00 2001
+From: Al Viro <viro@ZenIV.linux.org.uk>
+Date: Wed, 8 Jul 2015 02:42:38 +0100
+Subject: freeing unlinked file indefinitely delayed
+
+From: Al Viro <viro@ZenIV.linux.org.uk>
+
+commit 75a6f82a0d10ef8f13cd8fe7212911a0252ab99e upstream.
+
+	Normally opening a file, unlinking it and then closing will have
+the inode freed upon close() (provided that it's not otherwise busy and
+has no remaining links, of course).  However, there's one case where that
+does *not* happen.  Namely, if you open it by fhandle with cold dcache,
+then unlink() and close().
+
+	In normal case you get d_delete() in unlink(2) notice that dentry
+is busy and unhash it; on the final dput() it will be forcibly evicted from
+dcache, triggering iput() and inode removal.  In this case, though, we end
+up with *two* dentries - disconnected (created by open-by-fhandle) and
+regular one (used by unlink()).  The latter will have its reference to inode
+dropped just fine, but the former will not - it's considered hashed (it
+is on the ->s_anon list), so it will stay around until the memory pressure
+will finally do it in.  As the result, we have the final iput() delayed
+indefinitely.  It's trivial to reproduce -
+
+void flush_dcache(void)
+{
+        system("mount -o remount,rw /");
+}
+
+static char buf[20 * 1024 * 1024];
+
+main()
+{
+        int fd;
+        union {
+                struct file_handle f;
+                char buf[MAX_HANDLE_SZ];
+        } x;
+        int m;
+
+        x.f.handle_bytes = sizeof(x);
+        chdir("/root");
+        mkdir("foo", 0700);
+        fd = open("foo/bar", O_CREAT | O_RDWR, 0600);
+        close(fd);
+        name_to_handle_at(AT_FDCWD, "foo/bar", &x.f, &m, 0);
+        flush_dcache();
+        fd = open_by_handle_at(AT_FDCWD, &x.f, O_RDWR);
+        unlink("foo/bar");
+        write(fd, buf, sizeof(buf));
+        system("df .");			/* 20Mb eaten */
+        close(fd);
+        system("df .");			/* should've freed those 20Mb */
+        flush_dcache();
+        system("df .");			/* should be the same as #2 */
+}
+
+will spit out something like
+Filesystem     1K-blocks   Used Available Use% Mounted on
+/dev/root         322023 303843      1131 100% /
+Filesystem     1K-blocks   Used Available Use% Mounted on
+/dev/root         322023 303843      1131 100% /
+Filesystem     1K-blocks   Used Available Use% Mounted on
+/dev/root         322023 283282     21692  93% /
+- inode gets freed only when dentry is finally evicted (here we trigger
+than by remount; normally it would've happened in response to memory
+pressure hell knows when).
+
+Acked-by: J. Bruce Fields <bfields@fieldses.org>
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/dcache.c |    7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@ -642,7 +642,7 @@ static inline bool fast_dput(struct dent
+ 
+ 	/*
+ 	 * If we have a d_op->d_delete() operation, we sould not
+-	 * let the dentry count go to zero, so use "put__or_lock".
++	 * let the dentry count go to zero, so use "put_or_lock".
+ 	 */
+ 	if (unlikely(dentry->d_flags & DCACHE_OP_DELETE))
+ 		return lockref_put_or_lock(&dentry->d_lockref);
+@@ -697,7 +697,7 @@ static inline bool fast_dput(struct dent
+ 	 */
+ 	smp_rmb();
+ 	d_flags = ACCESS_ONCE(dentry->d_flags);
+-	d_flags &= DCACHE_REFERENCED | DCACHE_LRU_LIST;
++	d_flags &= DCACHE_REFERENCED | DCACHE_LRU_LIST | DCACHE_DISCONNECTED;
+ 
+ 	/* Nothing to do? Dropping the reference was all we needed? */
+ 	if (d_flags == (DCACHE_REFERENCED | DCACHE_LRU_LIST) && !d_unhashed(dentry))
+@@ -776,6 +776,9 @@ repeat:
+ 	if (unlikely(d_unhashed(dentry)))
+ 		goto kill_it;
+ 
++	if (unlikely(dentry->d_flags & DCACHE_DISCONNECTED))
++		goto kill_it;
++
+ 	if (unlikely(dentry->d_flags & DCACHE_OP_DELETE)) {
+ 		if (dentry->d_op->d_delete(dentry))
+ 			goto kill_it;
