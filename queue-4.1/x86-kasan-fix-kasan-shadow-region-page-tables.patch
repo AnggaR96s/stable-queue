@@ -1,0 +1,192 @@
+From 5d5aa3cfca5cf74cd928daf3674642e6004328d1 Mon Sep 17 00:00:00 2001
+From: Alexander Popov <alpopov@ptsecurity.com>
+Date: Thu, 2 Jul 2015 12:09:34 +0300
+Subject: x86/kasan: Fix KASAN shadow region page tables
+
+From: Alexander Popov <alpopov@ptsecurity.com>
+
+commit 5d5aa3cfca5cf74cd928daf3674642e6004328d1 upstream.
+
+Currently KASAN shadow region page tables created without
+respect of physical offset (phys_base). This causes kernel halt
+when phys_base is not zero.
+
+So let's initialize KASAN shadow region page tables in
+kasan_early_init() using __pa_nodebug() which considers
+phys_base.
+
+This patch also separates x86_64_start_kernel() from KASAN low
+level details by moving kasan_map_early_shadow(init_level4_pgt)
+into kasan_early_init().
+
+Remove the comment before clear_bss() which stopped bringing
+much profit to the code readability. Otherwise describing all
+the new order dependencies would be too verbose.
+
+Signed-off-by: Alexander Popov <alpopov@ptsecurity.com>
+Signed-off-by: Andrey Ryabinin <a.ryabinin@samsung.com>
+Cc: Alexander Potapenko <glider@google.com>
+Cc: Andrey Konovalov <adech.fo@gmail.com>
+Cc: Borislav Petkov <bp@alien8.de>
+Cc: Dmitry Vyukov <dvyukov@google.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/1435828178-10975-3-git-send-email-a.ryabinin@samsung.com
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ arch/x86/include/asm/kasan.h |    8 ++------
+ arch/x86/kernel/head64.c     |    7 ++-----
+ arch/x86/kernel/head_64.S    |   29 -----------------------------
+ arch/x86/mm/kasan_init_64.c  |   36 ++++++++++++++++++++++++++++++++++--
+ 4 files changed, 38 insertions(+), 42 deletions(-)
+
+--- a/arch/x86/include/asm/kasan.h
++++ b/arch/x86/include/asm/kasan.h
+@@ -14,15 +14,11 @@
+ 
+ #ifndef __ASSEMBLY__
+ 
+-extern pte_t kasan_zero_pte[];
+-extern pte_t kasan_zero_pmd[];
+-extern pte_t kasan_zero_pud[];
+-
+ #ifdef CONFIG_KASAN
+-void __init kasan_map_early_shadow(pgd_t *pgd);
++void __init kasan_early_init(void);
+ void __init kasan_init(void);
+ #else
+-static inline void kasan_map_early_shadow(pgd_t *pgd) { }
++static inline void kasan_early_init(void) { }
+ static inline void kasan_init(void) { }
+ #endif
+ 
+--- a/arch/x86/kernel/head64.c
++++ b/arch/x86/kernel/head64.c
+@@ -161,13 +161,12 @@ asmlinkage __visible void __init x86_64_
+ 	/* Kill off the identity-map trampoline */
+ 	reset_early_page_tables();
+ 
+-	kasan_map_early_shadow(early_level4_pgt);
+-
+-	/* clear bss before set_intr_gate with early_idt_handler */
+ 	clear_bss();
+ 
+ 	clear_page(init_level4_pgt);
+ 
++	kasan_early_init();
++
+ 	for (i = 0; i < NUM_EXCEPTION_VECTORS; i++)
+ 		set_intr_gate(i, early_idt_handler_array[i]);
+ 	load_idt((const struct desc_ptr *)&idt_descr);
+@@ -182,8 +181,6 @@ asmlinkage __visible void __init x86_64_
+ 	/* set init_level4_pgt kernel high mapping*/
+ 	init_level4_pgt[511] = early_level4_pgt[511];
+ 
+-	kasan_map_early_shadow(init_level4_pgt);
+-
+ 	x86_64_start_reservations(real_mode_data);
+ }
+ 
+--- a/arch/x86/kernel/head_64.S
++++ b/arch/x86/kernel/head_64.S
+@@ -516,38 +516,9 @@ ENTRY(phys_base)
+ 	/* This must match the first entry in level2_kernel_pgt */
+ 	.quad   0x0000000000000000
+ 
+-#ifdef CONFIG_KASAN
+-#define FILL(VAL, COUNT)				\
+-	.rept (COUNT) ;					\
+-	.quad	(VAL) ;					\
+-	.endr
+-
+-NEXT_PAGE(kasan_zero_pte)
+-	FILL(kasan_zero_page - __START_KERNEL_map + _KERNPG_TABLE, 512)
+-NEXT_PAGE(kasan_zero_pmd)
+-	FILL(kasan_zero_pte - __START_KERNEL_map + _KERNPG_TABLE, 512)
+-NEXT_PAGE(kasan_zero_pud)
+-	FILL(kasan_zero_pmd - __START_KERNEL_map + _KERNPG_TABLE, 512)
+-
+-#undef FILL
+-#endif
+-
+-
+ #include "../../x86/xen/xen-head.S"
+ 	
+ 	__PAGE_ALIGNED_BSS
+ NEXT_PAGE(empty_zero_page)
+ 	.skip PAGE_SIZE
+ 
+-#ifdef CONFIG_KASAN
+-/*
+- * This page used as early shadow. We don't use empty_zero_page
+- * at early stages, stack instrumentation could write some garbage
+- * to this page.
+- * Latter we reuse it as zero shadow for large ranges of memory
+- * that allowed to access, but not instrumented by kasan
+- * (vmalloc/vmemmap ...).
+- */
+-NEXT_PAGE(kasan_zero_page)
+-	.skip PAGE_SIZE
+-#endif
+--- a/arch/x86/mm/kasan_init_64.c
++++ b/arch/x86/mm/kasan_init_64.c
+@@ -11,7 +11,19 @@
+ extern pgd_t early_level4_pgt[PTRS_PER_PGD];
+ extern struct range pfn_mapped[E820_X_MAX];
+ 
+-extern unsigned char kasan_zero_page[PAGE_SIZE];
++static pud_t kasan_zero_pud[PTRS_PER_PUD] __page_aligned_bss;
++static pmd_t kasan_zero_pmd[PTRS_PER_PMD] __page_aligned_bss;
++static pte_t kasan_zero_pte[PTRS_PER_PTE] __page_aligned_bss;
++
++/*
++ * This page used as early shadow. We don't use empty_zero_page
++ * at early stages, stack instrumentation could write some garbage
++ * to this page.
++ * Latter we reuse it as zero shadow for large ranges of memory
++ * that allowed to access, but not instrumented by kasan
++ * (vmalloc/vmemmap ...).
++ */
++static unsigned char kasan_zero_page[PAGE_SIZE] __page_aligned_bss;
+ 
+ static int __init map_range(struct range *range)
+ {
+@@ -36,7 +48,7 @@ static void __init clear_pgds(unsigned l
+ 		pgd_clear(pgd_offset_k(start));
+ }
+ 
+-void __init kasan_map_early_shadow(pgd_t *pgd)
++static void __init kasan_map_early_shadow(pgd_t *pgd)
+ {
+ 	int i;
+ 	unsigned long start = KASAN_SHADOW_START;
+@@ -166,6 +178,26 @@ static struct notifier_block kasan_die_n
+ };
+ #endif
+ 
++void __init kasan_early_init(void)
++{
++	int i;
++	pteval_t pte_val = __pa_nodebug(kasan_zero_page) | __PAGE_KERNEL;
++	pmdval_t pmd_val = __pa_nodebug(kasan_zero_pte) | _KERNPG_TABLE;
++	pudval_t pud_val = __pa_nodebug(kasan_zero_pmd) | _KERNPG_TABLE;
++
++	for (i = 0; i < PTRS_PER_PTE; i++)
++		kasan_zero_pte[i] = __pte(pte_val);
++
++	for (i = 0; i < PTRS_PER_PMD; i++)
++		kasan_zero_pmd[i] = __pmd(pmd_val);
++
++	for (i = 0; i < PTRS_PER_PUD; i++)
++		kasan_zero_pud[i] = __pud(pud_val);
++
++	kasan_map_early_shadow(early_level4_pgt);
++	kasan_map_early_shadow(init_level4_pgt);
++}
++
+ void __init kasan_init(void)
+ {
+ 	int i;
