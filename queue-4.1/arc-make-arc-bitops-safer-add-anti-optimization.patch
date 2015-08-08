@@ -1,0 +1,149 @@
+From 80f420842ff42ad61f84584716d74ef635f13892 Mon Sep 17 00:00:00 2001
+From: Vineet Gupta <vgupta@synopsys.com>
+Date: Fri, 3 Jul 2015 11:26:22 +0530
+Subject: ARC: Make ARC bitops "safer" (add anti-optimization)
+
+From: Vineet Gupta <vgupta@synopsys.com>
+
+commit 80f420842ff42ad61f84584716d74ef635f13892 upstream.
+
+ARCompact/ARCv2 ISA provide that any instructions which deals with
+bitpos/count operand ASL, LSL, BSET, BCLR, BMSK .... will only consider
+lower 5 bits. i.e. auto-clamp the pos to 0-31.
+
+ARC Linux bitops exploited this fact by NOT explicitly masking out upper
+bits for @nr operand in general, saving a bunch of AND/BMSK instructions
+in generated code around bitops.
+
+While this micro-optimization has worked well over years it is NOT safe
+as shifting a number with a value, greater than native size is
+"undefined" per "C" spec.
+
+So as it turns outm EZChip ran into this eventually, in their massive
+muti-core SMP build with 64 cpus. There was a test_bit() inside a loop
+from 63 to 0 and gcc was weirdly optimizing away the first iteration
+(so it was really adhering to standard by implementing undefined behaviour
+vs. removing all the iterations which were phony i.e. (1 << [63..32])
+
+| for i = 63 to 0
+|    X = ( 1 << i )
+|    if X == 0
+|       continue
+
+So fix the code to do the explicit masking at the expense of generating
+additional instructions. Fortunately, this can be mitigated to a large
+extent as gcc has SHIFT_COUNT_TRUNCATED which allows combiner to fold
+masking into shift operation itself. It is currently not enabled in ARC
+gcc backend, but could be done after a bit of testing.
+
+Fixes STAR 9000866918 ("unsafe "undefined behavior" code in kernel")
+
+Reported-by: Noam Camus <noamc@ezchip.com>
+Signed-off-by: Vineet Gupta <vgupta@synopsys.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ arch/arc/include/asm/bitops.h |   35 +++++++++--------------------------
+ 1 file changed, 9 insertions(+), 26 deletions(-)
+
+--- a/arch/arc/include/asm/bitops.h
++++ b/arch/arc/include/asm/bitops.h
+@@ -50,8 +50,7 @@ static inline void op##_bit(unsigned lon
+ 	 * done for const @nr, but no code is generated due to gcc	\
+ 	 * const prop.							\
+ 	 */								\
+-	if (__builtin_constant_p(nr))					\
+-		nr &= 0x1f;						\
++	nr &= 0x1f;							\
+ 									\
+ 	__asm__ __volatile__(						\
+ 	"1:	llock       %0, [%1]		\n"			\
+@@ -82,8 +81,7 @@ static inline int test_and_##op##_bit(un
+ 									\
+ 	m += nr >> 5;							\
+ 									\
+-	if (__builtin_constant_p(nr))					\
+-		nr &= 0x1f;						\
++	nr &= 0x1f;							\
+ 									\
+ 	/*								\
+ 	 * Explicit full memory barrier needed before/after as		\
+@@ -129,16 +127,13 @@ static inline void op##_bit(unsigned lon
+ 	unsigned long temp, flags;					\
+ 	m += nr >> 5;							\
+ 									\
+-	if (__builtin_constant_p(nr))					\
+-		nr &= 0x1f;						\
+-									\
+ 	/*								\
+ 	 * spin lock/unlock provide the needed smp_mb() before/after	\
+ 	 */								\
+ 	bitops_lock(flags);						\
+ 									\
+ 	temp = *m;							\
+-	*m = temp c_op (1UL << nr);					\
++	*m = temp c_op (1UL << (nr & 0x1f));					\
+ 									\
+ 	bitops_unlock(flags);						\
+ }
+@@ -149,17 +144,14 @@ static inline int test_and_##op##_bit(un
+ 	unsigned long old, flags;					\
+ 	m += nr >> 5;							\
+ 									\
+-	if (__builtin_constant_p(nr))					\
+-		nr &= 0x1f;						\
+-									\
+ 	bitops_lock(flags);						\
+ 									\
+ 	old = *m;							\
+-	*m = old c_op (1 << nr);					\
++	*m = old c_op (1UL << (nr & 0x1f));				\
+ 									\
+ 	bitops_unlock(flags);						\
+ 									\
+-	return (old & (1 << nr)) != 0;					\
++	return (old & (1UL << (nr & 0x1f))) != 0;			\
+ }
+ 
+ #endif /* CONFIG_ARC_HAS_LLSC */
+@@ -174,11 +166,8 @@ static inline void __##op##_bit(unsigned
+ 	unsigned long temp;						\
+ 	m += nr >> 5;							\
+ 									\
+-	if (__builtin_constant_p(nr))					\
+-		nr &= 0x1f;						\
+-									\
+ 	temp = *m;							\
+-	*m = temp c_op (1UL << nr);					\
++	*m = temp c_op (1UL << (nr & 0x1f));				\
+ }
+ 
+ #define __TEST_N_BIT_OP(op, c_op, asm_op)				\
+@@ -187,13 +176,10 @@ static inline int __test_and_##op##_bit(
+ 	unsigned long old;						\
+ 	m += nr >> 5;							\
+ 									\
+-	if (__builtin_constant_p(nr))					\
+-		nr &= 0x1f;						\
+-									\
+ 	old = *m;							\
+-	*m = old c_op (1 << nr);					\
++	*m = old c_op (1UL << (nr & 0x1f));				\
+ 									\
+-	return (old & (1 << nr)) != 0;					\
++	return (old & (1UL << (nr & 0x1f))) != 0;			\
+ }
+ 
+ #define BIT_OPS(op, c_op, asm_op)					\
+@@ -224,10 +210,7 @@ test_bit(unsigned int nr, const volatile
+ 
+ 	addr += nr >> 5;
+ 
+-	if (__builtin_constant_p(nr))
+-		nr &= 0x1f;
+-
+-	mask = 1 << nr;
++	mask = 1UL << (nr & 0x1f);
+ 
+ 	return ((mask & *addr) != 0);
+ }
