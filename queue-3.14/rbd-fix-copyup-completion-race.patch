@@ -1,0 +1,143 @@
+From 2761713d35e370fd640b5781109f753066b746c4 Mon Sep 17 00:00:00 2001
+From: Ilya Dryomov <idryomov@gmail.com>
+Date: Thu, 16 Jul 2015 17:36:11 +0300
+Subject: rbd: fix copyup completion race
+
+From: Ilya Dryomov <idryomov@gmail.com>
+
+commit 2761713d35e370fd640b5781109f753066b746c4 upstream.
+
+For write/discard obj_requests that involved a copyup method call, the
+opcode of the first op is CEPH_OSD_OP_CALL and the ->callback is
+rbd_img_obj_copyup_callback().  The latter frees copyup pages, sets
+->xferred and delegates to rbd_img_obj_callback(), the "normal" image
+object callback, for reporting to block layer and putting refs.
+
+rbd_osd_req_callback() however treats CEPH_OSD_OP_CALL as a trivial op,
+which means obj_request is marked done in rbd_osd_trivial_callback(),
+*before* ->callback is invoked and rbd_img_obj_copyup_callback() has
+a chance to run.  Marking obj_request done essentially means giving
+rbd_img_obj_callback() a license to end it at any moment, so if another
+obj_request from the same img_request is being completed concurrently,
+rbd_img_obj_end_request() may very well be called on such prematurally
+marked done request:
+
+<obj_request-1/2 reply>
+handle_reply()
+  rbd_osd_req_callback()
+    rbd_osd_trivial_callback()
+    rbd_obj_request_complete()
+    rbd_img_obj_copyup_callback()
+    rbd_img_obj_callback()
+                                    <obj_request-2/2 reply>
+                                    handle_reply()
+                                      rbd_osd_req_callback()
+                                        rbd_osd_trivial_callback()
+      for_each_obj_request(obj_request->img_request) {
+        rbd_img_obj_end_request(obj_request-1/2)
+        rbd_img_obj_end_request(obj_request-2/2) <--
+      }
+
+Calling rbd_img_obj_end_request() on such a request leads to trouble,
+in particular because its ->xfferred is 0.  We report 0 to the block
+layer with blk_update_request(), get back 1 for "this request has more
+data in flight" and then trip on
+
+    rbd_assert(more ^ (which == img_request->obj_request_count));
+
+with rhs (which == ...) being 1 because rbd_img_obj_end_request() has
+been called for both requests and lhs (more) being 1 because we haven't
+got a chance to set ->xfferred in rbd_img_obj_copyup_callback() yet.
+
+To fix this, leverage that rbd wants to call class methods in only two
+cases: one is a generic method call wrapper (obj_request is standalone)
+and the other is a copyup (obj_request is part of an img_request).  So
+make a dedicated handler for CEPH_OSD_OP_CALL and directly invoke
+rbd_img_obj_copyup_callback() from it if obj_request is part of an
+img_request, similar to how CEPH_OSD_OP_READ handler invokes
+rbd_img_obj_request_read_callback().
+
+Since rbd_img_obj_copyup_callback() is now being called from the OSD
+request callback (only), it is renamed to rbd_osd_copyup_callback().
+
+Cc: Alex Elder <elder@linaro.org>
+Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+Reviewed-by: Alex Elder <elder@linaro.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/block/rbd.c |   22 +++++++++++++++++-----
+ 1 file changed, 17 insertions(+), 5 deletions(-)
+
+--- a/drivers/block/rbd.c
++++ b/drivers/block/rbd.c
+@@ -508,6 +508,7 @@ void rbd_warn(struct rbd_device *rbd_dev
+ #  define rbd_assert(expr)	((void) 0)
+ #endif /* !RBD_DEBUG */
+ 
++static void rbd_osd_copyup_callback(struct rbd_obj_request *obj_request);
+ static int rbd_img_obj_request_submit(struct rbd_obj_request *obj_request);
+ static void rbd_img_parent_read(struct rbd_obj_request *obj_request);
+ static void rbd_dev_remove_parent(struct rbd_device *rbd_dev);
+@@ -1651,6 +1652,16 @@ static void rbd_osd_stat_callback(struct
+ 	obj_request_done_set(obj_request);
+ }
+ 
++static void rbd_osd_call_callback(struct rbd_obj_request *obj_request)
++{
++	dout("%s: obj %p\n", __func__, obj_request);
++
++	if (obj_request_img_data_test(obj_request))
++		rbd_osd_copyup_callback(obj_request);
++	else
++		obj_request_done_set(obj_request);
++}
++
+ static void rbd_osd_req_callback(struct ceph_osd_request *osd_req,
+ 				struct ceph_msg *msg)
+ {
+@@ -1689,6 +1700,8 @@ static void rbd_osd_req_callback(struct
+ 		rbd_osd_stat_callback(obj_request);
+ 		break;
+ 	case CEPH_OSD_OP_CALL:
++		rbd_osd_call_callback(obj_request);
++		break;
+ 	case CEPH_OSD_OP_NOTIFY_ACK:
+ 	case CEPH_OSD_OP_WATCH:
+ 		rbd_osd_trivial_callback(obj_request);
+@@ -2275,13 +2288,15 @@ out_unwind:
+ }
+ 
+ static void
+-rbd_img_obj_copyup_callback(struct rbd_obj_request *obj_request)
++rbd_osd_copyup_callback(struct rbd_obj_request *obj_request)
+ {
+ 	struct rbd_img_request *img_request;
+ 	struct rbd_device *rbd_dev;
+ 	struct page **pages;
+ 	u32 page_count;
+ 
++	dout("%s: obj %p\n", __func__, obj_request);
++
+ 	rbd_assert(obj_request->type == OBJ_REQUEST_BIO);
+ 	rbd_assert(obj_request_img_data_test(obj_request));
+ 	img_request = obj_request->img_request;
+@@ -2307,9 +2322,7 @@ rbd_img_obj_copyup_callback(struct rbd_o
+ 	if (!obj_request->result)
+ 		obj_request->xferred = obj_request->length;
+ 
+-	/* Finish up with the normal image object callback */
+-
+-	rbd_img_obj_callback(obj_request);
++	obj_request_done_set(obj_request);
+ }
+ 
+ static void
+@@ -2406,7 +2419,6 @@ rbd_img_obj_parent_read_full_callback(st
+ 
+ 	/* All set, send it off. */
+ 
+-	orig_request->callback = rbd_img_obj_copyup_callback;
+ 	osdc = &rbd_dev->rbd_client->client->osdc;
+ 	img_result = rbd_obj_request_submit(osdc, orig_request);
+ 	if (!img_result)
