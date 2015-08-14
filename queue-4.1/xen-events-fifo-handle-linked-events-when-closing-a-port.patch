@@ -1,0 +1,198 @@
+From fcdf31a7c162de0c93a2bee51df4688ab0a348f8 Mon Sep 17 00:00:00 2001
+From: Ross Lagerwall <ross.lagerwall@citrix.com>
+Date: Fri, 31 Jul 2015 14:30:42 +0100
+Subject: xen/events/fifo: Handle linked events when closing a port
+
+From: Ross Lagerwall <ross.lagerwall@citrix.com>
+
+commit fcdf31a7c162de0c93a2bee51df4688ab0a348f8 upstream.
+
+An event channel bound to a CPU that was offlined may still be linked
+on that CPU's queue.  If this event channel is closed and reused,
+subsequent events will be lost because the event channel is never
+unlinked and thus cannot be linked onto the correct queue.
+
+When a channel is closed and the event is still linked into a queue,
+ensure that it is unlinked before completing.
+
+If the CPU to which the event channel bound is online, spin until the
+event is handled by that CPU. If that CPU is offline, it can't handle
+the event, so clear the event queue during the close, dropping the
+events.
+
+This fixes the missing interrupts (and subsequent disk stalls etc.)
+when offlining a CPU.
+
+Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+Signed-off-by: David Vrabel <david.vrabel@citrix.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/xen/events/events_base.c     |   10 ++++---
+ drivers/xen/events/events_fifo.c     |   45 +++++++++++++++++++++++++++++++----
+ drivers/xen/events/events_internal.h |    7 +++++
+ 3 files changed, 53 insertions(+), 9 deletions(-)
+
+--- a/drivers/xen/events/events_base.c
++++ b/drivers/xen/events/events_base.c
+@@ -452,10 +452,12 @@ static void xen_free_irq(unsigned irq)
+ 	irq_free_desc(irq);
+ }
+ 
+-static void xen_evtchn_close(unsigned int port)
++static void xen_evtchn_close(unsigned int port, unsigned int cpu)
+ {
+ 	struct evtchn_close close;
+ 
++	xen_evtchn_op_close(port, cpu);
++
+ 	close.port = port;
+ 	if (HYPERVISOR_event_channel_op(EVTCHNOP_close, &close) != 0)
+ 		BUG();
+@@ -544,7 +546,7 @@ out:
+ 
+ err:
+ 	pr_err("irq%d: Failed to set port to irq mapping (%d)\n", irq, rc);
+-	xen_evtchn_close(evtchn);
++	xen_evtchn_close(evtchn, NR_CPUS);
+ 	return 0;
+ }
+ 
+@@ -565,7 +567,7 @@ static void shutdown_pirq(struct irq_dat
+ 		return;
+ 
+ 	mask_evtchn(evtchn);
+-	xen_evtchn_close(evtchn);
++	xen_evtchn_close(evtchn, cpu_from_evtchn(evtchn));
+ 	xen_irq_info_cleanup(info);
+ }
+ 
+@@ -609,7 +611,7 @@ static void __unbind_from_irq(unsigned i
+ 	if (VALID_EVTCHN(evtchn)) {
+ 		unsigned int cpu = cpu_from_irq(irq);
+ 
+-		xen_evtchn_close(evtchn);
++		xen_evtchn_close(evtchn, cpu);
+ 
+ 		switch (type_from_irq(irq)) {
+ 		case IRQT_VIRQ:
+--- a/drivers/xen/events/events_fifo.c
++++ b/drivers/xen/events/events_fifo.c
+@@ -255,6 +255,12 @@ static void evtchn_fifo_unmask(unsigned
+ 	}
+ }
+ 
++static bool evtchn_fifo_is_linked(unsigned port)
++{
++	event_word_t *word = event_word_from_port(port);
++	return sync_test_bit(EVTCHN_FIFO_BIT(LINKED, word), BM(word));
++}
++
+ static uint32_t clear_linked(volatile event_word_t *word)
+ {
+ 	event_word_t new, old, w;
+@@ -281,7 +287,8 @@ static void handle_irq_for_port(unsigned
+ 
+ static void consume_one_event(unsigned cpu,
+ 			      struct evtchn_fifo_control_block *control_block,
+-			      unsigned priority, unsigned long *ready)
++			      unsigned priority, unsigned long *ready,
++			      bool drop)
+ {
+ 	struct evtchn_fifo_queue *q = &per_cpu(cpu_queue, cpu);
+ 	uint32_t head;
+@@ -313,13 +320,15 @@ static void consume_one_event(unsigned c
+ 	if (head == 0)
+ 		clear_bit(priority, ready);
+ 
+-	if (evtchn_fifo_is_pending(port) && !evtchn_fifo_is_masked(port))
+-		handle_irq_for_port(port);
++	if (evtchn_fifo_is_pending(port) && !evtchn_fifo_is_masked(port)) {
++		if (likely(!drop))
++			handle_irq_for_port(port);
++	}
+ 
+ 	q->head[priority] = head;
+ }
+ 
+-static void evtchn_fifo_handle_events(unsigned cpu)
++static void __evtchn_fifo_handle_events(unsigned cpu, bool drop)
+ {
+ 	struct evtchn_fifo_control_block *control_block;
+ 	unsigned long ready;
+@@ -331,11 +340,16 @@ static void evtchn_fifo_handle_events(un
+ 
+ 	while (ready) {
+ 		q = find_first_bit(&ready, EVTCHN_FIFO_MAX_QUEUES);
+-		consume_one_event(cpu, control_block, q, &ready);
++		consume_one_event(cpu, control_block, q, &ready, drop);
+ 		ready |= xchg(&control_block->ready, 0);
+ 	}
+ }
+ 
++static void evtchn_fifo_handle_events(unsigned cpu)
++{
++	__evtchn_fifo_handle_events(cpu, false);
++}
++
+ static void evtchn_fifo_resume(void)
+ {
+ 	unsigned cpu;
+@@ -371,6 +385,26 @@ static void evtchn_fifo_resume(void)
+ 	event_array_pages = 0;
+ }
+ 
++static void evtchn_fifo_close(unsigned port, unsigned int cpu)
++{
++	if (cpu == NR_CPUS)
++		return;
++
++	get_online_cpus();
++	if (cpu_online(cpu)) {
++		if (WARN_ON(irqs_disabled()))
++			goto out;
++
++		while (evtchn_fifo_is_linked(port))
++			cpu_relax();
++	} else {
++		__evtchn_fifo_handle_events(cpu, true);
++	}
++
++out:
++	put_online_cpus();
++}
++
+ static const struct evtchn_ops evtchn_ops_fifo = {
+ 	.max_channels      = evtchn_fifo_max_channels,
+ 	.nr_channels       = evtchn_fifo_nr_channels,
+@@ -384,6 +418,7 @@ static const struct evtchn_ops evtchn_op
+ 	.unmask            = evtchn_fifo_unmask,
+ 	.handle_events     = evtchn_fifo_handle_events,
+ 	.resume            = evtchn_fifo_resume,
++	.close             = evtchn_fifo_close,
+ };
+ 
+ static int evtchn_fifo_alloc_control_block(unsigned cpu)
+--- a/drivers/xen/events/events_internal.h
++++ b/drivers/xen/events/events_internal.h
+@@ -68,6 +68,7 @@ struct evtchn_ops {
+ 	bool (*test_and_set_mask)(unsigned port);
+ 	void (*mask)(unsigned port);
+ 	void (*unmask)(unsigned port);
++	void (*close)(unsigned port, unsigned cpu);
+ 
+ 	void (*handle_events)(unsigned cpu);
+ 	void (*resume)(void);
+@@ -145,6 +146,12 @@ static inline void xen_evtchn_resume(voi
+ 		evtchn_ops->resume();
+ }
+ 
++static inline void xen_evtchn_op_close(unsigned port, unsigned cpu)
++{
++	if (evtchn_ops->close)
++		return evtchn_ops->close(port, cpu);
++}
++
+ void xen_evtchn_2l_init(void);
+ int xen_evtchn_fifo_init(void);
+ 
