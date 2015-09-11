@@ -1,0 +1,186 @@
+From d3392f41f6d3cd0a034bd0aca47fabea2b47218e Mon Sep 17 00:00:00 2001
+From: Jan Stancek <jstancek@redhat.com>
+Date: Sat, 8 Aug 2015 08:47:28 +0200
+Subject: crypto: nx - respect sg limit bounds when building sg lists for SHA
+
+From: Jan Stancek <jstancek@redhat.com>
+
+commit d3392f41f6d3cd0a034bd0aca47fabea2b47218e upstream.
+
+Commit 000851119e80 changed sha256/512 update functions to
+pass more data to nx_build_sg_list(), which ends with
+sg list overflows and usually with update functions failing
+for data larger than max_sg_len * NX_PAGE_SIZE.
+
+This happens because:
+- both "total" and "to_process" are updated, which leads to
+  "to_process" getting overflowed for some data lengths
+  For example:
+    In first iteration "total" is 50, and let's assume "to_process"
+    is 30 due to sg limits. At the end of first iteration "total" is
+    set to 20. At start of 2nd iteration "to_process" overflows on:
+      to_process = total - to_process;
+- "in_sg" is not reset to nx_ctx->in_sg after each iteration
+- nx_build_sg_list() is hitting overflow because the amount of data
+  passed to it would require more than sgmax elements
+- as consequence of previous item, data stored in overflowed sg list
+  may no longer be aligned to SHA*_BLOCK_SIZE
+
+This patch changes sha256/512 update functions so that "to_process"
+respects sg limits and never tries to pass more data to
+nx_build_sg_list() to avoid overflows. "to_process" is calculated
+as minimum of "total" and sg limits at start of every iteration.
+
+Fixes: 000851119e80 ("crypto: nx - Fix SHA concurrence issue and sg
+		      limit bounds")
+Signed-off-by: Jan Stancek <jstancek@redhat.com>
+Cc: Leonidas Da Silva Barbosa <leosilva@linux.vnet.ibm.com>
+Cc: Marcelo Henrique Cerri <mhcerri@linux.vnet.ibm.com>
+Cc: Fionnuala Gunter <fin@linux.vnet.ibm.com>
+Cc: "David S. Miller" <davem@davemloft.net>
+Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/crypto/nx/nx-sha256.c |   27 ++++++++++++++++-----------
+ drivers/crypto/nx/nx-sha512.c |   28 ++++++++++++++++------------
+ 2 files changed, 32 insertions(+), 23 deletions(-)
+
+--- a/drivers/crypto/nx/nx-sha256.c
++++ b/drivers/crypto/nx/nx-sha256.c
+@@ -71,7 +71,6 @@ static int nx_sha256_update(struct shash
+ 	struct sha256_state *sctx = shash_desc_ctx(desc);
+ 	struct nx_crypto_ctx *nx_ctx = crypto_tfm_ctx(&desc->tfm->base);
+ 	struct nx_csbcpb *csbcpb = (struct nx_csbcpb *)nx_ctx->csbcpb;
+-	struct nx_sg *in_sg;
+ 	struct nx_sg *out_sg;
+ 	u64 to_process = 0, leftover, total;
+ 	unsigned long irq_flags;
+@@ -97,7 +96,6 @@ static int nx_sha256_update(struct shash
+ 	NX_CPB_FDM(csbcpb) |= NX_FDM_INTERMEDIATE;
+ 	NX_CPB_FDM(csbcpb) |= NX_FDM_CONTINUATION;
+ 
+-	in_sg = nx_ctx->in_sg;
+ 	max_sg_len = min_t(u64, nx_ctx->ap->sglen,
+ 			nx_driver.of.max_sg_len/sizeof(struct nx_sg));
+ 	max_sg_len = min_t(u64, max_sg_len,
+@@ -114,17 +112,12 @@ static int nx_sha256_update(struct shash
+ 	}
+ 
+ 	do {
+-		/*
+-		 * to_process: the SHA256_BLOCK_SIZE data chunk to process in
+-		 * this update. This value is also restricted by the sg list
+-		 * limits.
+-		 */
+-		to_process = total - to_process;
+-		to_process = to_process & ~(SHA256_BLOCK_SIZE - 1);
++		int used_sgs = 0;
++		struct nx_sg *in_sg = nx_ctx->in_sg;
+ 
+ 		if (buf_len) {
+ 			data_len = buf_len;
+-			in_sg = nx_build_sg_list(nx_ctx->in_sg,
++			in_sg = nx_build_sg_list(in_sg,
+ 						 (u8 *) sctx->buf,
+ 						 &data_len,
+ 						 max_sg_len);
+@@ -133,15 +126,27 @@ static int nx_sha256_update(struct shash
+ 				rc = -EINVAL;
+ 				goto out;
+ 			}
++			used_sgs = in_sg - nx_ctx->in_sg;
+ 		}
+ 
++		/* to_process: SHA256_BLOCK_SIZE aligned chunk to be
++		 * processed in this iteration. This value is restricted
++		 * by sg list limits and number of sgs we already used
++		 * for leftover data. (see above)
++		 * In ideal case, we could allow NX_PAGE_SIZE * max_sg_len,
++		 * but because data may not be aligned, we need to account
++		 * for that too. */
++		to_process = min_t(u64, total,
++			(max_sg_len - 1 - used_sgs) * NX_PAGE_SIZE);
++		to_process = to_process & ~(SHA256_BLOCK_SIZE - 1);
++
+ 		data_len = to_process - buf_len;
+ 		in_sg = nx_build_sg_list(in_sg, (u8 *) data,
+ 					 &data_len, max_sg_len);
+ 
+ 		nx_ctx->op.inlen = (nx_ctx->in_sg - in_sg) * sizeof(struct nx_sg);
+ 
+-		to_process = (data_len + buf_len);
++		to_process = data_len + buf_len;
+ 		leftover = total - to_process;
+ 
+ 		/*
+--- a/drivers/crypto/nx/nx-sha512.c
++++ b/drivers/crypto/nx/nx-sha512.c
+@@ -71,7 +71,6 @@ static int nx_sha512_update(struct shash
+ 	struct sha512_state *sctx = shash_desc_ctx(desc);
+ 	struct nx_crypto_ctx *nx_ctx = crypto_tfm_ctx(&desc->tfm->base);
+ 	struct nx_csbcpb *csbcpb = (struct nx_csbcpb *)nx_ctx->csbcpb;
+-	struct nx_sg *in_sg;
+ 	struct nx_sg *out_sg;
+ 	u64 to_process, leftover = 0, total;
+ 	unsigned long irq_flags;
+@@ -97,7 +96,6 @@ static int nx_sha512_update(struct shash
+ 	NX_CPB_FDM(csbcpb) |= NX_FDM_INTERMEDIATE;
+ 	NX_CPB_FDM(csbcpb) |= NX_FDM_CONTINUATION;
+ 
+-	in_sg = nx_ctx->in_sg;
+ 	max_sg_len = min_t(u64, nx_ctx->ap->sglen,
+ 			nx_driver.of.max_sg_len/sizeof(struct nx_sg));
+ 	max_sg_len = min_t(u64, max_sg_len,
+@@ -114,18 +112,12 @@ static int nx_sha512_update(struct shash
+ 	}
+ 
+ 	do {
+-		/*
+-		 * to_process: the SHA512_BLOCK_SIZE data chunk to process in
+-		 * this update. This value is also restricted by the sg list
+-		 * limits.
+-		 */
+-		to_process = total - leftover;
+-		to_process = to_process & ~(SHA512_BLOCK_SIZE - 1);
+-		leftover = total - to_process;
++		int used_sgs = 0;
++		struct nx_sg *in_sg = nx_ctx->in_sg;
+ 
+ 		if (buf_len) {
+ 			data_len = buf_len;
+-			in_sg = nx_build_sg_list(nx_ctx->in_sg,
++			in_sg = nx_build_sg_list(in_sg,
+ 						 (u8 *) sctx->buf,
+ 						 &data_len, max_sg_len);
+ 
+@@ -133,8 +125,20 @@ static int nx_sha512_update(struct shash
+ 				rc = -EINVAL;
+ 				goto out;
+ 			}
++			used_sgs = in_sg - nx_ctx->in_sg;
+ 		}
+ 
++		/* to_process: SHA512_BLOCK_SIZE aligned chunk to be
++		 * processed in this iteration. This value is restricted
++		 * by sg list limits and number of sgs we already used
++		 * for leftover data. (see above)
++		 * In ideal case, we could allow NX_PAGE_SIZE * max_sg_len,
++		 * but because data may not be aligned, we need to account
++		 * for that too. */
++		to_process = min_t(u64, total,
++			(max_sg_len - 1 - used_sgs) * NX_PAGE_SIZE);
++		to_process = to_process & ~(SHA512_BLOCK_SIZE - 1);
++
+ 		data_len = to_process - buf_len;
+ 		in_sg = nx_build_sg_list(in_sg, (u8 *) data,
+ 					 &data_len, max_sg_len);
+@@ -146,7 +150,7 @@ static int nx_sha512_update(struct shash
+ 			goto out;
+ 		}
+ 
+-		to_process = (data_len + buf_len);
++		to_process = data_len + buf_len;
+ 		leftover = total - to_process;
+ 
+ 		/*
