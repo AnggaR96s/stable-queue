@@ -1,0 +1,89 @@
+From foo@baz Sat Sep 26 11:13:07 PDT 2015
+From: Daniel Borkmann <daniel@iogearbox.net>
+Date: Fri, 7 Aug 2015 00:26:41 +0200
+Subject: netlink: make sure -EBUSY won't escape from netlink_insert
+
+From: Daniel Borkmann <daniel@iogearbox.net>
+
+[ Upstream commit 4e7c1330689e27556de407d3fdadc65ffff5eb12 ]
+
+Linus reports the following deadlock on rtnl_mutex; triggered only
+once so far (extract):
+
+[12236.694209] NetworkManager  D 0000000000013b80     0  1047      1 0x00000000
+[12236.694218]  ffff88003f902640 0000000000000000 ffffffff815d15a9 0000000000000018
+[12236.694224]  ffff880119538000 ffff88003f902640 ffffffff81a8ff84 00000000ffffffff
+[12236.694230]  ffffffff81a8ff88 ffff880119c47f00 ffffffff815d133a ffffffff81a8ff80
+[12236.694235] Call Trace:
+[12236.694250]  [<ffffffff815d15a9>] ? schedule_preempt_disabled+0x9/0x10
+[12236.694257]  [<ffffffff815d133a>] ? schedule+0x2a/0x70
+[12236.694263]  [<ffffffff815d15a9>] ? schedule_preempt_disabled+0x9/0x10
+[12236.694271]  [<ffffffff815d2c3f>] ? __mutex_lock_slowpath+0x7f/0xf0
+[12236.694280]  [<ffffffff815d2cc6>] ? mutex_lock+0x16/0x30
+[12236.694291]  [<ffffffff814f1f90>] ? rtnetlink_rcv+0x10/0x30
+[12236.694299]  [<ffffffff8150ce3b>] ? netlink_unicast+0xfb/0x180
+[12236.694309]  [<ffffffff814f5ad3>] ? rtnl_getlink+0x113/0x190
+[12236.694319]  [<ffffffff814f202a>] ? rtnetlink_rcv_msg+0x7a/0x210
+[12236.694331]  [<ffffffff8124565c>] ? sock_has_perm+0x5c/0x70
+[12236.694339]  [<ffffffff814f1fb0>] ? rtnetlink_rcv+0x30/0x30
+[12236.694346]  [<ffffffff8150d62c>] ? netlink_rcv_skb+0x9c/0xc0
+[12236.694354]  [<ffffffff814f1f9f>] ? rtnetlink_rcv+0x1f/0x30
+[12236.694360]  [<ffffffff8150ce3b>] ? netlink_unicast+0xfb/0x180
+[12236.694367]  [<ffffffff8150d344>] ? netlink_sendmsg+0x484/0x5d0
+[12236.694376]  [<ffffffff810a236f>] ? __wake_up+0x2f/0x50
+[12236.694387]  [<ffffffff814cad23>] ? sock_sendmsg+0x33/0x40
+[12236.694396]  [<ffffffff814cb05e>] ? ___sys_sendmsg+0x22e/0x240
+[12236.694405]  [<ffffffff814cab75>] ? ___sys_recvmsg+0x135/0x1a0
+[12236.694415]  [<ffffffff811a9d12>] ? eventfd_write+0x82/0x210
+[12236.694423]  [<ffffffff811a0f9e>] ? fsnotify+0x32e/0x4c0
+[12236.694429]  [<ffffffff8108cb70>] ? wake_up_q+0x60/0x60
+[12236.694434]  [<ffffffff814cba09>] ? __sys_sendmsg+0x39/0x70
+[12236.694440]  [<ffffffff815d4797>] ? entry_SYSCALL_64_fastpath+0x12/0x6a
+
+It seems so far plausible that the recursive call into rtnetlink_rcv()
+looks suspicious. One way, where this could trigger is that the senders
+NETLINK_CB(skb).portid was wrongly 0 (which is rtnetlink socket), so
+the rtnl_getlink() request's answer would be sent to the kernel instead
+to the actual user process, thus grabbing rtnl_mutex() twice.
+
+One theory would be that netlink_autobind() triggered via netlink_sendmsg()
+internally overwrites the -EBUSY error to 0, but where it is wrongly
+originating from __netlink_insert() instead. That would reset the
+socket's portid to 0, which is then filled into NETLINK_CB(skb).portid
+later on. As commit d470e3b483dc ("[NETLINK]: Fix two socket hashing bugs.")
+also puts it, -EBUSY should not be propagated from netlink_insert().
+
+It looks like it's very unlikely to reproduce. We need to trigger the
+rhashtable_insert_rehash() handler under a situation where rehashing
+currently occurs (one /rare/ way would be to hit ht->elasticity limits
+while not filled enough to expand the hashtable, but that would rather
+require a specifically crafted bind() sequence with knowledge about
+destination slots, seems unlikely). It probably makes sense to guard
+__netlink_insert() in any case and remap that error. It was suggested
+that EOVERFLOW might be better than an already overloaded ENOMEM.
+
+Reference: http://thread.gmane.org/gmane.linux.network/372676
+Reported-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Herbert Xu <herbert@gondor.apana.org.au>
+Acked-by: Thomas Graf <tgraf@suug.ch>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/netlink/af_netlink.c |    5 +++++
+ 1 file changed, 5 insertions(+)
+
+--- a/net/netlink/af_netlink.c
++++ b/net/netlink/af_netlink.c
+@@ -1094,6 +1094,11 @@ static int netlink_insert(struct sock *s
+ 
+ 	err = __netlink_insert(table, sk);
+ 	if (err) {
++		/* In case the hashtable backend returns with -EBUSY
++		 * from here, it must not escape to the caller.
++		 */
++		if (unlikely(err == -EBUSY))
++			err = -EOVERFLOW;
+ 		if (err == -EEXIST)
+ 			err = -EADDRINUSE;
+ 		nlk_sk(sk)->portid = 0;

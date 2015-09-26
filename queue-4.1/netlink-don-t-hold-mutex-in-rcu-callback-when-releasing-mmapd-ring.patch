@@ -1,0 +1,210 @@
+From foo@baz Sat Sep 26 11:13:07 PDT 2015
+From: Florian Westphal <fw@strlen.de>
+Date: Tue, 21 Jul 2015 16:33:50 +0200
+Subject: netlink: don't hold mutex in rcu callback when releasing mmapd ring
+
+From: Florian Westphal <fw@strlen.de>
+
+[ Upstream commit 0470eb99b4721586ccac954faac3fa4472da0845 ]
+
+Kirill A. Shutemov says:
+
+This simple test-case trigers few locking asserts in kernel:
+
+int main(int argc, char **argv)
+{
+        unsigned int block_size = 16 * 4096;
+        struct nl_mmap_req req = {
+                .nm_block_size          = block_size,
+                .nm_block_nr            = 64,
+                .nm_frame_size          = 16384,
+                .nm_frame_nr            = 64 * block_size / 16384,
+        };
+        unsigned int ring_size;
+	int fd;
+
+	fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_GENERIC);
+        if (setsockopt(fd, SOL_NETLINK, NETLINK_RX_RING, &req, sizeof(req)) < 0)
+                exit(1);
+        if (setsockopt(fd, SOL_NETLINK, NETLINK_TX_RING, &req, sizeof(req)) < 0)
+                exit(1);
+
+	ring_size = req.nm_block_nr * req.nm_block_size;
+	mmap(NULL, 2 * ring_size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+	return 0;
+}
+
++++ exited with 0 +++
+BUG: sleeping function called from invalid context at /home/kas/git/public/linux-mm/kernel/locking/mutex.c:616
+in_atomic(): 1, irqs_disabled(): 0, pid: 1, name: init
+3 locks held by init/1:
+ #0:  (reboot_mutex){+.+...}, at: [<ffffffff81080959>] SyS_reboot+0xa9/0x220
+ #1:  ((reboot_notifier_list).rwsem){.+.+..}, at: [<ffffffff8107f379>] __blocking_notifier_call_chain+0x39/0x70
+ #2:  (rcu_callback){......}, at: [<ffffffff810d32e0>] rcu_do_batch.isra.49+0x160/0x10c0
+Preemption disabled at:[<ffffffff8145365f>] __delay+0xf/0x20
+
+CPU: 1 PID: 1 Comm: init Not tainted 4.1.0-00009-gbddf4c4818e0 #253
+Hardware name: QEMU Standard PC (Q35 + ICH9, 2009), BIOS Debian-1.8.2-1 04/01/2014
+ ffff88017b3d8000 ffff88027bc03c38 ffffffff81929ceb 0000000000000102
+ 0000000000000000 ffff88027bc03c68 ffffffff81085a9d 0000000000000002
+ ffffffff81ca2a20 0000000000000268 0000000000000000 ffff88027bc03c98
+Call Trace:
+ <IRQ>  [<ffffffff81929ceb>] dump_stack+0x4f/0x7b
+ [<ffffffff81085a9d>] ___might_sleep+0x16d/0x270
+ [<ffffffff81085bed>] __might_sleep+0x4d/0x90
+ [<ffffffff8192e96f>] mutex_lock_nested+0x2f/0x430
+ [<ffffffff81932fed>] ? _raw_spin_unlock_irqrestore+0x5d/0x80
+ [<ffffffff81464143>] ? __this_cpu_preempt_check+0x13/0x20
+ [<ffffffff8182fc3d>] netlink_set_ring+0x1ed/0x350
+ [<ffffffff8182e000>] ? netlink_undo_bind+0x70/0x70
+ [<ffffffff8182fe20>] netlink_sock_destruct+0x80/0x150
+ [<ffffffff817e484d>] __sk_free+0x1d/0x160
+ [<ffffffff817e49a9>] sk_free+0x19/0x20
+[..]
+
+Cong Wang says:
+
+We can't hold mutex lock in a rcu callback, [..]
+
+Thomas Graf says:
+
+The socket should be dead at this point. It might be simpler to
+add a netlink_release_ring() function which doesn't require
+locking at all.
+
+Reported-by: "Kirill A. Shutemov" <kirill@shutemov.name>
+Diagnosed-by: Cong Wang <cwang@twopensource.com>
+Suggested-by: Thomas Graf <tgraf@suug.ch>
+Signed-off-by: Florian Westphal <fw@strlen.de>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/netlink/af_netlink.c |   79 +++++++++++++++++++++++++++--------------------
+ 1 file changed, 47 insertions(+), 32 deletions(-)
+
+--- a/net/netlink/af_netlink.c
++++ b/net/netlink/af_netlink.c
+@@ -355,25 +355,52 @@ err1:
+ 	return NULL;
+ }
+ 
++
++static void
++__netlink_set_ring(struct sock *sk, struct nl_mmap_req *req, bool tx_ring, void **pg_vec,
++		   unsigned int order)
++{
++	struct netlink_sock *nlk = nlk_sk(sk);
++	struct sk_buff_head *queue;
++	struct netlink_ring *ring;
++
++	queue = tx_ring ? &sk->sk_write_queue : &sk->sk_receive_queue;
++	ring  = tx_ring ? &nlk->tx_ring : &nlk->rx_ring;
++
++	spin_lock_bh(&queue->lock);
++
++	ring->frame_max		= req->nm_frame_nr - 1;
++	ring->head		= 0;
++	ring->frame_size	= req->nm_frame_size;
++	ring->pg_vec_pages	= req->nm_block_size / PAGE_SIZE;
++
++	swap(ring->pg_vec_len, req->nm_block_nr);
++	swap(ring->pg_vec_order, order);
++	swap(ring->pg_vec, pg_vec);
++
++	__skb_queue_purge(queue);
++	spin_unlock_bh(&queue->lock);
++
++	WARN_ON(atomic_read(&nlk->mapped));
++
++	if (pg_vec)
++		free_pg_vec(pg_vec, order, req->nm_block_nr);
++}
++
+ static int netlink_set_ring(struct sock *sk, struct nl_mmap_req *req,
+-			    bool closing, bool tx_ring)
++			    bool tx_ring)
+ {
+ 	struct netlink_sock *nlk = nlk_sk(sk);
+ 	struct netlink_ring *ring;
+-	struct sk_buff_head *queue;
+ 	void **pg_vec = NULL;
+ 	unsigned int order = 0;
+-	int err;
+ 
+ 	ring  = tx_ring ? &nlk->tx_ring : &nlk->rx_ring;
+-	queue = tx_ring ? &sk->sk_write_queue : &sk->sk_receive_queue;
+ 
+-	if (!closing) {
+-		if (atomic_read(&nlk->mapped))
+-			return -EBUSY;
+-		if (atomic_read(&ring->pending))
+-			return -EBUSY;
+-	}
++	if (atomic_read(&nlk->mapped))
++		return -EBUSY;
++	if (atomic_read(&ring->pending))
++		return -EBUSY;
+ 
+ 	if (req->nm_block_nr) {
+ 		if (ring->pg_vec != NULL)
+@@ -405,31 +432,19 @@ static int netlink_set_ring(struct sock
+ 			return -EINVAL;
+ 	}
+ 
+-	err = -EBUSY;
+ 	mutex_lock(&nlk->pg_vec_lock);
+-	if (closing || atomic_read(&nlk->mapped) == 0) {
+-		err = 0;
+-		spin_lock_bh(&queue->lock);
+-
+-		ring->frame_max		= req->nm_frame_nr - 1;
+-		ring->head		= 0;
+-		ring->frame_size	= req->nm_frame_size;
+-		ring->pg_vec_pages	= req->nm_block_size / PAGE_SIZE;
+-
+-		swap(ring->pg_vec_len, req->nm_block_nr);
+-		swap(ring->pg_vec_order, order);
+-		swap(ring->pg_vec, pg_vec);
+-
+-		__skb_queue_purge(queue);
+-		spin_unlock_bh(&queue->lock);
+-
+-		WARN_ON(atomic_read(&nlk->mapped));
++	if (atomic_read(&nlk->mapped) == 0) {
++		__netlink_set_ring(sk, req, tx_ring, pg_vec, order);
++		mutex_unlock(&nlk->pg_vec_lock);
++		return 0;
+ 	}
++
+ 	mutex_unlock(&nlk->pg_vec_lock);
+ 
+ 	if (pg_vec)
+ 		free_pg_vec(pg_vec, order, req->nm_block_nr);
+-	return err;
++
++	return -EBUSY;
+ }
+ 
+ static void netlink_mm_open(struct vm_area_struct *vma)
+@@ -898,10 +913,10 @@ static void netlink_sock_destruct(struct
+ 
+ 		memset(&req, 0, sizeof(req));
+ 		if (nlk->rx_ring.pg_vec)
+-			netlink_set_ring(sk, &req, true, false);
++			__netlink_set_ring(sk, &req, false, NULL, 0);
+ 		memset(&req, 0, sizeof(req));
+ 		if (nlk->tx_ring.pg_vec)
+-			netlink_set_ring(sk, &req, true, true);
++			__netlink_set_ring(sk, &req, true, NULL, 0);
+ 	}
+ #endif /* CONFIG_NETLINK_MMAP */
+ 
+@@ -2197,7 +2212,7 @@ static int netlink_setsockopt(struct soc
+ 			return -EINVAL;
+ 		if (copy_from_user(&req, optval, sizeof(req)))
+ 			return -EFAULT;
+-		err = netlink_set_ring(sk, &req, false,
++		err = netlink_set_ring(sk, &req,
+ 				       optname == NETLINK_TX_RING);
+ 		break;
+ 	}
