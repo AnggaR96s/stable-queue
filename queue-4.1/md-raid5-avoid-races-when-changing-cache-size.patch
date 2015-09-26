@@ -1,0 +1,145 @@
+From 2d5b569b665ea6d0b15c52529ff06300de81a7ce Mon Sep 17 00:00:00 2001
+From: NeilBrown <neilb@suse.com>
+Date: Mon, 6 Jul 2015 12:49:23 +1000
+Subject: md/raid5: avoid races when changing cache size.
+
+From: NeilBrown <neilb@suse.com>
+
+commit 2d5b569b665ea6d0b15c52529ff06300de81a7ce upstream.
+
+Cache size can grow or shrink due to various pressures at
+any time.  So when we resize the cache as part of a 'grow'
+operation (i.e. change the size to allow more devices) we need
+to blocks that automatic growing/shrinking.
+
+So introduce a mutex.  auto grow/shrink uses mutex_trylock()
+and just doesn't bother if there is a blockage.
+Resizing the whole cache holds the mutex to ensure that
+the correct number of new stripes is allocated.
+
+This bug can result in some stripes not being freed when an
+array is stopped.  This leads to the kmem_cache not being
+freed and a subsequent array can try to use the same kmem_cache
+and get confused.
+
+Fixes: edbe83ab4c27 ("md/raid5: allow the stripe_cache to grow and shrink.")
+Signed-off-by: NeilBrown <neilb@suse.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+
+---
+ drivers/md/raid5.c |   31 +++++++++++++++++++++++++------
+ drivers/md/raid5.h |    3 ++-
+ 2 files changed, 27 insertions(+), 7 deletions(-)
+
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -2151,6 +2151,9 @@ static int resize_stripes(struct r5conf
+ 	if (!sc)
+ 		return -ENOMEM;
+ 
++	/* Need to ensure auto-resizing doesn't interfere */
++	mutex_lock(&conf->cache_size_mutex);
++
+ 	for (i = conf->max_nr_stripes; i; i--) {
+ 		nsh = alloc_stripe(sc, GFP_KERNEL);
+ 		if (!nsh)
+@@ -2167,6 +2170,7 @@ static int resize_stripes(struct r5conf
+ 			kmem_cache_free(sc, nsh);
+ 		}
+ 		kmem_cache_destroy(sc);
++		mutex_unlock(&conf->cache_size_mutex);
+ 		return -ENOMEM;
+ 	}
+ 	/* Step 2 - Must use GFP_NOIO now.
+@@ -2213,6 +2217,7 @@ static int resize_stripes(struct r5conf
+ 	} else
+ 		err = -ENOMEM;
+ 
++	mutex_unlock(&conf->cache_size_mutex);
+ 	/* Step 4, return new stripes to service */
+ 	while(!list_empty(&newstripes)) {
+ 		nsh = list_entry(newstripes.next, struct stripe_head, lru);
+@@ -5846,12 +5851,14 @@ static void raid5d(struct md_thread *thr
+ 	pr_debug("%d stripes handled\n", handled);
+ 
+ 	spin_unlock_irq(&conf->device_lock);
+-	if (test_and_clear_bit(R5_ALLOC_MORE, &conf->cache_state)) {
++	if (test_and_clear_bit(R5_ALLOC_MORE, &conf->cache_state) &&
++	    mutex_trylock(&conf->cache_size_mutex)) {
+ 		grow_one_stripe(conf, __GFP_NOWARN);
+ 		/* Set flag even if allocation failed.  This helps
+ 		 * slow down allocation requests when mem is short
+ 		 */
+ 		set_bit(R5_DID_ALLOC, &conf->cache_state);
++		mutex_unlock(&conf->cache_size_mutex);
+ 	}
+ 
+ 	async_tx_issue_pending_all();
+@@ -5883,18 +5890,22 @@ raid5_set_cache_size(struct mddev *mddev
+ 		return -EINVAL;
+ 
+ 	conf->min_nr_stripes = size;
++	mutex_lock(&conf->cache_size_mutex);
+ 	while (size < conf->max_nr_stripes &&
+ 	       drop_one_stripe(conf))
+ 		;
++	mutex_unlock(&conf->cache_size_mutex);
+ 
+ 
+ 	err = md_allow_write(mddev);
+ 	if (err)
+ 		return err;
+ 
++	mutex_lock(&conf->cache_size_mutex);
+ 	while (size > conf->max_nr_stripes)
+ 		if (!grow_one_stripe(conf, GFP_KERNEL))
+ 			break;
++	mutex_unlock(&conf->cache_size_mutex);
+ 
+ 	return 0;
+ }
+@@ -6360,11 +6371,18 @@ static unsigned long raid5_cache_scan(st
+ 				      struct shrink_control *sc)
+ {
+ 	struct r5conf *conf = container_of(shrink, struct r5conf, shrinker);
+-	int ret = 0;
+-	while (ret < sc->nr_to_scan) {
+-		if (drop_one_stripe(conf) == 0)
+-			return SHRINK_STOP;
+-		ret++;
++	unsigned long ret = SHRINK_STOP;
++
++	if (mutex_trylock(&conf->cache_size_mutex)) {
++		ret= 0;
++		while (ret < sc->nr_to_scan) {
++			if (drop_one_stripe(conf) == 0) {
++				ret = SHRINK_STOP;
++				break;
++			}
++			ret++;
++		}
++		mutex_unlock(&conf->cache_size_mutex);
+ 	}
+ 	return ret;
+ }
+@@ -6433,6 +6451,7 @@ static struct r5conf *setup_conf(struct
+ 		goto abort;
+ 	spin_lock_init(&conf->device_lock);
+ 	seqcount_init(&conf->gen_lock);
++	mutex_init(&conf->cache_size_mutex);
+ 	init_waitqueue_head(&conf->wait_for_stripe);
+ 	init_waitqueue_head(&conf->wait_for_overlap);
+ 	INIT_LIST_HEAD(&conf->handle_list);
+--- a/drivers/md/raid5.h
++++ b/drivers/md/raid5.h
+@@ -482,7 +482,8 @@ struct r5conf {
+ 	 */
+ 	int			active_name;
+ 	char			cache_name[2][32];
+-	struct kmem_cache		*slab_cache; /* for allocating stripes */
++	struct kmem_cache	*slab_cache; /* for allocating stripes */
++	struct mutex		cache_size_mutex; /* Protect changes to cache size */
+ 
+ 	int			seq_flush, seq_write;
+ 	int			quiesce;
