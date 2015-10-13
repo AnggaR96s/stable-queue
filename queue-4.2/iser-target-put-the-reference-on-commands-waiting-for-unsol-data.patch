@@ -1,0 +1,87 @@
+From 3e03c4b01da3e6a5f3081eb0aa252490fe83e352 Mon Sep 17 00:00:00 2001
+From: Jenny Derzhavetz <jennyf@mellanox.com>
+Date: Sun, 6 Sep 2015 14:52:21 +0300
+Subject: iser-target: Put the reference on commands waiting for unsol data
+
+From: Jenny Derzhavetz <jennyf@mellanox.com>
+
+commit 3e03c4b01da3e6a5f3081eb0aa252490fe83e352 upstream.
+
+The iscsi target core teardown sequence calls wait_conn for
+all active commands to finish gracefully by:
+- move the queue-pair to error state
+- drain all the completions
+- wait for the core to finish handling all session commands
+
+However, when tearing down a session while there are sequenced
+commands that are still waiting for unsolicited data outs, we can
+block forever as these are missing an extra reference put.
+
+We basically need the equivalent of iscsit_free_queue_reqs_for_conn()
+which is called after wait_conn has returned. Address this by an
+explicit walk on conn_cmd_list and put the extra reference.
+
+Signed-off-by: Jenny Derzhavetz <jennyf@mellanox.com>
+Signed-off-by: Sagi Grimberg <sagig@mellanox.com>
+Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/infiniband/ulp/isert/ib_isert.c |   38 +++++++++++++++++++++++++++++++-
+ 1 file changed, 37 insertions(+), 1 deletion(-)
+
+--- a/drivers/infiniband/ulp/isert/ib_isert.c
++++ b/drivers/infiniband/ulp/isert/ib_isert.c
+@@ -3386,6 +3386,41 @@ isert_wait4flush(struct isert_conn *iser
+ 	wait_for_completion(&isert_conn->wait_comp_err);
+ }
+ 
++/**
++ * isert_put_unsol_pending_cmds() - Drop commands waiting for
++ *     unsolicitate dataout
++ * @conn:    iscsi connection
++ *
++ * We might still have commands that are waiting for unsolicited
++ * dataouts messages. We must put the extra reference on those
++ * before blocking on the target_wait_for_session_cmds
++ */
++static void
++isert_put_unsol_pending_cmds(struct iscsi_conn *conn)
++{
++	struct iscsi_cmd *cmd, *tmp;
++	static LIST_HEAD(drop_cmd_list);
++
++	spin_lock_bh(&conn->cmd_lock);
++	list_for_each_entry_safe(cmd, tmp, &conn->conn_cmd_list, i_conn_node) {
++		if ((cmd->cmd_flags & ICF_NON_IMMEDIATE_UNSOLICITED_DATA) &&
++		    (cmd->write_data_done < conn->sess->sess_ops->FirstBurstLength) &&
++		    (cmd->write_data_done < cmd->se_cmd.data_length))
++			list_move_tail(&cmd->i_conn_node, &drop_cmd_list);
++	}
++	spin_unlock_bh(&conn->cmd_lock);
++
++	list_for_each_entry_safe(cmd, tmp, &drop_cmd_list, i_conn_node) {
++		list_del_init(&cmd->i_conn_node);
++		if (cmd->i_state != ISTATE_REMOVE) {
++			struct isert_cmd *isert_cmd = iscsit_priv_cmd(cmd);
++
++			isert_info("conn %p dropping cmd %p\n", conn, cmd);
++			isert_put_cmd(isert_cmd, true);
++		}
++	}
++}
++
+ static void isert_wait_conn(struct iscsi_conn *conn)
+ {
+ 	struct isert_conn *isert_conn = conn->context;
+@@ -3404,8 +3439,9 @@ static void isert_wait_conn(struct iscsi
+ 	isert_conn_terminate(isert_conn);
+ 	mutex_unlock(&isert_conn->mutex);
+ 
+-	isert_wait4cmds(conn);
+ 	isert_wait4flush(isert_conn);
++	isert_put_unsol_pending_cmds(conn);
++	isert_wait4cmds(conn);
+ 	isert_wait4logout(isert_conn);
+ 
+ 	queue_work(isert_release_wq, &isert_conn->release_work);
