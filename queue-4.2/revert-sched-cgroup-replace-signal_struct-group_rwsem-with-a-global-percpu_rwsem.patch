@@ -1,0 +1,306 @@
+From 0c986253b939cc14c69d4adbe2b4121bdf4aa220 Mon Sep 17 00:00:00 2001
+From: Tejun Heo <tj@kernel.org>
+Date: Wed, 16 Sep 2015 11:51:12 -0400
+Subject: Revert "sched, cgroup: replace signal_struct->group_rwsem with a global percpu_rwsem"
+
+From: Tejun Heo <tj@kernel.org>
+
+commit 0c986253b939cc14c69d4adbe2b4121bdf4aa220 upstream.
+
+This reverts commit d59cfc09c32a2ae31f1c3bc2983a0cd79afb3f14.
+
+d59cfc09c32a ("sched, cgroup: replace signal_struct->group_rwsem with
+a global percpu_rwsem") and b5ba75b5fc0e ("cgroup: simplify
+threadgroup locking") changed how cgroup synchronizes against task
+fork and exits so that it uses global percpu_rwsem instead of
+per-process rwsem; unfortunately, the write [un]lock paths of
+percpu_rwsem always involve synchronize_rcu_expedited() which turned
+out to be too expensive.
+
+Improvements for percpu_rwsem are scheduled to be merged in the coming
+v4.4-rc1 merge window which alleviates this issue.  For now, revert
+the two commits to restore per-process rwsem.  They will be re-applied
+for the v4.4-rc1 merge window.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Link: http://lkml.kernel.org/g/55F8097A.7000206@de.ibm.com
+Reported-by: Christian Borntraeger <borntraeger@de.ibm.com>
+Cc: Oleg Nesterov <oleg@redhat.com>
+Cc: "Paul E. McKenney" <paulmck@linux.vnet.ibm.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ include/linux/cgroup-defs.h |   27 +--------------
+ include/linux/init_task.h   |    8 ++++
+ include/linux/sched.h       |   12 ++++++
+ kernel/cgroup.c             |   77 ++++++++++++++++++++++++++++++++------------
+ kernel/fork.c               |    4 ++
+ 5 files changed, 83 insertions(+), 45 deletions(-)
+
+--- a/include/linux/cgroup-defs.h
++++ b/include/linux/cgroup-defs.h
+@@ -463,31 +463,8 @@ struct cgroup_subsys {
+ 	unsigned int depends_on;
+ };
+ 
+-extern struct percpu_rw_semaphore cgroup_threadgroup_rwsem;
+-
+-/**
+- * cgroup_threadgroup_change_begin - threadgroup exclusion for cgroups
+- * @tsk: target task
+- *
+- * Called from threadgroup_change_begin() and allows cgroup operations to
+- * synchronize against threadgroup changes using a percpu_rw_semaphore.
+- */
+-static inline void cgroup_threadgroup_change_begin(struct task_struct *tsk)
+-{
+-	percpu_down_read(&cgroup_threadgroup_rwsem);
+-}
+-
+-/**
+- * cgroup_threadgroup_change_end - threadgroup exclusion for cgroups
+- * @tsk: target task
+- *
+- * Called from threadgroup_change_end().  Counterpart of
+- * cgroup_threadcgroup_change_begin().
+- */
+-static inline void cgroup_threadgroup_change_end(struct task_struct *tsk)
+-{
+-	percpu_up_read(&cgroup_threadgroup_rwsem);
+-}
++void cgroup_threadgroup_change_begin(struct task_struct *tsk);
++void cgroup_threadgroup_change_end(struct task_struct *tsk);
+ 
+ #else	/* CONFIG_CGROUPS */
+ 
+--- a/include/linux/init_task.h
++++ b/include/linux/init_task.h
+@@ -25,6 +25,13 @@
+ extern struct files_struct init_files;
+ extern struct fs_struct init_fs;
+ 
++#ifdef CONFIG_CGROUPS
++#define INIT_GROUP_RWSEM(sig)						\
++	.group_rwsem = __RWSEM_INITIALIZER(sig.group_rwsem),
++#else
++#define INIT_GROUP_RWSEM(sig)
++#endif
++
+ #ifdef CONFIG_CPUSETS
+ #define INIT_CPUSET_SEQ(tsk)							\
+ 	.mems_allowed_seq = SEQCNT_ZERO(tsk.mems_allowed_seq),
+@@ -48,6 +55,7 @@ extern struct fs_struct init_fs;
+ 	},								\
+ 	.cred_guard_mutex =						\
+ 		 __MUTEX_INITIALIZER(sig.cred_guard_mutex),		\
++	INIT_GROUP_RWSEM(sig)						\
+ }
+ 
+ extern struct nsproxy init_nsproxy;
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -754,6 +754,18 @@ struct signal_struct {
+ 	unsigned audit_tty_log_passwd;
+ 	struct tty_audit_buf *tty_audit_buf;
+ #endif
++#ifdef CONFIG_CGROUPS
++	/*
++	 * group_rwsem prevents new tasks from entering the threadgroup and
++	 * member tasks from exiting,a more specifically, setting of
++	 * PF_EXITING.  fork and exit paths are protected with this rwsem
++	 * using threadgroup_change_begin/end().  Users which require
++	 * threadgroup to remain stable should use threadgroup_[un]lock()
++	 * which also takes care of exec path.  Currently, cgroup is the
++	 * only user.
++	 */
++	struct rw_semaphore group_rwsem;
++#endif
+ 
+ 	oom_flags_t oom_flags;
+ 	short oom_score_adj;		/* OOM kill score adjustment */
+--- a/kernel/cgroup.c
++++ b/kernel/cgroup.c
+@@ -46,7 +46,6 @@
+ #include <linux/slab.h>
+ #include <linux/spinlock.h>
+ #include <linux/rwsem.h>
+-#include <linux/percpu-rwsem.h>
+ #include <linux/string.h>
+ #include <linux/sort.h>
+ #include <linux/kmod.h>
+@@ -104,8 +103,6 @@ static DEFINE_SPINLOCK(cgroup_idr_lock);
+  */
+ static DEFINE_SPINLOCK(release_agent_path_lock);
+ 
+-struct percpu_rw_semaphore cgroup_threadgroup_rwsem;
+-
+ #define cgroup_assert_mutex_or_rcu_locked()				\
+ 	rcu_lockdep_assert(rcu_read_lock_held() ||			\
+ 			   lockdep_is_held(&cgroup_mutex),		\
+@@ -870,6 +867,48 @@ static struct css_set *find_css_set(stru
+ 	return cset;
+ }
+ 
++void cgroup_threadgroup_change_begin(struct task_struct *tsk)
++{
++	down_read(&tsk->signal->group_rwsem);
++}
++
++void cgroup_threadgroup_change_end(struct task_struct *tsk)
++{
++	up_read(&tsk->signal->group_rwsem);
++}
++
++/**
++ * threadgroup_lock - lock threadgroup
++ * @tsk: member task of the threadgroup to lock
++ *
++ * Lock the threadgroup @tsk belongs to.  No new task is allowed to enter
++ * and member tasks aren't allowed to exit (as indicated by PF_EXITING) or
++ * change ->group_leader/pid.  This is useful for cases where the threadgroup
++ * needs to stay stable across blockable operations.
++ *
++ * fork and exit explicitly call threadgroup_change_{begin|end}() for
++ * synchronization.  While held, no new task will be added to threadgroup
++ * and no existing live task will have its PF_EXITING set.
++ *
++ * de_thread() does threadgroup_change_{begin|end}() when a non-leader
++ * sub-thread becomes a new leader.
++ */
++static void threadgroup_lock(struct task_struct *tsk)
++{
++	down_write(&tsk->signal->group_rwsem);
++}
++
++/**
++ * threadgroup_unlock - unlock threadgroup
++ * @tsk: member task of the threadgroup to unlock
++ *
++ * Reverse threadgroup_lock().
++ */
++static inline void threadgroup_unlock(struct task_struct *tsk)
++{
++	up_write(&tsk->signal->group_rwsem);
++}
++
+ static struct cgroup_root *cgroup_root_from_kf(struct kernfs_root *kf_root)
+ {
+ 	struct cgroup *root_cgrp = kf_root->kn->priv;
+@@ -2066,9 +2105,9 @@ static void cgroup_task_migrate(struct c
+ 	lockdep_assert_held(&css_set_rwsem);
+ 
+ 	/*
+-	 * We are synchronized through cgroup_threadgroup_rwsem against
+-	 * PF_EXITING setting such that we can't race against cgroup_exit()
+-	 * changing the css_set to init_css_set and dropping the old one.
++	 * We are synchronized through threadgroup_lock() against PF_EXITING
++	 * setting such that we can't race against cgroup_exit() changing the
++	 * css_set to init_css_set and dropping the old one.
+ 	 */
+ 	WARN_ON_ONCE(tsk->flags & PF_EXITING);
+ 	old_cset = task_css_set(tsk);
+@@ -2125,11 +2164,10 @@ static void cgroup_migrate_finish(struct
+  * @src_cset and add it to @preloaded_csets, which should later be cleaned
+  * up by cgroup_migrate_finish().
+  *
+- * This function may be called without holding cgroup_threadgroup_rwsem
+- * even if the target is a process.  Threads may be created and destroyed
+- * but as long as cgroup_mutex is not dropped, no new css_set can be put
+- * into play and the preloaded css_sets are guaranteed to cover all
+- * migrations.
++ * This function may be called without holding threadgroup_lock even if the
++ * target is a process.  Threads may be created and destroyed but as long
++ * as cgroup_mutex is not dropped, no new css_set can be put into play and
++ * the preloaded css_sets are guaranteed to cover all migrations.
+  */
+ static void cgroup_migrate_add_src(struct css_set *src_cset,
+ 				   struct cgroup *dst_cgrp,
+@@ -2232,7 +2270,7 @@ err:
+  * @threadgroup: whether @leader points to the whole process or a single task
+  *
+  * Migrate a process or task denoted by @leader to @cgrp.  If migrating a
+- * process, the caller must be holding cgroup_threadgroup_rwsem.  The
++ * process, the caller must be holding threadgroup_lock of @leader.  The
+  * caller is also responsible for invoking cgroup_migrate_add_src() and
+  * cgroup_migrate_prepare_dst() on the targets before invoking this
+  * function and following up with cgroup_migrate_finish().
+@@ -2360,7 +2398,7 @@ out_release_tset:
+  * @leader: the task or the leader of the threadgroup to be attached
+  * @threadgroup: attach the whole threadgroup?
+  *
+- * Call holding cgroup_mutex and cgroup_threadgroup_rwsem.
++ * Call holding cgroup_mutex and threadgroup_lock of @leader.
+  */
+ static int cgroup_attach_task(struct cgroup *dst_cgrp,
+ 			      struct task_struct *leader, bool threadgroup)
+@@ -2482,7 +2520,7 @@ retry_find_task:
+ 	get_task_struct(tsk);
+ 	rcu_read_unlock();
+ 
+-	percpu_down_write(&cgroup_threadgroup_rwsem);
++	threadgroup_lock(tsk);
+ 	if (threadgroup) {
+ 		if (!thread_group_leader(tsk)) {
+ 			/*
+@@ -2492,7 +2530,7 @@ retry_find_task:
+ 			 * try again; this is
+ 			 * "double-double-toil-and-trouble-check locking".
+ 			 */
+-			percpu_up_write(&cgroup_threadgroup_rwsem);
++			threadgroup_unlock(tsk);
+ 			put_task_struct(tsk);
+ 			goto retry_find_task;
+ 		}
+@@ -2502,7 +2540,7 @@ retry_find_task:
+ 	if (!ret)
+ 		ret = cgroup_attach_task(cgrp, tsk, threadgroup);
+ 
+-	percpu_up_write(&cgroup_threadgroup_rwsem);
++	threadgroup_unlock(tsk);
+ 
+ 	put_task_struct(tsk);
+ out_unlock_cgroup:
+@@ -2705,17 +2743,17 @@ static int cgroup_update_dfl_csses(struc
+ 				goto out_finish;
+ 			last_task = task;
+ 
+-			percpu_down_write(&cgroup_threadgroup_rwsem);
++			threadgroup_lock(task);
+ 			/* raced against de_thread() from another thread? */
+ 			if (!thread_group_leader(task)) {
+-				percpu_up_write(&cgroup_threadgroup_rwsem);
++				threadgroup_unlock(task);
+ 				put_task_struct(task);
+ 				continue;
+ 			}
+ 
+ 			ret = cgroup_migrate(src_cset->dfl_cgrp, task, true);
+ 
+-			percpu_up_write(&cgroup_threadgroup_rwsem);
++			threadgroup_unlock(task);
+ 			put_task_struct(task);
+ 
+ 			if (WARN(ret, "cgroup: failed to update controllers for the default hierarchy (%d), further operations may crash or hang\n", ret))
+@@ -5034,7 +5072,6 @@ int __init cgroup_init(void)
+ 	unsigned long key;
+ 	int ssid, err;
+ 
+-	BUG_ON(percpu_init_rwsem(&cgroup_threadgroup_rwsem));
+ 	BUG_ON(cgroup_init_cftypes(NULL, cgroup_dfl_base_files));
+ 	BUG_ON(cgroup_init_cftypes(NULL, cgroup_legacy_base_files));
+ 
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1146,6 +1146,10 @@ static int copy_signal(unsigned long clo
+ 	tty_audit_fork(sig);
+ 	sched_autogroup_fork(sig);
+ 
++#ifdef CONFIG_CGROUPS
++	init_rwsem(&sig->group_rwsem);
++#endif
++
+ 	sig->oom_score_adj = current->signal->oom_score_adj;
+ 	sig->oom_score_adj_min = current->signal->oom_score_adj_min;
+ 

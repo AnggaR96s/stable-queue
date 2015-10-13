@@ -1,0 +1,136 @@
+From f9f9e7b776142fb1c0782cade004cc8e0147a199 Mon Sep 17 00:00:00 2001
+From: Tejun Heo <tj@kernel.org>
+Date: Wed, 16 Sep 2015 11:51:12 -0400
+Subject: Revert "cgroup: simplify threadgroup locking"
+
+From: Tejun Heo <tj@kernel.org>
+
+commit f9f9e7b776142fb1c0782cade004cc8e0147a199 upstream.
+
+This reverts commit b5ba75b5fc0e8404e2c50cb68f39bb6a53fc916f.
+
+d59cfc09c32a ("sched, cgroup: replace signal_struct->group_rwsem with
+a global percpu_rwsem") and b5ba75b5fc0e ("cgroup: simplify
+threadgroup locking") changed how cgroup synchronizes against task
+fork and exits so that it uses global percpu_rwsem instead of
+per-process rwsem; unfortunately, the write [un]lock paths of
+percpu_rwsem always involve synchronize_rcu_expedited() which turned
+out to be too expensive.
+
+Improvements for percpu_rwsem are scheduled to be merged in the coming
+v4.4-rc1 merge window which alleviates this issue.  For now, revert
+the two commits to restore per-process rwsem.  They will be re-applied
+for the v4.4-rc1 merge window.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Link: http://lkml.kernel.org/g/55F8097A.7000206@de.ibm.com
+Reported-by: Christian Borntraeger <borntraeger@de.ibm.com>
+Cc: Oleg Nesterov <oleg@redhat.com>
+Cc: "Paul E. McKenney" <paulmck@linux.vnet.ibm.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ kernel/cgroup.c |   45 +++++++++++++++++++++++++++++++++------------
+ 1 file changed, 33 insertions(+), 12 deletions(-)
+
+--- a/kernel/cgroup.c
++++ b/kernel/cgroup.c
+@@ -2452,13 +2452,14 @@ static ssize_t __cgroup_procs_write(stru
+ 	if (!cgrp)
+ 		return -ENODEV;
+ 
+-	percpu_down_write(&cgroup_threadgroup_rwsem);
++retry_find_task:
+ 	rcu_read_lock();
+ 	if (pid) {
+ 		tsk = find_task_by_vpid(pid);
+ 		if (!tsk) {
++			rcu_read_unlock();
+ 			ret = -ESRCH;
+-			goto out_unlock_rcu;
++			goto out_unlock_cgroup;
+ 		}
+ 	} else {
+ 		tsk = current;
+@@ -2474,23 +2475,37 @@ static ssize_t __cgroup_procs_write(stru
+ 	 */
+ 	if (tsk == kthreadd_task || (tsk->flags & PF_NO_SETAFFINITY)) {
+ 		ret = -EINVAL;
+-		goto out_unlock_rcu;
++		rcu_read_unlock();
++		goto out_unlock_cgroup;
+ 	}
+ 
+ 	get_task_struct(tsk);
+ 	rcu_read_unlock();
+ 
++	percpu_down_write(&cgroup_threadgroup_rwsem);
++	if (threadgroup) {
++		if (!thread_group_leader(tsk)) {
++			/*
++			 * a race with de_thread from another thread's exec()
++			 * may strip us of our leadership, if this happens,
++			 * there is no choice but to throw this task away and
++			 * try again; this is
++			 * "double-double-toil-and-trouble-check locking".
++			 */
++			percpu_up_write(&cgroup_threadgroup_rwsem);
++			put_task_struct(tsk);
++			goto retry_find_task;
++		}
++	}
++
+ 	ret = cgroup_procs_write_permission(tsk, cgrp, of);
+ 	if (!ret)
+ 		ret = cgroup_attach_task(cgrp, tsk, threadgroup);
+ 
+-	put_task_struct(tsk);
+-	goto out_unlock_threadgroup;
+-
+-out_unlock_rcu:
+-	rcu_read_unlock();
+-out_unlock_threadgroup:
+ 	percpu_up_write(&cgroup_threadgroup_rwsem);
++
++	put_task_struct(tsk);
++out_unlock_cgroup:
+ 	cgroup_kn_unlock(of->kn);
+ 	return ret ?: nbytes;
+ }
+@@ -2635,8 +2650,6 @@ static int cgroup_update_dfl_csses(struc
+ 
+ 	lockdep_assert_held(&cgroup_mutex);
+ 
+-	percpu_down_write(&cgroup_threadgroup_rwsem);
+-
+ 	/* look up all csses currently attached to @cgrp's subtree */
+ 	down_read(&css_set_rwsem);
+ 	css_for_each_descendant_pre(css, cgroup_css(cgrp, NULL)) {
+@@ -2692,8 +2705,17 @@ static int cgroup_update_dfl_csses(struc
+ 				goto out_finish;
+ 			last_task = task;
+ 
++			percpu_down_write(&cgroup_threadgroup_rwsem);
++			/* raced against de_thread() from another thread? */
++			if (!thread_group_leader(task)) {
++				percpu_up_write(&cgroup_threadgroup_rwsem);
++				put_task_struct(task);
++				continue;
++			}
++
+ 			ret = cgroup_migrate(src_cset->dfl_cgrp, task, true);
+ 
++			percpu_up_write(&cgroup_threadgroup_rwsem);
+ 			put_task_struct(task);
+ 
+ 			if (WARN(ret, "cgroup: failed to update controllers for the default hierarchy (%d), further operations may crash or hang\n", ret))
+@@ -2703,7 +2725,6 @@ static int cgroup_update_dfl_csses(struc
+ 
+ out_finish:
+ 	cgroup_migrate_finish(&preloaded_csets);
+-	percpu_up_write(&cgroup_threadgroup_rwsem);
+ 	return ret;
+ }
+ 

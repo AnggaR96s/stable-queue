@@ -1,0 +1,98 @@
+From 95913d97914f44db2b81271c2e2ebd4d2ac2df83 Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Tue, 29 Sep 2015 14:45:09 +0200
+Subject: sched/core: Fix TASK_DEAD race in finish_task_switch()
+
+From: Peter Zijlstra <peterz@infradead.org>
+
+commit 95913d97914f44db2b81271c2e2ebd4d2ac2df83 upstream.
+
+So the problem this patch is trying to address is as follows:
+
+        CPU0                            CPU1
+
+        context_switch(A, B)
+                                        ttwu(A)
+                                          LOCK A->pi_lock
+                                          A->on_cpu == 0
+        finish_task_switch(A)
+          prev_state = A->state  <-.
+          WMB                      |
+          A->on_cpu = 0;           |
+          UNLOCK rq0->lock         |
+                                   |    context_switch(C, A)
+                                   `--  A->state = TASK_DEAD
+          prev_state == TASK_DEAD
+            put_task_struct(A)
+                                        context_switch(A, C)
+                                        finish_task_switch(A)
+                                          A->state == TASK_DEAD
+                                            put_task_struct(A)
+
+The argument being that the WMB will allow the load of A->state on CPU0
+to cross over and observe CPU1's store of A->state, which will then
+result in a double-drop and use-after-free.
+
+Now the comment states (and this was true once upon a long time ago)
+that we need to observe A->state while holding rq->lock because that
+will order us against the wakeup; however the wakeup will not in fact
+acquire (that) rq->lock; it takes A->pi_lock these days.
+
+We can obviously fix this by upgrading the WMB to an MB, but that is
+expensive, so we'd rather avoid that.
+
+The alternative this patch takes is: smp_store_release(&A->on_cpu, 0),
+which avoids the MB on some archs, but not important ones like ARM.
+
+Reported-by: Oleg Nesterov <oleg@redhat.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Acked-by: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: linux-kernel@vger.kernel.org
+Cc: manfred@colorfullife.com
+Cc: will.deacon@arm.com
+Fixes: e4a52bcb9a18 ("sched: Remove rq->lock from the first half of ttwu()")
+Link: http://lkml.kernel.org/r/20150929124509.GG3816@twins.programming.kicks-ass.net
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ kernel/sched/core.c  |   10 +++++-----
+ kernel/sched/sched.h |    5 +++--
+ 2 files changed, 8 insertions(+), 7 deletions(-)
+
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -2461,11 +2461,11 @@ static struct rq *finish_task_switch(str
+ 	 * If a task dies, then it sets TASK_DEAD in tsk->state and calls
+ 	 * schedule one last time. The schedule call will never return, and
+ 	 * the scheduled task must drop that reference.
+-	 * The test for TASK_DEAD must occur while the runqueue locks are
+-	 * still held, otherwise prev could be scheduled on another cpu, die
+-	 * there before we look at prev->state, and then the reference would
+-	 * be dropped twice.
+-	 *		Manfred Spraul <manfred@colorfullife.com>
++	 *
++	 * We must observe prev->state before clearing prev->on_cpu (in
++	 * finish_lock_switch), otherwise a concurrent wakeup can get prev
++	 * running on another CPU and we could rave with its RUNNING -> DEAD
++	 * transition, resulting in a double drop.
+ 	 */
+ 	prev_state = prev->state;
+ 	vtime_task_switch(prev);
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -1091,9 +1091,10 @@ static inline void finish_lock_switch(st
+ 	 * After ->on_cpu is cleared, the task can be moved to a different CPU.
+ 	 * We must ensure this doesn't happen until the switch is completely
+ 	 * finished.
++	 *
++	 * Pairs with the control dependency and rmb in try_to_wake_up().
+ 	 */
+-	smp_wmb();
+-	prev->on_cpu = 0;
++	smp_store_release(&prev->on_cpu, 0);
+ #endif
+ #ifdef CONFIG_DEBUG_SPINLOCK
+ 	/* this is a valid case when another task releases the spinlock */

@@ -1,0 +1,152 @@
+From eddd3826a1a0190e5235703d1e666affa4d13b96 Mon Sep 17 00:00:00 2001
+From: Thomas Gleixner <tglx@linutronix.de>
+Date: Wed, 30 Sep 2015 08:38:22 +0000
+Subject: x86/process: Add proper bound checks in 64bit get_wchan()
+
+From: Thomas Gleixner <tglx@linutronix.de>
+
+commit eddd3826a1a0190e5235703d1e666affa4d13b96 upstream.
+
+Dmitry Vyukov reported the following using trinity and the memory
+error detector AddressSanitizer
+(https://code.google.com/p/address-sanitizer/wiki/AddressSanitizerForKernel).
+
+[ 124.575597] ERROR: AddressSanitizer: heap-buffer-overflow on
+address ffff88002e280000
+[ 124.576801] ffff88002e280000 is located 131938492886538 bytes to
+the left of 28857600-byte region [ffffffff81282e0a, ffffffff82e0830a)
+[ 124.578633] Accessed by thread T10915:
+[ 124.579295] inlined in describe_heap_address
+./arch/x86/mm/asan/report.c:164
+[ 124.579295] #0 ffffffff810dd277 in asan_report_error
+./arch/x86/mm/asan/report.c:278
+[ 124.580137] #1 ffffffff810dc6a0 in asan_check_region
+./arch/x86/mm/asan/asan.c:37
+[ 124.581050] #2 ffffffff810dd423 in __tsan_read8 ??:0
+[ 124.581893] #3 ffffffff8107c093 in get_wchan
+./arch/x86/kernel/process_64.c:444
+
+The address checks in the 64bit implementation of get_wchan() are
+wrong in several ways:
+
+ - The lower bound of the stack is not the start of the stack
+   page. It's the start of the stack page plus sizeof (struct
+   thread_info)
+
+ - The upper bound must be:
+
+       top_of_stack - TOP_OF_KERNEL_STACK_PADDING - 2 * sizeof(unsigned long).
+
+   The 2 * sizeof(unsigned long) is required because the stack pointer
+   points at the frame pointer. The layout on the stack is: ... IP FP
+   ... IP FP. So we need to make sure that both IP and FP are in the
+   bounds.
+
+Fix the bound checks and get rid of the mix of numeric constants, u64
+and unsigned long. Making all unsigned long allows us to use the same
+function for 32bit as well.
+
+Use READ_ONCE() when accessing the stack. This does not prevent a
+concurrent wakeup of the task and the stack changing, but at least it
+avoids TOCTOU.
+
+Also check task state at the end of the loop. Again that does not
+prevent concurrent changes, but it avoids walking for nothing.
+
+Add proper comments while at it.
+
+Reported-by: Dmitry Vyukov <dvyukov@google.com>
+Reported-by: Sasha Levin <sasha.levin@oracle.com>
+Based-on-patch-from: Wolfram Gloger <wmglo@dent.med.uni-muenchen.de>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Reviewed-by: Borislav Petkov <bp@alien8.de>
+Reviewed-by: Dmitry Vyukov <dvyukov@google.com>
+Cc: Andrey Ryabinin <ryabinin.a.a@gmail.com>
+Cc: Andy Lutomirski <luto@amacapital.net>
+Cc: Andrey Konovalov <andreyknvl@google.com>
+Cc: Kostya Serebryany <kcc@google.com>
+Cc: Alexander Potapenko <glider@google.com>
+Cc: kasan-dev <kasan-dev@googlegroups.com>
+Cc: Denys Vlasenko <dvlasenk@redhat.com>
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: Wolfram Gloger <wmglo@dent.med.uni-muenchen.de>
+Link: http://lkml.kernel.org/r/20150930083302.694788319@linutronix.de
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ arch/x86/kernel/process_64.c |   52 ++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 42 insertions(+), 10 deletions(-)
+
+--- a/arch/x86/kernel/process_64.c
++++ b/arch/x86/kernel/process_64.c
+@@ -497,27 +497,59 @@ void set_personality_ia32(bool x32)
+ }
+ EXPORT_SYMBOL_GPL(set_personality_ia32);
+ 
++/*
++ * Called from fs/proc with a reference on @p to find the function
++ * which called into schedule(). This needs to be done carefully
++ * because the task might wake up and we might look at a stack
++ * changing under us.
++ */
+ unsigned long get_wchan(struct task_struct *p)
+ {
+-	unsigned long stack;
+-	u64 fp, ip;
++	unsigned long start, bottom, top, sp, fp, ip;
+ 	int count = 0;
+ 
+ 	if (!p || p == current || p->state == TASK_RUNNING)
+ 		return 0;
+-	stack = (unsigned long)task_stack_page(p);
+-	if (p->thread.sp < stack || p->thread.sp >= stack+THREAD_SIZE)
++
++	start = (unsigned long)task_stack_page(p);
++	if (!start)
+ 		return 0;
+-	fp = *(u64 *)(p->thread.sp);
++
++	/*
++	 * Layout of the stack page:
++	 *
++	 * ----------- topmax = start + THREAD_SIZE - sizeof(unsigned long)
++	 * PADDING
++	 * ----------- top = topmax - TOP_OF_KERNEL_STACK_PADDING
++	 * stack
++	 * ----------- bottom = start + sizeof(thread_info)
++	 * thread_info
++	 * ----------- start
++	 *
++	 * The tasks stack pointer points at the location where the
++	 * framepointer is stored. The data on the stack is:
++	 * ... IP FP ... IP FP
++	 *
++	 * We need to read FP and IP, so we need to adjust the upper
++	 * bound by another unsigned long.
++	 */
++	top = start + THREAD_SIZE - TOP_OF_KERNEL_STACK_PADDING;
++	top -= 2 * sizeof(unsigned long);
++	bottom = start + sizeof(struct thread_info);
++
++	sp = READ_ONCE(p->thread.sp);
++	if (sp < bottom || sp > top)
++		return 0;
++
++	fp = READ_ONCE(*(unsigned long *)sp);
+ 	do {
+-		if (fp < (unsigned long)stack ||
+-		    fp >= (unsigned long)stack+THREAD_SIZE)
++		if (fp < bottom || fp > top)
+ 			return 0;
+-		ip = *(u64 *)(fp+8);
++		ip = READ_ONCE(*(unsigned long *)(fp + sizeof(unsigned long)));
+ 		if (!in_sched_functions(ip))
+ 			return ip;
+-		fp = *(u64 *)fp;
+-	} while (count++ < 16);
++		fp = READ_ONCE(*(unsigned long *)fp);
++	} while (count++ < 16 && p->state != TASK_RUNNING);
+ 	return 0;
+ }
+ 
