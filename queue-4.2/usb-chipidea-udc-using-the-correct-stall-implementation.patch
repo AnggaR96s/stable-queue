@@ -1,0 +1,160 @@
+From 56ffa1d154c7e12af16273f0cdc42690dd05caf5 Mon Sep 17 00:00:00 2001
+From: Peter Chen <peter.chen@freescale.com>
+Date: Mon, 24 Aug 2015 14:10:07 +0800
+Subject: usb: chipidea: udc: using the correct stall implementation
+
+From: Peter Chen <peter.chen@freescale.com>
+
+commit 56ffa1d154c7e12af16273f0cdc42690dd05caf5 upstream.
+
+According to spec, there are functional and protocol stalls.
+
+For functional stall, it is for bulk and interrupt endpoints,
+below are cases for it:
+- Host sends SET_FEATURE request for Set-Halt, the udc driver
+needs to set stall, and return true unconditionally.
+- The gadget driver may call usb_ep_set_halt to stall certain
+endpoints, if there is a transfer in pending, the udc driver
+should not set stall, and return -EAGAIN accordingly.
+These two kinds of stall need to be cleared by host using CLEAR_FEATURE
+request (Clear-Halt).
+
+For protocol stall, it is for control endpoint, this stall will
+be set if the control request has failed. This stall will be
+cleared by next setup request (hardware will do it).
+
+It fixed usbtest (drivers/usb/misc/usbtest.c) Test 13 "set/clear halt"
+test failure, meanwhile, this change has been verified by
+USB2 CV Compliance Test and MSC Tests.
+
+Cc: Alan Stern <stern@rowland.harvard.edu>
+Cc: Felipe Balbi <balbi@ti.com>
+Signed-off-by: Peter Chen <peter.chen@freescale.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/usb/chipidea/udc.c |   84 +++++++++++++++++++++++----------------------
+ 1 file changed, 44 insertions(+), 40 deletions(-)
+
+--- a/drivers/usb/chipidea/udc.c
++++ b/drivers/usb/chipidea/udc.c
+@@ -656,6 +656,44 @@ __acquires(hwep->lock)
+ 	return 0;
+ }
+ 
++static int _ep_set_halt(struct usb_ep *ep, int value, bool check_transfer)
++{
++	struct ci_hw_ep *hwep = container_of(ep, struct ci_hw_ep, ep);
++	int direction, retval = 0;
++	unsigned long flags;
++
++	if (ep == NULL || hwep->ep.desc == NULL)
++		return -EINVAL;
++
++	if (usb_endpoint_xfer_isoc(hwep->ep.desc))
++		return -EOPNOTSUPP;
++
++	spin_lock_irqsave(hwep->lock, flags);
++
++	if (value && hwep->dir == TX && check_transfer &&
++		!list_empty(&hwep->qh.queue) &&
++			!usb_endpoint_xfer_control(hwep->ep.desc)) {
++		spin_unlock_irqrestore(hwep->lock, flags);
++		return -EAGAIN;
++	}
++
++	direction = hwep->dir;
++	do {
++		retval |= hw_ep_set_halt(hwep->ci, hwep->num, hwep->dir, value);
++
++		if (!value)
++			hwep->wedge = 0;
++
++		if (hwep->type == USB_ENDPOINT_XFER_CONTROL)
++			hwep->dir = (hwep->dir == TX) ? RX : TX;
++
++	} while (hwep->dir != direction);
++
++	spin_unlock_irqrestore(hwep->lock, flags);
++	return retval;
++}
++
++
+ /**
+  * _gadget_stop_activity: stops all USB activity, flushes & disables all endpts
+  * @gadget: gadget
+@@ -1051,7 +1089,7 @@ __acquires(ci->lock)
+ 				num += ci->hw_ep_max / 2;
+ 
+ 			spin_unlock(&ci->lock);
+-			err = usb_ep_set_halt(&ci->ci_hw_ep[num].ep);
++			err = _ep_set_halt(&ci->ci_hw_ep[num].ep, 1, false);
+ 			spin_lock(&ci->lock);
+ 			if (!err)
+ 				isr_setup_status_phase(ci);
+@@ -1110,8 +1148,8 @@ delegate:
+ 
+ 	if (err < 0) {
+ 		spin_unlock(&ci->lock);
+-		if (usb_ep_set_halt(&hwep->ep))
+-			dev_err(ci->dev, "error: ep_set_halt\n");
++		if (_ep_set_halt(&hwep->ep, 1, false))
++			dev_err(ci->dev, "error: _ep_set_halt\n");
+ 		spin_lock(&ci->lock);
+ 	}
+ }
+@@ -1142,9 +1180,9 @@ __acquires(ci->lock)
+ 					err = isr_setup_status_phase(ci);
+ 				if (err < 0) {
+ 					spin_unlock(&ci->lock);
+-					if (usb_ep_set_halt(&hwep->ep))
++					if (_ep_set_halt(&hwep->ep, 1, false))
+ 						dev_err(ci->dev,
+-							"error: ep_set_halt\n");
++						"error: _ep_set_halt\n");
+ 					spin_lock(&ci->lock);
+ 				}
+ 			}
+@@ -1390,41 +1428,7 @@ static int ep_dequeue(struct usb_ep *ep,
+  */
+ static int ep_set_halt(struct usb_ep *ep, int value)
+ {
+-	struct ci_hw_ep *hwep = container_of(ep, struct ci_hw_ep, ep);
+-	int direction, retval = 0;
+-	unsigned long flags;
+-
+-	if (ep == NULL || hwep->ep.desc == NULL)
+-		return -EINVAL;
+-
+-	if (usb_endpoint_xfer_isoc(hwep->ep.desc))
+-		return -EOPNOTSUPP;
+-
+-	spin_lock_irqsave(hwep->lock, flags);
+-
+-#ifndef STALL_IN
+-	/* g_file_storage MS compliant but g_zero fails chapter 9 compliance */
+-	if (value && hwep->type == USB_ENDPOINT_XFER_BULK && hwep->dir == TX &&
+-	    !list_empty(&hwep->qh.queue)) {
+-		spin_unlock_irqrestore(hwep->lock, flags);
+-		return -EAGAIN;
+-	}
+-#endif
+-
+-	direction = hwep->dir;
+-	do {
+-		retval |= hw_ep_set_halt(hwep->ci, hwep->num, hwep->dir, value);
+-
+-		if (!value)
+-			hwep->wedge = 0;
+-
+-		if (hwep->type == USB_ENDPOINT_XFER_CONTROL)
+-			hwep->dir = (hwep->dir == TX) ? RX : TX;
+-
+-	} while (hwep->dir != direction);
+-
+-	spin_unlock_irqrestore(hwep->lock, flags);
+-	return retval;
++	return _ep_set_halt(ep, value, true);
+ }
+ 
+ /**
