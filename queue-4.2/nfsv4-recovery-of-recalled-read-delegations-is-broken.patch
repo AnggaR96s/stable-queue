@@ -1,0 +1,214 @@
+From 24311f884189d42d40354a6f38ca218eb9aeb811 Mon Sep 17 00:00:00 2001
+From: Trond Myklebust <trond.myklebust@primarydata.com>
+Date: Sun, 20 Sep 2015 10:50:17 -0400
+Subject: NFSv4: Recovery of recalled read delegations is broken
+
+From: Trond Myklebust <trond.myklebust@primarydata.com>
+
+commit 24311f884189d42d40354a6f38ca218eb9aeb811 upstream.
+
+When a read delegation is being recalled, and we're reclaiming the
+cached opens, we need to make sure that we only reclaim read-only
+modes.
+A previous attempt to do this, relied on retrieving the delegation
+type from the nfs4_opendata structure. Unfortunately, as Kinglong
+pointed out, this field can only be set when performing reboot recovery.
+
+Furthermore, if we call nfs4_open_recover(), then we end up clobbering
+the state->flags for all modes that we're not recovering...
+
+The fix is to have the delegation recall code pass this information
+to the recovery call, and then refactor the recovery code so that
+nfs4_open_delegation_recall() does not need to call nfs4_open_recover().
+
+Reported-by: Kinglong Mee <kinglongmee@gmail.com>
+Fixes: 39f897fdbd46 ("NFSv4: When returning a delegation, don't...")
+Tested-by: Kinglong Mee <kinglongmee@gmail.com>
+Cc: NeilBrown <neilb@suse.com>
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/nfs/delegation.c |    8 +++--
+ fs/nfs/delegation.h |    2 -
+ fs/nfs/nfs4proc.c   |   81 ++++++++++++++++++++++++++++++----------------------
+ 3 files changed, 53 insertions(+), 38 deletions(-)
+
+--- a/fs/nfs/delegation.c
++++ b/fs/nfs/delegation.c
+@@ -113,7 +113,8 @@ out:
+ 	return status;
+ }
+ 
+-static int nfs_delegation_claim_opens(struct inode *inode, const nfs4_stateid *stateid)
++static int nfs_delegation_claim_opens(struct inode *inode,
++		const nfs4_stateid *stateid, fmode_t type)
+ {
+ 	struct nfs_inode *nfsi = NFS_I(inode);
+ 	struct nfs_open_context *ctx;
+@@ -140,7 +141,7 @@ again:
+ 		/* Block nfs4_proc_unlck */
+ 		mutex_lock(&sp->so_delegreturn_mutex);
+ 		seq = raw_seqcount_begin(&sp->so_reclaim_seqcount);
+-		err = nfs4_open_delegation_recall(ctx, state, stateid);
++		err = nfs4_open_delegation_recall(ctx, state, stateid, type);
+ 		if (!err)
+ 			err = nfs_delegation_claim_locks(ctx, state, stateid);
+ 		if (!err && read_seqcount_retry(&sp->so_reclaim_seqcount, seq))
+@@ -411,7 +412,8 @@ static int nfs_end_delegation_return(str
+ 	do {
+ 		if (test_bit(NFS_DELEGATION_REVOKED, &delegation->flags))
+ 			break;
+-		err = nfs_delegation_claim_opens(inode, &delegation->stateid);
++		err = nfs_delegation_claim_opens(inode, &delegation->stateid,
++				delegation->type);
+ 		if (!issync || err != -EAGAIN)
+ 			break;
+ 		/*
+--- a/fs/nfs/delegation.h
++++ b/fs/nfs/delegation.h
+@@ -54,7 +54,7 @@ void nfs_delegation_reap_unclaimed(struc
+ 
+ /* NFSv4 delegation-related procedures */
+ int nfs4_proc_delegreturn(struct inode *inode, struct rpc_cred *cred, const nfs4_stateid *stateid, int issync);
+-int nfs4_open_delegation_recall(struct nfs_open_context *ctx, struct nfs4_state *state, const nfs4_stateid *stateid);
++int nfs4_open_delegation_recall(struct nfs_open_context *ctx, struct nfs4_state *state, const nfs4_stateid *stateid, fmode_t type);
+ int nfs4_lock_delegation_recall(struct file_lock *fl, struct nfs4_state *state, const nfs4_stateid *stateid);
+ bool nfs4_copy_delegation_stateid(nfs4_stateid *dst, struct inode *inode, fmode_t flags);
+ 
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@ -1127,6 +1127,21 @@ static int nfs4_wait_for_completion_rpc_
+ 	return ret;
+ }
+ 
++static bool nfs4_mode_match_open_stateid(struct nfs4_state *state,
++		fmode_t fmode)
++{
++	switch(fmode & (FMODE_READ|FMODE_WRITE)) {
++	case FMODE_READ|FMODE_WRITE:
++		return state->n_rdwr != 0;
++	case FMODE_WRITE:
++		return state->n_wronly != 0;
++	case FMODE_READ:
++		return state->n_rdonly != 0;
++	}
++	WARN_ON_ONCE(1);
++	return false;
++}
++
+ static int can_open_cached(struct nfs4_state *state, fmode_t mode, int open_mode)
+ {
+ 	int ret = 0;
+@@ -1561,17 +1576,13 @@ static struct nfs4_opendata *nfs4_open_r
+ 	return opendata;
+ }
+ 
+-static int nfs4_open_recover_helper(struct nfs4_opendata *opendata, fmode_t fmode, struct nfs4_state **res)
++static int nfs4_open_recover_helper(struct nfs4_opendata *opendata,
++		fmode_t fmode)
+ {
+ 	struct nfs4_state *newstate;
+ 	int ret;
+ 
+-	if ((opendata->o_arg.claim == NFS4_OPEN_CLAIM_DELEGATE_CUR ||
+-	     opendata->o_arg.claim == NFS4_OPEN_CLAIM_DELEG_CUR_FH) &&
+-	    (opendata->o_arg.u.delegation_type & fmode) != fmode)
+-		/* This mode can't have been delegated, so we must have
+-		 * a valid open_stateid to cover it - not need to reclaim.
+-		 */
++	if (!nfs4_mode_match_open_stateid(opendata->state, fmode))
+ 		return 0;
+ 	opendata->o_arg.open_flags = 0;
+ 	opendata->o_arg.fmode = fmode;
+@@ -1587,14 +1598,14 @@ static int nfs4_open_recover_helper(stru
+ 	newstate = nfs4_opendata_to_nfs4_state(opendata);
+ 	if (IS_ERR(newstate))
+ 		return PTR_ERR(newstate);
++	if (newstate != opendata->state)
++		ret = -ESTALE;
+ 	nfs4_close_state(newstate, fmode);
+-	*res = newstate;
+-	return 0;
++	return ret;
+ }
+ 
+ static int nfs4_open_recover(struct nfs4_opendata *opendata, struct nfs4_state *state)
+ {
+-	struct nfs4_state *newstate;
+ 	int ret;
+ 
+ 	/* Don't trigger recovery in nfs_test_and_clear_all_open_stateid */
+@@ -1605,27 +1616,15 @@ static int nfs4_open_recover(struct nfs4
+ 	clear_bit(NFS_DELEGATED_STATE, &state->flags);
+ 	clear_bit(NFS_OPEN_STATE, &state->flags);
+ 	smp_rmb();
+-	if (state->n_rdwr != 0) {
+-		ret = nfs4_open_recover_helper(opendata, FMODE_READ|FMODE_WRITE, &newstate);
+-		if (ret != 0)
+-			return ret;
+-		if (newstate != state)
+-			return -ESTALE;
+-	}
+-	if (state->n_wronly != 0) {
+-		ret = nfs4_open_recover_helper(opendata, FMODE_WRITE, &newstate);
+-		if (ret != 0)
+-			return ret;
+-		if (newstate != state)
+-			return -ESTALE;
+-	}
+-	if (state->n_rdonly != 0) {
+-		ret = nfs4_open_recover_helper(opendata, FMODE_READ, &newstate);
+-		if (ret != 0)
+-			return ret;
+-		if (newstate != state)
+-			return -ESTALE;
+-	}
++	ret = nfs4_open_recover_helper(opendata, FMODE_READ|FMODE_WRITE);
++	if (ret != 0)
++		return ret;
++	ret = nfs4_open_recover_helper(opendata, FMODE_WRITE);
++	if (ret != 0)
++		return ret;
++	ret = nfs4_open_recover_helper(opendata, FMODE_READ);
++	if (ret != 0)
++		return ret;
+ 	/*
+ 	 * We may have performed cached opens for all three recoveries.
+ 	 * Check if we need to update the current stateid.
+@@ -1749,18 +1748,32 @@ static int nfs4_handle_delegation_recall
+ 	return err;
+ }
+ 
+-int nfs4_open_delegation_recall(struct nfs_open_context *ctx, struct nfs4_state *state, const nfs4_stateid *stateid)
++int nfs4_open_delegation_recall(struct nfs_open_context *ctx,
++		struct nfs4_state *state, const nfs4_stateid *stateid,
++		fmode_t type)
+ {
+ 	struct nfs_server *server = NFS_SERVER(state->inode);
+ 	struct nfs4_opendata *opendata;
+-	int err;
++	int err = 0;
+ 
+ 	opendata = nfs4_open_recoverdata_alloc(ctx, state,
+ 			NFS4_OPEN_CLAIM_DELEG_CUR_FH);
+ 	if (IS_ERR(opendata))
+ 		return PTR_ERR(opendata);
+ 	nfs4_stateid_copy(&opendata->o_arg.u.delegation, stateid);
+-	err = nfs4_open_recover(opendata, state);
++	clear_bit(NFS_DELEGATED_STATE, &state->flags);
++	switch (type & (FMODE_READ|FMODE_WRITE)) {
++	case FMODE_READ|FMODE_WRITE:
++	case FMODE_WRITE:
++		err = nfs4_open_recover_helper(opendata, FMODE_READ|FMODE_WRITE);
++		if (err)
++			break;
++		err = nfs4_open_recover_helper(opendata, FMODE_WRITE);
++		if (err)
++			break;
++	case FMODE_READ:
++		err = nfs4_open_recover_helper(opendata, FMODE_READ);
++	}
+ 	nfs4_opendata_put(opendata);
+ 	return nfs4_handle_delegation_recall_error(server, state, stateid, err);
+ }
