@@ -1,0 +1,169 @@
+From 199dc6ed5179251fa6158a461499c24bdd99c836 Mon Sep 17 00:00:00 2001
+From: NeilBrown <neilb@suse.com>
+Date: Mon, 3 Aug 2015 13:11:47 +1000
+Subject: md/raid0: update queue parameter in a safer location.
+
+From: NeilBrown <neilb@suse.com>
+
+commit 199dc6ed5179251fa6158a461499c24bdd99c836 upstream.
+
+When a (e.g.) RAID5 array is reshaped to RAID0, the updating
+of queue parameters (e.g. max number of sectors per bio) is
+done in the wrong place.
+It should be part of ->run, but it is actually part of ->takeover.
+This means it happens before level_store() calls:
+
+	blk_set_stacking_limits(&mddev->queue->limits);
+
+and so it ineffective.  This can lead to errors from underlying
+devices.
+
+So move all the relevant settings out of create_stripe_zones()
+and into raid0_run().
+
+As this can lead to a bug-on it is suitable for any -stable
+kernel which supports reshape to RAID0.  So 2.6.35 or later.
+As the bug has been present for five years there is no urgency,
+so no need to rush into -stable.
+
+Fixes: 9af204cf720c ("md: Add support for Raid5->Raid0 and Raid10->Raid0 takeover")
+Reported-by: Yi Zhang <yizhan@redhat.com>
+Signed-off-by: NeilBrown <neilb@suse.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/md/raid0.c |   75 +++++++++++++++++++++++++++--------------------------
+ 1 file changed, 39 insertions(+), 36 deletions(-)
+
+--- a/drivers/md/raid0.c
++++ b/drivers/md/raid0.c
+@@ -83,7 +83,7 @@ static int create_strip_zones(struct mdd
+ 	char b[BDEVNAME_SIZE];
+ 	char b2[BDEVNAME_SIZE];
+ 	struct r0conf *conf = kzalloc(sizeof(*conf), GFP_KERNEL);
+-	bool discard_supported = false;
++	unsigned short blksize = 512;
+ 
+ 	if (!conf)
+ 		return -ENOMEM;
+@@ -98,6 +98,9 @@ static int create_strip_zones(struct mdd
+ 		sector_div(sectors, mddev->chunk_sectors);
+ 		rdev1->sectors = sectors * mddev->chunk_sectors;
+ 
++		blksize = max(blksize, queue_logical_block_size(
++				      rdev1->bdev->bd_disk->queue));
++
+ 		rdev_for_each(rdev2, mddev) {
+ 			pr_debug("md/raid0:%s:   comparing %s(%llu)"
+ 				 " with %s(%llu)\n",
+@@ -134,6 +137,18 @@ static int create_strip_zones(struct mdd
+ 	}
+ 	pr_debug("md/raid0:%s: FINAL %d zones\n",
+ 		 mdname(mddev), conf->nr_strip_zones);
++	/*
++	 * now since we have the hard sector sizes, we can make sure
++	 * chunk size is a multiple of that sector size
++	 */
++	if ((mddev->chunk_sectors << 9) % blksize) {
++		printk(KERN_ERR "md/raid0:%s: chunk_size of %d not multiple of block size %d\n",
++		       mdname(mddev),
++		       mddev->chunk_sectors << 9, blksize);
++		err = -EINVAL;
++		goto abort;
++	}
++
+ 	err = -ENOMEM;
+ 	conf->strip_zone = kzalloc(sizeof(struct strip_zone)*
+ 				conf->nr_strip_zones, GFP_KERNEL);
+@@ -188,19 +203,12 @@ static int create_strip_zones(struct mdd
+ 		}
+ 		dev[j] = rdev1;
+ 
+-		if (mddev->queue)
+-			disk_stack_limits(mddev->gendisk, rdev1->bdev,
+-					  rdev1->data_offset << 9);
+-
+ 		if (rdev1->bdev->bd_disk->queue->merge_bvec_fn)
+ 			conf->has_merge_bvec = 1;
+ 
+ 		if (!smallest || (rdev1->sectors < smallest->sectors))
+ 			smallest = rdev1;
+ 		cnt++;
+-
+-		if (blk_queue_discard(bdev_get_queue(rdev1->bdev)))
+-			discard_supported = true;
+ 	}
+ 	if (cnt != mddev->raid_disks) {
+ 		printk(KERN_ERR "md/raid0:%s: too few disks (%d of %d) - "
+@@ -261,28 +269,6 @@ static int create_strip_zones(struct mdd
+ 			 (unsigned long long)smallest->sectors);
+ 	}
+ 
+-	/*
+-	 * now since we have the hard sector sizes, we can make sure
+-	 * chunk size is a multiple of that sector size
+-	 */
+-	if ((mddev->chunk_sectors << 9) % queue_logical_block_size(mddev->queue)) {
+-		printk(KERN_ERR "md/raid0:%s: chunk_size of %d not valid\n",
+-		       mdname(mddev),
+-		       mddev->chunk_sectors << 9);
+-		goto abort;
+-	}
+-
+-	if (mddev->queue) {
+-		blk_queue_io_min(mddev->queue, mddev->chunk_sectors << 9);
+-		blk_queue_io_opt(mddev->queue,
+-				 (mddev->chunk_sectors << 9) * mddev->raid_disks);
+-
+-		if (!discard_supported)
+-			queue_flag_clear_unlocked(QUEUE_FLAG_DISCARD, mddev->queue);
+-		else
+-			queue_flag_set_unlocked(QUEUE_FLAG_DISCARD, mddev->queue);
+-	}
+-
+ 	pr_debug("md/raid0:%s: done.\n", mdname(mddev));
+ 	*private_conf = conf;
+ 
+@@ -433,12 +419,6 @@ static int raid0_run(struct mddev *mddev
+ 	if (md_check_no_bitmap(mddev))
+ 		return -EINVAL;
+ 
+-	if (mddev->queue) {
+-		blk_queue_max_hw_sectors(mddev->queue, mddev->chunk_sectors);
+-		blk_queue_max_write_same_sectors(mddev->queue, mddev->chunk_sectors);
+-		blk_queue_max_discard_sectors(mddev->queue, mddev->chunk_sectors);
+-	}
+-
+ 	/* if private is not null, we are here after takeover */
+ 	if (mddev->private == NULL) {
+ 		ret = create_strip_zones(mddev, &conf);
+@@ -447,6 +427,29 @@ static int raid0_run(struct mddev *mddev
+ 		mddev->private = conf;
+ 	}
+ 	conf = mddev->private;
++	if (mddev->queue) {
++		struct md_rdev *rdev;
++		bool discard_supported = false;
++
++		rdev_for_each(rdev, mddev) {
++			disk_stack_limits(mddev->gendisk, rdev->bdev,
++					  rdev->data_offset << 9);
++			if (blk_queue_discard(bdev_get_queue(rdev->bdev)))
++				discard_supported = true;
++		}
++		blk_queue_max_hw_sectors(mddev->queue, mddev->chunk_sectors);
++		blk_queue_max_write_same_sectors(mddev->queue, mddev->chunk_sectors);
++		blk_queue_max_discard_sectors(mddev->queue, mddev->chunk_sectors);
++
++		blk_queue_io_min(mddev->queue, mddev->chunk_sectors << 9);
++		blk_queue_io_opt(mddev->queue,
++				 (mddev->chunk_sectors << 9) * mddev->raid_disks);
++
++		if (!discard_supported)
++			queue_flag_clear_unlocked(QUEUE_FLAG_DISCARD, mddev->queue);
++		else
++			queue_flag_set_unlocked(QUEUE_FLAG_DISCARD, mddev->queue);
++	}
+ 
+ 	/* calculate array device size */
+ 	md_set_array_sectors(mddev, raid0_size(mddev, 0, 0));

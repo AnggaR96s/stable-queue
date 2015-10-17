@@ -1,0 +1,149 @@
+From 0610c25daa3e76e38ad5a8fae683a89ff9f71798 Mon Sep 17 00:00:00 2001
+From: Greg Thelen <gthelen@google.com>
+Date: Thu, 1 Oct 2015 15:37:02 -0700
+Subject: memcg: fix dirty page migration
+
+From: Greg Thelen <gthelen@google.com>
+
+commit 0610c25daa3e76e38ad5a8fae683a89ff9f71798 upstream.
+
+The problem starts with a file backed dirty page which is charged to a
+memcg.  Then page migration is used to move oldpage to newpage.
+
+Migration:
+ - copies the oldpage's data to newpage
+ - clears oldpage.PG_dirty
+ - sets newpage.PG_dirty
+ - uncharges oldpage from memcg
+ - charges newpage to memcg
+
+Clearing oldpage.PG_dirty decrements the charged memcg's dirty page
+count.
+
+However, because newpage is not yet charged, setting newpage.PG_dirty
+does not increment the memcg's dirty page count.  After migration
+completes newpage.PG_dirty is eventually cleared, often in
+account_page_cleaned().  At this time newpage is charged to a memcg so
+the memcg's dirty page count is decremented which causes underflow
+because the count was not previously incremented by migration.  This
+underflow causes balance_dirty_pages() to see a very large unsigned
+number of dirty memcg pages which leads to aggressive throttling of
+buffered writes by processes in non root memcg.
+
+This issue:
+ - can harm performance of non root memcg buffered writes.
+ - can report too small (even negative) values in
+   memory.stat[(total_)dirty] counters of all memcg, including the root.
+
+To avoid polluting migrate.c with #ifdef CONFIG_MEMCG checks, introduce
+page_memcg() and set_page_memcg() helpers.
+
+Test:
+    0) setup and enter limited memcg
+    mkdir /sys/fs/cgroup/test
+    echo 1G > /sys/fs/cgroup/test/memory.limit_in_bytes
+    echo $$ > /sys/fs/cgroup/test/cgroup.procs
+
+    1) buffered writes baseline
+    dd if=/dev/zero of=/data/tmp/foo bs=1M count=1k
+    sync
+    grep ^dirty /sys/fs/cgroup/test/memory.stat
+
+    2) buffered writes with compaction antagonist to induce migration
+    yes 1 > /proc/sys/vm/compact_memory &
+    rm -rf /data/tmp/foo
+    dd if=/dev/zero of=/data/tmp/foo bs=1M count=1k
+    kill %
+    sync
+    grep ^dirty /sys/fs/cgroup/test/memory.stat
+
+    3) buffered writes without antagonist, should match baseline
+    rm -rf /data/tmp/foo
+    dd if=/dev/zero of=/data/tmp/foo bs=1M count=1k
+    sync
+    grep ^dirty /sys/fs/cgroup/test/memory.stat
+
+                       (speed, dirty residue)
+             unpatched                       patched
+    1) 841 MB/s 0 dirty pages          886 MB/s 0 dirty pages
+    2) 611 MB/s -33427456 dirty pages  793 MB/s 0 dirty pages
+    3) 114 MB/s -33427456 dirty pages  891 MB/s 0 dirty pages
+
+    Notice that unpatched baseline performance (1) fell after
+    migration (3): 841 -> 114 MB/s.  In the patched kernel, post
+    migration performance matches baseline.
+
+Fixes: c4843a7593a9 ("memcg: add per cgroup dirty page accounting")
+Signed-off-by: Greg Thelen <gthelen@google.com>
+Reported-by: Dave Hansen <dave.hansen@intel.com>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ include/linux/mm.h |   21 +++++++++++++++++++++
+ mm/migrate.c       |   12 +++++++++++-
+ 2 files changed, 32 insertions(+), 1 deletion(-)
+
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -916,6 +916,27 @@ static inline void set_page_links(struct
+ #endif
+ }
+ 
++#ifdef CONFIG_MEMCG
++static inline struct mem_cgroup *page_memcg(struct page *page)
++{
++	return page->mem_cgroup;
++}
++
++static inline void set_page_memcg(struct page *page, struct mem_cgroup *memcg)
++{
++	page->mem_cgroup = memcg;
++}
++#else
++static inline struct mem_cgroup *page_memcg(struct page *page)
++{
++	return NULL;
++}
++
++static inline void set_page_memcg(struct page *page, struct mem_cgroup *memcg)
++{
++}
++#endif
++
+ /*
+  * Some inline functions in vmstat.h depend on page_zone()
+  */
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -734,6 +734,15 @@ static int move_to_new_page(struct page
+ 	if (PageSwapBacked(page))
+ 		SetPageSwapBacked(newpage);
+ 
++	/*
++	 * Indirectly called below, migrate_page_copy() copies PG_dirty and thus
++	 * needs newpage's memcg set to transfer memcg dirty page accounting.
++	 * So perform memcg migration in two steps:
++	 * 1. set newpage->mem_cgroup (here)
++	 * 2. clear page->mem_cgroup (below)
++	 */
++	set_page_memcg(newpage, page_memcg(page));
++
+ 	mapping = page_mapping(page);
+ 	if (!mapping)
+ 		rc = migrate_page(mapping, newpage, page, mode);
+@@ -750,9 +759,10 @@ static int move_to_new_page(struct page
+ 		rc = fallback_migrate_page(mapping, newpage, page, mode);
+ 
+ 	if (rc != MIGRATEPAGE_SUCCESS) {
++		set_page_memcg(newpage, NULL);
+ 		newpage->mapping = NULL;
+ 	} else {
+-		mem_cgroup_migrate(page, newpage, false);
++		set_page_memcg(page, NULL);
+ 		if (page_was_mapped)
+ 			remove_migration_ptes(page, newpage);
+ 		page->mapping = NULL;
