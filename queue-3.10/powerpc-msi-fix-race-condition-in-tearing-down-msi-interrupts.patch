@@ -1,0 +1,169 @@
+From e297c939b745e420ef0b9dc989cb87bda617b399 Mon Sep 17 00:00:00 2001
+From: Paul Mackerras <paulus@ozlabs.org>
+Date: Thu, 10 Sep 2015 14:36:21 +1000
+Subject: powerpc/MSI: Fix race condition in tearing down MSI interrupts
+
+From: Paul Mackerras <paulus@ozlabs.org>
+
+commit e297c939b745e420ef0b9dc989cb87bda617b399 upstream.
+
+This fixes a race which can result in the same virtual IRQ number
+being assigned to two different MSI interrupts.  The most visible
+consequence of that is usually a warning and stack trace from the
+sysfs code about an attempt to create a duplicate entry in sysfs.
+
+The race happens when one CPU (say CPU 0) is disposing of an MSI
+while another CPU (say CPU 1) is setting up an MSI.  CPU 0 calls
+(for example) pnv_teardown_msi_irqs(), which calls
+msi_bitmap_free_hwirqs() to indicate that the MSI (i.e. its
+hardware IRQ number) is no longer in use.  Then, before CPU 0 gets
+to calling irq_dispose_mapping() to free up the virtal IRQ number,
+CPU 1 comes in and calls msi_bitmap_alloc_hwirqs() to allocate an
+MSI, and gets the same hardware IRQ number that CPU 0 just freed.
+CPU 1 then calls irq_create_mapping() to get a virtual IRQ number,
+which sees that there is currently a mapping for that hardware IRQ
+number and returns the corresponding virtual IRQ number (which is
+the same virtual IRQ number that CPU 0 was using).  CPU 0 then
+calls irq_dispose_mapping() and frees that virtual IRQ number.
+Now, if another CPU comes along and calls irq_create_mapping(), it
+is likely to get the virtual IRQ number that was just freed,
+resulting in the same virtual IRQ number apparently being used for
+two different hardware interrupts.
+
+To fix this race, we just move the call to msi_bitmap_free_hwirqs()
+to after the call to irq_dispose_mapping().  Since virq_to_hw()
+doesn't work for the virtual IRQ number after irq_dispose_mapping()
+has been called, we need to call it before irq_dispose_mapping() and
+remember the result for the msi_bitmap_free_hwirqs() call.
+
+The pattern of calling msi_bitmap_free_hwirqs() before
+irq_dispose_mapping() appears in 5 places under arch/powerpc, and
+appears to have originated in commit 05af7bd2d75e ("[POWERPC] MPIC
+U3/U4 MSI backend") from 2007.
+
+Fixes: 05af7bd2d75e ("[POWERPC] MPIC U3/U4 MSI backend")
+Reported-by: Alexey Kardashevskiy <aik@ozlabs.ru>
+Signed-off-by: Paul Mackerras <paulus@samba.org>
+Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+
+---
+ arch/powerpc/platforms/powernv/pci.c  |    5 +++--
+ arch/powerpc/sysdev/fsl_msi.c         |    5 +++--
+ arch/powerpc/sysdev/mpic_pasemi_msi.c |    6 ++++--
+ arch/powerpc/sysdev/mpic_u3msi.c      |    5 +++--
+ arch/powerpc/sysdev/ppc4xx_msi.c      |    5 +++--
+ 5 files changed, 16 insertions(+), 10 deletions(-)
+
+--- a/arch/powerpc/platforms/powernv/pci.c
++++ b/arch/powerpc/platforms/powernv/pci.c
+@@ -106,6 +106,7 @@ static void pnv_teardown_msi_irqs(struct
+ 	struct pci_controller *hose = pci_bus_to_host(pdev->bus);
+ 	struct pnv_phb *phb = hose->private_data;
+ 	struct msi_desc *entry;
++	irq_hw_number_t hwirq;
+ 
+ 	if (WARN_ON(!phb))
+ 		return;
+@@ -113,10 +114,10 @@ static void pnv_teardown_msi_irqs(struct
+ 	list_for_each_entry(entry, &pdev->msi_list, list) {
+ 		if (entry->irq == NO_IRQ)
+ 			continue;
++		hwirq = virq_to_hw(entry->irq);
+ 		irq_set_msi_desc(entry->irq, NULL);
+-		msi_bitmap_free_hwirqs(&phb->msi_bmp,
+-			virq_to_hw(entry->irq) - phb->msi_base, 1);
+ 		irq_dispose_mapping(entry->irq);
++		msi_bitmap_free_hwirqs(&phb->msi_bmp, hwirq - phb->msi_base, 1);
+ 	}
+ }
+ #endif /* CONFIG_PCI_MSI */
+--- a/arch/powerpc/sysdev/fsl_msi.c
++++ b/arch/powerpc/sysdev/fsl_msi.c
+@@ -108,15 +108,16 @@ static void fsl_teardown_msi_irqs(struct
+ {
+ 	struct msi_desc *entry;
+ 	struct fsl_msi *msi_data;
++	irq_hw_number_t hwirq;
+ 
+ 	list_for_each_entry(entry, &pdev->msi_list, list) {
+ 		if (entry->irq == NO_IRQ)
+ 			continue;
++		hwirq = virq_to_hw(entry->irq);
+ 		msi_data = irq_get_chip_data(entry->irq);
+ 		irq_set_msi_desc(entry->irq, NULL);
+-		msi_bitmap_free_hwirqs(&msi_data->bitmap,
+-				       virq_to_hw(entry->irq), 1);
+ 		irq_dispose_mapping(entry->irq);
++		msi_bitmap_free_hwirqs(&msi_data->bitmap, hwirq, 1);
+ 	}
+ 
+ 	return;
+--- a/arch/powerpc/sysdev/mpic_pasemi_msi.c
++++ b/arch/powerpc/sysdev/mpic_pasemi_msi.c
+@@ -74,6 +74,7 @@ static int pasemi_msi_check_device(struc
+ static void pasemi_msi_teardown_msi_irqs(struct pci_dev *pdev)
+ {
+ 	struct msi_desc *entry;
++	irq_hw_number_t hwirq;
+ 
+ 	pr_debug("pasemi_msi_teardown_msi_irqs, pdev %p\n", pdev);
+ 
+@@ -81,10 +82,11 @@ static void pasemi_msi_teardown_msi_irqs
+ 		if (entry->irq == NO_IRQ)
+ 			continue;
+ 
++		hwirq = virq_to_hw(entry->irq);
+ 		irq_set_msi_desc(entry->irq, NULL);
+-		msi_bitmap_free_hwirqs(&msi_mpic->msi_bitmap,
+-				       virq_to_hw(entry->irq), ALLOC_CHUNK);
+ 		irq_dispose_mapping(entry->irq);
++		msi_bitmap_free_hwirqs(&msi_mpic->msi_bitmap,
++				       hwirq, ALLOC_CHUNK);
+ 	}
+ 
+ 	return;
+--- a/arch/powerpc/sysdev/mpic_u3msi.c
++++ b/arch/powerpc/sysdev/mpic_u3msi.c
+@@ -124,15 +124,16 @@ static int u3msi_msi_check_device(struct
+ static void u3msi_teardown_msi_irqs(struct pci_dev *pdev)
+ {
+ 	struct msi_desc *entry;
++	irq_hw_number_t hwirq;
+ 
+         list_for_each_entry(entry, &pdev->msi_list, list) {
+ 		if (entry->irq == NO_IRQ)
+ 			continue;
+ 
++		hwirq = virq_to_hw(entry->irq);
+ 		irq_set_msi_desc(entry->irq, NULL);
+-		msi_bitmap_free_hwirqs(&msi_mpic->msi_bitmap,
+-				       virq_to_hw(entry->irq), 1);
+ 		irq_dispose_mapping(entry->irq);
++		msi_bitmap_free_hwirqs(&msi_mpic->msi_bitmap, hwirq, 1);
+ 	}
+ 
+ 	return;
+--- a/arch/powerpc/sysdev/ppc4xx_msi.c
++++ b/arch/powerpc/sysdev/ppc4xx_msi.c
+@@ -121,16 +121,17 @@ void ppc4xx_teardown_msi_irqs(struct pci
+ {
+ 	struct msi_desc *entry;
+ 	struct ppc4xx_msi *msi_data = &ppc4xx_msi;
++	irq_hw_number_t hwirq;
+ 
+ 	dev_dbg(&dev->dev, "PCIE-MSI: tearing down msi irqs\n");
+ 
+ 	list_for_each_entry(entry, &dev->msi_list, list) {
+ 		if (entry->irq == NO_IRQ)
+ 			continue;
++		hwirq = virq_to_hw(entry->irq);
+ 		irq_set_msi_desc(entry->irq, NULL);
+-		msi_bitmap_free_hwirqs(&msi_data->bitmap,
+-				virq_to_hw(entry->irq), 1);
+ 		irq_dispose_mapping(entry->irq);
++		msi_bitmap_free_hwirqs(&msi_data->bitmap, hwirq, 1);
+ 	}
+ }
+ 
