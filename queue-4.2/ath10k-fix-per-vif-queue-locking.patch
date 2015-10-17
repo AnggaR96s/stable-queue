@@ -1,0 +1,154 @@
+From acd0b27bb13a09dd0a56d4562d3eb4137a7318b2 Mon Sep 17 00:00:00 2001
+From: Michal Kazior <michal.kazior@tieto.com>
+Date: Thu, 9 Jul 2015 13:08:38 +0200
+Subject: ath10k: fix per-vif queue locking
+
+From: Michal Kazior <michal.kazior@tieto.com>
+
+commit acd0b27bb13a09dd0a56d4562d3eb4137a7318b2 upstream.
+
+Whenever any vdev was supposed to be paused all Tx
+queues were stopped (except offchannel) instead of
+only these associated with the given vdev.
+
+This caused subtle issues with
+multi-channel/multi-vif scenarios, e.g.
+authentication of station vif could sometimes fail
+depending on fw tx pause request timing.
+
+Fixes: b4aa539dd8f2 ("ath10k: implement tx pause wmi event")
+Signed-off-by: Michal Kazior <michal.kazior@tieto.com>
+Signed-off-by: Kalle Valo <kvalo@qca.qualcomm.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/net/wireless/ath/ath10k/mac.c     |   47 ++++++++----------------------
+ drivers/net/wireless/ath/ath10k/mac.h     |    6 +--
+ drivers/net/wireless/ath/ath10k/wmi-tlv.c |   32 +++++++++++++++++---
+ 3 files changed, 44 insertions(+), 41 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath10k/mac.c
++++ b/drivers/net/wireless/ath/ath10k/mac.c
+@@ -3034,38 +3034,16 @@ static void ath10k_mac_vif_handle_tx_pau
+ 
+ 	lockdep_assert_held(&ar->htt.tx_lock);
+ 
+-	switch (pause_id) {
+-	case WMI_TLV_TX_PAUSE_ID_MCC:
+-	case WMI_TLV_TX_PAUSE_ID_P2P_CLI_NOA:
+-	case WMI_TLV_TX_PAUSE_ID_P2P_GO_PS:
+-	case WMI_TLV_TX_PAUSE_ID_AP_PS:
+-	case WMI_TLV_TX_PAUSE_ID_IBSS_PS:
+-		switch (action) {
+-		case WMI_TLV_TX_PAUSE_ACTION_STOP:
+-			ath10k_mac_vif_tx_lock(arvif, pause_id);
+-			break;
+-		case WMI_TLV_TX_PAUSE_ACTION_WAKE:
+-			ath10k_mac_vif_tx_unlock(arvif, pause_id);
+-			break;
+-		default:
+-			ath10k_warn(ar, "received unknown tx pause action %d on vdev %i, ignoring\n",
+-				    action, arvif->vdev_id);
+-			break;
+-		}
++	switch (action) {
++	case WMI_TLV_TX_PAUSE_ACTION_STOP:
++		ath10k_mac_vif_tx_lock(arvif, pause_id);
++		break;
++	case WMI_TLV_TX_PAUSE_ACTION_WAKE:
++		ath10k_mac_vif_tx_unlock(arvif, pause_id);
+ 		break;
+-	case WMI_TLV_TX_PAUSE_ID_AP_PEER_PS:
+-	case WMI_TLV_TX_PAUSE_ID_AP_PEER_UAPSD:
+-	case WMI_TLV_TX_PAUSE_ID_STA_ADD_BA:
+-	case WMI_TLV_TX_PAUSE_ID_HOST:
+ 	default:
+-		/* FIXME: Some pause_ids aren't vdev specific. Instead they
+-		 * target peer_id and tid. Implementing these could improve
+-		 * traffic scheduling fairness across multiple connected
+-		 * stations in AP/IBSS modes.
+-		 */
+-		ath10k_dbg(ar, ATH10K_DBG_MAC,
+-			   "mac ignoring unsupported tx pause vdev %i id %d\n",
+-			   arvif->vdev_id, pause_id);
++		ath10k_warn(ar, "received unknown tx pause action %d on vdev %i, ignoring\n",
++			    action, arvif->vdev_id);
+ 		break;
+ 	}
+ }
+@@ -3082,12 +3060,15 @@ static void ath10k_mac_handle_tx_pause_i
+ 	struct ath10k_vif *arvif = ath10k_vif_to_arvif(vif);
+ 	struct ath10k_mac_tx_pause *arg = data;
+ 
++	if (arvif->vdev_id != arg->vdev_id)
++		return;
++
+ 	ath10k_mac_vif_handle_tx_pause(arvif, arg->pause_id, arg->action);
+ }
+ 
+-void ath10k_mac_handle_tx_pause(struct ath10k *ar, u32 vdev_id,
+-				enum wmi_tlv_tx_pause_id pause_id,
+-				enum wmi_tlv_tx_pause_action action)
++void ath10k_mac_handle_tx_pause_vdev(struct ath10k *ar, u32 vdev_id,
++				     enum wmi_tlv_tx_pause_id pause_id,
++				     enum wmi_tlv_tx_pause_action action)
+ {
+ 	struct ath10k_mac_tx_pause arg = {
+ 		.vdev_id = vdev_id,
+--- a/drivers/net/wireless/ath/ath10k/mac.h
++++ b/drivers/net/wireless/ath/ath10k/mac.h
+@@ -61,9 +61,9 @@ int ath10k_mac_vif_chan(struct ieee80211
+ 
+ void ath10k_mac_handle_beacon(struct ath10k *ar, struct sk_buff *skb);
+ void ath10k_mac_handle_beacon_miss(struct ath10k *ar, u32 vdev_id);
+-void ath10k_mac_handle_tx_pause(struct ath10k *ar, u32 vdev_id,
+-				enum wmi_tlv_tx_pause_id pause_id,
+-				enum wmi_tlv_tx_pause_action action);
++void ath10k_mac_handle_tx_pause_vdev(struct ath10k *ar, u32 vdev_id,
++				     enum wmi_tlv_tx_pause_id pause_id,
++				     enum wmi_tlv_tx_pause_action action);
+ 
+ u8 ath10k_mac_hw_rate_to_idx(const struct ieee80211_supported_band *sband,
+ 			     u8 hw_rate);
+--- a/drivers/net/wireless/ath/ath10k/wmi-tlv.c
++++ b/drivers/net/wireless/ath/ath10k/wmi-tlv.c
+@@ -377,12 +377,34 @@ static int ath10k_wmi_tlv_event_tx_pause
+ 		   "wmi tlv tx pause pause_id %u action %u vdev_map 0x%08x peer_id %u tid_map 0x%08x\n",
+ 		   pause_id, action, vdev_map, peer_id, tid_map);
+ 
+-	for (vdev_id = 0; vdev_map; vdev_id++) {
+-		if (!(vdev_map & BIT(vdev_id)))
+-			continue;
++	switch (pause_id) {
++	case WMI_TLV_TX_PAUSE_ID_MCC:
++	case WMI_TLV_TX_PAUSE_ID_P2P_CLI_NOA:
++	case WMI_TLV_TX_PAUSE_ID_P2P_GO_PS:
++	case WMI_TLV_TX_PAUSE_ID_AP_PS:
++	case WMI_TLV_TX_PAUSE_ID_IBSS_PS:
++		for (vdev_id = 0; vdev_map; vdev_id++) {
++			if (!(vdev_map & BIT(vdev_id)))
++				continue;
+ 
+-		vdev_map &= ~BIT(vdev_id);
+-		ath10k_mac_handle_tx_pause(ar, vdev_id, pause_id, action);
++			vdev_map &= ~BIT(vdev_id);
++			ath10k_mac_handle_tx_pause_vdev(ar, vdev_id, pause_id,
++							action);
++		}
++		break;
++	case WMI_TLV_TX_PAUSE_ID_AP_PEER_PS:
++	case WMI_TLV_TX_PAUSE_ID_AP_PEER_UAPSD:
++	case WMI_TLV_TX_PAUSE_ID_STA_ADD_BA:
++	case WMI_TLV_TX_PAUSE_ID_HOST:
++		ath10k_dbg(ar, ATH10K_DBG_MAC,
++			   "mac ignoring unsupported tx pause id %d\n",
++			   pause_id);
++		break;
++	default:
++		ath10k_dbg(ar, ATH10K_DBG_MAC,
++			   "mac ignoring unknown tx pause vdev %d\n",
++			   pause_id);
++		break;
+ 	}
+ 
+ 	kfree(tb);
