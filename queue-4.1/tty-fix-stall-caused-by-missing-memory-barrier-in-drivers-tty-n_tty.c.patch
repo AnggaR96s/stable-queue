@@ -1,0 +1,140 @@
+From e81107d4c6bd098878af9796b24edc8d4a9524fd Mon Sep 17 00:00:00 2001
+From: Kosuke Tatsukawa <tatsu@ab.jp.nec.com>
+Date: Fri, 2 Oct 2015 08:27:05 +0000
+Subject: tty: fix stall caused by missing memory barrier in drivers/tty/n_tty.c
+
+From: Kosuke Tatsukawa <tatsu@ab.jp.nec.com>
+
+commit e81107d4c6bd098878af9796b24edc8d4a9524fd upstream.
+
+My colleague ran into a program stall on a x86_64 server, where
+n_tty_read() was waiting for data even if there was data in the buffer
+in the pty.  kernel stack for the stuck process looks like below.
+ #0 [ffff88303d107b58] __schedule at ffffffff815c4b20
+ #1 [ffff88303d107bd0] schedule at ffffffff815c513e
+ #2 [ffff88303d107bf0] schedule_timeout at ffffffff815c7818
+ #3 [ffff88303d107ca0] wait_woken at ffffffff81096bd2
+ #4 [ffff88303d107ce0] n_tty_read at ffffffff8136fa23
+ #5 [ffff88303d107dd0] tty_read at ffffffff81368013
+ #6 [ffff88303d107e20] __vfs_read at ffffffff811a3704
+ #7 [ffff88303d107ec0] vfs_read at ffffffff811a3a57
+ #8 [ffff88303d107f00] sys_read at ffffffff811a4306
+ #9 [ffff88303d107f50] entry_SYSCALL_64_fastpath at ffffffff815c86d7
+
+There seems to be two problems causing this issue.
+
+First, in drivers/tty/n_tty.c, __receive_buf() stores the data and
+updates ldata->commit_head using smp_store_release() and then checks
+the wait queue using waitqueue_active().  However, since there is no
+memory barrier, __receive_buf() could return without calling
+wake_up_interactive_poll(), and at the same time, n_tty_read() could
+start to wait in wait_woken() as in the following chart.
+
+        __receive_buf()                         n_tty_read()
+------------------------------------------------------------------------
+if (waitqueue_active(&tty->read_wait))
+/* Memory operations issued after the
+   RELEASE may be completed before the
+   RELEASE operation has completed */
+                                        add_wait_queue(&tty->read_wait, &wait);
+                                        ...
+                                        if (!input_available_p(tty, 0)) {
+smp_store_release(&ldata->commit_head,
+                  ldata->read_head);
+                                        ...
+                                        timeout = wait_woken(&wait,
+                                          TASK_INTERRUPTIBLE, timeout);
+------------------------------------------------------------------------
+
+The second problem is that n_tty_read() also lacks a memory barrier
+call and could also cause __receive_buf() to return without calling
+wake_up_interactive_poll(), and n_tty_read() to wait in wait_woken()
+as in the chart below.
+
+        __receive_buf()                         n_tty_read()
+------------------------------------------------------------------------
+                                        spin_lock_irqsave(&q->lock, flags);
+                                        /* from add_wait_queue() */
+                                        ...
+                                        if (!input_available_p(tty, 0)) {
+                                        /* Memory operations issued after the
+                                           RELEASE may be completed before the
+                                           RELEASE operation has completed */
+smp_store_release(&ldata->commit_head,
+                  ldata->read_head);
+if (waitqueue_active(&tty->read_wait))
+                                        __add_wait_queue(q, wait);
+                                        spin_unlock_irqrestore(&q->lock,flags);
+                                        /* from add_wait_queue() */
+                                        ...
+                                        timeout = wait_woken(&wait,
+                                          TASK_INTERRUPTIBLE, timeout);
+------------------------------------------------------------------------
+
+There are also other places in drivers/tty/n_tty.c which have similar
+calls to waitqueue_active(), so instead of adding many memory barrier
+calls, this patch simply removes the call to waitqueue_active(),
+leaving just wake_up*() behind.
+
+This fixes both problems because, even though the memory access before
+or after the spinlocks in both wake_up*() and add_wait_queue() can
+sneak into the critical section, it cannot go past it and the critical
+section assures that they will be serialized (please see "INTER-CPU
+ACQUIRING BARRIER EFFECTS" in Documentation/memory-barriers.txt for a
+better explanation).  Moreover, the resulting code is much simpler.
+
+Latency measurement using a ping-pong test over a pty doesn't show any
+visible performance drop.
+
+Signed-off-by: Kosuke Tatsukawa <tatsu@ab.jp.nec.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/tty/n_tty.c |   15 +++++----------
+ 1 file changed, 5 insertions(+), 10 deletions(-)
+
+--- a/drivers/tty/n_tty.c
++++ b/drivers/tty/n_tty.c
+@@ -343,8 +343,7 @@ static void n_tty_packet_mode_flush(stru
+ 		spin_lock_irqsave(&tty->ctrl_lock, flags);
+ 		tty->ctrl_status |= TIOCPKT_FLUSHREAD;
+ 		spin_unlock_irqrestore(&tty->ctrl_lock, flags);
+-		if (waitqueue_active(&tty->link->read_wait))
+-			wake_up_interruptible(&tty->link->read_wait);
++		wake_up_interruptible(&tty->link->read_wait);
+ 	}
+ }
+ 
+@@ -1383,8 +1382,7 @@ handle_newline:
+ 			put_tty_queue(c, ldata);
+ 			smp_store_release(&ldata->canon_head, ldata->read_head);
+ 			kill_fasync(&tty->fasync, SIGIO, POLL_IN);
+-			if (waitqueue_active(&tty->read_wait))
+-				wake_up_interruptible_poll(&tty->read_wait, POLLIN);
++			wake_up_interruptible_poll(&tty->read_wait, POLLIN);
+ 			return 0;
+ 		}
+ 	}
+@@ -1670,8 +1668,7 @@ static void __receive_buf(struct tty_str
+ 
+ 	if ((read_cnt(ldata) >= ldata->minimum_to_wake) || L_EXTPROC(tty)) {
+ 		kill_fasync(&tty->fasync, SIGIO, POLL_IN);
+-		if (waitqueue_active(&tty->read_wait))
+-			wake_up_interruptible_poll(&tty->read_wait, POLLIN);
++		wake_up_interruptible_poll(&tty->read_wait, POLLIN);
+ 	}
+ }
+ 
+@@ -1890,10 +1887,8 @@ static void n_tty_set_termios(struct tty
+ 	}
+ 
+ 	/* The termios change make the tty ready for I/O */
+-	if (waitqueue_active(&tty->write_wait))
+-		wake_up_interruptible(&tty->write_wait);
+-	if (waitqueue_active(&tty->read_wait))
+-		wake_up_interruptible(&tty->read_wait);
++	wake_up_interruptible(&tty->write_wait);
++	wake_up_interruptible(&tty->read_wait);
+ }
+ 
+ /**

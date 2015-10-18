@@ -1,0 +1,290 @@
+From 4bacc9c9234c7c8eec44f5ed4e960d9f96fa0f01 Mon Sep 17 00:00:00 2001
+From: David Howells <dhowells@redhat.com>
+Date: Thu, 18 Jun 2015 14:32:31 +0100
+Subject: overlayfs: Make f_path always point to the overlay and f_inode to the underlay
+
+From: David Howells <dhowells@redhat.com>
+
+commit 4bacc9c9234c7c8eec44f5ed4e960d9f96fa0f01 upstream.
+
+Make file->f_path always point to the overlay dentry so that the path in
+/proc/pid/fd is correct and to ensure that label-based LSMs have access to the
+overlay as well as the underlay (path-based LSMs probably don't need it).
+
+Using my union testsuite to set things up, before the patch I see:
+
+	[root@andromeda union-testsuite]# bash 5</mnt/a/foo107
+	[root@andromeda union-testsuite]# ls -l /proc/$$/fd/
+	...
+	lr-x------. 1 root root 64 Jun  5 14:38 5 -> /a/foo107
+	[root@andromeda union-testsuite]# stat /mnt/a/foo107
+	...
+	Device: 23h/35d Inode: 13381       Links: 1
+	...
+	[root@andromeda union-testsuite]# stat -L /proc/$$/fd/5
+	...
+	Device: 23h/35d Inode: 13381       Links: 1
+	...
+
+After the patch:
+
+	[root@andromeda union-testsuite]# bash 5</mnt/a/foo107
+	[root@andromeda union-testsuite]# ls -l /proc/$$/fd/
+	...
+	lr-x------. 1 root root 64 Jun  5 14:22 5 -> /mnt/a/foo107
+	[root@andromeda union-testsuite]# stat /mnt/a/foo107
+	...
+	Device: 23h/35d Inode: 40346       Links: 1
+	...
+	[root@andromeda union-testsuite]# stat -L /proc/$$/fd/5
+	...
+	Device: 23h/35d Inode: 40346       Links: 1
+	...
+
+Note the change in where /proc/$$/fd/5 points to in the ls command.  It was
+pointing to /a/foo107 (which doesn't exist) and now points to /mnt/a/foo107
+(which is correct).
+
+The inode accessed, however, is the lower layer.  The union layer is on device
+25h/37d and the upper layer on 24h/36d.
+
+Signed-off-by: David Howells <dhowells@redhat.com>
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+Cc: "Kamata, Munehisa" <kamatam@amazon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/dcache.c              |    5 +++-
+ fs/internal.h            |    1 
+ fs/open.c                |   49 ++++++++++++++++++++++++-----------------------
+ fs/overlayfs/inode.c     |   14 +++++--------
+ fs/overlayfs/overlayfs.h |    1 
+ fs/overlayfs/super.c     |    1 
+ include/linux/dcache.h   |    2 +
+ include/linux/fs.h       |    2 -
+ 8 files changed, 41 insertions(+), 34 deletions(-)
+
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@ -1676,7 +1676,8 @@ void d_set_d_op(struct dentry *dentry, c
+ 				DCACHE_OP_COMPARE	|
+ 				DCACHE_OP_REVALIDATE	|
+ 				DCACHE_OP_WEAK_REVALIDATE	|
+-				DCACHE_OP_DELETE ));
++				DCACHE_OP_DELETE	|
++				DCACHE_OP_SELECT_INODE));
+ 	dentry->d_op = op;
+ 	if (!op)
+ 		return;
+@@ -1692,6 +1693,8 @@ void d_set_d_op(struct dentry *dentry, c
+ 		dentry->d_flags |= DCACHE_OP_DELETE;
+ 	if (op->d_prune)
+ 		dentry->d_flags |= DCACHE_OP_PRUNE;
++	if (op->d_select_inode)
++		dentry->d_flags |= DCACHE_OP_SELECT_INODE;
+ 
+ }
+ EXPORT_SYMBOL(d_set_d_op);
+--- a/fs/internal.h
++++ b/fs/internal.h
+@@ -107,6 +107,7 @@ extern struct file *do_file_open_root(st
+ extern long do_handle_open(int mountdirfd,
+ 			   struct file_handle __user *ufh, int open_flag);
+ extern int open_check_o_direct(struct file *f);
++extern int vfs_open(const struct path *, struct file *, const struct cred *);
+ 
+ /*
+  * inode.c
+--- a/fs/open.c
++++ b/fs/open.c
+@@ -678,18 +678,18 @@ int open_check_o_direct(struct file *f)
+ }
+ 
+ static int do_dentry_open(struct file *f,
++			  struct inode *inode,
+ 			  int (*open)(struct inode *, struct file *),
+ 			  const struct cred *cred)
+ {
+ 	static const struct file_operations empty_fops = {};
+-	struct inode *inode;
+ 	int error;
+ 
+ 	f->f_mode = OPEN_FMODE(f->f_flags) | FMODE_LSEEK |
+ 				FMODE_PREAD | FMODE_PWRITE;
+ 
+ 	path_get(&f->f_path);
+-	inode = f->f_inode = f->f_path.dentry->d_inode;
++	f->f_inode = inode;
+ 	f->f_mapping = inode->i_mapping;
+ 
+ 	if (unlikely(f->f_flags & O_PATH)) {
+@@ -793,7 +793,8 @@ int finish_open(struct file *file, struc
+ 	BUG_ON(*opened & FILE_OPENED); /* once it's opened, it's opened */
+ 
+ 	file->f_path.dentry = dentry;
+-	error = do_dentry_open(file, open, current_cred());
++	error = do_dentry_open(file, d_backing_inode(dentry), open,
++			       current_cred());
+ 	if (!error)
+ 		*opened |= FILE_OPENED;
+ 
+@@ -822,6 +823,28 @@ int finish_no_open(struct file *file, st
+ }
+ EXPORT_SYMBOL(finish_no_open);
+ 
++/**
++ * vfs_open - open the file at the given path
++ * @path: path to open
++ * @file: newly allocated file with f_flag initialized
++ * @cred: credentials to use
++ */
++int vfs_open(const struct path *path, struct file *file,
++	     const struct cred *cred)
++{
++	struct dentry *dentry = path->dentry;
++	struct inode *inode = dentry->d_inode;
++
++	file->f_path = *path;
++	if (dentry->d_flags & DCACHE_OP_SELECT_INODE) {
++		inode = dentry->d_op->d_select_inode(dentry, file->f_flags);
++		if (IS_ERR(inode))
++			return PTR_ERR(inode);
++	}
++
++	return do_dentry_open(file, inode, NULL, cred);
++}
++
+ struct file *dentry_open(const struct path *path, int flags,
+ 			 const struct cred *cred)
+ {
+@@ -853,26 +876,6 @@ struct file *dentry_open(const struct pa
+ }
+ EXPORT_SYMBOL(dentry_open);
+ 
+-/**
+- * vfs_open - open the file at the given path
+- * @path: path to open
+- * @filp: newly allocated file with f_flag initialized
+- * @cred: credentials to use
+- */
+-int vfs_open(const struct path *path, struct file *filp,
+-	     const struct cred *cred)
+-{
+-	struct inode *inode = path->dentry->d_inode;
+-
+-	if (inode->i_op->dentry_open)
+-		return inode->i_op->dentry_open(path->dentry, filp, cred);
+-	else {
+-		filp->f_path = *path;
+-		return do_dentry_open(filp, NULL, cred);
+-	}
+-}
+-EXPORT_SYMBOL(vfs_open);
+-
+ static inline int build_open_flags(int flags, umode_t mode, struct open_flags *op)
+ {
+ 	int lookup_flags = 0;
+--- a/fs/overlayfs/inode.c
++++ b/fs/overlayfs/inode.c
+@@ -336,31 +336,30 @@ static bool ovl_open_need_copy_up(int fl
+ 	return true;
+ }
+ 
+-static int ovl_dentry_open(struct dentry *dentry, struct file *file,
+-		    const struct cred *cred)
++struct inode *ovl_d_select_inode(struct dentry *dentry, unsigned file_flags)
+ {
+ 	int err;
+ 	struct path realpath;
+ 	enum ovl_path_type type;
+ 
+ 	type = ovl_path_real(dentry, &realpath);
+-	if (ovl_open_need_copy_up(file->f_flags, type, realpath.dentry)) {
++	if (ovl_open_need_copy_up(file_flags, type, realpath.dentry)) {
+ 		err = ovl_want_write(dentry);
+ 		if (err)
+-			return err;
++			return ERR_PTR(err);
+ 
+-		if (file->f_flags & O_TRUNC)
++		if (file_flags & O_TRUNC)
+ 			err = ovl_copy_up_last(dentry, NULL, true);
+ 		else
+ 			err = ovl_copy_up(dentry);
+ 		ovl_drop_write(dentry);
+ 		if (err)
+-			return err;
++			return ERR_PTR(err);
+ 
+ 		ovl_path_upper(dentry, &realpath);
+ 	}
+ 
+-	return vfs_open(&realpath, file, cred);
++	return d_backing_inode(realpath.dentry);
+ }
+ 
+ static const struct inode_operations ovl_file_inode_operations = {
+@@ -371,7 +370,6 @@ static const struct inode_operations ovl
+ 	.getxattr	= ovl_getxattr,
+ 	.listxattr	= ovl_listxattr,
+ 	.removexattr	= ovl_removexattr,
+-	.dentry_open	= ovl_dentry_open,
+ };
+ 
+ static const struct inode_operations ovl_symlink_inode_operations = {
+--- a/fs/overlayfs/overlayfs.h
++++ b/fs/overlayfs/overlayfs.h
+@@ -173,6 +173,7 @@ ssize_t ovl_getxattr(struct dentry *dent
+ 		     void *value, size_t size);
+ ssize_t ovl_listxattr(struct dentry *dentry, char *list, size_t size);
+ int ovl_removexattr(struct dentry *dentry, const char *name);
++struct inode *ovl_d_select_inode(struct dentry *dentry, unsigned file_flags);
+ 
+ struct inode *ovl_new_inode(struct super_block *sb, umode_t mode,
+ 			    struct ovl_entry *oe);
+--- a/fs/overlayfs/super.c
++++ b/fs/overlayfs/super.c
+@@ -275,6 +275,7 @@ static void ovl_dentry_release(struct de
+ 
+ static const struct dentry_operations ovl_dentry_operations = {
+ 	.d_release = ovl_dentry_release,
++	.d_select_inode = ovl_d_select_inode,
+ };
+ 
+ static struct ovl_entry *ovl_alloc_entry(unsigned int numlower)
+--- a/include/linux/dcache.h
++++ b/include/linux/dcache.h
+@@ -160,6 +160,7 @@ struct dentry_operations {
+ 	char *(*d_dname)(struct dentry *, char *, int);
+ 	struct vfsmount *(*d_automount)(struct path *);
+ 	int (*d_manage)(struct dentry *, bool);
++	struct inode *(*d_select_inode)(struct dentry *, unsigned);
+ } ____cacheline_aligned;
+ 
+ /*
+@@ -225,6 +226,7 @@ struct dentry_operations {
+ 
+ #define DCACHE_MAY_FREE			0x00800000
+ #define DCACHE_FALLTHRU			0x01000000 /* Fall through to lower layer */
++#define DCACHE_OP_SELECT_INODE		0x02000000 /* Unioned entry: dcache op selects inode */
+ 
+ extern seqlock_t rename_lock;
+ 
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -1641,7 +1641,6 @@ struct inode_operations {
+ 	int (*set_acl)(struct inode *, struct posix_acl *, int);
+ 
+ 	/* WARNING: probably going away soon, do not use! */
+-	int (*dentry_open)(struct dentry *, struct file *, const struct cred *);
+ } ____cacheline_aligned;
+ 
+ ssize_t rw_copy_check_uvector(int type, const struct iovec __user * uvector,
+@@ -2193,7 +2192,6 @@ extern struct file *file_open_name(struc
+ extern struct file *filp_open(const char *, int, umode_t);
+ extern struct file *file_open_root(struct dentry *, struct vfsmount *,
+ 				   const char *, int);
+-extern int vfs_open(const struct path *, struct file *, const struct cred *);
+ extern struct file * dentry_open(const struct path *, int, const struct cred *);
+ extern int filp_close(struct file *, fl_owner_t id);
+ 
