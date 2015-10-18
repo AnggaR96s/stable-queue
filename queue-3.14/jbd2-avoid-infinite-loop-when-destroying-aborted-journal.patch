@@ -1,0 +1,174 @@
+From 841df7df196237ea63233f0f9eaa41db53afd70f Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.com>
+Date: Tue, 28 Jul 2015 14:57:14 -0400
+Subject: jbd2: avoid infinite loop when destroying aborted journal
+
+From: Jan Kara <jack@suse.com>
+
+commit 841df7df196237ea63233f0f9eaa41db53afd70f upstream.
+
+Commit 6f6a6fda2945 "jbd2: fix ocfs2 corrupt when updating journal
+superblock fails" changed jbd2_cleanup_journal_tail() to return EIO
+when the journal is aborted. That makes logic in
+jbd2_log_do_checkpoint() bail out which is fine, except that
+jbd2_journal_destroy() expects jbd2_log_do_checkpoint() to always make
+a progress in cleaning the journal. Without it jbd2_journal_destroy()
+just loops in an infinite loop.
+
+Fix jbd2_journal_destroy() to cleanup journal checkpoint lists of
+jbd2_log_do_checkpoint() fails with error.
+
+Reported-by: Eryu Guan <guaneryu@gmail.com>
+Tested-by: Eryu Guan <guaneryu@gmail.com>
+Fixes: 6f6a6fda294506dfe0e3e0a253bb2d2923f28f0a
+Signed-off-by: Jan Kara <jack@suse.com>
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/jbd2/checkpoint.c |   39 +++++++++++++++++++++++++++++++++------
+ fs/jbd2/commit.c     |    2 +-
+ fs/jbd2/journal.c    |   11 ++++++++++-
+ include/linux/jbd2.h |    3 ++-
+ 4 files changed, 46 insertions(+), 9 deletions(-)
+
+--- a/fs/jbd2/checkpoint.c
++++ b/fs/jbd2/checkpoint.c
+@@ -475,14 +475,15 @@ int jbd2_cleanup_journal_tail(journal_t
+  * journal_clean_one_cp_list
+  *
+  * Find all the written-back checkpoint buffers in the given list and
+- * release them.
++ * release them. If 'destroy' is set, clean all buffers unconditionally.
+  *
+  * Called with the journal locked.
+  * Called with j_list_lock held.
+  * Returns number of buffers reaped (for debug)
+  */
+ 
+-static int journal_clean_one_cp_list(struct journal_head *jh, int *released)
++static int journal_clean_one_cp_list(struct journal_head *jh, bool destroy,
++				     int *released)
+ {
+ 	struct journal_head *last_jh;
+ 	struct journal_head *next_jh = jh;
+@@ -496,7 +497,10 @@ static int journal_clean_one_cp_list(str
+ 	do {
+ 		jh = next_jh;
+ 		next_jh = jh->b_cpnext;
+-		ret = __try_to_free_cp_buf(jh);
++		if (!destroy)
++			ret = __try_to_free_cp_buf(jh);
++		else
++			ret = __jbd2_journal_remove_checkpoint(jh) + 1;
+ 		if (ret) {
+ 			freed++;
+ 			if (ret == 2) {
+@@ -521,13 +525,14 @@ static int journal_clean_one_cp_list(str
+  * journal_clean_checkpoint_list
+  *
+  * Find all the written-back checkpoint buffers in the journal and release them.
++ * If 'destroy' is set, release all buffers unconditionally.
+  *
+  * Called with the journal locked.
+  * Called with j_list_lock held.
+  * Returns number of buffers reaped (for debug)
+  */
+ 
+-int __jbd2_journal_clean_checkpoint_list(journal_t *journal)
++int __jbd2_journal_clean_checkpoint_list(journal_t *journal, bool destroy)
+ {
+ 	transaction_t *transaction, *last_transaction, *next_transaction;
+ 	int ret = 0;
+@@ -543,7 +548,7 @@ int __jbd2_journal_clean_checkpoint_list
+ 		transaction = next_transaction;
+ 		next_transaction = transaction->t_cpnext;
+ 		ret += journal_clean_one_cp_list(transaction->
+-				t_checkpoint_list, &released);
++				t_checkpoint_list, destroy, &released);
+ 		/*
+ 		 * This function only frees up some memory if possible so we
+ 		 * dont have an obligation to finish processing. Bail out if
+@@ -559,7 +564,7 @@ int __jbd2_journal_clean_checkpoint_list
+ 		 * we can possibly see not yet submitted buffers on io_list
+ 		 */
+ 		ret += journal_clean_one_cp_list(transaction->
+-				t_checkpoint_io_list, &released);
++				t_checkpoint_io_list, destroy, &released);
+ 		if (need_resched())
+ 			goto out;
+ 	} while (transaction != last_transaction);
+@@ -568,6 +573,28 @@ out:
+ }
+ 
+ /*
++ * Remove buffers from all checkpoint lists as journal is aborted and we just
++ * need to free memory
++ */
++void jbd2_journal_destroy_checkpoint(journal_t *journal)
++{
++	/*
++	 * We loop because __jbd2_journal_clean_checkpoint_list() may abort
++	 * early due to a need of rescheduling.
++	 */
++	while (1) {
++		spin_lock(&journal->j_list_lock);
++		if (!journal->j_checkpoint_transactions) {
++			spin_unlock(&journal->j_list_lock);
++			break;
++		}
++		__jbd2_journal_clean_checkpoint_list(journal, true);
++		spin_unlock(&journal->j_list_lock);
++		cond_resched();
++	}
++}
++
++/*
+  * journal_remove_checkpoint: called after a buffer has been committed
+  * to disk (either by being write-back flushed to disk, or being
+  * committed to the log).
+--- a/fs/jbd2/commit.c
++++ b/fs/jbd2/commit.c
+@@ -510,7 +510,7 @@ void jbd2_journal_commit_transaction(jou
+ 	 * frees some memory
+ 	 */
+ 	spin_lock(&journal->j_list_lock);
+-	__jbd2_journal_clean_checkpoint_list(journal);
++	__jbd2_journal_clean_checkpoint_list(journal, false);
+ 	spin_unlock(&journal->j_list_lock);
+ 
+ 	jbd_debug(3, "JBD2: commit phase 1\n");
+--- a/fs/jbd2/journal.c
++++ b/fs/jbd2/journal.c
+@@ -1708,8 +1708,17 @@ int jbd2_journal_destroy(journal_t *jour
+ 	while (journal->j_checkpoint_transactions != NULL) {
+ 		spin_unlock(&journal->j_list_lock);
+ 		mutex_lock(&journal->j_checkpoint_mutex);
+-		jbd2_log_do_checkpoint(journal);
++		err = jbd2_log_do_checkpoint(journal);
+ 		mutex_unlock(&journal->j_checkpoint_mutex);
++		/*
++		 * If checkpointing failed, just free the buffers to avoid
++		 * looping forever
++		 */
++		if (err) {
++			jbd2_journal_destroy_checkpoint(journal);
++			spin_lock(&journal->j_list_lock);
++			break;
++		}
+ 		spin_lock(&journal->j_list_lock);
+ 	}
+ 
+--- a/include/linux/jbd2.h
++++ b/include/linux/jbd2.h
+@@ -1042,8 +1042,9 @@ void jbd2_update_log_tail(journal_t *jou
+ extern void jbd2_journal_commit_transaction(journal_t *);
+ 
+ /* Checkpoint list management */
+-int __jbd2_journal_clean_checkpoint_list(journal_t *journal);
++int __jbd2_journal_clean_checkpoint_list(journal_t *journal, bool destroy);
+ int __jbd2_journal_remove_checkpoint(struct journal_head *);
++void jbd2_journal_destroy_checkpoint(journal_t *journal);
+ void __jbd2_journal_insert_checkpoint(struct journal_head *, transaction_t *);
+ 
+ 
