@@ -1,0 +1,149 @@
+From 6d69bb536bac0d403d83db1ca841444981b280cd Mon Sep 17 00:00:00 2001
+From: Ilya Dryomov <idryomov@gmail.com>
+Date: Sun, 11 Oct 2015 19:38:00 +0200
+Subject: rbd: prevent kernel stack blow up on rbd map
+
+From: Ilya Dryomov <idryomov@gmail.com>
+
+commit 6d69bb536bac0d403d83db1ca841444981b280cd upstream.
+
+Mapping an image with a long parent chain (e.g. image foo, whose parent
+is bar, whose parent is baz, etc) currently leads to a kernel stack
+overflow, due to the following recursion in the reply path:
+
+  rbd_osd_req_callback()
+    rbd_obj_request_complete()
+      rbd_img_obj_callback()
+        rbd_img_parent_read_callback()
+          rbd_obj_request_complete()
+            ...
+
+Limit the parent chain to 16 images, which is ~5K worth of stack.  When
+the above recursion is eliminated, this limit can be lifted.
+
+Fixes: http://tracker.ceph.com/issues/12538
+
+Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+Reviewed-by: Josh Durgin <jdurgin@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/block/rbd.c |   33 +++++++++++++++++++++++----------
+ 1 file changed, 23 insertions(+), 10 deletions(-)
+
+--- a/drivers/block/rbd.c
++++ b/drivers/block/rbd.c
+@@ -96,6 +96,8 @@ static int atomic_dec_return_safe(atomic
+ #define RBD_MINORS_PER_MAJOR		256
+ #define RBD_SINGLE_MAJOR_PART_SHIFT	4
+ 
++#define RBD_MAX_PARENT_CHAIN_LEN	16
++
+ #define RBD_SNAP_DEV_NAME_PREFIX	"snap_"
+ #define RBD_MAX_SNAP_NAME_LEN	\
+ 			(NAME_MAX - (sizeof (RBD_SNAP_DEV_NAME_PREFIX) - 1))
+@@ -426,7 +428,7 @@ static ssize_t rbd_add_single_major(stru
+ 				    size_t count);
+ static ssize_t rbd_remove_single_major(struct bus_type *bus, const char *buf,
+ 				       size_t count);
+-static int rbd_dev_image_probe(struct rbd_device *rbd_dev, bool mapping);
++static int rbd_dev_image_probe(struct rbd_device *rbd_dev, int depth);
+ static void rbd_spec_put(struct rbd_spec *spec);
+ 
+ static int rbd_dev_id_to_minor(int dev_id)
+@@ -5172,7 +5174,12 @@ out_err:
+ 	return ret;
+ }
+ 
+-static int rbd_dev_probe_parent(struct rbd_device *rbd_dev)
++/*
++ * @depth is rbd_dev_image_probe() -> rbd_dev_probe_parent() ->
++ * rbd_dev_image_probe() recursion depth, which means it's also the
++ * length of the already discovered part of the parent chain.
++ */
++static int rbd_dev_probe_parent(struct rbd_device *rbd_dev, int depth)
+ {
+ 	struct rbd_device *parent = NULL;
+ 	int ret;
+@@ -5180,6 +5187,12 @@ static int rbd_dev_probe_parent(struct r
+ 	if (!rbd_dev->parent_spec)
+ 		return 0;
+ 
++	if (++depth > RBD_MAX_PARENT_CHAIN_LEN) {
++		pr_info("parent chain is too long (%d)\n", depth);
++		ret = -EINVAL;
++		goto out_err;
++	}
++
+ 	parent = rbd_dev_create(rbd_dev->rbd_client, rbd_dev->parent_spec,
+ 				NULL);
+ 	if (!parent) {
+@@ -5194,7 +5207,7 @@ static int rbd_dev_probe_parent(struct r
+ 	__rbd_get_client(rbd_dev->rbd_client);
+ 	rbd_spec_get(rbd_dev->parent_spec);
+ 
+-	ret = rbd_dev_image_probe(parent, false);
++	ret = rbd_dev_image_probe(parent, depth);
+ 	if (ret < 0)
+ 		goto out_err;
+ 
+@@ -5323,7 +5336,7 @@ static void rbd_dev_image_release(struct
+  * parent), initiate a watch on its header object before using that
+  * object to get detailed information about the rbd image.
+  */
+-static int rbd_dev_image_probe(struct rbd_device *rbd_dev, bool mapping)
++static int rbd_dev_image_probe(struct rbd_device *rbd_dev, int depth)
+ {
+ 	int ret;
+ 
+@@ -5341,7 +5354,7 @@ static int rbd_dev_image_probe(struct rb
+ 	if (ret)
+ 		goto err_out_format;
+ 
+-	if (mapping) {
++	if (!depth) {
+ 		ret = rbd_dev_header_watch_sync(rbd_dev);
+ 		if (ret) {
+ 			if (ret == -ENOENT)
+@@ -5362,7 +5375,7 @@ static int rbd_dev_image_probe(struct rb
+ 	 * Otherwise this is a parent image, identified by pool, image
+ 	 * and snap ids - need to fill in names for those ids.
+ 	 */
+-	if (mapping)
++	if (!depth)
+ 		ret = rbd_spec_fill_snap_id(rbd_dev);
+ 	else
+ 		ret = rbd_spec_fill_names(rbd_dev);
+@@ -5384,12 +5397,12 @@ static int rbd_dev_image_probe(struct rb
+ 		 * Need to warn users if this image is the one being
+ 		 * mapped and has a parent.
+ 		 */
+-		if (mapping && rbd_dev->parent_spec)
++		if (!depth && rbd_dev->parent_spec)
+ 			rbd_warn(rbd_dev,
+ 				 "WARNING: kernel layering is EXPERIMENTAL!");
+ 	}
+ 
+-	ret = rbd_dev_probe_parent(rbd_dev);
++	ret = rbd_dev_probe_parent(rbd_dev, depth);
+ 	if (ret)
+ 		goto err_out_probe;
+ 
+@@ -5400,7 +5413,7 @@ static int rbd_dev_image_probe(struct rb
+ err_out_probe:
+ 	rbd_dev_unprobe(rbd_dev);
+ err_out_watch:
+-	if (mapping)
++	if (!depth)
+ 		rbd_dev_header_unwatch_sync(rbd_dev);
+ out_header_name:
+ 	kfree(rbd_dev->header_name);
+@@ -5463,7 +5476,7 @@ static ssize_t do_rbd_add(struct bus_typ
+ 	spec = NULL;		/* rbd_dev now owns this */
+ 	rbd_opts = NULL;	/* rbd_dev now owns this */
+ 
+-	rc = rbd_dev_image_probe(rbd_dev, true);
++	rc = rbd_dev_image_probe(rbd_dev, 0);
+ 	if (rc < 0)
+ 		goto err_out_rbd_dev;
+ 
