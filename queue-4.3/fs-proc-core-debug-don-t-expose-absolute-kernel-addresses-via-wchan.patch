@@ -1,0 +1,170 @@
+From b2f73922d119686323f14fbbe46587f863852328 Mon Sep 17 00:00:00 2001
+From: Ingo Molnar <mingo@kernel.org>
+Date: Wed, 30 Sep 2015 15:59:17 +0200
+Subject: fs/proc, core/debug: Don't expose absolute kernel addresses via wchan
+
+From: Ingo Molnar <mingo@kernel.org>
+
+commit b2f73922d119686323f14fbbe46587f863852328 upstream.
+
+So the /proc/PID/stat 'wchan' field (the 30th field, which contains
+the absolute kernel address of the kernel function a task is blocked in)
+leaks absolute kernel addresses to unprivileged user-space:
+
+        seq_put_decimal_ull(m, ' ', wchan);
+
+The absolute address might also leak via /proc/PID/wchan as well, if
+KALLSYMS is turned off or if the symbol lookup fails for some reason:
+
+static int proc_pid_wchan(struct seq_file *m, struct pid_namespace *ns,
+                          struct pid *pid, struct task_struct *task)
+{
+        unsigned long wchan;
+        char symname[KSYM_NAME_LEN];
+
+        wchan = get_wchan(task);
+
+        if (lookup_symbol_name(wchan, symname) < 0) {
+                if (!ptrace_may_access(task, PTRACE_MODE_READ))
+                        return 0;
+                seq_printf(m, "%lu", wchan);
+        } else {
+                seq_printf(m, "%s", symname);
+        }
+
+        return 0;
+}
+
+This isn't ideal, because for example it trivially leaks the KASLR offset
+to any local attacker:
+
+  fomalhaut:~> printf "%016lx\n" $(cat /proc/$$/stat | cut -d' ' -f35)
+  ffffffff8123b380
+
+Most real-life uses of wchan are symbolic:
+
+  ps -eo pid:10,tid:10,wchan:30,comm
+
+and procps uses /proc/PID/wchan, not the absolute address in /proc/PID/stat:
+
+  triton:~/tip> strace -f ps -eo pid:10,tid:10,wchan:30,comm 2>&1 | grep wchan | tail -1
+  open("/proc/30833/wchan", O_RDONLY)     = 6
+
+There's one compatibility quirk here: procps relies on whether the
+absolute value is non-zero - and we can provide that functionality
+by outputing "0" or "1" depending on whether the task is blocked
+(whether there's a wchan address).
+
+These days there appears to be very little legitimate reason
+user-space would be interested in  the absolute address. The
+absolute address is mostly historic: from the days when we
+didn't have kallsyms and user-space procps had to do the
+decoding itself via the System.map.
+
+So this patch sets all numeric output to "0" or "1" and keeps only
+symbolic output, in /proc/PID/wchan.
+
+( The absolute sleep address can generally still be profiled via
+  perf, by tasks with sufficient privileges. )
+
+Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+Acked-by: Kees Cook <keescook@chromium.org>
+Acked-by: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Alexander Potapenko <glider@google.com>
+Cc: Andrey Konovalov <andreyknvl@google.com>
+Cc: Andrey Ryabinin <ryabinin.a.a@gmail.com>
+Cc: Andy Lutomirski <luto@amacapital.net>
+Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Borislav Petkov <bp@alien8.de>
+Cc: Denys Vlasenko <dvlasenk@redhat.com>
+Cc: Dmitry Vyukov <dvyukov@google.com>
+Cc: Kostya Serebryany <kcc@google.com>
+Cc: Mike Galbraith <efault@gmx.de>
+Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Sasha Levin <sasha.levin@oracle.com>
+Cc: kasan-dev <kasan-dev@googlegroups.com>
+Cc: linux-kernel@vger.kernel.org
+Link: http://lkml.kernel.org/r/20150930135917.GA3285@gmail.com
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ Documentation/filesystems/proc.txt |    5 +++--
+ fs/proc/array.c                    |   16 ++++++++++++++--
+ fs/proc/base.c                     |    9 +++------
+ 3 files changed, 20 insertions(+), 10 deletions(-)
+
+--- a/Documentation/filesystems/proc.txt
++++ b/Documentation/filesystems/proc.txt
+@@ -140,7 +140,8 @@ Table 1-1: Process specific entries in /
+  stat		Process status
+  statm		Process memory status information
+  status		Process status in human readable form
+- wchan		If CONFIG_KALLSYMS is set, a pre-decoded wchan
++ wchan		Present with CONFIG_KALLSYMS=y: it shows the kernel function
++		symbol the task is blocked in - or "0" if not blocked.
+  pagemap	Page table
+  stack		Report full stack trace, enable via CONFIG_STACKTRACE
+  smaps		a extension based on maps, showing the memory consumption of
+@@ -310,7 +311,7 @@ Table 1-4: Contents of the stat files (a
+   blocked       bitmap of blocked signals
+   sigign        bitmap of ignored signals
+   sigcatch      bitmap of caught signals
+-  wchan         address where process went to sleep
++  0		(place holder, used to be the wchan address, use /proc/PID/wchan instead)
+   0             (place holder)
+   0             (place holder)
+   exit_signal   signal to send to parent thread on exit
+--- a/fs/proc/array.c
++++ b/fs/proc/array.c
+@@ -375,7 +375,7 @@ int proc_pid_status(struct seq_file *m,
+ static int do_task_stat(struct seq_file *m, struct pid_namespace *ns,
+ 			struct pid *pid, struct task_struct *task, int whole)
+ {
+-	unsigned long vsize, eip, esp, wchan = ~0UL;
++	unsigned long vsize, eip, esp, wchan = 0;
+ 	int priority, nice;
+ 	int tty_pgrp = -1, tty_nr = 0;
+ 	sigset_t sigign, sigcatch;
+@@ -507,7 +507,19 @@ static int do_task_stat(struct seq_file
+ 	seq_put_decimal_ull(m, ' ', task->blocked.sig[0] & 0x7fffffffUL);
+ 	seq_put_decimal_ull(m, ' ', sigign.sig[0] & 0x7fffffffUL);
+ 	seq_put_decimal_ull(m, ' ', sigcatch.sig[0] & 0x7fffffffUL);
+-	seq_put_decimal_ull(m, ' ', wchan);
++
++	/*
++	 * We used to output the absolute kernel address, but that's an
++	 * information leak - so instead we show a 0/1 flag here, to signal
++	 * to user-space whether there's a wchan field in /proc/PID/wchan.
++	 *
++	 * This works with older implementations of procps as well.
++	 */
++	if (wchan)
++		seq_puts(m, " 1");
++	else
++		seq_puts(m, " 0");
++
+ 	seq_put_decimal_ull(m, ' ', 0);
+ 	seq_put_decimal_ull(m, ' ', 0);
+ 	seq_put_decimal_ll(m, ' ', task->exit_signal);
+--- a/fs/proc/base.c
++++ b/fs/proc/base.c
+@@ -430,13 +430,10 @@ static int proc_pid_wchan(struct seq_fil
+ 
+ 	wchan = get_wchan(task);
+ 
+-	if (lookup_symbol_name(wchan, symname) < 0) {
+-		if (!ptrace_may_access(task, PTRACE_MODE_READ))
+-			return 0;
+-		seq_printf(m, "%lu", wchan);
+-	} else {
++	if (wchan && ptrace_may_access(task, PTRACE_MODE_READ) && !lookup_symbol_name(wchan, symname))
+ 		seq_printf(m, "%s", symname);
+-	}
++	else
++		seq_putc(m, '0');
+ 
+ 	return 0;
+ }
