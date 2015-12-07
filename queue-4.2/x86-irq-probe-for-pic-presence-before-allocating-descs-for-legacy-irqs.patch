@@ -1,0 +1,144 @@
+From 8c058b0b9c34d8c8d7912880956543769323e2d8 Mon Sep 17 00:00:00 2001
+From: Vitaly Kuznetsov <vkuznets@redhat.com>
+Date: Tue, 3 Nov 2015 10:40:14 +0100
+Subject: x86/irq: Probe for PIC presence before allocating descs for legacy IRQs
+
+From: Vitaly Kuznetsov <vkuznets@redhat.com>
+
+commit 8c058b0b9c34d8c8d7912880956543769323e2d8 upstream.
+
+Commit d32932d02e18 ("x86/irq: Convert IOAPIC to use hierarchical irqdomain
+interfaces") brought a regression for Hyper-V Gen2 instances. These
+instances don't have i8259 legacy PIC but they use legacy IRQs for serial
+port, rtc, and acpi. With this commit included we end up with these IRQs
+not initialized. Earlier, there was a special workaround for legacy IRQs
+in mp_map_pin_to_irq() doing mp_irqdomain_map() without looking at
+nr_legacy_irqs() and now we fail in __irq_domain_alloc_irqs() when
+irq_domain_alloc_descs() returns -EEXIST.
+
+The essence of the issue seems to be that early_irq_init() calls
+arch_probe_nr_irqs() to figure out the number of legacy IRQs before
+we probe for i8259 and gets 16. Later when init_8259A() is called we switch
+to NULL legacy PIC and nr_legacy_irqs() starts to return 0 but we already
+have 16 descs allocated.
+
+Solve the issue by separating i8259 probe from init and calling it in
+arch_probe_nr_irqs() before we actually use nr_legacy_irqs() information.
+
+Fixes: d32932d02e18 ("x86/irq: Convert IOAPIC to use hierarchical irqdomain interfaces")
+Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+Cc: Jiang Liu <jiang.liu@linux.intel.com>
+Cc: K. Y. Srinivasan <kys@microsoft.com>
+Link: http://lkml.kernel.org/r/1446543614-3621-1-git-send-email-vkuznets@redhat.com
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ arch/x86/include/asm/i8259.h  |    1 +
+ arch/x86/kernel/apic/vector.c |    6 +++++-
+ arch/x86/kernel/i8259.c       |   29 +++++++++++++++++++++--------
+ 3 files changed, 27 insertions(+), 9 deletions(-)
+
+--- a/arch/x86/include/asm/i8259.h
++++ b/arch/x86/include/asm/i8259.h
+@@ -60,6 +60,7 @@ struct legacy_pic {
+ 	void (*mask_all)(void);
+ 	void (*restore_mask)(void);
+ 	void (*init)(int auto_eoi);
++	int (*probe)(void);
+ 	int (*irq_pending)(unsigned int irq);
+ 	void (*make_irq)(unsigned int irq);
+ };
+--- a/arch/x86/kernel/apic/vector.c
++++ b/arch/x86/kernel/apic/vector.c
+@@ -360,7 +360,11 @@ int __init arch_probe_nr_irqs(void)
+ 	if (nr < nr_irqs)
+ 		nr_irqs = nr;
+ 
+-	return nr_legacy_irqs();
++	/*
++	 * We don't know if PIC is present at this point so we need to do
++	 * probe() to get the right number of legacy IRQs.
++	 */
++	return legacy_pic->probe();
+ }
+ 
+ #ifdef	CONFIG_X86_IO_APIC
+--- a/arch/x86/kernel/i8259.c
++++ b/arch/x86/kernel/i8259.c
+@@ -295,16 +295,11 @@ static void unmask_8259A(void)
+ 	raw_spin_unlock_irqrestore(&i8259A_lock, flags);
+ }
+ 
+-static void init_8259A(int auto_eoi)
++static int probe_8259A(void)
+ {
+ 	unsigned long flags;
+ 	unsigned char probe_val = ~(1 << PIC_CASCADE_IR);
+ 	unsigned char new_val;
+-
+-	i8259A_auto_eoi = auto_eoi;
+-
+-	raw_spin_lock_irqsave(&i8259A_lock, flags);
+-
+ 	/*
+ 	 * Check to see if we have a PIC.
+ 	 * Mask all except the cascade and read
+@@ -312,16 +307,28 @@ static void init_8259A(int auto_eoi)
+ 	 * have a PIC, we will read 0xff as opposed to the
+ 	 * value we wrote.
+ 	 */
++	raw_spin_lock_irqsave(&i8259A_lock, flags);
++
+ 	outb(0xff, PIC_SLAVE_IMR);	/* mask all of 8259A-2 */
+ 	outb(probe_val, PIC_MASTER_IMR);
+ 	new_val = inb(PIC_MASTER_IMR);
+ 	if (new_val != probe_val) {
+ 		printk(KERN_INFO "Using NULL legacy PIC\n");
+ 		legacy_pic = &null_legacy_pic;
+-		raw_spin_unlock_irqrestore(&i8259A_lock, flags);
+-		return;
+ 	}
+ 
++	raw_spin_unlock_irqrestore(&i8259A_lock, flags);
++	return nr_legacy_irqs();
++}
++
++static void init_8259A(int auto_eoi)
++{
++	unsigned long flags;
++
++	i8259A_auto_eoi = auto_eoi;
++
++	raw_spin_lock_irqsave(&i8259A_lock, flags);
++
+ 	outb(0xff, PIC_MASTER_IMR);	/* mask all of 8259A-1 */
+ 
+ 	/*
+@@ -379,6 +386,10 @@ static int legacy_pic_irq_pending_noop(u
+ {
+ 	return 0;
+ }
++static int legacy_pic_probe(void)
++{
++	return 0;
++}
+ 
+ struct legacy_pic null_legacy_pic = {
+ 	.nr_legacy_irqs = 0,
+@@ -388,6 +399,7 @@ struct legacy_pic null_legacy_pic = {
+ 	.mask_all = legacy_pic_noop,
+ 	.restore_mask = legacy_pic_noop,
+ 	.init = legacy_pic_int_noop,
++	.probe = legacy_pic_probe,
+ 	.irq_pending = legacy_pic_irq_pending_noop,
+ 	.make_irq = legacy_pic_uint_noop,
+ };
+@@ -400,6 +412,7 @@ struct legacy_pic default_legacy_pic = {
+ 	.mask_all = mask_8259A,
+ 	.restore_mask = unmask_8259A,
+ 	.init = init_8259A,
++	.probe = probe_8259A,
+ 	.irq_pending = i8259A_irq_pending,
+ 	.make_irq = make_8259A_irq,
+ };
