@@ -1,0 +1,81 @@
+From foo@baz Fri Dec 11 11:38:06 EST 2015
+From: Eric Dumazet <edumazet@google.com>
+Date: Wed, 18 Nov 2015 21:03:33 -0800
+Subject: tcp: fix potential huge kmalloc() calls in TCP_REPAIR
+
+From: Eric Dumazet <edumazet@google.com>
+
+[ Upstream commit 5d4c9bfbabdb1d497f21afd81501e5c54b0c85d9 ]
+
+tcp_send_rcvq() is used for re-injecting data into tcp receive queue.
+
+Problems :
+
+- No check against size is performed, allowed user to fool kernel in
+  attempting very large memory allocations, eventually triggering
+  OOM when memory is fragmented.
+
+- In case of fault during the copy we do not return correct errno.
+
+Lets use alloc_skb_with_frags() to cook optimal skbs.
+
+Fixes: 292e8d8c8538 ("tcp: Move rcvq sending to tcp_input.c")
+Fixes: c0e88ff0f256 ("tcp: Repair socket queues")
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Cc: Pavel Emelyanov <xemul@parallels.com>
+Acked-by: Pavel Emelyanov <xemul@parallels.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/ipv4/tcp_input.c |   22 +++++++++++++++++++---
+ 1 file changed, 19 insertions(+), 3 deletions(-)
+
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -4457,19 +4457,34 @@ static int __must_check tcp_queue_rcv(st
+ int tcp_send_rcvq(struct sock *sk, struct msghdr *msg, size_t size)
+ {
+ 	struct sk_buff *skb;
++	int err = -ENOMEM;
++	int data_len = 0;
+ 	bool fragstolen;
+ 
+ 	if (size == 0)
+ 		return 0;
+ 
+-	skb = alloc_skb(size, sk->sk_allocation);
++	if (size > PAGE_SIZE) {
++		int npages = min_t(size_t, size >> PAGE_SHIFT, MAX_SKB_FRAGS);
++
++		data_len = npages << PAGE_SHIFT;
++		size = data_len + (size & ~PAGE_MASK);
++	}
++	skb = alloc_skb_with_frags(size - data_len, data_len,
++				   PAGE_ALLOC_COSTLY_ORDER,
++				   &err, sk->sk_allocation);
+ 	if (!skb)
+ 		goto err;
+ 
++	skb_put(skb, size - data_len);
++	skb->data_len = data_len;
++	skb->len = size;
++
+ 	if (tcp_try_rmem_schedule(sk, skb, skb->truesize))
+ 		goto err_free;
+ 
+-	if (memcpy_from_msg(skb_put(skb, size), msg, size))
++	err = skb_copy_datagram_from_iter(skb, 0, &msg->msg_iter, size);
++	if (err)
+ 		goto err_free;
+ 
+ 	TCP_SKB_CB(skb)->seq = tcp_sk(sk)->rcv_nxt;
+@@ -4485,7 +4500,8 @@ int tcp_send_rcvq(struct sock *sk, struc
+ err_free:
+ 	kfree_skb(skb);
+ err:
+-	return -ENOMEM;
++	return err;
++
+ }
+ 
+ static void tcp_data_queue(struct sock *sk, struct sk_buff *skb)

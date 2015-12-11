@@ -1,0 +1,215 @@
+From foo@baz Fri Dec 11 11:38:06 EST 2015
+From: Eric Dumazet <edumazet@google.com>
+Date: Tue, 1 Dec 2015 20:08:51 -0800
+Subject: net_sched: fix qdisc_tree_decrease_qlen() races
+
+From: Eric Dumazet <edumazet@google.com>
+
+[ Upstream commit 4eaf3b84f2881c9c028f1d5e76c52ab575fe3a66 ]
+
+qdisc_tree_decrease_qlen() suffers from two problems on multiqueue
+devices.
+
+One problem is that it updates sch->q.qlen and sch->qstats.drops
+on the mq/mqprio root qdisc, while it should not : Daniele
+reported underflows errors :
+[  681.774821] PAX: sch->q.qlen: 0 n: 1
+[  681.774825] PAX: size overflow detected in function qdisc_tree_decrease_qlen net/sched/sch_api.c:769 cicus.693_49 min, count: 72, decl: qlen; num: 0; context: sk_buff_head;
+[  681.774954] CPU: 2 PID: 19 Comm: ksoftirqd/2 Tainted: G           O    4.2.6.201511282239-1-grsec #1
+[  681.774955] Hardware name: ASUSTeK COMPUTER INC. X302LJ/X302LJ, BIOS X302LJ.202 03/05/2015
+[  681.774956]  ffffffffa9a04863 0000000000000000 0000000000000000 ffffffffa990ff7c
+[  681.774959]  ffffc90000d3bc38 ffffffffa95d2810 0000000000000007 ffffffffa991002b
+[  681.774960]  ffffc90000d3bc68 ffffffffa91a44f4 0000000000000001 0000000000000001
+[  681.774962] Call Trace:
+[  681.774967]  [<ffffffffa95d2810>] dump_stack+0x4c/0x7f
+[  681.774970]  [<ffffffffa91a44f4>] report_size_overflow+0x34/0x50
+[  681.774972]  [<ffffffffa94d17e2>] qdisc_tree_decrease_qlen+0x152/0x160
+[  681.774976]  [<ffffffffc02694b1>] fq_codel_dequeue+0x7b1/0x820 [sch_fq_codel]
+[  681.774978]  [<ffffffffc02680a0>] ? qdisc_peek_dequeued+0xa0/0xa0 [sch_fq_codel]
+[  681.774980]  [<ffffffffa94cd92d>] __qdisc_run+0x4d/0x1d0
+[  681.774983]  [<ffffffffa949b2b2>] net_tx_action+0xc2/0x160
+[  681.774985]  [<ffffffffa90664c1>] __do_softirq+0xf1/0x200
+[  681.774987]  [<ffffffffa90665ee>] run_ksoftirqd+0x1e/0x30
+[  681.774989]  [<ffffffffa90896b0>] smpboot_thread_fn+0x150/0x260
+[  681.774991]  [<ffffffffa9089560>] ? sort_range+0x40/0x40
+[  681.774992]  [<ffffffffa9085fe4>] kthread+0xe4/0x100
+[  681.774994]  [<ffffffffa9085f00>] ? kthread_worker_fn+0x170/0x170
+[  681.774995]  [<ffffffffa95d8d1e>] ret_from_fork+0x3e/0x70
+
+mq/mqprio have their own ways to report qlen/drops by folding stats on
+all their queues, with appropriate locking.
+
+A second problem is that qdisc_tree_decrease_qlen() calls qdisc_lookup()
+without proper locking : concurrent qdisc updates could corrupt the list
+that qdisc_match_from_root() parses to find a qdisc given its handle.
+
+Fix first problem adding a TCQ_F_NOPARENT qdisc flag that
+qdisc_tree_decrease_qlen() can use to abort its tree traversal,
+as soon as it meets a mq/mqprio qdisc children.
+
+Second problem can be fixed by RCU protection.
+Qdisc are already freed after RCU grace period, so qdisc_list_add() and
+qdisc_list_del() simply have to use appropriate rcu list variants.
+
+A future patch will add a per struct netdev_queue list anchor, so that
+qdisc_tree_decrease_qlen() can have more efficient lookups.
+
+Reported-by: Daniele Fucini <dfucini@gmail.com>
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Cc: Cong Wang <cwang@twopensource.com>
+Cc: Jamal Hadi Salim <jhs@mojatatu.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/net/sch_generic.h |    3 +++
+ net/sched/sch_api.c       |   27 ++++++++++++++++++---------
+ net/sched/sch_generic.c   |    2 +-
+ net/sched/sch_mq.c        |    4 ++--
+ net/sched/sch_mqprio.c    |    4 ++--
+ 5 files changed, 26 insertions(+), 14 deletions(-)
+
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@ -61,6 +61,9 @@ struct Qdisc {
+ 				      */
+ #define TCQ_F_WARN_NONWC	(1 << 16)
+ #define TCQ_F_CPUSTATS		0x20 /* run using percpu statistics */
++#define TCQ_F_NOPARENT		0x40 /* root of its hierarchy :
++				      * qdisc_tree_decrease_qlen() should stop.
++				      */
+ 	u32			limit;
+ 	const struct Qdisc_ops	*ops;
+ 	struct qdisc_size_table	__rcu *stab;
+--- a/net/sched/sch_api.c
++++ b/net/sched/sch_api.c
+@@ -253,7 +253,8 @@ int qdisc_set_default(const char *name)
+ }
+ 
+ /* We know handle. Find qdisc among all qdisc's attached to device
+-   (root qdisc, all its children, children of children etc.)
++ * (root qdisc, all its children, children of children etc.)
++ * Note: caller either uses rtnl or rcu_read_lock()
+  */
+ 
+ static struct Qdisc *qdisc_match_from_root(struct Qdisc *root, u32 handle)
+@@ -264,7 +265,7 @@ static struct Qdisc *qdisc_match_from_ro
+ 	    root->handle == handle)
+ 		return root;
+ 
+-	list_for_each_entry(q, &root->list, list) {
++	list_for_each_entry_rcu(q, &root->list, list) {
+ 		if (q->handle == handle)
+ 			return q;
+ 	}
+@@ -277,15 +278,18 @@ void qdisc_list_add(struct Qdisc *q)
+ 		struct Qdisc *root = qdisc_dev(q)->qdisc;
+ 
+ 		WARN_ON_ONCE(root == &noop_qdisc);
+-		list_add_tail(&q->list, &root->list);
++		ASSERT_RTNL();
++		list_add_tail_rcu(&q->list, &root->list);
+ 	}
+ }
+ EXPORT_SYMBOL(qdisc_list_add);
+ 
+ void qdisc_list_del(struct Qdisc *q)
+ {
+-	if ((q->parent != TC_H_ROOT) && !(q->flags & TCQ_F_INGRESS))
+-		list_del(&q->list);
++	if ((q->parent != TC_H_ROOT) && !(q->flags & TCQ_F_INGRESS)) {
++		ASSERT_RTNL();
++		list_del_rcu(&q->list);
++	}
+ }
+ EXPORT_SYMBOL(qdisc_list_del);
+ 
+@@ -750,14 +754,18 @@ void qdisc_tree_decrease_qlen(struct Qdi
+ 	if (n == 0)
+ 		return;
+ 	drops = max_t(int, n, 0);
++	rcu_read_lock();
+ 	while ((parentid = sch->parent)) {
+ 		if (TC_H_MAJ(parentid) == TC_H_MAJ(TC_H_INGRESS))
+-			return;
++			break;
+ 
++		if (sch->flags & TCQ_F_NOPARENT)
++			break;
++		/* TODO: perform the search on a per txq basis */
+ 		sch = qdisc_lookup(qdisc_dev(sch), TC_H_MAJ(parentid));
+ 		if (sch == NULL) {
+-			WARN_ON(parentid != TC_H_ROOT);
+-			return;
++			WARN_ON_ONCE(parentid != TC_H_ROOT);
++			break;
+ 		}
+ 		cops = sch->ops->cl_ops;
+ 		if (cops->qlen_notify) {
+@@ -768,6 +776,7 @@ void qdisc_tree_decrease_qlen(struct Qdi
+ 		sch->q.qlen -= n;
+ 		__qdisc_qstats_drop(sch, drops);
+ 	}
++	rcu_read_unlock();
+ }
+ EXPORT_SYMBOL(qdisc_tree_decrease_qlen);
+ 
+@@ -941,7 +950,7 @@ qdisc_create(struct net_device *dev, str
+ 		}
+ 		lockdep_set_class(qdisc_lock(sch), &qdisc_tx_lock);
+ 		if (!netif_is_multiqueue(dev))
+-			sch->flags |= TCQ_F_ONETXQUEUE;
++			sch->flags |= TCQ_F_ONETXQUEUE | TCQ_F_NOPARENT;
+ 	}
+ 
+ 	sch->handle = handle;
+--- a/net/sched/sch_generic.c
++++ b/net/sched/sch_generic.c
+@@ -737,7 +737,7 @@ static void attach_one_default_qdisc(str
+ 		return;
+ 	}
+ 	if (!netif_is_multiqueue(dev))
+-		qdisc->flags |= TCQ_F_ONETXQUEUE;
++		qdisc->flags |= TCQ_F_ONETXQUEUE | TCQ_F_NOPARENT;
+ 	dev_queue->qdisc_sleeping = qdisc;
+ }
+ 
+--- a/net/sched/sch_mq.c
++++ b/net/sched/sch_mq.c
+@@ -63,7 +63,7 @@ static int mq_init(struct Qdisc *sch, st
+ 		if (qdisc == NULL)
+ 			goto err;
+ 		priv->qdiscs[ntx] = qdisc;
+-		qdisc->flags |= TCQ_F_ONETXQUEUE;
++		qdisc->flags |= TCQ_F_ONETXQUEUE | TCQ_F_NOPARENT;
+ 	}
+ 
+ 	sch->flags |= TCQ_F_MQROOT;
+@@ -156,7 +156,7 @@ static int mq_graft(struct Qdisc *sch, u
+ 
+ 	*old = dev_graft_qdisc(dev_queue, new);
+ 	if (new)
+-		new->flags |= TCQ_F_ONETXQUEUE;
++		new->flags |= TCQ_F_ONETXQUEUE | TCQ_F_NOPARENT;
+ 	if (dev->flags & IFF_UP)
+ 		dev_activate(dev);
+ 	return 0;
+--- a/net/sched/sch_mqprio.c
++++ b/net/sched/sch_mqprio.c
+@@ -132,7 +132,7 @@ static int mqprio_init(struct Qdisc *sch
+ 			goto err;
+ 		}
+ 		priv->qdiscs[i] = qdisc;
+-		qdisc->flags |= TCQ_F_ONETXQUEUE;
++		qdisc->flags |= TCQ_F_ONETXQUEUE | TCQ_F_NOPARENT;
+ 	}
+ 
+ 	/* If the mqprio options indicate that hardware should own
+@@ -209,7 +209,7 @@ static int mqprio_graft(struct Qdisc *sc
+ 	*old = dev_graft_qdisc(dev_queue, new);
+ 
+ 	if (new)
+-		new->flags |= TCQ_F_ONETXQUEUE;
++		new->flags |= TCQ_F_ONETXQUEUE | TCQ_F_NOPARENT;
+ 
+ 	if (dev->flags & IFF_UP)
+ 		dev_activate(dev);

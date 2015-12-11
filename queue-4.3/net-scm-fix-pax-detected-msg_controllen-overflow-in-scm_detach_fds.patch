@@ -1,0 +1,142 @@
+From foo@baz Fri Dec 11 11:38:06 EST 2015
+From: Daniel Borkmann <daniel@iogearbox.net>
+Date: Fri, 20 Nov 2015 00:11:56 +0100
+Subject: net, scm: fix PaX detected msg_controllen overflow in scm_detach_fds
+
+From: Daniel Borkmann <daniel@iogearbox.net>
+
+[ Upstream commit 6900317f5eff0a7070c5936e5383f589e0de7a09 ]
+
+David and HacKurx reported a following/similar size overflow triggered
+in a grsecurity kernel, thanks to PaX's gcc size overflow plugin:
+
+(Already fixed in later grsecurity versions by Brad and PaX Team.)
+
+[ 1002.296137] PAX: size overflow detected in function scm_detach_fds net/core/scm.c:314
+               cicus.202_127 min, count: 4, decl: msg_controllen; num: 0; context: msghdr;
+[ 1002.296145] CPU: 0 PID: 3685 Comm: scm_rights_recv Not tainted 4.2.3-grsec+ #7
+[ 1002.296149] Hardware name: Apple Inc. MacBookAir5,1/Mac-66F35F19FE2A0D05, [...]
+[ 1002.296153]  ffffffff81c27366 0000000000000000 ffffffff81c27375 ffffc90007843aa8
+[ 1002.296162]  ffffffff818129ba 0000000000000000 ffffffff81c27366 ffffc90007843ad8
+[ 1002.296169]  ffffffff8121f838 fffffffffffffffc fffffffffffffffc ffffc90007843e60
+[ 1002.296176] Call Trace:
+[ 1002.296190]  [<ffffffff818129ba>] dump_stack+0x45/0x57
+[ 1002.296200]  [<ffffffff8121f838>] report_size_overflow+0x38/0x60
+[ 1002.296209]  [<ffffffff816a979e>] scm_detach_fds+0x2ce/0x300
+[ 1002.296220]  [<ffffffff81791899>] unix_stream_read_generic+0x609/0x930
+[ 1002.296228]  [<ffffffff81791c9f>] unix_stream_recvmsg+0x4f/0x60
+[ 1002.296236]  [<ffffffff8178dc00>] ? unix_set_peek_off+0x50/0x50
+[ 1002.296243]  [<ffffffff8168fac7>] sock_recvmsg+0x47/0x60
+[ 1002.296248]  [<ffffffff81691522>] ___sys_recvmsg+0xe2/0x1e0
+[ 1002.296257]  [<ffffffff81693496>] __sys_recvmsg+0x46/0x80
+[ 1002.296263]  [<ffffffff816934fc>] SyS_recvmsg+0x2c/0x40
+[ 1002.296271]  [<ffffffff8181a3ab>] entry_SYSCALL_64_fastpath+0x12/0x85
+
+Further investigation showed that this can happen when an *odd* number of
+fds are being passed over AF_UNIX sockets.
+
+In these cases CMSG_LEN(i * sizeof(int)) and CMSG_SPACE(i * sizeof(int)),
+where i is the number of successfully passed fds, differ by 4 bytes due
+to the extra CMSG_ALIGN() padding in CMSG_SPACE() to an 8 byte boundary
+on 64 bit. The padding is used to align subsequent cmsg headers in the
+control buffer.
+
+When the control buffer passed in from the receiver side *lacks* these 4
+bytes (e.g. due to buggy/wrong API usage), then msg->msg_controllen will
+overflow in scm_detach_fds():
+
+  int cmlen = CMSG_LEN(i * sizeof(int));  <--- cmlen w/o tail-padding
+  err = put_user(SOL_SOCKET, &cm->cmsg_level);
+  if (!err)
+    err = put_user(SCM_RIGHTS, &cm->cmsg_type);
+  if (!err)
+    err = put_user(cmlen, &cm->cmsg_len);
+  if (!err) {
+    cmlen = CMSG_SPACE(i * sizeof(int));  <--- cmlen w/ 4 byte extra tail-padding
+    msg->msg_control += cmlen;
+    msg->msg_controllen -= cmlen;         <--- iff no tail-padding space here ...
+  }                                            ... wrap-around
+
+F.e. it will wrap to a length of 18446744073709551612 bytes in case the
+receiver passed in msg->msg_controllen of 20 bytes, and the sender
+properly transferred 1 fd to the receiver, so that its CMSG_LEN results
+in 20 bytes and CMSG_SPACE in 24 bytes.
+
+In case of MSG_CMSG_COMPAT (scm_detach_fds_compat()), I haven't seen an
+issue in my tests as alignment seems always on 4 byte boundary. Same
+should be in case of native 32 bit, where we end up with 4 byte boundaries
+as well.
+
+In practice, passing msg->msg_controllen of 20 to recvmsg() while receiving
+a single fd would mean that on successful return, msg->msg_controllen is
+being set by the kernel to 24 bytes instead, thus more than the input
+buffer advertised. It could f.e. become an issue if such application later
+on zeroes or copies the control buffer based on the returned msg->msg_controllen
+elsewhere.
+
+Maximum number of fds we can send is a hard upper limit SCM_MAX_FD (253).
+
+Going over the code, it seems like msg->msg_controllen is not being read
+after scm_detach_fds() in scm_recv() anymore by the kernel, good!
+
+Relevant recvmsg() handler are unix_dgram_recvmsg() (unix_seqpacket_recvmsg())
+and unix_stream_recvmsg(). Both return back to their recvmsg() caller,
+and ___sys_recvmsg() places the updated length, that is, new msg_control -
+old msg_control pointer into msg->msg_controllen (hence the 24 bytes seen
+in the example).
+
+Long time ago, Wei Yongjun fixed something related in commit 1ac70e7ad24a
+("[NET]: Fix function put_cmsg() which may cause usr application memory
+overflow").
+
+RFC3542, section 20.2. says:
+
+  The fields shown as "XX" are possible padding, between the cmsghdr
+  structure and the data, and between the data and the next cmsghdr
+  structure, if required by the implementation. While sending an
+  application may or may not include padding at the end of last
+  ancillary data in msg_controllen and implementations must accept both
+  as valid. On receiving a portable application must provide space for
+  padding at the end of the last ancillary data as implementations may
+  copy out the padding at the end of the control message buffer and
+  include it in the received msg_controllen. When recvmsg() is called
+  if msg_controllen is too small for all the ancillary data items
+  including any trailing padding after the last item an implementation
+  may set MSG_CTRUNC.
+
+Since we didn't place MSG_CTRUNC for already quite a long time, just do
+the same as in 1ac70e7ad24a to avoid an overflow.
+
+Btw, even man-page author got this wrong :/ See db939c9b26e9 ("cmsg.3: Fix
+error in SCM_RIGHTS code sample"). Some people must have copied this (?),
+thus it got triggered in the wild (reported several times during boot by
+David and HacKurx).
+
+No Fixes tag this time as pre 2002 (that is, pre history tree).
+
+Reported-by: David Sterba <dave@jikos.cz>
+Reported-by: HacKurx <hackurx@gmail.com>
+Cc: PaX Team <pageexec@freemail.hu>
+Cc: Emese Revfy <re.emese@gmail.com>
+Cc: Brad Spengler <spender@grsecurity.net>
+Cc: Wei Yongjun <yongjun_wei@trendmicro.com.cn>
+Cc: Eric Dumazet <edumazet@google.com>
+Reviewed-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/core/scm.c |    2 ++
+ 1 file changed, 2 insertions(+)
+
+--- a/net/core/scm.c
++++ b/net/core/scm.c
+@@ -305,6 +305,8 @@ void scm_detach_fds(struct msghdr *msg,
+ 			err = put_user(cmlen, &cm->cmsg_len);
+ 		if (!err) {
+ 			cmlen = CMSG_SPACE(i*sizeof(int));
++			if (msg->msg_controllen < cmlen)
++				cmlen = msg->msg_controllen;
+ 			msg->msg_control += cmlen;
+ 			msg->msg_controllen -= cmlen;
+ 		}
