@@ -1,0 +1,104 @@
+From 22b886dd1018093920c4250dee2a9a3cb7cff7b8 Mon Sep 17 00:00:00 2001
+From: Tejun Heo <tj@kernel.org>
+Date: Wed, 4 Nov 2015 12:15:33 -0500
+Subject: timers: Use proper base migration in add_timer_on()
+
+From: Tejun Heo <tj@kernel.org>
+
+commit 22b886dd1018093920c4250dee2a9a3cb7cff7b8 upstream.
+
+Regardless of the previous CPU a timer was on, add_timer_on()
+currently simply sets timer->flags to the new CPU.  As the caller must
+be seeing the timer as idle, this is locally fine, but the timer
+leaving the old base while unlocked can lead to race conditions as
+follows.
+
+Let's say timer was on cpu 0.
+
+  cpu 0					cpu 1
+  -----------------------------------------------------------------------------
+  del_timer(timer) succeeds
+					del_timer(timer)
+					  lock_timer_base(timer) locks cpu_0_base
+  add_timer_on(timer, 1)
+    spin_lock(&cpu_1_base->lock)
+    timer->flags set to cpu_1_base
+    operates on @timer			  operates on @timer
+
+This triggered with mod_delayed_work_on() which contains
+"if (del_timer()) add_timer_on()" sequence eventually leading to the
+following oops.
+
+  BUG: unable to handle kernel NULL pointer dereference at           (null)
+  IP: [<ffffffff810ca6e9>] detach_if_pending+0x69/0x1a0
+  ...
+  Workqueue: wqthrash wqthrash_workfunc [wqthrash]
+  task: ffff8800172ca680 ti: ffff8800172d0000 task.ti: ffff8800172d0000
+  RIP: 0010:[<ffffffff810ca6e9>]  [<ffffffff810ca6e9>] detach_if_pending+0x69/0x1a0
+  ...
+  Call Trace:
+   [<ffffffff810cb0b4>] del_timer+0x44/0x60
+   [<ffffffff8106e836>] try_to_grab_pending+0xb6/0x160
+   [<ffffffff8106e913>] mod_delayed_work_on+0x33/0x80
+   [<ffffffffa0000081>] wqthrash_workfunc+0x61/0x90 [wqthrash]
+   [<ffffffff8106dba8>] process_one_work+0x1e8/0x650
+   [<ffffffff8106e05e>] worker_thread+0x4e/0x450
+   [<ffffffff810746af>] kthread+0xef/0x110
+   [<ffffffff8185980f>] ret_from_fork+0x3f/0x70
+
+Fix it by updating add_timer_on() to perform proper migration as
+__mod_timer() does.
+
+Reported-and-tested-by: Jeff Layton <jlayton@poochiereds.net>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Cc: Chris Worley <chris.worley@primarydata.com>
+Cc: bfields@fieldses.org
+Cc: Michael Skralivetsky <michael.skralivetsky@primarydata.com>
+Cc: Trond Myklebust <trond.myklebust@primarydata.com>
+Cc: Shaohua Li <shli@fb.com>
+Cc: Jeff Layton <jlayton@poochiereds.net>
+Cc: kernel-team@fb.com
+Link: http://lkml.kernel.org/r/20151029103113.2f893924@tlielax.poochiereds.net
+Link: http://lkml.kernel.org/r/20151104171533.GI5749@mtj.duckdns.org
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ kernel/time/timer.c |   22 +++++++++++++++++++---
+ 1 file changed, 19 insertions(+), 3 deletions(-)
+
+--- a/kernel/time/timer.c
++++ b/kernel/time/timer.c
+@@ -970,13 +970,29 @@ EXPORT_SYMBOL(add_timer);
+  */
+ void add_timer_on(struct timer_list *timer, int cpu)
+ {
+-	struct tvec_base *base = per_cpu_ptr(&tvec_bases, cpu);
++	struct tvec_base *new_base = per_cpu_ptr(&tvec_bases, cpu);
++	struct tvec_base *base;
+ 	unsigned long flags;
+ 
+ 	timer_stats_timer_set_start_info(timer);
+ 	BUG_ON(timer_pending(timer) || !timer->function);
+-	spin_lock_irqsave(&base->lock, flags);
+-	timer->flags = (timer->flags & ~TIMER_BASEMASK) | cpu;
++
++	/*
++	 * If @timer was on a different CPU, it should be migrated with the
++	 * old base locked to prevent other operations proceeding with the
++	 * wrong base locked.  See lock_timer_base().
++	 */
++	base = lock_timer_base(timer, &flags);
++	if (base != new_base) {
++		timer->flags |= TIMER_MIGRATING;
++
++		spin_unlock(&base->lock);
++		base = new_base;
++		spin_lock(&base->lock);
++		WRITE_ONCE(timer->flags,
++			   (timer->flags & ~TIMER_BASEMASK) | cpu);
++	}
++
+ 	debug_activate(timer, timer->expires);
+ 	internal_add_timer(base, timer);
+ 	spin_unlock_irqrestore(&base->lock, flags);
