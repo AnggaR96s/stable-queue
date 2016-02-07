@@ -1,0 +1,197 @@
+From e7fdd52779a6c2b49d457f452296a77c8cffef6a Mon Sep 17 00:00:00 2001
+From: Takashi Iwai <tiwai@suse.de>
+Date: Tue, 8 Dec 2015 17:00:42 +0100
+Subject: ALSA: hda - Implement loopback control switch for Realtek and other codecs
+
+From: Takashi Iwai <tiwai@suse.de>
+
+commit e7fdd52779a6c2b49d457f452296a77c8cffef6a upstream.
+
+Many codecs, typically found on Realtek codecs, have the analog
+loopback path merged to the secondary input of the middle of the
+output paths.  Currently, we don't offer the dynamic switching in such
+configuration but let each loopback path mute by itself.
+
+This should work well in theory, but in reality, we often see that
+such a dead loopback path causes some background noises even if all
+the elements get muted.  Such a problem has been fixed by adding the
+quirk accordingly to disable aamix, and it's the right fix, per se.
+The only problem is that it's not so trivial to achieve it; user needs
+to pass a hint string via patch module option or sysfs.
+
+This patch gives a bit improvement on the situation: it adds "Loopback
+Mixing" control element for such codecs like other codecs (e.g. IDT or
+VIA codecs) with the individual loopback paths.  User can turn on/off
+the loopback path simply via a mixer app.
+
+For keeping the compatibility, the loopback is still enabled on these
+codecs.  But user can try to turn it off if experiencing a suspicious
+background or click noise on the fly, then build a static fixup later
+once after the problem is addressed.
+
+Other than the addition of the loopback enable/disablement control,
+there should be no changes.
+
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ sound/pci/hda/hda_generic.c |   87 ++++++++++++++++++++++++++++++++++----------
+ 1 file changed, 68 insertions(+), 19 deletions(-)
+
+--- a/sound/pci/hda/hda_generic.c
++++ b/sound/pci/hda/hda_generic.c
+@@ -771,9 +771,6 @@ static void activate_amp(struct hda_code
+ 	unsigned int caps;
+ 	unsigned int mask, val;
+ 
+-	if (!enable && is_active_nid(codec, nid, dir, idx_to_check))
+-		return;
+-
+ 	caps = query_amp_caps(codec, nid, dir);
+ 	val = get_amp_val_to_activate(codec, nid, dir, caps, enable);
+ 	mask = get_amp_mask_to_modify(codec, nid, dir, idx_to_check, caps);
+@@ -784,12 +781,22 @@ static void activate_amp(struct hda_code
+ 	update_amp(codec, nid, dir, idx, mask, val);
+ }
+ 
++static void check_and_activate_amp(struct hda_codec *codec, hda_nid_t nid,
++				   int dir, int idx, int idx_to_check,
++				   bool enable)
++{
++	/* check whether the given amp is still used by others */
++	if (!enable && is_active_nid(codec, nid, dir, idx_to_check))
++		return;
++	activate_amp(codec, nid, dir, idx, idx_to_check, enable);
++}
++
+ static void activate_amp_out(struct hda_codec *codec, struct nid_path *path,
+ 			     int i, bool enable)
+ {
+ 	hda_nid_t nid = path->path[i];
+ 	init_amp(codec, nid, HDA_OUTPUT, 0);
+-	activate_amp(codec, nid, HDA_OUTPUT, 0, 0, enable);
++	check_and_activate_amp(codec, nid, HDA_OUTPUT, 0, 0, enable);
+ }
+ 
+ static void activate_amp_in(struct hda_codec *codec, struct nid_path *path,
+@@ -817,9 +824,16 @@ static void activate_amp_in(struct hda_c
+ 	 * when aa-mixer is available, we need to enable the path as well
+ 	 */
+ 	for (n = 0; n < nums; n++) {
+-		if (n != idx && (!add_aamix || conn[n] != spec->mixer_merge_nid))
+-			continue;
+-		activate_amp(codec, nid, HDA_INPUT, n, idx, enable);
++		if (n != idx) {
++			if (conn[n] != spec->mixer_merge_nid)
++				continue;
++			/* when aamix is disabled, force to off */
++			if (!add_aamix) {
++				activate_amp(codec, nid, HDA_INPUT, n, n, false);
++				continue;
++			}
++		}
++		check_and_activate_amp(codec, nid, HDA_INPUT, n, idx, enable);
+ 	}
+ }
+ 
+@@ -1580,6 +1594,12 @@ static bool map_singles(struct hda_codec
+ 	return found;
+ }
+ 
++static inline bool has_aamix_out_paths(struct hda_gen_spec *spec)
++{
++	return spec->aamix_out_paths[0] || spec->aamix_out_paths[1] ||
++		spec->aamix_out_paths[2];
++}
++
+ /* create a new path including aamix if available, and return its index */
+ static int check_aamix_out_path(struct hda_codec *codec, int path_idx)
+ {
+@@ -2422,25 +2442,51 @@ static void update_aamix_paths(struct hd
+ 	}
+ }
+ 
++/* re-initialize the output paths; only called from loopback_mixing_put() */
++static void update_output_paths(struct hda_codec *codec, int num_outs,
++				const int *paths)
++{
++	struct hda_gen_spec *spec = codec->spec;
++	struct nid_path *path;
++	int i;
++
++	for (i = 0; i < num_outs; i++) {
++		path = snd_hda_get_path_from_idx(codec, paths[i]);
++		if (path)
++			snd_hda_activate_path(codec, path, path->active,
++					      spec->aamix_mode);
++	}
++}
++
+ static int loopback_mixing_put(struct snd_kcontrol *kcontrol,
+ 			       struct snd_ctl_elem_value *ucontrol)
+ {
+ 	struct hda_codec *codec = snd_kcontrol_chip(kcontrol);
+ 	struct hda_gen_spec *spec = codec->spec;
++	const struct auto_pin_cfg *cfg = &spec->autocfg;
+ 	unsigned int val = ucontrol->value.enumerated.item[0];
+ 
+ 	if (val == spec->aamix_mode)
+ 		return 0;
+ 	spec->aamix_mode = val;
+-	update_aamix_paths(codec, val, spec->out_paths[0],
+-			   spec->aamix_out_paths[0],
+-			   spec->autocfg.line_out_type);
+-	update_aamix_paths(codec, val, spec->hp_paths[0],
+-			   spec->aamix_out_paths[1],
+-			   AUTO_PIN_HP_OUT);
+-	update_aamix_paths(codec, val, spec->speaker_paths[0],
+-			   spec->aamix_out_paths[2],
+-			   AUTO_PIN_SPEAKER_OUT);
++	if (has_aamix_out_paths(spec)) {
++		update_aamix_paths(codec, val, spec->out_paths[0],
++				   spec->aamix_out_paths[0],
++				   cfg->line_out_type);
++		update_aamix_paths(codec, val, spec->hp_paths[0],
++				   spec->aamix_out_paths[1],
++				   AUTO_PIN_HP_OUT);
++		update_aamix_paths(codec, val, spec->speaker_paths[0],
++				   spec->aamix_out_paths[2],
++				   AUTO_PIN_SPEAKER_OUT);
++	} else {
++		update_output_paths(codec, cfg->line_outs, spec->out_paths);
++		if (cfg->line_out_type != AUTO_PIN_HP_OUT)
++			update_output_paths(codec, cfg->hp_outs, spec->hp_paths);
++		if (cfg->line_out_type != AUTO_PIN_SPEAKER_OUT)
++			update_output_paths(codec, cfg->speaker_outs,
++					    spec->speaker_paths);
++	}
+ 	return 1;
+ }
+ 
+@@ -2458,12 +2504,13 @@ static int create_loopback_mixing_ctl(st
+ 
+ 	if (!spec->mixer_nid)
+ 		return 0;
+-	if (!(spec->aamix_out_paths[0] || spec->aamix_out_paths[1] ||
+-	      spec->aamix_out_paths[2]))
+-		return 0;
+ 	if (!snd_hda_gen_add_kctl(spec, NULL, &loopback_mixing_enum))
+ 		return -ENOMEM;
+ 	spec->have_aamix_ctl = 1;
++	/* if no explicit aamix path is present (e.g. for Realtek codecs),
++	 * enable aamix as default -- just for compatibility
++	 */
++	spec->aamix_mode = !has_aamix_out_paths(spec);
+ 	return 0;
+ }
+ 
+@@ -5664,6 +5711,8 @@ static void init_aamix_paths(struct hda_
+ 
+ 	if (!spec->have_aamix_ctl)
+ 		return;
++	if (!has_aamix_out_paths(spec))
++		return;
+ 	update_aamix_paths(codec, spec->aamix_mode, spec->out_paths[0],
+ 			   spec->aamix_out_paths[0],
+ 			   spec->autocfg.line_out_type);
