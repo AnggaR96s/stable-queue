@@ -1,0 +1,92 @@
+From dbe409e4f5e5075bd9ff7f8dd5c627abf3ee38c1 Mon Sep 17 00:00:00 2001
+From: Mike Kravetz <mike.kravetz@oracle.com>
+Date: Fri, 11 Dec 2015 13:40:52 -0800
+Subject: mm/hugetlb.c: fix resv map memory leak for placeholder entries
+
+From: Mike Kravetz <mike.kravetz@oracle.com>
+
+commit dbe409e4f5e5075bd9ff7f8dd5c627abf3ee38c1 upstream.
+
+Dmitry Vyukov reported the following memory leak
+
+unreferenced object 0xffff88002eaafd88 (size 32):
+  comm "a.out", pid 5063, jiffies 4295774645 (age 15.810s)
+  hex dump (first 32 bytes):
+    28 e9 4e 63 00 88 ff ff 28 e9 4e 63 00 88 ff ff  (.Nc....(.Nc....
+    00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+  backtrace:
+     kmalloc include/linux/slab.h:458
+     region_chg+0x2d4/0x6b0 mm/hugetlb.c:398
+     __vma_reservation_common+0x2c3/0x390 mm/hugetlb.c:1791
+     vma_needs_reservation mm/hugetlb.c:1813
+     alloc_huge_page+0x19e/0xc70 mm/hugetlb.c:1845
+     hugetlb_no_page mm/hugetlb.c:3543
+     hugetlb_fault+0x7a1/0x1250 mm/hugetlb.c:3717
+     follow_hugetlb_page+0x339/0xc70 mm/hugetlb.c:3880
+     __get_user_pages+0x542/0xf30 mm/gup.c:497
+     populate_vma_page_range+0xde/0x110 mm/gup.c:919
+     __mm_populate+0x1c7/0x310 mm/gup.c:969
+     do_mlock+0x291/0x360 mm/mlock.c:637
+     SYSC_mlock2 mm/mlock.c:658
+     SyS_mlock2+0x4b/0x70 mm/mlock.c:648
+
+Dmitry identified a potential memory leak in the routine region_chg,
+where a region descriptor is not free'ed on an error path.
+
+However, the root cause for the above memory leak resides in region_del.
+In this specific case, a "placeholder" entry is created in region_chg.
+The associated page allocation fails, and the placeholder entry is left
+in the reserve map.  This is "by design" as the entry should be deleted
+when the map is released.  The bug is in the region_del routine which is
+used to delete entries within a specific range (and when the map is
+released).  region_del did not handle the case where a placeholder entry
+exactly matched the start of the range range to be deleted.  In this
+case, the entry would not be deleted and leaked.  The fix is to take
+these special placeholder entries into account in region_del.
+
+The region_chg error path leak is also fixed.
+
+Fixes: feba16e25a57 ("mm/hugetlb: add region_del() to delete a specific range of entries")
+Signed-off-by: Mike Kravetz <mike.kravetz@oracle.com>
+Reported-by: Dmitry Vyukov <dvyukov@google.com>
+Acked-by: Hillf Danton <hillf.zj@alibaba-inc.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ mm/hugetlb.c |   14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -372,8 +372,10 @@ retry_locked:
+ 		spin_unlock(&resv->lock);
+ 
+ 		trg = kmalloc(sizeof(*trg), GFP_KERNEL);
+-		if (!trg)
++		if (!trg) {
++			kfree(nrg);
+ 			return -ENOMEM;
++		}
+ 
+ 		spin_lock(&resv->lock);
+ 		list_add(&trg->link, &resv->region_cache);
+@@ -483,8 +485,16 @@ static long region_del(struct resv_map *
+ retry:
+ 	spin_lock(&resv->lock);
+ 	list_for_each_entry_safe(rg, trg, head, link) {
+-		if (rg->to <= f)
++		/*
++		 * Skip regions before the range to be deleted.  file_region
++		 * ranges are normally of the form [from, to).  However, there
++		 * may be a "placeholder" entry in the map which is of the form
++		 * (from, to) with from == to.  Check for placeholder entries
++		 * at the beginning of the range to be deleted.
++		 */
++		if (rg->to <= f && (rg->to != rg->from || rg->to != f))
+ 			continue;
++
+ 		if (rg->from >= t)
+ 			break;
+ 

@@ -1,0 +1,122 @@
+From 373ccbe5927034b55bdc80b0f8b54d6e13fe8d12 Mon Sep 17 00:00:00 2001
+From: Michal Hocko <mhocko@suse.com>
+Date: Fri, 11 Dec 2015 13:40:32 -0800
+Subject: mm, vmstat: allow WQ concurrency to discover memory reclaim doesn't make any progress
+
+From: Michal Hocko <mhocko@suse.com>
+
+commit 373ccbe5927034b55bdc80b0f8b54d6e13fe8d12 upstream.
+
+Tetsuo Handa has reported that the system might basically livelock in
+OOM condition without triggering the OOM killer.
+
+The issue is caused by internal dependency of the direct reclaim on
+vmstat counter updates (via zone_reclaimable) which are performed from
+the workqueue context.  If all the current workers get assigned to an
+allocation request, though, they will be looping inside the allocator
+trying to reclaim memory but zone_reclaimable can see stalled numbers so
+it will consider a zone reclaimable even though it has been scanned way
+too much.  WQ concurrency logic will not consider this situation as a
+congested workqueue because it relies that worker would have to sleep in
+such a situation.  This also means that it doesn't try to spawn new
+workers or invoke the rescuer thread if the one is assigned to the
+queue.
+
+In order to fix this issue we need to do two things.  First we have to
+let wq concurrency code know that we are in trouble so we have to do a
+short sleep.  In order to prevent from issues handled by 0e093d99763e
+("writeback: do not sleep on the congestion queue if there are no
+congested BDIs or if significant congestion is not being encountered in
+the current zone") we limit the sleep only to worker threads which are
+the ones of the interest anyway.
+
+The second thing to do is to create a dedicated workqueue for vmstat and
+mark it WQ_MEM_RECLAIM to note it participates in the reclaim and to
+have a spare worker thread for it.
+
+Signed-off-by: Michal Hocko <mhocko@suse.com>
+Reported-by: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: Cristopher Lameter <clameter@sgi.com>
+Cc: Joonsoo Kim <js1304@gmail.com>
+Cc: Arkadiusz Miskiewicz <arekm@maven.pl>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ mm/backing-dev.c |   19 ++++++++++++++++---
+ mm/vmstat.c      |    6 ++++--
+ 2 files changed, 20 insertions(+), 5 deletions(-)
+
+--- a/mm/backing-dev.c
++++ b/mm/backing-dev.c
+@@ -957,8 +957,9 @@ EXPORT_SYMBOL(congestion_wait);
+  * jiffies for either a BDI to exit congestion of the given @sync queue
+  * or a write to complete.
+  *
+- * In the absence of zone congestion, cond_resched() is called to yield
+- * the processor if necessary but otherwise does not sleep.
++ * In the absence of zone congestion, a short sleep or a cond_resched is
++ * performed to yield the processor and to allow other subsystems to make
++ * a forward progress.
+  *
+  * The return value is 0 if the sleep is for the full timeout. Otherwise,
+  * it is the number of jiffies that were still remaining when the function
+@@ -978,7 +979,19 @@ long wait_iff_congested(struct zone *zon
+ 	 */
+ 	if (atomic_read(&nr_wb_congested[sync]) == 0 ||
+ 	    !test_bit(ZONE_CONGESTED, &zone->flags)) {
+-		cond_resched();
++
++		/*
++		 * Memory allocation/reclaim might be called from a WQ
++		 * context and the current implementation of the WQ
++		 * concurrency control doesn't recognize that a particular
++		 * WQ is congested if the worker thread is looping without
++		 * ever sleeping. Therefore we have to do a short sleep
++		 * here rather than calling cond_resched().
++		 */
++		if (current->flags & PF_WQ_WORKER)
++			schedule_timeout(1);
++		else
++			cond_resched();
+ 
+ 		/* In case we scheduled, work out time remaining */
+ 		ret = timeout - (jiffies - start);
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@ -1357,6 +1357,7 @@ static const struct file_operations proc
+ #endif /* CONFIG_PROC_FS */
+ 
+ #ifdef CONFIG_SMP
++static struct workqueue_struct *vmstat_wq;
+ static DEFINE_PER_CPU(struct delayed_work, vmstat_work);
+ int sysctl_stat_interval __read_mostly = HZ;
+ static cpumask_var_t cpu_stat_off;
+@@ -1369,7 +1370,7 @@ static void vmstat_update(struct work_st
+ 		 * to occur in the future. Keep on running the
+ 		 * update worker thread.
+ 		 */
+-		schedule_delayed_work_on(smp_processor_id(),
++		queue_delayed_work_on(smp_processor_id(), vmstat_wq,
+ 			this_cpu_ptr(&vmstat_work),
+ 			round_jiffies_relative(sysctl_stat_interval));
+ 	} else {
+@@ -1438,7 +1439,7 @@ static void vmstat_shepherd(struct work_
+ 		if (need_update(cpu) &&
+ 			cpumask_test_and_clear_cpu(cpu, cpu_stat_off))
+ 
+-			schedule_delayed_work_on(cpu,
++			queue_delayed_work_on(cpu, vmstat_wq,
+ 				&per_cpu(vmstat_work, cpu), 0);
+ 
+ 	put_online_cpus();
+@@ -1527,6 +1528,7 @@ static int __init setup_vmstat(void)
+ 
+ 	start_shepherd_timer();
+ 	cpu_notifier_register_done();
++	vmstat_wq = alloc_workqueue("vmstat", WQ_FREEZABLE|WQ_MEM_RECLAIM, 0);
+ #endif
+ #ifdef CONFIG_PROC_FS
+ 	proc_create("buddyinfo", S_IRUGO, NULL, &fragmentation_file_operations);
