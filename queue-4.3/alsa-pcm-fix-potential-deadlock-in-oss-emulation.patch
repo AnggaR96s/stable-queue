@@ -1,0 +1,100 @@
+From b248371628aad599a48540962f6b85a21a8a0c3f Mon Sep 17 00:00:00 2001
+From: Takashi Iwai <tiwai@suse.de>
+Date: Sun, 31 Jan 2016 10:32:37 +0100
+Subject: ALSA: pcm: Fix potential deadlock in OSS emulation
+
+From: Takashi Iwai <tiwai@suse.de>
+
+commit b248371628aad599a48540962f6b85a21a8a0c3f upstream.
+
+There are potential deadlocks in PCM OSS emulation code while
+accessing read/write and mmap concurrently.  This comes from the
+infamous mmap_sem usage in copy_from/to_user().  Namely,
+
+   snd_pcm_oss_write() ->
+     &runtime->oss.params_lock ->
+        copy_to_user() ->
+          &mm->mmap_sem
+  mmap() ->
+    &mm->mmap_sem ->
+      snd_pcm_oss_mmap() ->
+        &runtime->oss.params_lock
+
+Since we can't avoid taking params_lock from mmap code path, use
+trylock variant and aborts with -EAGAIN as a workaround of this AB/BA
+deadlock.
+
+BugLink: http://lkml.kernel.org/r/CACT4Y+bVrBKDG0G2_AcUgUQa+X91VKTeS4v+wN7BSHwHtqn3kQ@mail.gmail.com
+Reported-by: Dmitry Vyukov <dvyukov@google.com>
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ sound/core/oss/pcm_oss.c |   21 +++++++++++++++------
+ 1 file changed, 15 insertions(+), 6 deletions(-)
+
+--- a/sound/core/oss/pcm_oss.c
++++ b/sound/core/oss/pcm_oss.c
+@@ -834,7 +834,8 @@ static int choose_rate(struct snd_pcm_su
+ 	return snd_pcm_hw_param_near(substream, params, SNDRV_PCM_HW_PARAM_RATE, best_rate, NULL);
+ }
+ 
+-static int snd_pcm_oss_change_params(struct snd_pcm_substream *substream)
++static int snd_pcm_oss_change_params(struct snd_pcm_substream *substream,
++				     bool trylock)
+ {
+ 	struct snd_pcm_runtime *runtime = substream->runtime;
+ 	struct snd_pcm_hw_params *params, *sparams;
+@@ -848,7 +849,10 @@ static int snd_pcm_oss_change_params(str
+ 	struct snd_mask sformat_mask;
+ 	struct snd_mask mask;
+ 
+-	if (mutex_lock_interruptible(&runtime->oss.params_lock))
++	if (trylock) {
++		if (!(mutex_trylock(&runtime->oss.params_lock)))
++			return -EAGAIN;
++	} else if (mutex_lock_interruptible(&runtime->oss.params_lock))
+ 		return -EINTR;
+ 	sw_params = kmalloc(sizeof(*sw_params), GFP_KERNEL);
+ 	params = kmalloc(sizeof(*params), GFP_KERNEL);
+@@ -1092,7 +1096,7 @@ static int snd_pcm_oss_get_active_substr
+ 		if (asubstream == NULL)
+ 			asubstream = substream;
+ 		if (substream->runtime->oss.params) {
+-			err = snd_pcm_oss_change_params(substream);
++			err = snd_pcm_oss_change_params(substream, false);
+ 			if (err < 0)
+ 				return err;
+ 		}
+@@ -1132,7 +1136,7 @@ static int snd_pcm_oss_make_ready(struct
+ 		return 0;
+ 	runtime = substream->runtime;
+ 	if (runtime->oss.params) {
+-		err = snd_pcm_oss_change_params(substream);
++		err = snd_pcm_oss_change_params(substream, false);
+ 		if (err < 0)
+ 			return err;
+ 	}
+@@ -2163,7 +2167,7 @@ static int snd_pcm_oss_get_space(struct
+ 	runtime = substream->runtime;
+ 
+ 	if (runtime->oss.params &&
+-	    (err = snd_pcm_oss_change_params(substream)) < 0)
++	    (err = snd_pcm_oss_change_params(substream, false)) < 0)
+ 		return err;
+ 
+ 	info.fragsize = runtime->oss.period_bytes;
+@@ -2800,7 +2804,12 @@ static int snd_pcm_oss_mmap(struct file
+ 		return -EIO;
+ 	
+ 	if (runtime->oss.params) {
+-		if ((err = snd_pcm_oss_change_params(substream)) < 0)
++		/* use mutex_trylock() for params_lock for avoiding a deadlock
++		 * between mmap_sem and params_lock taken by
++		 * copy_from/to_user() in snd_pcm_oss_write/read()
++		 */
++		err = snd_pcm_oss_change_params(substream, true);
++		if (err < 0)
+ 			return err;
+ 	}
+ #ifdef CONFIG_SND_PCM_OSS_PLUGINS

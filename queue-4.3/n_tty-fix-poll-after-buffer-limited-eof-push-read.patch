@@ -1,0 +1,118 @@
+From ac8f3bf8832a405cc6e4dccb1d26d5cb2994d234 Mon Sep 17 00:00:00 2001
+From: Peter Hurley <peter@hurleysoftware.com>
+Date: Fri, 27 Nov 2015 13:59:20 -0500
+Subject: n_tty: Fix poll() after buffer-limited eof push read
+
+From: Peter Hurley <peter@hurleysoftware.com>
+
+commit ac8f3bf8832a405cc6e4dccb1d26d5cb2994d234 upstream.
+
+commit 40d5e0905a03 ("n_tty: Fix EOF push handling") fixed EOF push
+for reads. However, that approach still allows a condition mismatch
+between poll() and read(), where poll() returns POLLIN but read()
+blocks. This state can happen when a previous read() returned because
+the user buffer was full and the next character was an EOF not at the
+beginning of the line. While the next read() will properly identify
+the condition and advance the read buffer tail without improperly
+indicating an EOF file condition (ie., read() will not mistakenly
+return 0), poll() will mistakenly indicate POLLIN.
+
+Although a possible solution would be to peek at the input buffer
+in n_tty_poll(), the better solution in this patch is to eat the
+EOF during the previous read() (ie., fix the problem by eliminating
+the condition).
+
+The current canon line buffer copy limits the scan for next end-of-line
+to the smaller of either,
+   a. the remaining user buffer size
+   b. completed lines in the input buffer
+When the remaining user buffer size is exactly one less than the
+end-of-line marked by EOF push, the EOF is not scanned nor skipped
+but left for subsequent reads. In the example below, the scan
+index 'eol' has stopped at the EOF because it is past the scan
+limit of 5 (not because it has found the next set bit in read_flags)
+
+   user buffer [*nr = 5]    _ _ _ _ _
+
+   read_flags               0 0 0 0 0   1
+   input buffer             h e l l o [EOF]
+                            ^           ^
+                           /           /
+                         tail        eol
+
+   result: found = 0, tail += 5, *nr += 5
+
+Instead, allow the scan to peek ahead 1 byte (while still limiting the
+scan to completed lines in the input buffer). For the example above,
+
+   result: found = 1, tail += 6, *nr += 5
+
+Because the scan limit is now bumped +1 byte, when the scan is
+completed, the tail advance and the user buffer copy limit is
+re-clamped to *nr when EOF is _not_ found.
+
+Fixes: 40d5e0905a03 ("n_tty: Fix EOF push handling")
+Signed-off-by: Peter Hurley <peter@hurleysoftware.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/tty/n_tty.c |   22 +++++++++-------------
+ 1 file changed, 9 insertions(+), 13 deletions(-)
+
+--- a/drivers/tty/n_tty.c
++++ b/drivers/tty/n_tty.c
+@@ -2058,13 +2058,13 @@ static int canon_copy_from_read_buf(stru
+ 	size_t eol;
+ 	size_t tail;
+ 	int ret, found = 0;
+-	bool eof_push = 0;
+ 
+ 	/* N.B. avoid overrun if nr == 0 */
+-	n = min(*nr, smp_load_acquire(&ldata->canon_head) - ldata->read_tail);
+-	if (!n)
++	if (!*nr)
+ 		return 0;
+ 
++	n = min(*nr + 1, smp_load_acquire(&ldata->canon_head) - ldata->read_tail);
++
+ 	tail = ldata->read_tail & (N_TTY_BUF_SIZE - 1);
+ 	size = min_t(size_t, tail + n, N_TTY_BUF_SIZE);
+ 
+@@ -2085,12 +2085,11 @@ static int canon_copy_from_read_buf(stru
+ 	n = eol - tail;
+ 	if (n > N_TTY_BUF_SIZE)
+ 		n += N_TTY_BUF_SIZE;
+-	n += found;
+-	c = n;
++	c = n + found;
+ 
+-	if (found && !ldata->push && read_buf(ldata, eol) == __DISABLED_CHAR) {
+-		n--;
+-		eof_push = !n && ldata->read_tail != ldata->line_start;
++	if (!found || read_buf(ldata, eol) != __DISABLED_CHAR) {
++		c = min(*nr, c);
++		n = c;
+ 	}
+ 
+ 	n_tty_trace("%s: eol:%zu found:%d n:%zu c:%zu size:%zu more:%zu\n",
+@@ -2120,7 +2119,7 @@ static int canon_copy_from_read_buf(stru
+ 			ldata->push = 0;
+ 		tty_audit_push(tty);
+ 	}
+-	return eof_push ? -EAGAIN : 0;
++	return 0;
+ }
+ 
+ extern ssize_t redirected_tty_write(struct file *, const char __user *,
+@@ -2299,10 +2298,7 @@ static ssize_t n_tty_read(struct tty_str
+ 
+ 		if (ldata->icanon && !L_EXTPROC(tty)) {
+ 			retval = canon_copy_from_read_buf(tty, &b, &nr);
+-			if (retval == -EAGAIN) {
+-				retval = 0;
+-				continue;
+-			} else if (retval)
++			if (retval)
+ 				break;
+ 		} else {
+ 			int uncopied;

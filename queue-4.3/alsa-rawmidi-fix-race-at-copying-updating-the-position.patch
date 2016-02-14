@@ -1,0 +1,121 @@
+From 81f577542af15640cbcb6ef68baa4caa610cbbfc Mon Sep 17 00:00:00 2001
+From: Takashi Iwai <tiwai@suse.de>
+Date: Wed, 3 Feb 2016 14:41:22 +0100
+Subject: ALSA: rawmidi: Fix race at copying & updating the position
+
+From: Takashi Iwai <tiwai@suse.de>
+
+commit 81f577542af15640cbcb6ef68baa4caa610cbbfc upstream.
+
+The rawmidi read and write functions manage runtime stream status
+such as runtime->appl_ptr and runtime->avail.  These point where to
+copy the new data and how many bytes have been copied (or to be
+read).  The problem is that rawmidi read/write call copy_from_user()
+or copy_to_user(), and the runtime spinlock is temporarily unlocked
+and relocked while copying user-space.  Since the current code
+advances and updates the runtime status after the spin unlock/relock,
+the copy and the update may be asynchronous, and eventually
+runtime->avail might go to a negative value when many concurrent
+accesses are done.  This may lead to memory corruption in the end.
+
+For fixing this race, in this patch, the status update code is
+performed in the same lock before the temporary unlock.  Also, the
+spinlock is now taken more widely in snd_rawmidi_kernel_read1() for
+protecting more properly during the whole operation.
+
+BugLink: http://lkml.kernel.org/r/CACT4Y+b-dCmNf1GpgPKfDO0ih+uZCL2JV4__j-r1kdhPLSgQCQ@mail.gmail.com
+Reported-by: Dmitry Vyukov <dvyukov@google.com>
+Tested-by: Dmitry Vyukov <dvyukov@google.com>
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ sound/core/rawmidi.c |   34 ++++++++++++++++++++++------------
+ 1 file changed, 22 insertions(+), 12 deletions(-)
+
+--- a/sound/core/rawmidi.c
++++ b/sound/core/rawmidi.c
+@@ -942,31 +942,36 @@ static long snd_rawmidi_kernel_read1(str
+ 	unsigned long flags;
+ 	long result = 0, count1;
+ 	struct snd_rawmidi_runtime *runtime = substream->runtime;
++	unsigned long appl_ptr;
+ 
++	spin_lock_irqsave(&runtime->lock, flags);
+ 	while (count > 0 && runtime->avail) {
+ 		count1 = runtime->buffer_size - runtime->appl_ptr;
+ 		if (count1 > count)
+ 			count1 = count;
+-		spin_lock_irqsave(&runtime->lock, flags);
+ 		if (count1 > (int)runtime->avail)
+ 			count1 = runtime->avail;
++
++		/* update runtime->appl_ptr before unlocking for userbuf */
++		appl_ptr = runtime->appl_ptr;
++		runtime->appl_ptr += count1;
++		runtime->appl_ptr %= runtime->buffer_size;
++		runtime->avail -= count1;
++
+ 		if (kernelbuf)
+-			memcpy(kernelbuf + result, runtime->buffer + runtime->appl_ptr, count1);
++			memcpy(kernelbuf + result, runtime->buffer + appl_ptr, count1);
+ 		if (userbuf) {
+ 			spin_unlock_irqrestore(&runtime->lock, flags);
+ 			if (copy_to_user(userbuf + result,
+-					 runtime->buffer + runtime->appl_ptr, count1)) {
++					 runtime->buffer + appl_ptr, count1)) {
+ 				return result > 0 ? result : -EFAULT;
+ 			}
+ 			spin_lock_irqsave(&runtime->lock, flags);
+ 		}
+-		runtime->appl_ptr += count1;
+-		runtime->appl_ptr %= runtime->buffer_size;
+-		runtime->avail -= count1;
+-		spin_unlock_irqrestore(&runtime->lock, flags);
+ 		result += count1;
+ 		count -= count1;
+ 	}
++	spin_unlock_irqrestore(&runtime->lock, flags);
+ 	return result;
+ }
+ 
+@@ -1223,6 +1228,7 @@ static long snd_rawmidi_kernel_write1(st
+ 	unsigned long flags;
+ 	long count1, result;
+ 	struct snd_rawmidi_runtime *runtime = substream->runtime;
++	unsigned long appl_ptr;
+ 
+ 	if (!kernelbuf && !userbuf)
+ 		return -EINVAL;
+@@ -1243,12 +1249,19 @@ static long snd_rawmidi_kernel_write1(st
+ 			count1 = count;
+ 		if (count1 > (long)runtime->avail)
+ 			count1 = runtime->avail;
++
++		/* update runtime->appl_ptr before unlocking for userbuf */
++		appl_ptr = runtime->appl_ptr;
++		runtime->appl_ptr += count1;
++		runtime->appl_ptr %= runtime->buffer_size;
++		runtime->avail -= count1;
++
+ 		if (kernelbuf)
+-			memcpy(runtime->buffer + runtime->appl_ptr,
++			memcpy(runtime->buffer + appl_ptr,
+ 			       kernelbuf + result, count1);
+ 		else if (userbuf) {
+ 			spin_unlock_irqrestore(&runtime->lock, flags);
+-			if (copy_from_user(runtime->buffer + runtime->appl_ptr,
++			if (copy_from_user(runtime->buffer + appl_ptr,
+ 					   userbuf + result, count1)) {
+ 				spin_lock_irqsave(&runtime->lock, flags);
+ 				result = result > 0 ? result : -EFAULT;
+@@ -1256,9 +1269,6 @@ static long snd_rawmidi_kernel_write1(st
+ 			}
+ 			spin_lock_irqsave(&runtime->lock, flags);
+ 		}
+-		runtime->appl_ptr += count1;
+-		runtime->appl_ptr %= runtime->buffer_size;
+-		runtime->avail -= count1;
+ 		result += count1;
+ 		count -= count1;
+ 	}
