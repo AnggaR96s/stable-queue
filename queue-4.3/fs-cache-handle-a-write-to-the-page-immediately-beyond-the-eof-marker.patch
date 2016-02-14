@@ -1,0 +1,141 @@
+From 102f4d900c9c8f5ed89ae4746d493fe3ebd7ba64 Mon Sep 17 00:00:00 2001
+From: David Howells <dhowells@redhat.com>
+Date: Wed, 4 Nov 2015 15:20:42 +0000
+Subject: FS-Cache: Handle a write to the page immediately beyond the EOF marker
+
+From: David Howells <dhowells@redhat.com>
+
+commit 102f4d900c9c8f5ed89ae4746d493fe3ebd7ba64 upstream.
+
+Handle a write being requested to the page immediately beyond the EOF
+marker on a cache object.  Currently this gets an assertion failure in
+CacheFiles because the EOF marker is used there to encode information about
+a partial page at the EOF - which could lead to an unknown blank spot in
+the file if we extend the file over it.
+
+The problem is actually in fscache where we check the index of the page
+being written against store_limit.  store_limit is set to the number of
+pages that we're allowed to store by fscache_set_store_limit() - which
+means it's one more than the index of the last page we're allowed to store.
+The problem is that we permit writing to a page with an index _equal_ to
+the store limit - when we should reject that case.
+
+Whilst we're at it, change the triggered assertion in CacheFiles to just
+return -ENOBUFS instead.
+
+The assertion failure looks something like this:
+
+CacheFiles: Assertion failed
+1000 < 7b1 is false
+------------[ cut here ]------------
+kernel BUG at fs/cachefiles/rdwr.c:962!
+...
+RIP: 0010:[<ffffffffa02c9e83>]  [<ffffffffa02c9e83>] cachefiles_write_page+0x273/0x2d0 [cachefiles]
+
+Signed-off-by: David Howells <dhowells@redhat.com>
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/cachefiles/rdwr.c |   67 ++++++++++++++++++++++++++++-----------------------
+ fs/fscache/page.c    |    2 -
+ 2 files changed, 38 insertions(+), 31 deletions(-)
+
+--- a/fs/cachefiles/rdwr.c
++++ b/fs/cachefiles/rdwr.c
+@@ -905,6 +905,15 @@ int cachefiles_write_page(struct fscache
+ 	cache = container_of(object->fscache.cache,
+ 			     struct cachefiles_cache, cache);
+ 
++	pos = (loff_t)page->index << PAGE_SHIFT;
++
++	/* We mustn't write more data than we have, so we have to beware of a
++	 * partial page at EOF.
++	 */
++	eof = object->fscache.store_limit_l;
++	if (pos >= eof)
++		goto error;
++
+ 	/* write the page to the backing filesystem and let it store it in its
+ 	 * own time */
+ 	path.mnt = cache->mnt;
+@@ -912,40 +921,38 @@ int cachefiles_write_page(struct fscache
+ 	file = dentry_open(&path, O_RDWR | O_LARGEFILE, cache->cache_cred);
+ 	if (IS_ERR(file)) {
+ 		ret = PTR_ERR(file);
+-	} else {
+-		pos = (loff_t) page->index << PAGE_SHIFT;
+-
+-		/* we mustn't write more data than we have, so we have
+-		 * to beware of a partial page at EOF */
+-		eof = object->fscache.store_limit_l;
+-		len = PAGE_SIZE;
+-		if (eof & ~PAGE_MASK) {
+-			ASSERTCMP(pos, <, eof);
+-			if (eof - pos < PAGE_SIZE) {
+-				_debug("cut short %llx to %llx",
+-				       pos, eof);
+-				len = eof - pos;
+-				ASSERTCMP(pos + len, ==, eof);
+-			}
+-		}
+-
+-		data = kmap(page);
+-		ret = __kernel_write(file, data, len, &pos);
+-		kunmap(page);
+-		if (ret != len)
+-			ret = -EIO;
+-		fput(file);
++		goto error_2;
+ 	}
+ 
+-	if (ret < 0) {
+-		if (ret == -EIO)
+-			cachefiles_io_error_obj(
+-				object, "Write page to backing file failed");
+-		ret = -ENOBUFS;
++	len = PAGE_SIZE;
++	if (eof & ~PAGE_MASK) {
++		if (eof - pos < PAGE_SIZE) {
++			_debug("cut short %llx to %llx",
++			       pos, eof);
++			len = eof - pos;
++			ASSERTCMP(pos + len, ==, eof);
++		}
+ 	}
+ 
+-	_leave(" = %d", ret);
+-	return ret;
++	data = kmap(page);
++	ret = __kernel_write(file, data, len, &pos);
++	kunmap(page);
++	fput(file);
++	if (ret != len)
++		goto error_eio;
++
++	_leave(" = 0");
++	return 0;
++
++error_eio:
++	ret = -EIO;
++error_2:
++	if (ret == -EIO)
++		cachefiles_io_error_obj(object,
++					"Write page to backing file failed");
++error:
++	_leave(" = -ENOBUFS [%d]", ret);
++	return -ENOBUFS;
+ }
+ 
+ /*
+--- a/fs/fscache/page.c
++++ b/fs/fscache/page.c
+@@ -816,7 +816,7 @@ static void fscache_write_op(struct fsca
+ 		goto superseded;
+ 	page = results[0];
+ 	_debug("gang %d [%lx]", n, page->index);
+-	if (page->index > op->store_limit) {
++	if (page->index >= op->store_limit) {
+ 		fscache_stat(&fscache_n_store_pages_over_limit);
+ 		goto superseded;
+ 	}
