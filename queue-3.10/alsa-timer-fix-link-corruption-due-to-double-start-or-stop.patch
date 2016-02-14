@@ -1,0 +1,111 @@
+From f784beb75ce82f4136f8a0960d3ee872f7109e09 Mon Sep 17 00:00:00 2001
+From: Takashi Iwai <tiwai@suse.de>
+Date: Sat, 30 Jan 2016 23:09:08 +0100
+Subject: ALSA: timer: Fix link corruption due to double start or stop
+
+From: Takashi Iwai <tiwai@suse.de>
+
+commit f784beb75ce82f4136f8a0960d3ee872f7109e09 upstream.
+
+Although ALSA timer code got hardening for races, it still causes
+use-after-free error.  This is however rather a corrupted linked list,
+not actually the concurrent accesses.  Namely, when timer start is
+triggered twice, list_add_tail() is called twice, too.  This ends
+up with the link corruption and triggers KASAN error.
+
+The simplest fix would be replacing list_add_tail() with
+list_move_tail(), but fundamentally it's the problem that we don't
+check the double start/stop correctly.  So, the right fix here is to
+add the proper checks to snd_timer_start() and snd_timer_stop() (and
+their variants).
+
+BugLink: http://lkml.kernel.org/r/CACT4Y+ZyPRoMQjmawbvmCEDrkBD2BQuH7R09=eOkf5ESK8kJAw@mail.gmail.com
+Reported-by: Dmitry Vyukov <dvyukov@google.com>
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ sound/core/timer.c |   30 ++++++++++++++++++++++++++++--
+ 1 file changed, 28 insertions(+), 2 deletions(-)
+
+--- a/sound/core/timer.c
++++ b/sound/core/timer.c
+@@ -444,6 +444,10 @@ static int snd_timer_start_slave(struct
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&slave_active_lock, flags);
++	if (timeri->flags & SNDRV_TIMER_IFLG_RUNNING) {
++		spin_unlock_irqrestore(&slave_active_lock, flags);
++		return -EBUSY;
++	}
+ 	timeri->flags |= SNDRV_TIMER_IFLG_RUNNING;
+ 	if (timeri->master && timeri->timer) {
+ 		spin_lock(&timeri->timer->lock);
+@@ -468,18 +472,26 @@ int snd_timer_start(struct snd_timer_ins
+ 		return -EINVAL;
+ 	if (timeri->flags & SNDRV_TIMER_IFLG_SLAVE) {
+ 		result = snd_timer_start_slave(timeri);
+-		snd_timer_notify1(timeri, SNDRV_TIMER_EVENT_START);
++		if (result >= 0)
++			snd_timer_notify1(timeri, SNDRV_TIMER_EVENT_START);
+ 		return result;
+ 	}
+ 	timer = timeri->timer;
+ 	if (timer == NULL)
+ 		return -EINVAL;
+ 	spin_lock_irqsave(&timer->lock, flags);
++	if (timeri->flags & (SNDRV_TIMER_IFLG_RUNNING |
++			     SNDRV_TIMER_IFLG_START)) {
++		result = -EBUSY;
++		goto unlock;
++	}
+ 	timeri->ticks = timeri->cticks = ticks;
+ 	timeri->pticks = 0;
+ 	result = snd_timer_start1(timer, timeri, ticks);
++ unlock:
+ 	spin_unlock_irqrestore(&timer->lock, flags);
+-	snd_timer_notify1(timeri, SNDRV_TIMER_EVENT_START);
++	if (result >= 0)
++		snd_timer_notify1(timeri, SNDRV_TIMER_EVENT_START);
+ 	return result;
+ }
+ 
+@@ -495,6 +507,10 @@ static int _snd_timer_stop(struct snd_ti
+ 	if (timeri->flags & SNDRV_TIMER_IFLG_SLAVE) {
+ 		if (!keep_flag) {
+ 			spin_lock_irqsave(&slave_active_lock, flags);
++			if (!(timeri->flags & SNDRV_TIMER_IFLG_RUNNING)) {
++				spin_unlock_irqrestore(&slave_active_lock, flags);
++				return -EBUSY;
++			}
+ 			timeri->flags &= ~SNDRV_TIMER_IFLG_RUNNING;
+ 			list_del_init(&timeri->ack_list);
+ 			list_del_init(&timeri->active_list);
+@@ -506,6 +522,11 @@ static int _snd_timer_stop(struct snd_ti
+ 	if (!timer)
+ 		return -EINVAL;
+ 	spin_lock_irqsave(&timer->lock, flags);
++	if (!(timeri->flags & (SNDRV_TIMER_IFLG_RUNNING |
++			       SNDRV_TIMER_IFLG_START))) {
++		spin_unlock_irqrestore(&timer->lock, flags);
++		return -EBUSY;
++	}
+ 	list_del_init(&timeri->ack_list);
+ 	list_del_init(&timeri->active_list);
+ 	if ((timeri->flags & SNDRV_TIMER_IFLG_RUNNING) &&
+@@ -571,10 +592,15 @@ int snd_timer_continue(struct snd_timer_
+ 	if (! timer)
+ 		return -EINVAL;
+ 	spin_lock_irqsave(&timer->lock, flags);
++	if (timeri->flags & SNDRV_TIMER_IFLG_RUNNING) {
++		result = -EBUSY;
++		goto unlock;
++	}
+ 	if (!timeri->cticks)
+ 		timeri->cticks = 1;
+ 	timeri->pticks = 0;
+ 	result = snd_timer_start1(timer, timeri, timer->sticks);
++ unlock:
+ 	spin_unlock_irqrestore(&timer->lock, flags);
+ 	snd_timer_notify1(timeri, SNDRV_TIMER_EVENT_CONTINUE);
+ 	return result;
