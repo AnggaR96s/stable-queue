@@ -1,0 +1,92 @@
+From 820962dc700598ffe8cd21b967e30e7520c34748 Mon Sep 17 00:00:00 2001
+From: Rabin Vincent <rabin.vincent@axis.com>
+Date: Wed, 23 Dec 2015 07:32:41 +0100
+Subject: cifs: fix race between call_async() and reconnect()
+
+From: Rabin Vincent <rabin.vincent@axis.com>
+
+commit 820962dc700598ffe8cd21b967e30e7520c34748 upstream.
+
+cifs_call_async() queues the MID to the pending list and calls
+smb_send_rqst().  If smb_send_rqst() performs a partial send, it sets
+the tcpStatus to CifsNeedReconnect and returns an error code to
+cifs_call_async().  In this case, cifs_call_async() removes the MID
+from the list and returns to the caller.
+
+However, cifs_call_async() releases the server mutex _before_ removing
+the MID.  This means that a cifs_reconnect() can race with this function
+and manage to remove the MID from the list and delete the entry before
+cifs_call_async() calls cifs_delete_mid().  This leads to various
+crashes due to the use after free in cifs_delete_mid().
+
+Task1				Task2
+
+cifs_call_async():
+ - rc = -EAGAIN
+ - mutex_unlock(srv_mutex)
+
+				cifs_reconnect():
+				 - mutex_lock(srv_mutex)
+				 - mutex_unlock(srv_mutex)
+				 - list_delete(mid)
+				 - mid->callback()
+				 	cifs_writev_callback():
+				 		- mutex_lock(srv_mutex)
+						- delete(mid)
+				 		- mutex_unlock(srv_mutex)
+
+ - cifs_delete_mid(mid) <---- use after free
+
+Fix this by removing the MID in cifs_call_async() before releasing the
+srv_mutex.  Also hold the srv_mutex in cifs_reconnect() until the MIDs
+are moved out of the pending list.
+
+Signed-off-by: Rabin Vincent <rabin.vincent@axis.com>
+Acked-by: Shirish Pargaonkar <shirishpargaonkar@gmail.com>
+Signed-off-by: Steve French <sfrench@localhost.localdomain>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/cifs/connect.c   |    2 +-
+ fs/cifs/transport.c |    6 ++++--
+ 2 files changed, 5 insertions(+), 3 deletions(-)
+
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@ -368,7 +368,6 @@ cifs_reconnect(struct TCP_Server_Info *s
+ 	server->session_key.response = NULL;
+ 	server->session_key.len = 0;
+ 	server->lstrp = jiffies;
+-	mutex_unlock(&server->srv_mutex);
+ 
+ 	/* mark submitted MIDs for retry and issue callback */
+ 	INIT_LIST_HEAD(&retry_list);
+@@ -381,6 +380,7 @@ cifs_reconnect(struct TCP_Server_Info *s
+ 		list_move(&mid_entry->qhead, &retry_list);
+ 	}
+ 	spin_unlock(&GlobalMid_Lock);
++	mutex_unlock(&server->srv_mutex);
+ 
+ 	cifs_dbg(FYI, "%s: issuing mid callbacks\n", __func__);
+ 	list_for_each_safe(tmp, tmp2, &retry_list) {
+--- a/fs/cifs/transport.c
++++ b/fs/cifs/transport.c
+@@ -576,14 +576,16 @@ cifs_call_async(struct TCP_Server_Info *
+ 	cifs_in_send_dec(server);
+ 	cifs_save_when_sent(mid);
+ 
+-	if (rc < 0)
++	if (rc < 0) {
+ 		server->sequence_number -= 2;
++		cifs_delete_mid(mid);
++	}
++
+ 	mutex_unlock(&server->srv_mutex);
+ 
+ 	if (rc == 0)
+ 		return 0;
+ 
+-	cifs_delete_mid(mid);
+ 	add_credits_and_wake_if(server, credits, optype);
+ 	return rc;
+ }

@@ -1,0 +1,111 @@
+From 1f55c718c290616889c04946864a13ef30f64929 Mon Sep 17 00:00:00 2001
+From: "Herton R. Krzesinski" <herton@redhat.com>
+Date: Thu, 14 Jan 2016 17:56:58 -0200
+Subject: pty: make sure super_block is still valid in final /dev/tty close
+
+From: Herton R. Krzesinski <herton@redhat.com>
+
+commit 1f55c718c290616889c04946864a13ef30f64929 upstream.
+
+Considering current pty code and multiple devpts instances, it's possible
+to umount a devpts file system while a program still has /dev/tty opened
+pointing to a previosuly closed pty pair in that instance. In the case all
+ptmx and pts/N files are closed, umount can be done. If the program closes
+/dev/tty after umount is done, devpts_kill_index will use now an invalid
+super_block, which was already destroyed in the umount operation after
+running ->kill_sb. This is another "use after free" type of issue, but now
+related to the allocated super_block instance.
+
+To avoid the problem (warning at ida_remove and potential crashes) for
+this specific case, I added two functions in devpts which grabs additional
+references to the super_block, which pty code now uses so it makes sure
+the super block structure is still valid until pty shutdown is done.
+I also moved the additional inode references to the same functions, which
+also covered similar case with inode being freed before /dev/tty final
+close/shutdown.
+
+Signed-off-by: Herton R. Krzesinski <herton@redhat.com>
+Reviewed-by: Peter Hurley <peter@hurleysoftware.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/tty/pty.c         |    9 ++++++---
+ fs/devpts/inode.c         |   20 ++++++++++++++++++++
+ include/linux/devpts_fs.h |    4 ++++
+ 3 files changed, 30 insertions(+), 3 deletions(-)
+
+--- a/drivers/tty/pty.c
++++ b/drivers/tty/pty.c
+@@ -688,7 +688,7 @@ static void pty_unix98_shutdown(struct t
+ 	else
+ 		ptmx_inode = tty->link->driver_data;
+ 	devpts_kill_index(ptmx_inode, tty->index);
+-	iput(ptmx_inode); /* drop reference we acquired at ptmx_open */
++	devpts_del_ref(ptmx_inode);
+ }
+ 
+ static const struct tty_operations ptm_unix98_ops = {
+@@ -785,9 +785,12 @@ static int ptmx_open(struct inode *inode
+ 	 * still have /dev/tty opened pointing to the master/slave pair (ptmx
+ 	 * is closed/released before /dev/tty), we must make sure that the inode
+ 	 * is still valid when we call the final pty_unix98_shutdown, thus we
+-	 * hold an additional reference to the ptmx inode
++	 * hold an additional reference to the ptmx inode. For the same /dev/tty
++	 * last close case, we also need to make sure the super_block isn't
++	 * destroyed (devpts instance unmounted), before /dev/tty is closed and
++	 * on its release devpts_kill_index is called.
+ 	 */
+-	ihold(inode);
++	devpts_add_ref(inode);
+ 
+ 	tty_add_file(tty, filp);
+ 
+--- a/fs/devpts/inode.c
++++ b/fs/devpts/inode.c
+@@ -575,6 +575,26 @@ void devpts_kill_index(struct inode *ptm
+ 	mutex_unlock(&allocated_ptys_lock);
+ }
+ 
++/*
++ * pty code needs to hold extra references in case of last /dev/tty close
++ */
++
++void devpts_add_ref(struct inode *ptmx_inode)
++{
++	struct super_block *sb = pts_sb_from_inode(ptmx_inode);
++
++	atomic_inc(&sb->s_active);
++	ihold(ptmx_inode);
++}
++
++void devpts_del_ref(struct inode *ptmx_inode)
++{
++	struct super_block *sb = pts_sb_from_inode(ptmx_inode);
++
++	iput(ptmx_inode);
++	deactivate_super(sb);
++}
++
+ /**
+  * devpts_pty_new -- create a new inode in /dev/pts/
+  * @ptmx_inode: inode of the master
+--- a/include/linux/devpts_fs.h
++++ b/include/linux/devpts_fs.h
+@@ -19,6 +19,8 @@
+ 
+ int devpts_new_index(struct inode *ptmx_inode);
+ void devpts_kill_index(struct inode *ptmx_inode, int idx);
++void devpts_add_ref(struct inode *ptmx_inode);
++void devpts_del_ref(struct inode *ptmx_inode);
+ /* mknod in devpts */
+ struct inode *devpts_pty_new(struct inode *ptmx_inode, dev_t device, int index,
+ 		void *priv);
+@@ -32,6 +34,8 @@ void devpts_pty_kill(struct inode *inode
+ /* Dummy stubs in the no-pty case */
+ static inline int devpts_new_index(struct inode *ptmx_inode) { return -EINVAL; }
+ static inline void devpts_kill_index(struct inode *ptmx_inode, int idx) { }
++static inline void devpts_add_ref(struct inode *ptmx_inode) { }
++static inline void devpts_del_ref(struct inode *ptmx_inode) { }
+ static inline struct inode *devpts_pty_new(struct inode *ptmx_inode,
+ 		dev_t device, int index, void *priv)
+ {

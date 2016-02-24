@@ -1,0 +1,126 @@
+From b79f4a1c68bb99152d0785ee4ea3ab4396cdacc6 Mon Sep 17 00:00:00 2001
+From: Dave Chinner <dchinner@redhat.com>
+Date: Tue, 12 Jan 2016 07:03:44 +1100
+Subject: xfs: inode recovery readahead can race with inode buffer creation
+
+From: Dave Chinner <dchinner@redhat.com>
+
+commit b79f4a1c68bb99152d0785ee4ea3ab4396cdacc6 upstream.
+
+When we do inode readahead in log recovery, we do can do the
+readahead before we've replayed the icreate transaction that stamps
+the buffer with inode cores. The inode readahead verifier catches
+this and marks the buffer as !done to indicate that it doesn't yet
+contain valid inodes.
+
+In adding buffer error notification  (i.e. setting b_error = -EIO at
+the same time as as we clear the done flag) to such a readahead
+verifier failure, we can then get subsequent inode recovery failing
+with this error:
+
+XFS (dm-0): metadata I/O error: block 0xa00060 ("xlog_recover_do..(read#2)") error 5 numblks 32
+
+This occurs when readahead completion races with icreate item replay
+such as:
+
+	inode readahead
+		find buffer
+		lock buffer
+		submit RA io
+	....
+	icreate recovery
+	    xfs_trans_get_buffer
+		find buffer
+		lock buffer
+		<blocks on RA completion>
+	.....
+	<ra completion>
+		fails verifier
+		clear XBF_DONE
+		set bp->b_error = -EIO
+		release and unlock buffer
+	<icreate gains lock>
+	icreate initialises buffer
+	marks buffer as done
+	adds buffer to delayed write queue
+	releases buffer
+
+At this point, we have an initialised inode buffer that is up to
+date but has an -EIO state registered against it. When we finally
+get to recovering an inode in that buffer:
+
+	inode item recovery
+	    xfs_trans_read_buffer
+		find buffer
+		lock buffer
+		sees XBF_DONE is set, returns buffer
+	    sees bp->b_error is set
+		fail log recovery!
+
+Essentially, we need xfs_trans_get_buf_map() to clear the error status of
+the buffer when doing a lookup. This function returns uninitialised
+buffers, so the buffer returned can not be in an error state and
+none of the code that uses this function expects b_error to be set
+on return. Indeed, there is an ASSERT(!bp->b_error); in the
+transaction case in xfs_trans_get_buf_map() that would have caught
+this if log recovery used transactions....
+
+This patch firstly changes the inode readahead failure to set -EIO
+on the buffer, and secondly changes xfs_buf_get_map() to never
+return a buffer with an error state set so this first change doesn't
+cause unexpected log recovery failures.
+
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Signed-off-by: Dave Chinner <david@fromorbit.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/xfs/libxfs/xfs_inode_buf.c |   12 +++++++-----
+ fs/xfs/xfs_buf.c              |    7 +++++++
+ 2 files changed, 14 insertions(+), 5 deletions(-)
+
+--- a/fs/xfs/libxfs/xfs_inode_buf.c
++++ b/fs/xfs/libxfs/xfs_inode_buf.c
+@@ -62,11 +62,12 @@ xfs_inobp_check(
+  * has not had the inode cores stamped into it. Hence for readahead, the buffer
+  * may be potentially invalid.
+  *
+- * If the readahead buffer is invalid, we don't want to mark it with an error,
+- * but we do want to clear the DONE status of the buffer so that a followup read
+- * will re-read it from disk. This will ensure that we don't get an unnecessary
+- * warnings during log recovery and we don't get unnecssary panics on debug
+- * kernels.
++ * If the readahead buffer is invalid, we need to mark it with an error and
++ * clear the DONE status of the buffer so that a followup read will re-read it
++ * from disk. We don't report the error otherwise to avoid warnings during log
++ * recovery and we don't get unnecssary panics on debug kernels. We use EIO here
++ * because all we want to do is say readahead failed; there is no-one to report
++ * the error to, so this will distinguish it from a non-ra verifier failure.
+  */
+ static void
+ xfs_inode_buf_verify(
+@@ -93,6 +94,7 @@ xfs_inode_buf_verify(
+ 						XFS_RANDOM_ITOBP_INOTOBP))) {
+ 			if (readahead) {
+ 				bp->b_flags &= ~XBF_DONE;
++				xfs_buf_ioerror(bp, -EIO);
+ 				return;
+ 			}
+ 
+--- a/fs/xfs/xfs_buf.c
++++ b/fs/xfs/xfs_buf.c
+@@ -604,6 +604,13 @@ found:
+ 		}
+ 	}
+ 
++	/*
++	 * Clear b_error if this is a lookup from a caller that doesn't expect
++	 * valid data to be found in the buffer.
++	 */
++	if (!(flags & XBF_READ))
++		xfs_buf_ioerror(bp, 0);
++
+ 	XFS_STATS_INC(target->bt_mount, xb_get);
+ 	trace_xfs_buf_get(bp, flags, _RET_IP_);
+ 	return bp;

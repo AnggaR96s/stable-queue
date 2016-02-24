@@ -1,0 +1,379 @@
+From caaee6234d05a58c5b4d05e7bf766131b810a657 Mon Sep 17 00:00:00 2001
+From: Jann Horn <jann@thejh.net>
+Date: Wed, 20 Jan 2016 15:00:04 -0800
+Subject: ptrace: use fsuid, fsgid, effective creds for fs access checks
+
+From: Jann Horn <jann@thejh.net>
+
+commit caaee6234d05a58c5b4d05e7bf766131b810a657 upstream.
+
+By checking the effective credentials instead of the real UID / permitted
+capabilities, ensure that the calling process actually intended to use its
+credentials.
+
+To ensure that all ptrace checks use the correct caller credentials (e.g.
+in case out-of-tree code or newly added code omits the PTRACE_MODE_*CREDS
+flag), use two new flags and require one of them to be set.
+
+The problem was that when a privileged task had temporarily dropped its
+privileges, e.g.  by calling setreuid(0, user_uid), with the intent to
+perform following syscalls with the credentials of a user, it still passed
+ptrace access checks that the user would not be able to pass.
+
+While an attacker should not be able to convince the privileged task to
+perform a ptrace() syscall, this is a problem because the ptrace access
+check is reused for things in procfs.
+
+In particular, the following somewhat interesting procfs entries only rely
+on ptrace access checks:
+
+ /proc/$pid/stat - uses the check for determining whether pointers
+     should be visible, useful for bypassing ASLR
+ /proc/$pid/maps - also useful for bypassing ASLR
+ /proc/$pid/cwd - useful for gaining access to restricted
+     directories that contain files with lax permissions, e.g. in
+     this scenario:
+     lrwxrwxrwx root root /proc/13020/cwd -> /root/foobar
+     drwx------ root root /root
+     drwxr-xr-x root root /root/foobar
+     -rw-r--r-- root root /root/foobar/secret
+
+Therefore, on a system where a root-owned mode 6755 binary changes its
+effective credentials as described and then dumps a user-specified file,
+this could be used by an attacker to reveal the memory layout of root's
+processes or reveal the contents of files he is not allowed to access
+(through /proc/$pid/cwd).
+
+[akpm@linux-foundation.org: fix warning]
+Signed-off-by: Jann Horn <jann@thejh.net>
+Acked-by: Kees Cook <keescook@chromium.org>
+Cc: Casey Schaufler <casey@schaufler-ca.com>
+Cc: Oleg Nesterov <oleg@redhat.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: James Morris <james.l.morris@oracle.com>
+Cc: "Serge E. Hallyn" <serge.hallyn@ubuntu.com>
+Cc: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: "Eric W. Biederman" <ebiederm@xmission.com>
+Cc: Willy Tarreau <w@1wt.eu>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/proc/array.c        |    2 +-
+ fs/proc/base.c         |   21 +++++++++++----------
+ fs/proc/namespaces.c   |    4 ++--
+ include/linux/ptrace.h |   24 +++++++++++++++++++++++-
+ kernel/events/core.c   |    2 +-
+ kernel/futex.c         |    2 +-
+ kernel/futex_compat.c  |    2 +-
+ kernel/kcmp.c          |    4 ++--
+ kernel/ptrace.c        |   39 +++++++++++++++++++++++++++++++--------
+ mm/process_vm_access.c |    2 +-
+ security/commoncap.c   |    7 ++++++-
+ 11 files changed, 80 insertions(+), 29 deletions(-)
+
+--- a/fs/proc/array.c
++++ b/fs/proc/array.c
+@@ -395,7 +395,7 @@ static int do_task_stat(struct seq_file
+ 
+ 	state = *get_task_state(task);
+ 	vsize = eip = esp = 0;
+-	permitted = ptrace_may_access(task, PTRACE_MODE_READ | PTRACE_MODE_NOAUDIT);
++	permitted = ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS | PTRACE_MODE_NOAUDIT);
+ 	mm = get_task_mm(task);
+ 	if (mm) {
+ 		vsize = task_vsize(mm);
+--- a/fs/proc/base.c
++++ b/fs/proc/base.c
+@@ -403,7 +403,7 @@ static const struct file_operations proc
+ static int proc_pid_auxv(struct seq_file *m, struct pid_namespace *ns,
+ 			 struct pid *pid, struct task_struct *task)
+ {
+-	struct mm_struct *mm = mm_access(task, PTRACE_MODE_READ);
++	struct mm_struct *mm = mm_access(task, PTRACE_MODE_READ_FSCREDS);
+ 	if (mm && !IS_ERR(mm)) {
+ 		unsigned int nwords = 0;
+ 		do {
+@@ -430,7 +430,8 @@ static int proc_pid_wchan(struct seq_fil
+ 
+ 	wchan = get_wchan(task);
+ 
+-	if (wchan && ptrace_may_access(task, PTRACE_MODE_READ) && !lookup_symbol_name(wchan, symname))
++	if (wchan && ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS)
++			&& !lookup_symbol_name(wchan, symname))
+ 		seq_printf(m, "%s", symname);
+ 	else
+ 		seq_putc(m, '0');
+@@ -444,7 +445,7 @@ static int lock_trace(struct task_struct
+ 	int err = mutex_lock_killable(&task->signal->cred_guard_mutex);
+ 	if (err)
+ 		return err;
+-	if (!ptrace_may_access(task, PTRACE_MODE_ATTACH)) {
++	if (!ptrace_may_access(task, PTRACE_MODE_ATTACH_FSCREDS)) {
+ 		mutex_unlock(&task->signal->cred_guard_mutex);
+ 		return -EPERM;
+ 	}
+@@ -697,7 +698,7 @@ static int proc_fd_access_allowed(struct
+ 	 */
+ 	task = get_proc_task(inode);
+ 	if (task) {
+-		allowed = ptrace_may_access(task, PTRACE_MODE_READ);
++		allowed = ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS);
+ 		put_task_struct(task);
+ 	}
+ 	return allowed;
+@@ -732,7 +733,7 @@ static bool has_pid_permissions(struct p
+ 		return true;
+ 	if (in_group_p(pid->pid_gid))
+ 		return true;
+-	return ptrace_may_access(task, PTRACE_MODE_READ);
++	return ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS);
+ }
+ 
+ 
+@@ -809,7 +810,7 @@ struct mm_struct *proc_mem_open(struct i
+ 	struct mm_struct *mm = ERR_PTR(-ESRCH);
+ 
+ 	if (task) {
+-		mm = mm_access(task, mode);
++		mm = mm_access(task, mode | PTRACE_MODE_FSCREDS);
+ 		put_task_struct(task);
+ 
+ 		if (!IS_ERR_OR_NULL(mm)) {
+@@ -1856,7 +1857,7 @@ static int map_files_d_revalidate(struct
+ 	if (!task)
+ 		goto out_notask;
+ 
+-	mm = mm_access(task, PTRACE_MODE_READ);
++	mm = mm_access(task, PTRACE_MODE_READ_FSCREDS);
+ 	if (IS_ERR_OR_NULL(mm))
+ 		goto out;
+ 
+@@ -2007,7 +2008,7 @@ static struct dentry *proc_map_files_loo
+ 		goto out;
+ 
+ 	result = -EACCES;
+-	if (!ptrace_may_access(task, PTRACE_MODE_READ))
++	if (!ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS))
+ 		goto out_put_task;
+ 
+ 	result = -ENOENT;
+@@ -2060,7 +2061,7 @@ proc_map_files_readdir(struct file *file
+ 		goto out;
+ 
+ 	ret = -EACCES;
+-	if (!ptrace_may_access(task, PTRACE_MODE_READ))
++	if (!ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS))
+ 		goto out_put_task;
+ 
+ 	ret = 0;
+@@ -2530,7 +2531,7 @@ static int do_io_accounting(struct task_
+ 	if (result)
+ 		return result;
+ 
+-	if (!ptrace_may_access(task, PTRACE_MODE_READ)) {
++	if (!ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS)) {
+ 		result = -EACCES;
+ 		goto out_unlock;
+ 	}
+--- a/fs/proc/namespaces.c
++++ b/fs/proc/namespaces.c
+@@ -42,7 +42,7 @@ static const char *proc_ns_follow_link(s
+ 	if (!task)
+ 		return error;
+ 
+-	if (ptrace_may_access(task, PTRACE_MODE_READ)) {
++	if (ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS)) {
+ 		error = ns_get_path(&ns_path, task, ns_ops);
+ 		if (!error)
+ 			nd_jump_link(&ns_path);
+@@ -63,7 +63,7 @@ static int proc_ns_readlink(struct dentr
+ 	if (!task)
+ 		return res;
+ 
+-	if (ptrace_may_access(task, PTRACE_MODE_READ)) {
++	if (ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS)) {
+ 		res = ns_get_name(name, sizeof(name), task, ns_ops);
+ 		if (res >= 0)
+ 			res = readlink_copy(buffer, buflen, name);
+--- a/include/linux/ptrace.h
++++ b/include/linux/ptrace.h
+@@ -57,7 +57,29 @@ extern void exit_ptrace(struct task_stru
+ #define PTRACE_MODE_READ	0x01
+ #define PTRACE_MODE_ATTACH	0x02
+ #define PTRACE_MODE_NOAUDIT	0x04
+-/* Returns true on success, false on denial. */
++#define PTRACE_MODE_FSCREDS 0x08
++#define PTRACE_MODE_REALCREDS 0x10
++
++/* shorthands for READ/ATTACH and FSCREDS/REALCREDS combinations */
++#define PTRACE_MODE_READ_FSCREDS (PTRACE_MODE_READ | PTRACE_MODE_FSCREDS)
++#define PTRACE_MODE_READ_REALCREDS (PTRACE_MODE_READ | PTRACE_MODE_REALCREDS)
++#define PTRACE_MODE_ATTACH_FSCREDS (PTRACE_MODE_ATTACH | PTRACE_MODE_FSCREDS)
++#define PTRACE_MODE_ATTACH_REALCREDS (PTRACE_MODE_ATTACH | PTRACE_MODE_REALCREDS)
++
++/**
++ * ptrace_may_access - check whether the caller is permitted to access
++ * a target task.
++ * @task: target task
++ * @mode: selects type of access and caller credentials
++ *
++ * Returns true on success, false on denial.
++ *
++ * One of the flags PTRACE_MODE_FSCREDS and PTRACE_MODE_REALCREDS must
++ * be set in @mode to specify whether the access was requested through
++ * a filesystem syscall (should use effective capabilities and fsuid
++ * of the caller) or through an explicit syscall such as
++ * process_vm_writev or ptrace (and should use the real credentials).
++ */
+ extern bool ptrace_may_access(struct task_struct *task, unsigned int mode);
+ 
+ static inline int ptrace_reparented(struct task_struct *child)
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -3434,7 +3434,7 @@ find_lively_task_by_vpid(pid_t vpid)
+ 
+ 	/* Reuse ptrace permission checks for now. */
+ 	err = -EACCES;
+-	if (!ptrace_may_access(task, PTRACE_MODE_READ))
++	if (!ptrace_may_access(task, PTRACE_MODE_READ_REALCREDS))
+ 		goto errout;
+ 
+ 	return task;
+--- a/kernel/futex.c
++++ b/kernel/futex.c
+@@ -2881,7 +2881,7 @@ SYSCALL_DEFINE3(get_robust_list, int, pi
+ 	}
+ 
+ 	ret = -EPERM;
+-	if (!ptrace_may_access(p, PTRACE_MODE_READ))
++	if (!ptrace_may_access(p, PTRACE_MODE_READ_REALCREDS))
+ 		goto err_unlock;
+ 
+ 	head = p->robust_list;
+--- a/kernel/futex_compat.c
++++ b/kernel/futex_compat.c
+@@ -155,7 +155,7 @@ COMPAT_SYSCALL_DEFINE3(get_robust_list,
+ 	}
+ 
+ 	ret = -EPERM;
+-	if (!ptrace_may_access(p, PTRACE_MODE_READ))
++	if (!ptrace_may_access(p, PTRACE_MODE_READ_REALCREDS))
+ 		goto err_unlock;
+ 
+ 	head = p->compat_robust_list;
+--- a/kernel/kcmp.c
++++ b/kernel/kcmp.c
+@@ -122,8 +122,8 @@ SYSCALL_DEFINE5(kcmp, pid_t, pid1, pid_t
+ 			&task2->signal->cred_guard_mutex);
+ 	if (ret)
+ 		goto err;
+-	if (!ptrace_may_access(task1, PTRACE_MODE_READ) ||
+-	    !ptrace_may_access(task2, PTRACE_MODE_READ)) {
++	if (!ptrace_may_access(task1, PTRACE_MODE_READ_REALCREDS) ||
++	    !ptrace_may_access(task2, PTRACE_MODE_READ_REALCREDS)) {
+ 		ret = -EPERM;
+ 		goto err_unlock;
+ 	}
+--- a/kernel/ptrace.c
++++ b/kernel/ptrace.c
+@@ -219,6 +219,14 @@ static int ptrace_has_cap(struct user_na
+ static int __ptrace_may_access(struct task_struct *task, unsigned int mode)
+ {
+ 	const struct cred *cred = current_cred(), *tcred;
++	int dumpable = 0;
++	kuid_t caller_uid;
++	kgid_t caller_gid;
++
++	if (!(mode & PTRACE_MODE_FSCREDS) == !(mode & PTRACE_MODE_REALCREDS)) {
++		WARN(1, "denying ptrace access check without PTRACE_MODE_*CREDS\n");
++		return -EPERM;
++	}
+ 
+ 	/* May we inspect the given task?
+ 	 * This check is used both for attaching with ptrace
+@@ -228,18 +236,33 @@ static int __ptrace_may_access(struct ta
+ 	 * because setting up the necessary parent/child relationship
+ 	 * or halting the specified task is impossible.
+ 	 */
+-	int dumpable = 0;
++
+ 	/* Don't let security modules deny introspection */
+ 	if (same_thread_group(task, current))
+ 		return 0;
+ 	rcu_read_lock();
++	if (mode & PTRACE_MODE_FSCREDS) {
++		caller_uid = cred->fsuid;
++		caller_gid = cred->fsgid;
++	} else {
++		/*
++		 * Using the euid would make more sense here, but something
++		 * in userland might rely on the old behavior, and this
++		 * shouldn't be a security problem since
++		 * PTRACE_MODE_REALCREDS implies that the caller explicitly
++		 * used a syscall that requests access to another process
++		 * (and not a filesystem syscall to procfs).
++		 */
++		caller_uid = cred->uid;
++		caller_gid = cred->gid;
++	}
+ 	tcred = __task_cred(task);
+-	if (uid_eq(cred->uid, tcred->euid) &&
+-	    uid_eq(cred->uid, tcred->suid) &&
+-	    uid_eq(cred->uid, tcred->uid)  &&
+-	    gid_eq(cred->gid, tcred->egid) &&
+-	    gid_eq(cred->gid, tcred->sgid) &&
+-	    gid_eq(cred->gid, tcred->gid))
++	if (uid_eq(caller_uid, tcred->euid) &&
++	    uid_eq(caller_uid, tcred->suid) &&
++	    uid_eq(caller_uid, tcred->uid)  &&
++	    gid_eq(caller_gid, tcred->egid) &&
++	    gid_eq(caller_gid, tcred->sgid) &&
++	    gid_eq(caller_gid, tcred->gid))
+ 		goto ok;
+ 	if (ptrace_has_cap(tcred->user_ns, mode))
+ 		goto ok;
+@@ -306,7 +329,7 @@ static int ptrace_attach(struct task_str
+ 		goto out;
+ 
+ 	task_lock(task);
+-	retval = __ptrace_may_access(task, PTRACE_MODE_ATTACH);
++	retval = __ptrace_may_access(task, PTRACE_MODE_ATTACH_REALCREDS);
+ 	task_unlock(task);
+ 	if (retval)
+ 		goto unlock_creds;
+--- a/mm/process_vm_access.c
++++ b/mm/process_vm_access.c
+@@ -194,7 +194,7 @@ static ssize_t process_vm_rw_core(pid_t
+ 		goto free_proc_pages;
+ 	}
+ 
+-	mm = mm_access(task, PTRACE_MODE_ATTACH);
++	mm = mm_access(task, PTRACE_MODE_ATTACH_REALCREDS);
+ 	if (!mm || IS_ERR(mm)) {
+ 		rc = IS_ERR(mm) ? PTR_ERR(mm) : -ESRCH;
+ 		/*
+--- a/security/commoncap.c
++++ b/security/commoncap.c
+@@ -137,12 +137,17 @@ int cap_ptrace_access_check(struct task_
+ {
+ 	int ret = 0;
+ 	const struct cred *cred, *child_cred;
++	const kernel_cap_t *caller_caps;
+ 
+ 	rcu_read_lock();
+ 	cred = current_cred();
+ 	child_cred = __task_cred(child);
++	if (mode & PTRACE_MODE_FSCREDS)
++		caller_caps = &cred->cap_effective;
++	else
++		caller_caps = &cred->cap_permitted;
+ 	if (cred->user_ns == child_cred->user_ns &&
+-	    cap_issubset(child_cred->cap_permitted, cred->cap_permitted))
++	    cap_issubset(child_cred->cap_permitted, *caller_caps))
+ 		goto out;
+ 	if (ns_capable(child_cred->user_ns, CAP_SYS_PTRACE))
+ 		goto out;
