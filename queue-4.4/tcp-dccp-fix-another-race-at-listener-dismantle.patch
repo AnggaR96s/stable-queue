@@ -1,0 +1,263 @@
+From foo@baz Mon Feb 29 14:33:50 PST 2016
+From: Eric Dumazet <edumazet@google.com>
+Date: Thu, 18 Feb 2016 05:39:18 -0800
+Subject: tcp/dccp: fix another race at listener dismantle
+
+From: Eric Dumazet <edumazet@google.com>
+
+[ Upstream commit 7716682cc58e305e22207d5bb315f26af6b1e243 ]
+
+Ilya reported following lockdep splat:
+
+kernel: =========================
+kernel: [ BUG: held lock freed! ]
+kernel: 4.5.0-rc1-ceph-00026-g5e0a311 #1 Not tainted
+kernel: -------------------------
+kernel: swapper/5/0 is freeing memory
+ffff880035c9d200-ffff880035c9dbff, with a lock still held there!
+kernel: (&(&queue->rskq_lock)->rlock){+.-...}, at:
+[<ffffffff816f6a88>] inet_csk_reqsk_queue_add+0x28/0xa0
+kernel: 4 locks held by swapper/5/0:
+kernel: #0:  (rcu_read_lock){......}, at: [<ffffffff8169ef6b>]
+netif_receive_skb_internal+0x4b/0x1f0
+kernel: #1:  (rcu_read_lock){......}, at: [<ffffffff816e977f>]
+ip_local_deliver_finish+0x3f/0x380
+kernel: #2:  (slock-AF_INET){+.-...}, at: [<ffffffff81685ffb>]
+sk_clone_lock+0x19b/0x440
+kernel: #3:  (&(&queue->rskq_lock)->rlock){+.-...}, at:
+[<ffffffff816f6a88>] inet_csk_reqsk_queue_add+0x28/0xa0
+
+To properly fix this issue, inet_csk_reqsk_queue_add() needs
+to return to its callers if the child as been queued
+into accept queue.
+
+We also need to make sure listener is still there before
+calling sk->sk_data_ready(), by holding a reference on it,
+since the reference carried by the child can disappear as
+soon as the child is put on accept queue.
+
+Reported-by: Ilya Dryomov <idryomov@gmail.com>
+Fixes: ebb516af60e1 ("tcp/dccp: fix race at listener dismantle phase")
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/net/inet_connection_sock.h |    5 +++--
+ net/dccp/ipv4.c                    |   14 +++++++-------
+ net/dccp/ipv6.c                    |   14 +++++++-------
+ net/ipv4/inet_connection_sock.c    |   14 +++++++-------
+ net/ipv4/tcp_ipv4.c                |   14 +++++++-------
+ net/ipv6/tcp_ipv6.c                |   14 +++++++-------
+ 6 files changed, 38 insertions(+), 37 deletions(-)
+
+--- a/include/net/inet_connection_sock.h
++++ b/include/net/inet_connection_sock.h
+@@ -270,8 +270,9 @@ struct dst_entry *inet_csk_route_child_s
+ 					    struct sock *newsk,
+ 					    const struct request_sock *req);
+ 
+-void inet_csk_reqsk_queue_add(struct sock *sk, struct request_sock *req,
+-			      struct sock *child);
++struct sock *inet_csk_reqsk_queue_add(struct sock *sk,
++				      struct request_sock *req,
++				      struct sock *child);
+ void inet_csk_reqsk_queue_hash_add(struct sock *sk, struct request_sock *req,
+ 				   unsigned long timeout);
+ struct sock *inet_csk_complete_hashdance(struct sock *sk, struct sock *child,
+--- a/net/dccp/ipv4.c
++++ b/net/dccp/ipv4.c
+@@ -824,26 +824,26 @@ lookup:
+ 
+ 	if (sk->sk_state == DCCP_NEW_SYN_RECV) {
+ 		struct request_sock *req = inet_reqsk(sk);
+-		struct sock *nsk = NULL;
++		struct sock *nsk;
+ 
+ 		sk = req->rsk_listener;
+-		if (likely(sk->sk_state == DCCP_LISTEN)) {
+-			nsk = dccp_check_req(sk, skb, req);
+-		} else {
++		if (unlikely(sk->sk_state != DCCP_LISTEN)) {
+ 			inet_csk_reqsk_queue_drop_and_put(sk, req);
+ 			goto lookup;
+ 		}
++		sock_hold(sk);
++		nsk = dccp_check_req(sk, skb, req);
+ 		if (!nsk) {
+ 			reqsk_put(req);
+-			goto discard_it;
++			goto discard_and_relse;
+ 		}
+ 		if (nsk == sk) {
+-			sock_hold(sk);
+ 			reqsk_put(req);
+ 		} else if (dccp_child_process(sk, nsk, skb)) {
+ 			dccp_v4_ctl_send_reset(sk, skb);
+-			goto discard_it;
++			goto discard_and_relse;
+ 		} else {
++			sock_put(sk);
+ 			return 0;
+ 		}
+ 	}
+--- a/net/dccp/ipv6.c
++++ b/net/dccp/ipv6.c
+@@ -691,26 +691,26 @@ lookup:
+ 
+ 	if (sk->sk_state == DCCP_NEW_SYN_RECV) {
+ 		struct request_sock *req = inet_reqsk(sk);
+-		struct sock *nsk = NULL;
++		struct sock *nsk;
+ 
+ 		sk = req->rsk_listener;
+-		if (likely(sk->sk_state == DCCP_LISTEN)) {
+-			nsk = dccp_check_req(sk, skb, req);
+-		} else {
++		if (unlikely(sk->sk_state != DCCP_LISTEN)) {
+ 			inet_csk_reqsk_queue_drop_and_put(sk, req);
+ 			goto lookup;
+ 		}
++		sock_hold(sk);
++		nsk = dccp_check_req(sk, skb, req);
+ 		if (!nsk) {
+ 			reqsk_put(req);
+-			goto discard_it;
++			goto discard_and_relse;
+ 		}
+ 		if (nsk == sk) {
+-			sock_hold(sk);
+ 			reqsk_put(req);
+ 		} else if (dccp_child_process(sk, nsk, skb)) {
+ 			dccp_v6_ctl_send_reset(sk, skb);
+-			goto discard_it;
++			goto discard_and_relse;
+ 		} else {
++			sock_put(sk);
+ 			return 0;
+ 		}
+ 	}
+--- a/net/ipv4/inet_connection_sock.c
++++ b/net/ipv4/inet_connection_sock.c
+@@ -789,14 +789,16 @@ static void inet_child_forget(struct soc
+ 	reqsk_put(req);
+ }
+ 
+-void inet_csk_reqsk_queue_add(struct sock *sk, struct request_sock *req,
+-			      struct sock *child)
++struct sock *inet_csk_reqsk_queue_add(struct sock *sk,
++				      struct request_sock *req,
++				      struct sock *child)
+ {
+ 	struct request_sock_queue *queue = &inet_csk(sk)->icsk_accept_queue;
+ 
+ 	spin_lock(&queue->rskq_lock);
+ 	if (unlikely(sk->sk_state != TCP_LISTEN)) {
+ 		inet_child_forget(sk, req, child);
++		child = NULL;
+ 	} else {
+ 		req->sk = child;
+ 		req->dl_next = NULL;
+@@ -808,6 +810,7 @@ void inet_csk_reqsk_queue_add(struct soc
+ 		sk_acceptq_added(sk);
+ 	}
+ 	spin_unlock(&queue->rskq_lock);
++	return child;
+ }
+ EXPORT_SYMBOL(inet_csk_reqsk_queue_add);
+ 
+@@ -817,11 +820,8 @@ struct sock *inet_csk_complete_hashdance
+ 	if (own_req) {
+ 		inet_csk_reqsk_queue_drop(sk, req);
+ 		reqsk_queue_removed(&inet_csk(sk)->icsk_accept_queue, req);
+-		inet_csk_reqsk_queue_add(sk, req, child);
+-		/* Warning: caller must not call reqsk_put(req);
+-		 * child stole last reference on it.
+-		 */
+-		return child;
++		if (inet_csk_reqsk_queue_add(sk, req, child))
++			return child;
+ 	}
+ 	/* Too bad, another child took ownership of the request, undo. */
+ 	bh_unlock_sock(child);
+--- a/net/ipv4/tcp_ipv4.c
++++ b/net/ipv4/tcp_ipv4.c
+@@ -1594,30 +1594,30 @@ process:
+ 
+ 	if (sk->sk_state == TCP_NEW_SYN_RECV) {
+ 		struct request_sock *req = inet_reqsk(sk);
+-		struct sock *nsk = NULL;
++		struct sock *nsk;
+ 
+ 		sk = req->rsk_listener;
+ 		if (unlikely(tcp_v4_inbound_md5_hash(sk, skb))) {
+ 			reqsk_put(req);
+ 			goto discard_it;
+ 		}
+-		if (likely(sk->sk_state == TCP_LISTEN)) {
+-			nsk = tcp_check_req(sk, skb, req, false);
+-		} else {
++		if (unlikely(sk->sk_state != TCP_LISTEN)) {
+ 			inet_csk_reqsk_queue_drop_and_put(sk, req);
+ 			goto lookup;
+ 		}
++		sock_hold(sk);
++		nsk = tcp_check_req(sk, skb, req, false);
+ 		if (!nsk) {
+ 			reqsk_put(req);
+-			goto discard_it;
++			goto discard_and_relse;
+ 		}
+ 		if (nsk == sk) {
+-			sock_hold(sk);
+ 			reqsk_put(req);
+ 		} else if (tcp_child_process(sk, nsk, skb)) {
+ 			tcp_v4_send_reset(nsk, skb);
+-			goto discard_it;
++			goto discard_and_relse;
+ 		} else {
++			sock_put(sk);
+ 			return 0;
+ 		}
+ 	}
+--- a/net/ipv6/tcp_ipv6.c
++++ b/net/ipv6/tcp_ipv6.c
+@@ -1388,7 +1388,7 @@ process:
+ 
+ 	if (sk->sk_state == TCP_NEW_SYN_RECV) {
+ 		struct request_sock *req = inet_reqsk(sk);
+-		struct sock *nsk = NULL;
++		struct sock *nsk;
+ 
+ 		sk = req->rsk_listener;
+ 		tcp_v6_fill_cb(skb, hdr, th);
+@@ -1396,24 +1396,24 @@ process:
+ 			reqsk_put(req);
+ 			goto discard_it;
+ 		}
+-		if (likely(sk->sk_state == TCP_LISTEN)) {
+-			nsk = tcp_check_req(sk, skb, req, false);
+-		} else {
++		if (unlikely(sk->sk_state != TCP_LISTEN)) {
+ 			inet_csk_reqsk_queue_drop_and_put(sk, req);
+ 			goto lookup;
+ 		}
++		sock_hold(sk);
++		nsk = tcp_check_req(sk, skb, req, false);
+ 		if (!nsk) {
+ 			reqsk_put(req);
+-			goto discard_it;
++			goto discard_and_relse;
+ 		}
+ 		if (nsk == sk) {
+-			sock_hold(sk);
+ 			reqsk_put(req);
+ 			tcp_v6_restore_cb(skb);
+ 		} else if (tcp_child_process(sk, nsk, skb)) {
+ 			tcp_v6_send_reset(nsk, skb);
+-			goto discard_it;
++			goto discard_and_relse;
+ 		} else {
++			sock_put(sk);
+ 			return 0;
+ 		}
+ 	}

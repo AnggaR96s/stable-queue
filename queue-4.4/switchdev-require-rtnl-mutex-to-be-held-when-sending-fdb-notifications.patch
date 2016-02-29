@@ -1,0 +1,167 @@
+From foo@baz Mon Feb 29 14:33:50 PST 2016
+From: Ido Schimmel <idosch@mellanox.com>
+Date: Wed, 27 Jan 2016 15:16:43 +0100
+Subject: switchdev: Require RTNL mutex to be held when sending FDB notifications
+
+From: Ido Schimmel <idosch@mellanox.com>
+
+[ Upstream commit 4f2c6ae5c64c353fb1b0425e4747e5603feadba1 ]
+
+When switchdev drivers process FDB notifications from the underlying
+device they resolve the netdev to which the entry points to and notify
+the bridge using the switchdev notifier.
+
+However, since the RTNL mutex is not held there is nothing preventing
+the netdev from disappearing in the middle, which will cause
+br_switchdev_event() to dereference a non-existing netdev.
+
+Make switchdev drivers hold the lock at the beginning of the
+notification processing session and release it once it ends, after
+notifying the bridge.
+
+Also, remove switchdev_mutex and fdb_lock, as they are no longer needed
+when RTNL mutex is held.
+
+Fixes: 03bf0c281234 ("switchdev: introduce switchdev notifier")
+Signed-off-by: Ido Schimmel <idosch@mellanox.com>
+Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c |    3 +++
+ drivers/net/ethernet/rocker/rocker.c                     |    2 ++
+ net/bridge/br.c                                          |    3 +--
+ net/switchdev/switchdev.c                                |   15 ++++++++-------
+ 4 files changed, 14 insertions(+), 9 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
+@@ -45,6 +45,7 @@
+ #include <linux/if_bridge.h>
+ #include <linux/workqueue.h>
+ #include <linux/jiffies.h>
++#include <linux/rtnetlink.h>
+ #include <net/switchdev.h>
+ 
+ #include "spectrum.h"
+@@ -812,6 +813,7 @@ static void mlxsw_sp_fdb_notify_work(str
+ 
+ 	mlxsw_sp = container_of(work, struct mlxsw_sp, fdb_notify.dw.work);
+ 
++	rtnl_lock();
+ 	do {
+ 		mlxsw_reg_sfn_pack(sfn_pl);
+ 		err = mlxsw_reg_query(mlxsw_sp->core, MLXSW_REG(sfn), sfn_pl);
+@@ -824,6 +826,7 @@ static void mlxsw_sp_fdb_notify_work(str
+ 			mlxsw_sp_fdb_notify_rec_process(mlxsw_sp, sfn_pl, i);
+ 
+ 	} while (num_rec);
++	rtnl_unlock();
+ 
+ 	kfree(sfn_pl);
+ 	mlxsw_sp_fdb_notify_work_schedule(mlxsw_sp);
+--- a/drivers/net/ethernet/rocker/rocker.c
++++ b/drivers/net/ethernet/rocker/rocker.c
+@@ -3531,12 +3531,14 @@ static void rocker_port_fdb_learn_work(s
+ 	info.addr = lw->addr;
+ 	info.vid = lw->vid;
+ 
++	rtnl_lock();
+ 	if (learned && removing)
+ 		call_switchdev_notifiers(SWITCHDEV_FDB_DEL,
+ 					 lw->rocker_port->dev, &info.info);
+ 	else if (learned && !removing)
+ 		call_switchdev_notifiers(SWITCHDEV_FDB_ADD,
+ 					 lw->rocker_port->dev, &info.info);
++	rtnl_unlock();
+ 
+ 	rocker_port_kfree(lw->trans, work);
+ }
+--- a/net/bridge/br.c
++++ b/net/bridge/br.c
+@@ -121,6 +121,7 @@ static struct notifier_block br_device_n
+ 	.notifier_call = br_device_event
+ };
+ 
++/* called with RTNL */
+ static int br_switchdev_event(struct notifier_block *unused,
+ 			      unsigned long event, void *ptr)
+ {
+@@ -130,7 +131,6 @@ static int br_switchdev_event(struct not
+ 	struct switchdev_notifier_fdb_info *fdb_info;
+ 	int err = NOTIFY_DONE;
+ 
+-	rtnl_lock();
+ 	p = br_port_get_rtnl(dev);
+ 	if (!p)
+ 		goto out;
+@@ -155,7 +155,6 @@ static int br_switchdev_event(struct not
+ 	}
+ 
+ out:
+-	rtnl_unlock();
+ 	return err;
+ }
+ 
+--- a/net/switchdev/switchdev.c
++++ b/net/switchdev/switchdev.c
+@@ -20,6 +20,7 @@
+ #include <linux/list.h>
+ #include <linux/workqueue.h>
+ #include <linux/if_vlan.h>
++#include <linux/rtnetlink.h>
+ #include <net/ip_fib.h>
+ #include <net/switchdev.h>
+ 
+@@ -565,7 +566,6 @@ int switchdev_port_obj_dump(struct net_d
+ }
+ EXPORT_SYMBOL_GPL(switchdev_port_obj_dump);
+ 
+-static DEFINE_MUTEX(switchdev_mutex);
+ static RAW_NOTIFIER_HEAD(switchdev_notif_chain);
+ 
+ /**
+@@ -580,9 +580,9 @@ int register_switchdev_notifier(struct n
+ {
+ 	int err;
+ 
+-	mutex_lock(&switchdev_mutex);
++	rtnl_lock();
+ 	err = raw_notifier_chain_register(&switchdev_notif_chain, nb);
+-	mutex_unlock(&switchdev_mutex);
++	rtnl_unlock();
+ 	return err;
+ }
+ EXPORT_SYMBOL_GPL(register_switchdev_notifier);
+@@ -598,9 +598,9 @@ int unregister_switchdev_notifier(struct
+ {
+ 	int err;
+ 
+-	mutex_lock(&switchdev_mutex);
++	rtnl_lock();
+ 	err = raw_notifier_chain_unregister(&switchdev_notif_chain, nb);
+-	mutex_unlock(&switchdev_mutex);
++	rtnl_unlock();
+ 	return err;
+ }
+ EXPORT_SYMBOL_GPL(unregister_switchdev_notifier);
+@@ -614,16 +614,17 @@ EXPORT_SYMBOL_GPL(unregister_switchdev_n
+  *	Call all network notifier blocks. This should be called by driver
+  *	when it needs to propagate hardware event.
+  *	Return values are same as for atomic_notifier_call_chain().
++ *	rtnl_lock must be held.
+  */
+ int call_switchdev_notifiers(unsigned long val, struct net_device *dev,
+ 			     struct switchdev_notifier_info *info)
+ {
+ 	int err;
+ 
++	ASSERT_RTNL();
++
+ 	info->dev = dev;
+-	mutex_lock(&switchdev_mutex);
+ 	err = raw_notifier_call_chain(&switchdev_notif_chain, val, info);
+-	mutex_unlock(&switchdev_mutex);
+ 	return err;
+ }
+ EXPORT_SYMBOL_GPL(call_switchdev_notifiers);
