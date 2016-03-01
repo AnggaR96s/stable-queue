@@ -1,0 +1,98 @@
+From 4ae2182b1e3407de369f8c5d799543b7db74221b Mon Sep 17 00:00:00 2001
+From: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Date: Mon, 25 Jan 2016 10:08:00 -0600
+Subject: PCI/AER: Flush workqueue on device remove to avoid use-after-free
+
+From: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+
+commit 4ae2182b1e3407de369f8c5d799543b7db74221b upstream.
+
+A Root Port's AER structure (rpc) contains a queue of events.  aer_irq()
+enqueues AER status information and schedules aer_isr() to dequeue and
+process it.  When we remove a device, aer_remove() waits for the queue to
+be empty, then frees the rpc struct.
+
+But aer_isr() references the rpc struct after dequeueing and possibly
+emptying the queue, which can cause a use-after-free error as in the
+following scenario with two threads, aer_isr() on the left and a
+concurrent aer_remove() on the right:
+
+  Thread A                      Thread B
+  --------                      --------
+  aer_irq():
+    rpc->prod_idx++
+                                aer_remove():
+                                  wait_event(rpc->prod_idx == rpc->cons_idx)
+                                  # now blocked until queue becomes empty
+  aer_isr():                      # ...
+    rpc->cons_idx++               # unblocked because queue is now empty
+    ...                           kfree(rpc)
+    mutex_unlock(&rpc->rpc_mutex)
+
+To prevent this problem, use flush_work() to wait until the last scheduled
+instance of aer_isr() has completed before freeing the rpc struct in
+aer_remove().
+
+I reproduced this use-after-free by flashing a device FPGA and
+re-enumerating the bus to find the new device.  With SLUB debug, this
+crashes with 0x6b bytes (POISON_FREE, the use-after-free magic number) in
+GPR25:
+
+  pcieport 0000:00:00.0: AER: Multiple Corrected error received: id=0000
+  Unable to handle kernel paging request for data at address 0x27ef9e3e
+  Workqueue: events aer_isr
+  GPR24: dd6aa000 6b6b6b6b 605f8378 605f8360 d99b12c0 604fc674 606b1704 d99b12c0
+  NIP [602f5328] pci_walk_bus+0xd4/0x104
+
+[bhelgaas: changelog, stable tag]
+Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/pci/pcie/aer/aerdrv.c      |    4 +---
+ drivers/pci/pcie/aer/aerdrv.h      |    1 -
+ drivers/pci/pcie/aer/aerdrv_core.c |    2 --
+ 3 files changed, 1 insertion(+), 6 deletions(-)
+
+--- a/drivers/pci/pcie/aer/aerdrv.c
++++ b/drivers/pci/pcie/aer/aerdrv.c
+@@ -262,7 +262,6 @@ static struct aer_rpc *aer_alloc_rpc(str
+ 	rpc->rpd = dev;
+ 	INIT_WORK(&rpc->dpc_handler, aer_isr);
+ 	mutex_init(&rpc->rpc_mutex);
+-	init_waitqueue_head(&rpc->wait_release);
+ 
+ 	/* Use PCIe bus function to store rpc into PCIe device */
+ 	set_service_data(dev, rpc);
+@@ -285,8 +284,7 @@ static void aer_remove(struct pcie_devic
+ 		if (rpc->isr)
+ 			free_irq(dev->irq, dev);
+ 
+-		wait_event(rpc->wait_release, rpc->prod_idx == rpc->cons_idx);
+-
++		flush_work(&rpc->dpc_handler);
+ 		aer_disable_rootport(rpc);
+ 		kfree(rpc);
+ 		set_service_data(dev, NULL);
+--- a/drivers/pci/pcie/aer/aerdrv.h
++++ b/drivers/pci/pcie/aer/aerdrv.h
+@@ -76,7 +76,6 @@ struct aer_rpc {
+ 					 * recovery on the same
+ 					 * root port hierarchy
+ 					 */
+-	wait_queue_head_t wait_release;
+ };
+ 
+ struct aer_broadcast_data {
+--- a/drivers/pci/pcie/aer/aerdrv_core.c
++++ b/drivers/pci/pcie/aer/aerdrv_core.c
+@@ -817,8 +817,6 @@ void aer_isr(struct work_struct *work)
+ 	while (get_e_source(rpc, &e_src))
+ 		aer_isr_one_error(p_device, &e_src);
+ 	mutex_unlock(&rpc->rpc_mutex);
+-
+-	wake_up(&rpc->wait_release);
+ }
+ 
+ /**
