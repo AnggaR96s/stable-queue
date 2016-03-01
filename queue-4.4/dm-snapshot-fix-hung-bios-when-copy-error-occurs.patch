@@ -1,0 +1,135 @@
+From 385277bfb57faac44e92497104ba542cdd82d5fe Mon Sep 17 00:00:00 2001
+From: Mikulas Patocka <mpatocka@redhat.com>
+Date: Fri, 8 Jan 2016 19:07:55 -0500
+Subject: dm snapshot: fix hung bios when copy error occurs
+
+From: Mikulas Patocka <mpatocka@redhat.com>
+
+commit 385277bfb57faac44e92497104ba542cdd82d5fe upstream.
+
+When there is an error copying a chunk dm-snapshot can incorrectly hold
+associated bios indefinitely, resulting in hung IO.
+
+The function copy_callback sets pe->error if there was error copying the
+chunk, and then calls complete_exception.  complete_exception calls
+pending_complete on error, otherwise it calls commit_exception with
+commit_callback (and commit_callback calls complete_exception).
+
+The persistent exception store (dm-snap-persistent.c) assumes that calls
+to prepare_exception and commit_exception are paired.
+persistent_prepare_exception increases ps->pending_count and
+persistent_commit_exception decreases it.
+
+If there is a copy error, persistent_prepare_exception is called but
+persistent_commit_exception is not.  This results in the variable
+ps->pending_count never returning to zero and that causes some pending
+exceptions (and their associated bios) to be held forever.
+
+Fix this by unconditionally calling commit_exception regardless of
+whether the copy was successful.  A new "valid" parameter is added to
+commit_exception -- when the copy fails this parameter is set to zero so
+that the chunk that failed to copy (and all following chunks) is not
+recorded in the snapshot store.  Also, remove commit_callback now that
+it is merely a wrapper around pending_complete.
+
+Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/md/dm-exception-store.h |    2 +-
+ drivers/md/dm-snap-persistent.c |    5 ++++-
+ drivers/md/dm-snap-transient.c  |    4 ++--
+ drivers/md/dm-snap.c            |   20 +++++---------------
+ 4 files changed, 12 insertions(+), 19 deletions(-)
+
+--- a/drivers/md/dm-exception-store.h
++++ b/drivers/md/dm-exception-store.h
+@@ -69,7 +69,7 @@ struct dm_exception_store_type {
+ 	 * Update the metadata with this exception.
+ 	 */
+ 	void (*commit_exception) (struct dm_exception_store *store,
+-				  struct dm_exception *e,
++				  struct dm_exception *e, int valid,
+ 				  void (*callback) (void *, int success),
+ 				  void *callback_context);
+ 
+--- a/drivers/md/dm-snap-persistent.c
++++ b/drivers/md/dm-snap-persistent.c
+@@ -695,7 +695,7 @@ static int persistent_prepare_exception(
+ }
+ 
+ static void persistent_commit_exception(struct dm_exception_store *store,
+-					struct dm_exception *e,
++					struct dm_exception *e, int valid,
+ 					void (*callback) (void *, int success),
+ 					void *callback_context)
+ {
+@@ -704,6 +704,9 @@ static void persistent_commit_exception(
+ 	struct core_exception ce;
+ 	struct commit_callback *cb;
+ 
++	if (!valid)
++		ps->valid = 0;
++
+ 	ce.old_chunk = e->old_chunk;
+ 	ce.new_chunk = e->new_chunk;
+ 	write_exception(ps, ps->current_committed++, &ce);
+--- a/drivers/md/dm-snap-transient.c
++++ b/drivers/md/dm-snap-transient.c
+@@ -52,12 +52,12 @@ static int transient_prepare_exception(s
+ }
+ 
+ static void transient_commit_exception(struct dm_exception_store *store,
+-				       struct dm_exception *e,
++				       struct dm_exception *e, int valid,
+ 				       void (*callback) (void *, int success),
+ 				       void *callback_context)
+ {
+ 	/* Just succeed */
+-	callback(callback_context, 1);
++	callback(callback_context, valid);
+ }
+ 
+ static void transient_usage(struct dm_exception_store *store,
+--- a/drivers/md/dm-snap.c
++++ b/drivers/md/dm-snap.c
+@@ -1438,8 +1438,9 @@ static void __invalidate_snapshot(struct
+ 	dm_table_event(s->ti->table);
+ }
+ 
+-static void pending_complete(struct dm_snap_pending_exception *pe, int success)
++static void pending_complete(void *context, int success)
+ {
++	struct dm_snap_pending_exception *pe = context;
+ 	struct dm_exception *e;
+ 	struct dm_snapshot *s = pe->snap;
+ 	struct bio *origin_bios = NULL;
+@@ -1509,24 +1510,13 @@ out:
+ 	free_pending_exception(pe);
+ }
+ 
+-static void commit_callback(void *context, int success)
+-{
+-	struct dm_snap_pending_exception *pe = context;
+-
+-	pending_complete(pe, success);
+-}
+-
+ static void complete_exception(struct dm_snap_pending_exception *pe)
+ {
+ 	struct dm_snapshot *s = pe->snap;
+ 
+-	if (unlikely(pe->copy_error))
+-		pending_complete(pe, 0);
+-
+-	else
+-		/* Update the metadata if we are persistent */
+-		s->store->type->commit_exception(s->store, &pe->e,
+-						 commit_callback, pe);
++	/* Update the metadata if we are persistent */
++	s->store->type->commit_exception(s->store, &pe->e, !pe->copy_error,
++					 pending_complete, pe);
+ }
+ 
+ /*
