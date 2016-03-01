@@ -1,0 +1,269 @@
+From 0ad95472bf169a3501991f8f33f5147f792a8116 Mon Sep 17 00:00:00 2001
+From: Andrey Ryabinin <aryabinin@virtuozzo.com>
+Date: Wed, 23 Sep 2015 15:49:29 +0300
+Subject: lockd: create NSM handles per net namespace
+
+From: Andrey Ryabinin <aryabinin@virtuozzo.com>
+
+commit 0ad95472bf169a3501991f8f33f5147f792a8116 upstream.
+
+Commit cb7323fffa85 ("lockd: create and use per-net NSM
+ RPC clients on MON/UNMON requests") introduced per-net
+NSM RPC clients. Unfortunately this doesn't make any sense
+without per-net nsm_handle.
+
+E.g. the following scenario could happen
+Two hosts (X and Y) in different namespaces (A and B) share
+the same nsm struct.
+
+1. nsm_monitor(host_X) called => NSM rpc client created,
+	nsm->sm_monitored bit set.
+2. nsm_mointor(host-Y) called => nsm->sm_monitored already set,
+	we just exit. Thus in namespace B ln->nsm_clnt == NULL.
+3. host X destroyed => nsm->sm_count decremented to 1
+4. host Y destroyed => nsm_unmonitor() => nsm_mon_unmon() => NULL-ptr
+	dereference of *ln->nsm_clnt
+
+So this could be fixed by making per-net nsm_handles list,
+instead of global. Thus different net namespaces will not be able
+share the same nsm_handle.
+
+Signed-off-by: Andrey Ryabinin <aryabinin@virtuozzo.com>
+Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/lockd/host.c             |    7 ++++---
+ fs/lockd/mon.c              |   36 ++++++++++++++++++++++--------------
+ fs/lockd/netns.h            |    1 +
+ fs/lockd/svc.c              |    1 +
+ fs/lockd/svc4proc.c         |    2 +-
+ fs/lockd/svcproc.c          |    2 +-
+ include/linux/lockd/lockd.h |    9 ++++++---
+ 7 files changed, 36 insertions(+), 22 deletions(-)
+
+--- a/fs/lockd/host.c
++++ b/fs/lockd/host.c
+@@ -116,7 +116,7 @@ static struct nlm_host *nlm_alloc_host(s
+ 		atomic_inc(&nsm->sm_count);
+ 	else {
+ 		host = NULL;
+-		nsm = nsm_get_handle(ni->sap, ni->salen,
++		nsm = nsm_get_handle(ni->net, ni->sap, ni->salen,
+ 					ni->hostname, ni->hostname_len);
+ 		if (unlikely(nsm == NULL)) {
+ 			dprintk("lockd: %s failed; no nsm handle\n",
+@@ -534,17 +534,18 @@ static struct nlm_host *next_host_state(
+ 
+ /**
+  * nlm_host_rebooted - Release all resources held by rebooted host
++ * @net:  network namespace
+  * @info: pointer to decoded results of NLM_SM_NOTIFY call
+  *
+  * We were notified that the specified host has rebooted.  Release
+  * all resources held by that peer.
+  */
+-void nlm_host_rebooted(const struct nlm_reboot *info)
++void nlm_host_rebooted(const struct net *net, const struct nlm_reboot *info)
+ {
+ 	struct nsm_handle *nsm;
+ 	struct nlm_host	*host;
+ 
+-	nsm = nsm_reboot_lookup(info);
++	nsm = nsm_reboot_lookup(net, info);
+ 	if (unlikely(nsm == NULL))
+ 		return;
+ 
+--- a/fs/lockd/mon.c
++++ b/fs/lockd/mon.c
+@@ -51,7 +51,6 @@ struct nsm_res {
+ };
+ 
+ static const struct rpc_program	nsm_program;
+-static				LIST_HEAD(nsm_handles);
+ static				DEFINE_SPINLOCK(nsm_lock);
+ 
+ /*
+@@ -259,33 +258,35 @@ void nsm_unmonitor(const struct nlm_host
+ 	}
+ }
+ 
+-static struct nsm_handle *nsm_lookup_hostname(const char *hostname,
+-					      const size_t len)
++static struct nsm_handle *nsm_lookup_hostname(const struct list_head *nsm_handles,
++					const char *hostname, const size_t len)
+ {
+ 	struct nsm_handle *nsm;
+ 
+-	list_for_each_entry(nsm, &nsm_handles, sm_link)
++	list_for_each_entry(nsm, nsm_handles, sm_link)
+ 		if (strlen(nsm->sm_name) == len &&
+ 		    memcmp(nsm->sm_name, hostname, len) == 0)
+ 			return nsm;
+ 	return NULL;
+ }
+ 
+-static struct nsm_handle *nsm_lookup_addr(const struct sockaddr *sap)
++static struct nsm_handle *nsm_lookup_addr(const struct list_head *nsm_handles,
++					const struct sockaddr *sap)
+ {
+ 	struct nsm_handle *nsm;
+ 
+-	list_for_each_entry(nsm, &nsm_handles, sm_link)
++	list_for_each_entry(nsm, nsm_handles, sm_link)
+ 		if (rpc_cmp_addr(nsm_addr(nsm), sap))
+ 			return nsm;
+ 	return NULL;
+ }
+ 
+-static struct nsm_handle *nsm_lookup_priv(const struct nsm_private *priv)
++static struct nsm_handle *nsm_lookup_priv(const struct list_head *nsm_handles,
++					const struct nsm_private *priv)
+ {
+ 	struct nsm_handle *nsm;
+ 
+-	list_for_each_entry(nsm, &nsm_handles, sm_link)
++	list_for_each_entry(nsm, nsm_handles, sm_link)
+ 		if (memcmp(nsm->sm_priv.data, priv->data,
+ 					sizeof(priv->data)) == 0)
+ 			return nsm;
+@@ -350,6 +351,7 @@ static struct nsm_handle *nsm_create_han
+ 
+ /**
+  * nsm_get_handle - Find or create a cached nsm_handle
++ * @net: network namespace
+  * @sap: pointer to socket address of handle to find
+  * @salen: length of socket address
+  * @hostname: pointer to C string containing hostname to find
+@@ -362,11 +364,13 @@ static struct nsm_handle *nsm_create_han
+  * @hostname cannot be found in the handle cache.  Returns NULL if
+  * an error occurs.
+  */
+-struct nsm_handle *nsm_get_handle(const struct sockaddr *sap,
++struct nsm_handle *nsm_get_handle(const struct net *net,
++				  const struct sockaddr *sap,
+ 				  const size_t salen, const char *hostname,
+ 				  const size_t hostname_len)
+ {
+ 	struct nsm_handle *cached, *new = NULL;
++	struct lockd_net *ln = net_generic(net, lockd_net_id);
+ 
+ 	if (hostname && memchr(hostname, '/', hostname_len) != NULL) {
+ 		if (printk_ratelimit()) {
+@@ -381,9 +385,10 @@ retry:
+ 	spin_lock(&nsm_lock);
+ 
+ 	if (nsm_use_hostnames && hostname != NULL)
+-		cached = nsm_lookup_hostname(hostname, hostname_len);
++		cached = nsm_lookup_hostname(&ln->nsm_handles,
++					hostname, hostname_len);
+ 	else
+-		cached = nsm_lookup_addr(sap);
++		cached = nsm_lookup_addr(&ln->nsm_handles, sap);
+ 
+ 	if (cached != NULL) {
+ 		atomic_inc(&cached->sm_count);
+@@ -397,7 +402,7 @@ retry:
+ 	}
+ 
+ 	if (new != NULL) {
+-		list_add(&new->sm_link, &nsm_handles);
++		list_add(&new->sm_link, &ln->nsm_handles);
+ 		spin_unlock(&nsm_lock);
+ 		dprintk("lockd: created nsm_handle for %s (%s)\n",
+ 				new->sm_name, new->sm_addrbuf);
+@@ -414,19 +419,22 @@ retry:
+ 
+ /**
+  * nsm_reboot_lookup - match NLMPROC_SM_NOTIFY arguments to an nsm_handle
++ * @net:  network namespace
+  * @info: pointer to NLMPROC_SM_NOTIFY arguments
+  *
+  * Returns a matching nsm_handle if found in the nsm cache. The returned
+  * nsm_handle's reference count is bumped. Otherwise returns NULL if some
+  * error occurred.
+  */
+-struct nsm_handle *nsm_reboot_lookup(const struct nlm_reboot *info)
++struct nsm_handle *nsm_reboot_lookup(const struct net *net,
++				const struct nlm_reboot *info)
+ {
+ 	struct nsm_handle *cached;
++	struct lockd_net *ln = net_generic(net, lockd_net_id);
+ 
+ 	spin_lock(&nsm_lock);
+ 
+-	cached = nsm_lookup_priv(&info->priv);
++	cached = nsm_lookup_priv(&ln->nsm_handles, &info->priv);
+ 	if (unlikely(cached == NULL)) {
+ 		spin_unlock(&nsm_lock);
+ 		dprintk("lockd: never saw rebooted peer '%.*s' before\n",
+--- a/fs/lockd/netns.h
++++ b/fs/lockd/netns.h
+@@ -16,6 +16,7 @@ struct lockd_net {
+ 	spinlock_t nsm_clnt_lock;
+ 	unsigned int nsm_users;
+ 	struct rpc_clnt *nsm_clnt;
++	struct list_head nsm_handles;
+ };
+ 
+ extern int lockd_net_id;
+--- a/fs/lockd/svc.c
++++ b/fs/lockd/svc.c
+@@ -583,6 +583,7 @@ static int lockd_init_net(struct net *ne
+ 	INIT_DELAYED_WORK(&ln->grace_period_end, grace_ender);
+ 	INIT_LIST_HEAD(&ln->grace_list);
+ 	spin_lock_init(&ln->nsm_clnt_lock);
++	INIT_LIST_HEAD(&ln->nsm_handles);
+ 	return 0;
+ }
+ 
+--- a/fs/lockd/svc4proc.c
++++ b/fs/lockd/svc4proc.c
+@@ -421,7 +421,7 @@ nlm4svc_proc_sm_notify(struct svc_rqst *
+ 		return rpc_system_err;
+ 	}
+ 
+-	nlm_host_rebooted(argp);
++	nlm_host_rebooted(SVC_NET(rqstp), argp);
+ 	return rpc_success;
+ }
+ 
+--- a/fs/lockd/svcproc.c
++++ b/fs/lockd/svcproc.c
+@@ -464,7 +464,7 @@ nlmsvc_proc_sm_notify(struct svc_rqst *r
+ 		return rpc_system_err;
+ 	}
+ 
+-	nlm_host_rebooted(argp);
++	nlm_host_rebooted(SVC_NET(rqstp), argp);
+ 	return rpc_success;
+ }
+ 
+--- a/include/linux/lockd/lockd.h
++++ b/include/linux/lockd/lockd.h
+@@ -236,7 +236,8 @@ void		  nlm_rebind_host(struct nlm_host
+ struct nlm_host * nlm_get_host(struct nlm_host *);
+ void		  nlm_shutdown_hosts(void);
+ void		  nlm_shutdown_hosts_net(struct net *net);
+-void		  nlm_host_rebooted(const struct nlm_reboot *);
++void		  nlm_host_rebooted(const struct net *net,
++					const struct nlm_reboot *);
+ 
+ /*
+  * Host monitoring
+@@ -244,11 +245,13 @@ void		  nlm_host_rebooted(const struct n
+ int		  nsm_monitor(const struct nlm_host *host);
+ void		  nsm_unmonitor(const struct nlm_host *host);
+ 
+-struct nsm_handle *nsm_get_handle(const struct sockaddr *sap,
++struct nsm_handle *nsm_get_handle(const struct net *net,
++					const struct sockaddr *sap,
+ 					const size_t salen,
+ 					const char *hostname,
+ 					const size_t hostname_len);
+-struct nsm_handle *nsm_reboot_lookup(const struct nlm_reboot *info);
++struct nsm_handle *nsm_reboot_lookup(const struct net *net,
++					const struct nlm_reboot *info);
+ void		  nsm_release(struct nsm_handle *nsm);
+ 
+ /*
