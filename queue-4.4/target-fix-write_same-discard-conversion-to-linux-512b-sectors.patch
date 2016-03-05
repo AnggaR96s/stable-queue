@@ -1,0 +1,268 @@
+From 8a9ebe717a133ba7bc90b06047f43cc6b8bcb8b3 Mon Sep 17 00:00:00 2001
+From: Mike Christie <mchristi@redhat.com>
+Date: Mon, 18 Jan 2016 14:09:27 -0600
+Subject: target: Fix WRITE_SAME/DISCARD conversion to linux 512b sectors
+
+From: Mike Christie <mchristi@redhat.com>
+
+commit 8a9ebe717a133ba7bc90b06047f43cc6b8bcb8b3 upstream.
+
+In a couple places we are not converting to/from the Linux
+block layer 512 bytes sectors.
+
+1.
+
+The request queue values and what we do are a mismatch of
+things:
+
+max_discard_sectors - This is in linux block layer 512 byte
+sectors. We are just copying this to max_unmap_lba_count.
+
+discard_granularity - This is in bytes. We are converting it
+to Linux block layer 512 byte sectors.
+
+discard_alignment - This is in bytes. We are just copying
+this over.
+
+The problem is that the core LIO code exports these values in
+spc_emulate_evpd_b0 and we use them to test request arguments
+in sbc_execute_unmap, but we never convert to the block size
+we export to the initiator. If we are not using 512 byte sectors
+then we are exporting the wrong values or are checks are off.
+And, for the discard_alignment/bytes case we are just plain messed
+up.
+
+2.
+
+blkdev_issue_discard's start and number of sector arguments
+are supposed to be in linux block layer 512 byte sectors. We are
+currently passing in the values we get from the initiator which
+might be based on some other sector size.
+
+There is a similar problem in iblock_execute_write_same where
+the bio functions want values in 512 byte sectors but we are
+passing in what we got from the initiator.
+
+Signed-off-by: Mike Christie <mchristi@redhat.com>
+Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+[ kamal: backport to 4.4-stable: no unmap_zeroes_data ]
+Signed-off-by: Kamal Mostafa <kamal@canonical.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/target/target_core_device.c  |   43 ++++++++++++++++++++++++++
+ drivers/target/target_core_file.c    |   29 +++++-------------
+ drivers/target/target_core_iblock.c  |   56 ++++++++---------------------------
+ include/target/target_core_backend.h |    3 +
+ 4 files changed, 69 insertions(+), 62 deletions(-)
+
+--- a/drivers/target/target_core_device.c
++++ b/drivers/target/target_core_device.c
+@@ -826,6 +826,49 @@ struct se_device *target_alloc_device(st
+ 	return dev;
+ }
+ 
++/*
++ * Check if the underlying struct block_device request_queue supports
++ * the QUEUE_FLAG_DISCARD bit for UNMAP/WRITE_SAME in SCSI + TRIM
++ * in ATA and we need to set TPE=1
++ */
++bool target_configure_unmap_from_queue(struct se_dev_attrib *attrib,
++				       struct request_queue *q, int block_size)
++{
++	if (!blk_queue_discard(q))
++		return false;
++
++	attrib->max_unmap_lba_count = (q->limits.max_discard_sectors << 9) /
++								block_size;
++	/*
++	 * Currently hardcoded to 1 in Linux/SCSI code..
++	 */
++	attrib->max_unmap_block_desc_count = 1;
++	attrib->unmap_granularity = q->limits.discard_granularity / block_size;
++	attrib->unmap_granularity_alignment = q->limits.discard_alignment /
++								block_size;
++	return true;
++}
++EXPORT_SYMBOL(target_configure_unmap_from_queue);
++
++/*
++ * Convert from blocksize advertised to the initiator to the 512 byte
++ * units unconditionally used by the Linux block layer.
++ */
++sector_t target_to_linux_sector(struct se_device *dev, sector_t lb)
++{
++	switch (dev->dev_attrib.block_size) {
++	case 4096:
++		return lb << 3;
++	case 2048:
++		return lb << 2;
++	case 1024:
++		return lb << 1;
++	default:
++		return lb;
++	}
++}
++EXPORT_SYMBOL(target_to_linux_sector);
++
+ int target_configure_device(struct se_device *dev)
+ {
+ 	struct se_hba *hba = dev->se_hba;
+--- a/drivers/target/target_core_file.c
++++ b/drivers/target/target_core_file.c
+@@ -160,25 +160,11 @@ static int fd_configure_device(struct se
+ 			" block_device blocks: %llu logical_block_size: %d\n",
+ 			dev_size, div_u64(dev_size, fd_dev->fd_block_size),
+ 			fd_dev->fd_block_size);
+-		/*
+-		 * Check if the underlying struct block_device request_queue supports
+-		 * the QUEUE_FLAG_DISCARD bit for UNMAP/WRITE_SAME in SCSI + TRIM
+-		 * in ATA and we need to set TPE=1
+-		 */
+-		if (blk_queue_discard(q)) {
+-			dev->dev_attrib.max_unmap_lba_count =
+-				q->limits.max_discard_sectors;
+-			/*
+-			 * Currently hardcoded to 1 in Linux/SCSI code..
+-			 */
+-			dev->dev_attrib.max_unmap_block_desc_count = 1;
+-			dev->dev_attrib.unmap_granularity =
+-				q->limits.discard_granularity >> 9;
+-			dev->dev_attrib.unmap_granularity_alignment =
+-				q->limits.discard_alignment;
++
++		if (target_configure_unmap_from_queue(&dev->dev_attrib, q,
++						      fd_dev->fd_block_size))
+ 			pr_debug("IFILE: BLOCK Discard support available,"
+-					" disabled by default\n");
+-		}
++				 " disabled by default\n");
+ 		/*
+ 		 * Enable write same emulation for IBLOCK and use 0xFFFF as
+ 		 * the smaller WRITE_SAME(10) only has a two-byte block count.
+@@ -490,9 +476,12 @@ fd_execute_unmap(struct se_cmd *cmd, sec
+ 	if (S_ISBLK(inode->i_mode)) {
+ 		/* The backend is block device, use discard */
+ 		struct block_device *bdev = inode->i_bdev;
++		struct se_device *dev = cmd->se_dev;
+ 
+-		ret = blkdev_issue_discard(bdev, lba,
+-				nolb, GFP_KERNEL, 0);
++		ret = blkdev_issue_discard(bdev,
++					   target_to_linux_sector(dev, lba),
++					   target_to_linux_sector(dev,  nolb),
++					   GFP_KERNEL, 0);
+ 		if (ret < 0) {
+ 			pr_warn("FILEIO: blkdev_issue_discard() failed: %d\n",
+ 				ret);
+--- a/drivers/target/target_core_iblock.c
++++ b/drivers/target/target_core_iblock.c
+@@ -121,27 +121,11 @@ static int iblock_configure_device(struc
+ 	dev->dev_attrib.hw_max_sectors = queue_max_hw_sectors(q);
+ 	dev->dev_attrib.hw_queue_depth = q->nr_requests;
+ 
+-	/*
+-	 * Check if the underlying struct block_device request_queue supports
+-	 * the QUEUE_FLAG_DISCARD bit for UNMAP/WRITE_SAME in SCSI + TRIM
+-	 * in ATA and we need to set TPE=1
+-	 */
+-	if (blk_queue_discard(q)) {
+-		dev->dev_attrib.max_unmap_lba_count =
+-				q->limits.max_discard_sectors;
+-
+-		/*
+-		 * Currently hardcoded to 1 in Linux/SCSI code..
+-		 */
+-		dev->dev_attrib.max_unmap_block_desc_count = 1;
+-		dev->dev_attrib.unmap_granularity =
+-				q->limits.discard_granularity >> 9;
+-		dev->dev_attrib.unmap_granularity_alignment =
+-				q->limits.discard_alignment;
+-
++	if (target_configure_unmap_from_queue(&dev->dev_attrib, q,
++					      dev->dev_attrib.hw_block_size))
+ 		pr_debug("IBLOCK: BLOCK Discard support available,"
+-				" disabled by default\n");
+-	}
++			 " disabled by default\n");
++
+ 	/*
+ 	 * Enable write same emulation for IBLOCK and use 0xFFFF as
+ 	 * the smaller WRITE_SAME(10) only has a two-byte block count.
+@@ -413,9 +397,13 @@ static sense_reason_t
+ iblock_execute_unmap(struct se_cmd *cmd, sector_t lba, sector_t nolb)
+ {
+ 	struct block_device *bdev = IBLOCK_DEV(cmd->se_dev)->ibd_bd;
++	struct se_device *dev = cmd->se_dev;
+ 	int ret;
+ 
+-	ret = blkdev_issue_discard(bdev, lba, nolb, GFP_KERNEL, 0);
++	ret = blkdev_issue_discard(bdev,
++				   target_to_linux_sector(dev, lba),
++				   target_to_linux_sector(dev,  nolb),
++				   GFP_KERNEL, 0);
+ 	if (ret < 0) {
+ 		pr_err("blkdev_issue_discard() failed: %d\n", ret);
+ 		return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
+@@ -431,8 +419,10 @@ iblock_execute_write_same(struct se_cmd
+ 	struct scatterlist *sg;
+ 	struct bio *bio;
+ 	struct bio_list list;
+-	sector_t block_lba = cmd->t_task_lba;
+-	sector_t sectors = sbc_get_write_same_sectors(cmd);
++	struct se_device *dev = cmd->se_dev;
++	sector_t block_lba = target_to_linux_sector(dev, cmd->t_task_lba);
++	sector_t sectors = target_to_linux_sector(dev,
++					sbc_get_write_same_sectors(cmd));
+ 
+ 	if (cmd->prot_op) {
+ 		pr_err("WRITE_SAME: Protection information with IBLOCK"
+@@ -646,12 +636,12 @@ iblock_execute_rw(struct se_cmd *cmd, st
+ 		  enum dma_data_direction data_direction)
+ {
+ 	struct se_device *dev = cmd->se_dev;
++	sector_t block_lba = target_to_linux_sector(dev, cmd->t_task_lba);
+ 	struct iblock_req *ibr;
+ 	struct bio *bio, *bio_start;
+ 	struct bio_list list;
+ 	struct scatterlist *sg;
+ 	u32 sg_num = sgl_nents;
+-	sector_t block_lba;
+ 	unsigned bio_cnt;
+ 	int rw = 0;
+ 	int i;
+@@ -677,24 +667,6 @@ iblock_execute_rw(struct se_cmd *cmd, st
+ 		rw = READ;
+ 	}
+ 
+-	/*
+-	 * Convert the blocksize advertised to the initiator to the 512 byte
+-	 * units unconditionally used by the Linux block layer.
+-	 */
+-	if (dev->dev_attrib.block_size == 4096)
+-		block_lba = (cmd->t_task_lba << 3);
+-	else if (dev->dev_attrib.block_size == 2048)
+-		block_lba = (cmd->t_task_lba << 2);
+-	else if (dev->dev_attrib.block_size == 1024)
+-		block_lba = (cmd->t_task_lba << 1);
+-	else if (dev->dev_attrib.block_size == 512)
+-		block_lba = cmd->t_task_lba;
+-	else {
+-		pr_err("Unsupported SCSI -> BLOCK LBA conversion:"
+-				" %u\n", dev->dev_attrib.block_size);
+-		return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
+-	}
+-
+ 	ibr = kzalloc(sizeof(struct iblock_req), GFP_KERNEL);
+ 	if (!ibr)
+ 		goto fail;
+--- a/include/target/target_core_backend.h
++++ b/include/target/target_core_backend.h
+@@ -94,5 +94,8 @@ sense_reason_t passthrough_parse_cdb(str
+ 	sense_reason_t (*exec_cmd)(struct se_cmd *cmd));
+ 
+ bool target_sense_desc_format(struct se_device *dev);
++sector_t target_to_linux_sector(struct se_device *dev, sector_t lb);
++bool target_configure_unmap_from_queue(struct se_dev_attrib *attrib,
++				       struct request_queue *q, int block_size);
+ 
+ #endif /* TARGET_CORE_BACKEND_H */
