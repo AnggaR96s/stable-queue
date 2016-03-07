@@ -1,0 +1,424 @@
+From 131e6abc674edb9f9a59090bb35bf6650569b7e7 Mon Sep 17 00:00:00 2001
+From: Nicholas Bellinger <nab@linux-iscsi.org>
+Date: Sat, 22 Mar 2014 14:55:56 -0700
+Subject: target: Add TFO->abort_task for aborted task resources release
+
+From: Nicholas Bellinger <nab@linux-iscsi.org>
+
+commit 131e6abc674edb9f9a59090bb35bf6650569b7e7 upstream.
+
+Now that TASK_ABORTED status is not generated for all cases by
+TMR ABORT_TASK + LUN_RESET, a new TFO->abort_task() caller is
+necessary in order to give fabric drivers a chance to unmap
+hardware / software resources before the se_cmd descriptor is
+released via the normal TFO->release_cmd() codepath.
+
+This patch adds TFO->aborted_task() in core_tmr_abort_task()
+in place of the original transport_send_task_abort(), and
+also updates all fabric drivers to implement this caller.
+
+The fabric drivers that include changes to perform cleanup
+via ->aborted_task() are:
+
+  - iscsi-target
+  - iser-target
+  - srpt
+  - tcm_qla2xxx
+
+The fabric drivers that currently set ->aborted_task() to
+NOPs are:
+
+  - loopback
+  - tcm_fc
+  - usb-gadget
+  - sbp-target
+  - vhost-scsi
+
+For the latter five, there appears to be no additional cleanup
+required before invoking TFO->release_cmd() to release the
+se_cmd descriptor.
+
+v2 changes:
+  - Move ->aborted_task() call into transport_cmd_finish_abort (Alex)
+
+Cc: Alex Leung <amleung21@yahoo.com>
+Cc: Mark Rustad <mark.d.rustad@intel.com>
+Cc: Roland Dreier <roland@kernel.org>
+Cc: Vu Pham <vu@mellanox.com>
+Cc: Chris Boot <bootc@bootc.net>
+Cc: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Cc: Michael S. Tsirkin <mst@redhat.com>
+Cc: Giridhar Malavali <giridhar.malavali@qlogic.com>
+Cc: Saurav Kashyap <saurav.kashyap@qlogic.com>
+Cc: Quinn Tran <quinn.tran@qlogic.com>
+Cc: Sagi Grimberg <sagig@mellanox.com>
+Cc: Or Gerlitz <ogerlitz@mellanox.com>
+Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/infiniband/ulp/isert/ib_isert.c      |   19 +++++++++++++++++++
+ drivers/infiniband/ulp/srpt/ib_srpt.c        |    9 +++++++++
+ drivers/scsi/qla2xxx/tcm_qla2xxx.c           |   16 ++++++++++++++++
+ drivers/target/iscsi/iscsi_target.c          |   13 +++++++++++++
+ drivers/target/iscsi/iscsi_target_configfs.c |    8 ++++++++
+ drivers/target/iscsi/iscsi_target_util.c     |    4 ++--
+ drivers/target/iscsi/iscsi_target_util.h     |    1 +
+ drivers/target/loopback/tcm_loop.c           |    6 ++++++
+ drivers/target/sbp/sbp_target.c              |    6 ++++++
+ drivers/target/target_core_configfs.c        |    4 ++++
+ drivers/target/target_core_transport.c       |    6 ++++++
+ drivers/target/tcm_fc/tcm_fc.h               |    1 +
+ drivers/target/tcm_fc/tfc_cmd.c              |    5 +++++
+ drivers/target/tcm_fc/tfc_conf.c             |    1 +
+ drivers/usb/gadget/tcm_usb_gadget.c          |    6 ++++++
+ drivers/vhost/scsi.c                         |    6 ++++++
+ include/target/iscsi/iscsi_transport.h       |    1 +
+ include/target/target_core_fabric.h          |    1 +
+ 18 files changed, 111 insertions(+), 2 deletions(-)
+
+--- a/drivers/infiniband/ulp/isert/ib_isert.c
++++ b/drivers/infiniband/ulp/isert/ib_isert.c
+@@ -2071,6 +2071,24 @@ isert_put_response(struct iscsi_conn *co
+ 	return isert_post_response(isert_conn, isert_cmd);
+ }
+ 
++static void
++isert_aborted_task(struct iscsi_conn *conn, struct iscsi_cmd *cmd)
++{
++	struct isert_cmd *isert_cmd = iscsit_priv_cmd(cmd);
++	struct isert_conn *isert_conn = (struct isert_conn *)conn->context;
++	struct isert_device *device = isert_conn->conn_device;
++
++	spin_lock_bh(&conn->cmd_lock);
++	if (!list_empty(&cmd->i_conn_node))
++		list_del_init(&cmd->i_conn_node);
++	spin_unlock_bh(&conn->cmd_lock);
++
++	if (cmd->data_direction == DMA_TO_DEVICE)
++		iscsit_stop_dataout_timer(cmd);
++
++	device->unreg_rdma_mem(isert_cmd, isert_conn);
++}
++
+ static int
+ isert_put_nopin(struct iscsi_cmd *cmd, struct iscsi_conn *conn,
+ 		bool nopout_response)
+@@ -2999,6 +3017,7 @@ static struct iscsit_transport iser_targ
+ 	.iscsit_get_dataout	= isert_get_dataout,
+ 	.iscsit_queue_data_in	= isert_put_datain,
+ 	.iscsit_queue_status	= isert_put_response,
++	.iscsit_aborted_task	= isert_aborted_task,
+ };
+ 
+ static int __init isert_init(void)
+--- a/drivers/infiniband/ulp/srpt/ib_srpt.c
++++ b/drivers/infiniband/ulp/srpt/ib_srpt.c
+@@ -3093,6 +3093,14 @@ static void srpt_queue_tm_rsp(struct se_
+ 	srpt_queue_response(cmd);
+ }
+ 
++static void srpt_aborted_task(struct se_cmd *cmd)
++{
++	struct srpt_send_ioctx *ioctx = container_of(cmd,
++				struct srpt_send_ioctx, cmd);
++
++	srpt_unmap_sg_to_ib_sge(ioctx->ch, ioctx);
++}
++
+ static int srpt_queue_status(struct se_cmd *cmd)
+ {
+ 	struct srpt_send_ioctx *ioctx;
+@@ -3940,6 +3948,7 @@ static struct target_core_fabric_ops srp
+ 	.queue_data_in			= srpt_queue_data_in,
+ 	.queue_status			= srpt_queue_status,
+ 	.queue_tm_rsp			= srpt_queue_tm_rsp,
++	.aborted_task			= srpt_aborted_task,
+ 	/*
+ 	 * Setup function pointers for generic logic in
+ 	 * target_core_fabric_configfs.c
+--- a/drivers/scsi/qla2xxx/tcm_qla2xxx.c
++++ b/drivers/scsi/qla2xxx/tcm_qla2xxx.c
+@@ -684,6 +684,20 @@ static void tcm_qla2xxx_queue_tm_rsp(str
+ 	qlt_xmit_tm_rsp(mcmd);
+ }
+ 
++static void tcm_qla2xxx_aborted_task(struct se_cmd *se_cmd)
++{
++	struct qla_tgt_cmd *cmd = container_of(se_cmd,
++				struct qla_tgt_cmd, se_cmd);
++	struct scsi_qla_host *vha = cmd->vha;
++	struct qla_hw_data *ha = vha->hw;
++
++	if (!cmd->sg_mapped)
++		return;
++
++	pci_unmap_sg(ha->pdev, cmd->sg, cmd->sg_cnt, cmd->dma_data_direction);
++	cmd->sg_mapped = 0;
++}
++
+ /* Local pointer to allocated TCM configfs fabric module */
+ struct target_fabric_configfs *tcm_qla2xxx_fabric_configfs;
+ struct target_fabric_configfs *tcm_qla2xxx_npiv_fabric_configfs;
+@@ -1886,6 +1900,7 @@ static struct target_core_fabric_ops tcm
+ 	.queue_data_in			= tcm_qla2xxx_queue_data_in,
+ 	.queue_status			= tcm_qla2xxx_queue_status,
+ 	.queue_tm_rsp			= tcm_qla2xxx_queue_tm_rsp,
++	.aborted_task			= tcm_qla2xxx_aborted_task,
+ 	/*
+ 	 * Setup function pointers for generic logic in
+ 	 * target_core_fabric_configfs.c
+@@ -1935,6 +1950,7 @@ static struct target_core_fabric_ops tcm
+ 	.queue_data_in			= tcm_qla2xxx_queue_data_in,
+ 	.queue_status			= tcm_qla2xxx_queue_status,
+ 	.queue_tm_rsp			= tcm_qla2xxx_queue_tm_rsp,
++	.aborted_task			= tcm_qla2xxx_aborted_task,
+ 	/*
+ 	 * Setup function pointers for generic logic in
+ 	 * target_core_fabric_configfs.c
+--- a/drivers/target/iscsi/iscsi_target.c
++++ b/drivers/target/iscsi/iscsi_target.c
+@@ -500,6 +500,18 @@ static int iscsit_queue_rsp(struct iscsi
+ 	return 0;
+ }
+ 
++static void iscsit_aborted_task(struct iscsi_conn *conn, struct iscsi_cmd *cmd)
++{
++	bool scsi_cmd = (cmd->iscsi_opcode == ISCSI_OP_SCSI_CMD);
++
++	spin_lock_bh(&conn->cmd_lock);
++	if (!list_empty(&cmd->i_conn_node))
++		list_del_init(&cmd->i_conn_node);
++	spin_unlock_bh(&conn->cmd_lock);
++
++	__iscsit_free_cmd(cmd, scsi_cmd, true);
++}
++
+ static struct iscsit_transport iscsi_target_transport = {
+ 	.name			= "iSCSI/TCP",
+ 	.transport_type		= ISCSI_TCP,
+@@ -514,6 +526,7 @@ static struct iscsit_transport iscsi_tar
+ 	.iscsit_response_queue	= iscsit_response_queue,
+ 	.iscsit_queue_data_in	= iscsit_queue_rsp,
+ 	.iscsit_queue_status	= iscsit_queue_rsp,
++	.iscsit_aborted_task	= iscsit_aborted_task,
+ };
+ 
+ static int __init iscsi_target_init_module(void)
+--- a/drivers/target/iscsi/iscsi_target_configfs.c
++++ b/drivers/target/iscsi/iscsi_target_configfs.c
+@@ -1815,6 +1815,13 @@ static void lio_queue_tm_rsp(struct se_c
+ 	iscsit_add_cmd_to_response_queue(cmd, cmd->conn, cmd->i_state);
+ }
+ 
++static void lio_aborted_task(struct se_cmd *se_cmd)
++{
++	struct iscsi_cmd *cmd = container_of(se_cmd, struct iscsi_cmd, se_cmd);
++
++	cmd->conn->conn_transport->iscsit_aborted_task(cmd->conn, cmd);
++}
++
+ static char *lio_tpg_get_endpoint_wwn(struct se_portal_group *se_tpg)
+ {
+ 	struct iscsi_portal_group *tpg = se_tpg->se_tpg_fabric_ptr;
+@@ -2013,6 +2020,7 @@ int iscsi_target_register_configfs(void)
+ 	fabric->tf_ops.queue_data_in = &lio_queue_data_in;
+ 	fabric->tf_ops.queue_status = &lio_queue_status;
+ 	fabric->tf_ops.queue_tm_rsp = &lio_queue_tm_rsp;
++	fabric->tf_ops.aborted_task = &lio_aborted_task;
+ 	/*
+ 	 * Setup function pointers for generic logic in target_core_fabric_configfs.c
+ 	 */
+--- a/drivers/target/iscsi/iscsi_target_util.c
++++ b/drivers/target/iscsi/iscsi_target_util.c
+@@ -705,8 +705,8 @@ void iscsit_release_cmd(struct iscsi_cmd
+ }
+ EXPORT_SYMBOL(iscsit_release_cmd);
+ 
+-static void __iscsit_free_cmd(struct iscsi_cmd *cmd, bool scsi_cmd,
+-			      bool check_queues)
++void __iscsit_free_cmd(struct iscsi_cmd *cmd, bool scsi_cmd,
++		       bool check_queues)
+ {
+ 	struct iscsi_conn *conn = cmd->conn;
+ 
+--- a/drivers/target/iscsi/iscsi_target_util.h
++++ b/drivers/target/iscsi/iscsi_target_util.h
+@@ -30,6 +30,7 @@ extern void iscsit_remove_cmd_from_tx_qu
+ extern bool iscsit_conn_all_queues_empty(struct iscsi_conn *);
+ extern void iscsit_free_queue_reqs_for_conn(struct iscsi_conn *);
+ extern void iscsit_release_cmd(struct iscsi_cmd *);
++extern void __iscsit_free_cmd(struct iscsi_cmd *, bool, bool);
+ extern void iscsit_free_cmd(struct iscsi_cmd *, bool);
+ extern int iscsit_check_session_usage_count(struct iscsi_session *);
+ extern void iscsit_dec_session_usage_count(struct iscsi_session *);
+--- a/drivers/target/loopback/tcm_loop.c
++++ b/drivers/target/loopback/tcm_loop.c
+@@ -892,6 +892,11 @@ static void tcm_loop_queue_tm_rsp(struct
+ 	wake_up(&tl_tmr->tl_tmr_wait);
+ }
+ 
++static void tcm_loop_aborted_task(struct se_cmd *se_cmd)
++{
++	return;
++}
++
+ static char *tcm_loop_dump_proto_id(struct tcm_loop_hba *tl_hba)
+ {
+ 	switch (tl_hba->tl_proto_id) {
+@@ -1456,6 +1461,7 @@ static int tcm_loop_register_configfs(vo
+ 	fabric->tf_ops.queue_data_in = &tcm_loop_queue_data_in;
+ 	fabric->tf_ops.queue_status = &tcm_loop_queue_status;
+ 	fabric->tf_ops.queue_tm_rsp = &tcm_loop_queue_tm_rsp;
++	fabric->tf_ops.aborted_task = &tcm_loop_aborted_task;
+ 
+ 	/*
+ 	 * Setup function pointers for generic logic in target_core_fabric_configfs.c
+--- a/drivers/target/sbp/sbp_target.c
++++ b/drivers/target/sbp/sbp_target.c
+@@ -1846,6 +1846,11 @@ static void sbp_queue_tm_rsp(struct se_c
+ {
+ }
+ 
++static void sbp_aborted_task(struct se_cmd *se_cmd)
++{
++	return;
++}
++
+ static int sbp_check_stop_free(struct se_cmd *se_cmd)
+ {
+ 	struct sbp_target_request *req = container_of(se_cmd,
+@@ -2526,6 +2531,7 @@ static struct target_core_fabric_ops sbp
+ 	.queue_data_in			= sbp_queue_data_in,
+ 	.queue_status			= sbp_queue_status,
+ 	.queue_tm_rsp			= sbp_queue_tm_rsp,
++	.aborted_task			= sbp_aborted_task,
+ 	.check_stop_free		= sbp_check_stop_free,
+ 
+ 	.fabric_make_wwn		= sbp_make_tport,
+--- a/drivers/target/target_core_configfs.c
++++ b/drivers/target/target_core_configfs.c
+@@ -457,6 +457,10 @@ static int target_fabric_tf_ops_check(
+ 		pr_err("Missing tfo->queue_tm_rsp()\n");
+ 		return -EINVAL;
+ 	}
++	if (!tfo->aborted_task) {
++		pr_err("Missing tfo->aborted_task()\n");
++		return -EINVAL;
++	}
+ 	/*
+ 	 * We at least require tfo->fabric_make_wwn(), tfo->fabric_drop_wwn()
+ 	 * tfo->fabric_make_tpg() and tfo->fabric_drop_tpg() in
+--- a/drivers/target/target_core_transport.c
++++ b/drivers/target/target_core_transport.c
+@@ -605,6 +605,12 @@ void transport_cmd_finish_abort(struct s
+ {
+ 	if (cmd->se_cmd_flags & SCF_SE_LUN_CMD)
+ 		transport_lun_remove_cmd(cmd);
++	/*
++	 * Allow the fabric driver to unmap any resources before
++	 * releasing the descriptor via TFO->release_cmd()
++	 */
++	if (remove)
++		cmd->se_tfo->aborted_task(cmd);
+ 
+ 	if (transport_cmd_check_stop_to_fabric(cmd))
+ 		return;
+--- a/drivers/target/tcm_fc/tcm_fc.h
++++ b/drivers/target/tcm_fc/tcm_fc.h
+@@ -163,6 +163,7 @@ int ft_write_pending_status(struct se_cm
+ u32 ft_get_task_tag(struct se_cmd *);
+ int ft_get_cmd_state(struct se_cmd *);
+ void ft_queue_tm_resp(struct se_cmd *);
++void ft_aborted_task(struct se_cmd *);
+ 
+ /*
+  * other internal functions.
+--- a/drivers/target/tcm_fc/tfc_cmd.c
++++ b/drivers/target/tcm_fc/tfc_cmd.c
+@@ -426,6 +426,11 @@ void ft_queue_tm_resp(struct se_cmd *se_
+ 	ft_send_resp_code(cmd, code);
+ }
+ 
++void ft_aborted_task(struct se_cmd *se_cmd)
++{
++	return;
++}
++
+ static void ft_send_work(struct work_struct *work);
+ 
+ /*
+--- a/drivers/target/tcm_fc/tfc_conf.c
++++ b/drivers/target/tcm_fc/tfc_conf.c
+@@ -536,6 +536,7 @@ static struct target_core_fabric_ops ft_
+ 	.queue_data_in =		ft_queue_data_in,
+ 	.queue_status =			ft_queue_status,
+ 	.queue_tm_rsp =			ft_queue_tm_resp,
++	.aborted_task =			ft_aborted_task,
+ 	/*
+ 	 * Setup function pointers for generic logic in
+ 	 * target_core_fabric_configfs.c
+--- a/drivers/usb/gadget/tcm_usb_gadget.c
++++ b/drivers/usb/gadget/tcm_usb_gadget.c
+@@ -1471,6 +1471,11 @@ static void usbg_queue_tm_rsp(struct se_
+ {
+ }
+ 
++static void usbg_aborted_task(struct se_cmd *se_cmd)
++{
++	return;
++}
++
+ static const char *usbg_check_wwn(const char *name)
+ {
+ 	const char *n;
+@@ -1897,6 +1902,7 @@ static struct target_core_fabric_ops usb
+ 	.queue_data_in			= usbg_send_read_response,
+ 	.queue_status			= usbg_send_status_response,
+ 	.queue_tm_rsp			= usbg_queue_tm_rsp,
++	.aborted_task			= usbg_aborted_task,
+ 	.check_stop_free		= usbg_check_stop_free,
+ 
+ 	.fabric_make_wwn		= usbg_make_tport,
+--- a/drivers/vhost/scsi.c
++++ b/drivers/vhost/scsi.c
+@@ -539,6 +539,11 @@ static void tcm_vhost_queue_tm_rsp(struc
+ 	return;
+ }
+ 
++static void tcm_vhost_aborted_task(struct se_cmd *se_cmd)
++{
++	return;
++}
++
+ static void tcm_vhost_free_evt(struct vhost_scsi *vs, struct tcm_vhost_evt *evt)
+ {
+ 	vs->vs_events_nr--;
+@@ -2173,6 +2178,7 @@ static struct target_core_fabric_ops tcm
+ 	.queue_data_in			= tcm_vhost_queue_data_in,
+ 	.queue_status			= tcm_vhost_queue_status,
+ 	.queue_tm_rsp			= tcm_vhost_queue_tm_rsp,
++	.aborted_task			= tcm_vhost_aborted_task,
+ 	/*
+ 	 * Setup callers for generic logic in target_core_fabric_configfs.c
+ 	 */
+--- a/include/target/iscsi/iscsi_transport.h
++++ b/include/target/iscsi/iscsi_transport.h
+@@ -21,6 +21,7 @@ struct iscsit_transport {
+ 	int (*iscsit_get_dataout)(struct iscsi_conn *, struct iscsi_cmd *, bool);
+ 	int (*iscsit_queue_data_in)(struct iscsi_conn *, struct iscsi_cmd *);
+ 	int (*iscsit_queue_status)(struct iscsi_conn *, struct iscsi_cmd *);
++	void (*iscsit_aborted_task)(struct iscsi_conn *, struct iscsi_cmd *);
+ };
+ 
+ static inline void *iscsit_priv_cmd(struct iscsi_cmd *cmd)
+--- a/include/target/target_core_fabric.h
++++ b/include/target/target_core_fabric.h
+@@ -62,6 +62,7 @@ struct target_core_fabric_ops {
+ 	int (*queue_data_in)(struct se_cmd *);
+ 	int (*queue_status)(struct se_cmd *);
+ 	void (*queue_tm_rsp)(struct se_cmd *);
++	void (*aborted_task)(struct se_cmd *);
+ 	/*
+ 	 * fabric module calls for target_core_fabric_configfs.c
+ 	 */

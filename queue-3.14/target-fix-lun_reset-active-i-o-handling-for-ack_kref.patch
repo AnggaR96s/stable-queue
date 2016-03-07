@@ -1,0 +1,359 @@
+From febe562c20dfa8f33bee7d419c6b517986a5aa33 Mon Sep 17 00:00:00 2001
+From: Nicholas Bellinger <nab@linux-iscsi.org>
+Date: Mon, 11 Jan 2016 21:31:09 -0800
+Subject: target: Fix LUN_RESET active I/O handling for ACK_KREF
+
+From: Nicholas Bellinger <nab@linux-iscsi.org>
+
+commit febe562c20dfa8f33bee7d419c6b517986a5aa33 upstream.
+
+This patch fixes a NULL pointer se_cmd->cmd_kref < 0
+refcount bug during TMR LUN_RESET with active se_cmd
+I/O, that can be triggered during se_cmd descriptor
+shutdown + release via core_tmr_drain_state_list() code.
+
+To address this bug, add common __target_check_io_state()
+helper for ABORT_TASK + LUN_RESET w/ CMD_T_COMPLETE
+checking, and set CMD_T_ABORTED + obtain ->cmd_kref for
+both cases ahead of last target_put_sess_cmd() after
+TFO->aborted_task() -> transport_cmd_finish_abort()
+callback has completed.
+
+It also introduces SCF_ACK_KREF to determine when
+transport_cmd_finish_abort() needs to drop the second
+extra reference, ahead of calling target_put_sess_cmd()
+for the final kref_put(&se_cmd->cmd_kref).
+
+It also updates transport_cmd_check_stop() to avoid
+holding se_cmd->t_state_lock while dropping se_cmd
+device state via target_remove_from_state_list(), now
+that core_tmr_drain_state_list() is holding the
+se_device lock while checking se_cmd state from
+within TMR logic.
+
+Finally, move transport_put_cmd() release of SGL +
+TMR + extended CDB memory into target_free_cmd_mem()
+in order to avoid potential resource leaks in TMR
+ABORT_TASK + LUN_RESET code-paths.  Also update
+target_release_cmd_kref() accordingly.
+
+Reviewed-by: Quinn Tran <quinn.tran@qlogic.com>
+Cc: Himanshu Madhani <himanshu.madhani@qlogic.com>
+Cc: Sagi Grimberg <sagig@mellanox.com>
+Cc: Christoph Hellwig <hch@lst.de>
+Cc: Hannes Reinecke <hare@suse.de>
+Cc: Andy Grover <agrover@redhat.com>
+Cc: Mike Christie <mchristi@redhat.com>
+Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+
+---
+ drivers/target/target_core_tmr.c       |   64 +++++++++++++++++++++++--------
+ drivers/target/target_core_transport.c |   67 ++++++++++++++-------------------
+ 2 files changed, 76 insertions(+), 55 deletions(-)
+
+--- a/drivers/target/target_core_tmr.c
++++ b/drivers/target/target_core_tmr.c
+@@ -115,6 +115,34 @@ static int target_check_cdb_and_preempt(
+ 	return 1;
+ }
+ 
++static bool __target_check_io_state(struct se_cmd *se_cmd)
++{
++	struct se_session *sess = se_cmd->se_sess;
++
++	assert_spin_locked(&sess->sess_cmd_lock);
++	WARN_ON_ONCE(!irqs_disabled());
++	/*
++	 * If command already reached CMD_T_COMPLETE state within
++	 * target_complete_cmd(), this se_cmd has been passed to
++	 * fabric driver and will not be aborted.
++	 *
++	 * Otherwise, obtain a local se_cmd->cmd_kref now for TMR
++	 * ABORT_TASK + LUN_RESET for CMD_T_ABORTED processing as
++	 * long as se_cmd->cmd_kref is still active unless zero.
++	 */
++	spin_lock(&se_cmd->t_state_lock);
++	if (se_cmd->transport_state & CMD_T_COMPLETE) {
++		pr_debug("Attempted to abort io tag: %u already complete,"
++			" skipping\n", se_cmd->se_tfo->get_task_tag(se_cmd));
++		spin_unlock(&se_cmd->t_state_lock);
++		return false;
++	}
++	se_cmd->transport_state |= CMD_T_ABORTED;
++	spin_unlock(&se_cmd->t_state_lock);
++
++	return kref_get_unless_zero(&se_cmd->cmd_kref);
++}
++
+ void core_tmr_abort_task(
+ 	struct se_device *dev,
+ 	struct se_tmr_req *tmr,
+@@ -137,25 +165,20 @@ void core_tmr_abort_task(
+ 		printk("ABORT_TASK: Found referenced %s task_tag: %u\n",
+ 			se_cmd->se_tfo->get_fabric_name(), ref_tag);
+ 
+-		spin_lock(&se_cmd->t_state_lock);
+-		if (se_cmd->transport_state & CMD_T_COMPLETE) {
+-			printk("ABORT_TASK: ref_tag: %u already complete, skipping\n", ref_tag);
+-			spin_unlock(&se_cmd->t_state_lock);
++		if (!__target_check_io_state(se_cmd)) {
+ 			spin_unlock_irqrestore(&se_sess->sess_cmd_lock, flags);
++			target_put_sess_cmd(se_sess, se_cmd);
+ 			goto out;
+ 		}
+-		se_cmd->transport_state |= CMD_T_ABORTED;
+-		spin_unlock(&se_cmd->t_state_lock);
+ 
+ 		list_del_init(&se_cmd->se_cmd_list);
+-		kref_get(&se_cmd->cmd_kref);
+ 		spin_unlock_irqrestore(&se_sess->sess_cmd_lock, flags);
+ 
+ 		cancel_work_sync(&se_cmd->work);
+ 		transport_wait_for_tasks(se_cmd);
+ 
+-		target_put_sess_cmd(se_sess, se_cmd);
+ 		transport_cmd_finish_abort(se_cmd, true);
++		target_put_sess_cmd(se_sess, se_cmd);
+ 
+ 		printk("ABORT_TASK: Sending TMR_FUNCTION_COMPLETE for"
+ 				" ref_tag: %d\n", ref_tag);
+@@ -260,8 +283,10 @@ static void core_tmr_drain_state_list(
+ 	struct list_head *preempt_and_abort_list)
+ {
+ 	LIST_HEAD(drain_task_list);
++	struct se_session *sess;
+ 	struct se_cmd *cmd, *next;
+ 	unsigned long flags;
++	int rc;
+ 
+ 	/*
+ 	 * Complete outstanding commands with TASK_ABORTED SAM status.
+@@ -300,6 +325,16 @@ static void core_tmr_drain_state_list(
+ 		if (prout_cmd == cmd)
+ 			continue;
+ 
++		sess = cmd->se_sess;
++		if (WARN_ON_ONCE(!sess))
++			continue;
++
++		spin_lock(&sess->sess_cmd_lock);
++		rc = __target_check_io_state(cmd);
++		spin_unlock(&sess->sess_cmd_lock);
++		if (!rc)
++			continue;
++
+ 		list_move_tail(&cmd->state_list, &drain_task_list);
+ 		cmd->state_active = false;
+ 	}
+@@ -307,7 +342,7 @@ static void core_tmr_drain_state_list(
+ 
+ 	while (!list_empty(&drain_task_list)) {
+ 		cmd = list_entry(drain_task_list.next, struct se_cmd, state_list);
+-		list_del(&cmd->state_list);
++		list_del_init(&cmd->state_list);
+ 
+ 		pr_debug("LUN_RESET: %s cmd: %p"
+ 			" ITT/CmdSN: 0x%08x/0x%08x, i_state: %d, t_state: %d"
+@@ -331,16 +366,11 @@ static void core_tmr_drain_state_list(
+ 		 * loop above, but we do it down here given that
+ 		 * cancel_work_sync may block.
+ 		 */
+-		if (cmd->t_state == TRANSPORT_COMPLETE)
+-			cancel_work_sync(&cmd->work);
+-
+-		spin_lock_irqsave(&cmd->t_state_lock, flags);
+-		target_stop_cmd(cmd, &flags);
+-
+-		cmd->transport_state |= CMD_T_ABORTED;
+-		spin_unlock_irqrestore(&cmd->t_state_lock, flags);
++		cancel_work_sync(&cmd->work);
++		transport_wait_for_tasks(cmd);
+ 
+ 		core_tmr_handle_tas_abort(tmr_nacl, cmd, tas);
++		target_put_sess_cmd(cmd->se_sess, cmd);
+ 	}
+ }
+ 
+--- a/drivers/target/target_core_transport.c
++++ b/drivers/target/target_core_transport.c
+@@ -509,9 +509,6 @@ void transport_deregister_session(struct
+ }
+ EXPORT_SYMBOL(transport_deregister_session);
+ 
+-/*
+- * Called with cmd->t_state_lock held.
+- */
+ static void target_remove_from_state_list(struct se_cmd *cmd)
+ {
+ 	struct se_device *dev = cmd->se_dev;
+@@ -536,10 +533,6 @@ static int transport_cmd_check_stop(stru
+ {
+ 	unsigned long flags;
+ 
+-	spin_lock_irqsave(&cmd->t_state_lock, flags);
+-	if (write_pending)
+-		cmd->t_state = TRANSPORT_WRITE_PENDING;
+-
+ 	if (remove_from_lists) {
+ 		target_remove_from_state_list(cmd);
+ 
+@@ -549,6 +542,10 @@ static int transport_cmd_check_stop(stru
+ 		cmd->se_lun = NULL;
+ 	}
+ 
++	spin_lock_irqsave(&cmd->t_state_lock, flags);
++	if (write_pending)
++		cmd->t_state = TRANSPORT_WRITE_PENDING;
++
+ 	/*
+ 	 * Determine if frontend context caller is requesting the stopping of
+ 	 * this command for frontend exceptions.
+@@ -603,6 +600,8 @@ static void transport_lun_remove_cmd(str
+ 
+ void transport_cmd_finish_abort(struct se_cmd *cmd, int remove)
+ {
++	bool ack_kref = (cmd->se_cmd_flags & SCF_ACK_KREF);
++
+ 	if (cmd->se_cmd_flags & SCF_SE_LUN_CMD)
+ 		transport_lun_remove_cmd(cmd);
+ 	/*
+@@ -614,7 +613,7 @@ void transport_cmd_finish_abort(struct s
+ 
+ 	if (transport_cmd_check_stop_to_fabric(cmd))
+ 		return;
+-	if (remove)
++	if (remove && ack_kref)
+ 		transport_put_cmd(cmd);
+ }
+ 
+@@ -682,7 +681,7 @@ void target_complete_cmd(struct se_cmd *
+ 	 * Check for case where an explicit ABORT_TASK has been received
+ 	 * and transport_wait_for_tasks() will be waiting for completion..
+ 	 */
+-	if (cmd->transport_state & CMD_T_ABORTED &&
++	if (cmd->transport_state & CMD_T_ABORTED ||
+ 	    cmd->transport_state & CMD_T_STOP) {
+ 		spin_unlock_irqrestore(&cmd->t_state_lock, flags);
+ 		complete_all(&cmd->t_transport_stop_comp);
+@@ -2085,20 +2084,14 @@ static inline void transport_free_pages(
+ }
+ 
+ /**
+- * transport_release_cmd - free a command
+- * @cmd:       command to free
++ * transport_put_cmd - release a reference to a command
++ * @cmd:       command to release
+  *
+- * This routine unconditionally frees a command, and reference counting
+- * or list removal must be done in the caller.
++ * This routine releases our reference to the command and frees it if possible.
+  */
+-static int transport_release_cmd(struct se_cmd *cmd)
++static int transport_put_cmd(struct se_cmd *cmd)
+ {
+ 	BUG_ON(!cmd->se_tfo);
+-
+-	if (cmd->se_cmd_flags & SCF_SCSI_TMR_CDB)
+-		core_tmr_release_req(cmd->se_tmr_req);
+-	if (cmd->t_task_cdb != cmd->__t_task_cdb)
+-		kfree(cmd->t_task_cdb);
+ 	/*
+ 	 * If this cmd has been setup with target_get_sess_cmd(), drop
+ 	 * the kref and call ->release_cmd() in kref callback.
+@@ -2106,18 +2099,6 @@ static int transport_release_cmd(struct
+ 	return target_put_sess_cmd(cmd->se_sess, cmd);
+ }
+ 
+-/**
+- * transport_put_cmd - release a reference to a command
+- * @cmd:       command to release
+- *
+- * This routine releases our reference to the command and frees it if possible.
+- */
+-static int transport_put_cmd(struct se_cmd *cmd)
+-{
+-	transport_free_pages(cmd);
+-	return transport_release_cmd(cmd);
+-}
+-
+ void *transport_kmap_data_sg(struct se_cmd *cmd)
+ {
+ 	struct scatterlist *sg = cmd->t_data_sg;
+@@ -2307,14 +2288,13 @@ static void transport_write_pending_qf(s
+ 
+ int transport_generic_free_cmd(struct se_cmd *cmd, int wait_for_tasks)
+ {
+-	unsigned long flags;
+ 	int ret = 0;
+ 
+ 	if (!(cmd->se_cmd_flags & SCF_SE_LUN_CMD)) {
+ 		if (wait_for_tasks && (cmd->se_cmd_flags & SCF_SCSI_TMR_CDB))
+-			 transport_wait_for_tasks(cmd);
++			transport_wait_for_tasks(cmd);
+ 
+-		ret = transport_release_cmd(cmd);
++		ret = transport_put_cmd(cmd);
+ 	} else {
+ 		if (wait_for_tasks)
+ 			transport_wait_for_tasks(cmd);
+@@ -2323,11 +2303,8 @@ int transport_generic_free_cmd(struct se
+ 		 * has already added se_cmd to state_list, but fabric has
+ 		 * failed command before I/O submission.
+ 		 */
+-		if (cmd->state_active) {
+-			spin_lock_irqsave(&cmd->t_state_lock, flags);
++		if (cmd->state_active)
+ 			target_remove_from_state_list(cmd);
+-			spin_unlock_irqrestore(&cmd->t_state_lock, flags);
+-		}
+ 
+ 		if (cmd->se_lun)
+ 			transport_lun_remove_cmd(cmd);
+@@ -2375,6 +2352,16 @@ out:
+ }
+ EXPORT_SYMBOL(target_get_sess_cmd);
+ 
++static void target_free_cmd_mem(struct se_cmd *cmd)
++{
++	transport_free_pages(cmd);
++
++	if (cmd->se_cmd_flags & SCF_SCSI_TMR_CDB)
++		core_tmr_release_req(cmd->se_tmr_req);
++	if (cmd->t_task_cdb != cmd->__t_task_cdb)
++		kfree(cmd->t_task_cdb);
++}
++
+ static void target_release_cmd_kref(struct kref *kref)
+ {
+ 	struct se_cmd *se_cmd = container_of(kref, struct se_cmd, cmd_kref);
+@@ -2382,17 +2369,20 @@ static void target_release_cmd_kref(stru
+ 
+ 	if (list_empty(&se_cmd->se_cmd_list)) {
+ 		spin_unlock(&se_sess->sess_cmd_lock);
++		target_free_cmd_mem(se_cmd);
+ 		se_cmd->se_tfo->release_cmd(se_cmd);
+ 		return;
+ 	}
+ 	if (se_sess->sess_tearing_down && se_cmd->cmd_wait_set) {
+ 		spin_unlock(&se_sess->sess_cmd_lock);
++		target_free_cmd_mem(se_cmd);
+ 		complete(&se_cmd->cmd_wait_comp);
+ 		return;
+ 	}
+ 	list_del(&se_cmd->se_cmd_list);
+ 	spin_unlock(&se_sess->sess_cmd_lock);
+ 
++	target_free_cmd_mem(se_cmd);
+ 	se_cmd->se_tfo->release_cmd(se_cmd);
+ }
+ 
+@@ -2403,6 +2393,7 @@ static void target_release_cmd_kref(stru
+ int target_put_sess_cmd(struct se_session *se_sess, struct se_cmd *se_cmd)
+ {
+ 	if (!se_sess) {
++		target_free_cmd_mem(se_cmd);
+ 		se_cmd->se_tfo->release_cmd(se_cmd);
+ 		return 1;
+ 	}

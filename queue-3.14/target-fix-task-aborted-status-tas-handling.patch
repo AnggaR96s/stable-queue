@@ -1,0 +1,141 @@
+From 68259b5aac13a57cba797b9605ed9812158f0e72 Mon Sep 17 00:00:00 2001
+From: Alex Leung <amleung21@yahoo.com>
+Date: Fri, 21 Mar 2014 22:20:41 -0700
+Subject: target: Fix Task Aborted Status (TAS) handling
+
+From: Alex Leung <amleung21@yahoo.com>
+
+commit 68259b5aac13a57cba797b9605ed9812158f0e72 upstream.
+
+This patch addresses three of long standing issues wrt to Task
+Aborted Status (TAS) handling.
+
+The first is the incorrect assumption in core_tmr_handle_tas_abort()
+that TASK_ABORTED status is sent for the task referenced by TMR
+ABORT_TASK, and sending TASK_ABORTED status for TMR LUN_RESET on
+the same nexus the LUN_RESET was received.
+
+The second is to ensure the lun reference count is dropped within
+transport_cmd_finish_abort() by calling transport_lun_remove_cmd()
+before invoking transport_cmd_check_stop_to_fabric().
+
+The last is to fix the delayed TAS handling to allow outstanding
+WRITEs to complete before sending the TASK_ABORTED status. This
+includes changing transport_check_aborted_status() to avoid
+processing when SCF_SEND_DELAYED_TAS has not be set, and updating
+transport_send_task_abort() to drop the SCF_SENT_DELAYED_TAS
+check.
+
+Signed-off-by: Alex Leung <amleung21@yahoo.com>
+Cc: Alex Leung <amleung21@yahoo.com>
+Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/target/target_core_tmr.c       |   18 ++++++------------
+ drivers/target/target_core_transport.c |   14 +++++++++++---
+ include/target/target_core_base.h      |    2 +-
+ 3 files changed, 18 insertions(+), 16 deletions(-)
+
+--- a/drivers/target/target_core_tmr.c
++++ b/drivers/target/target_core_tmr.c
+@@ -87,14 +87,17 @@ static void core_tmr_handle_tas_abort(
+ 	struct se_cmd *cmd,
+ 	int tas)
+ {
++	bool remove = true;
+ 	/*
+ 	 * TASK ABORTED status (TAS) bit support
+ 	*/
+ 	if ((tmr_nacl &&
+-	     (tmr_nacl == cmd->se_sess->se_node_acl)) || tas)
++	     (tmr_nacl != cmd->se_sess->se_node_acl)) && tas) {
++		remove = false;
+ 		transport_send_task_abort(cmd);
++	}
+ 
+-	transport_cmd_finish_abort(cmd, 0);
++	transport_cmd_finish_abort(cmd, remove);
+ }
+ 
+ static int target_check_cdb_and_preempt(struct list_head *list,
+@@ -150,18 +153,9 @@ void core_tmr_abort_task(
+ 
+ 		cancel_work_sync(&se_cmd->work);
+ 		transport_wait_for_tasks(se_cmd);
+-		/*
+-		 * Now send SAM_STAT_TASK_ABORTED status for the referenced
+-		 * se_cmd descriptor..
+-		 */
+-		transport_send_task_abort(se_cmd);
+-		/*
+-		 * Also deal with possible extra acknowledge reference..
+-		 */
+-		if (se_cmd->se_cmd_flags & SCF_ACK_KREF)
+-			target_put_sess_cmd(se_sess, se_cmd);
+ 
+ 		target_put_sess_cmd(se_sess, se_cmd);
++		transport_cmd_finish_abort(se_cmd, true);
+ 
+ 		printk("ABORT_TASK: Sending TMR_FUNCTION_COMPLETE for"
+ 				" ref_tag: %d\n", ref_tag);
+--- a/drivers/target/target_core_transport.c
++++ b/drivers/target/target_core_transport.c
+@@ -603,6 +603,9 @@ static void transport_lun_remove_cmd(str
+ 
+ void transport_cmd_finish_abort(struct se_cmd *cmd, int remove)
+ {
++	if (cmd->se_cmd_flags & SCF_SE_LUN_CMD)
++		transport_lun_remove_cmd(cmd);
++
+ 	if (transport_cmd_check_stop_to_fabric(cmd))
+ 		return;
+ 	if (remove)
+@@ -2825,13 +2828,17 @@ int transport_check_aborted_status(struc
+ 	if (!(cmd->transport_state & CMD_T_ABORTED))
+ 		return 0;
+ 
+-	if (!send_status || (cmd->se_cmd_flags & SCF_SENT_DELAYED_TAS))
++	/*
++	 * If cmd has been aborted but either no status is to be sent or it has
++	 * already been sent, just return
++	 */
++	if (!send_status || !(cmd->se_cmd_flags & SCF_SEND_DELAYED_TAS))
+ 		return 1;
+ 
+ 	pr_debug("Sending delayed SAM_STAT_TASK_ABORTED status for CDB: 0x%02x ITT: 0x%08x\n",
+ 		 cmd->t_task_cdb[0], cmd->se_tfo->get_task_tag(cmd));
+ 
+-	cmd->se_cmd_flags |= SCF_SENT_DELAYED_TAS;
++	cmd->se_cmd_flags &= ~SCF_SEND_DELAYED_TAS;
+ 	cmd->scsi_status = SAM_STAT_TASK_ABORTED;
+ 	trace_target_cmd_complete(cmd);
+ 	cmd->se_tfo->queue_status(cmd);
+@@ -2845,7 +2852,7 @@ void transport_send_task_abort(struct se
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&cmd->t_state_lock, flags);
+-	if (cmd->se_cmd_flags & (SCF_SENT_CHECK_CONDITION | SCF_SENT_DELAYED_TAS)) {
++	if (cmd->se_cmd_flags & (SCF_SENT_CHECK_CONDITION)) {
+ 		spin_unlock_irqrestore(&cmd->t_state_lock, flags);
+ 		return;
+ 	}
+@@ -2860,6 +2867,7 @@ void transport_send_task_abort(struct se
+ 	if (cmd->data_direction == DMA_TO_DEVICE) {
+ 		if (cmd->se_tfo->write_pending_status(cmd) != 0) {
+ 			cmd->transport_state |= CMD_T_ABORTED;
++			cmd->se_cmd_flags |= SCF_SEND_DELAYED_TAS;
+ 			smp_mb__after_atomic_inc();
+ 			return;
+ 		}
+--- a/include/target/target_core_base.h
++++ b/include/target/target_core_base.h
+@@ -162,7 +162,7 @@ enum se_cmd_flags_table {
+ 	SCF_SENT_CHECK_CONDITION	= 0x00000800,
+ 	SCF_OVERFLOW_BIT		= 0x00001000,
+ 	SCF_UNDERFLOW_BIT		= 0x00002000,
+-	SCF_SENT_DELAYED_TAS		= 0x00004000,
++	SCF_SEND_DELAYED_TAS		= 0x00004000,
+ 	SCF_ALUA_NON_OPTIMIZED		= 0x00008000,
+ 	SCF_PASSTHROUGH_SG_TO_MEM_NOALLOC = 0x00020000,
+ 	SCF_ACK_KREF			= 0x00040000,
