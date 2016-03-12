@@ -1,0 +1,128 @@
+From 844a5fe219cf472060315971e15cbf97674a3324 Mon Sep 17 00:00:00 2001
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Tue, 8 Mar 2016 12:13:39 +0100
+Subject: KVM: MMU: fix ept=0/pte.u=1/pte.w=0/CR0.WP=0/CR4.SMEP=1/EFER.NX=0 combo
+
+From: Paolo Bonzini <pbonzini@redhat.com>
+
+commit 844a5fe219cf472060315971e15cbf97674a3324 upstream.
+
+Yes, all of these are needed. :) This is admittedly a bit odd, but
+kvm-unit-tests access.flat tests this if you run it with "-cpu host"
+and of course ept=0.
+
+KVM runs the guest with CR0.WP=1, so it must handle supervisor writes
+specially when pte.u=1/pte.w=0/CR0.WP=0.  Such writes cause a fault
+when U=1 and W=0 in the SPTE, but they must succeed because CR0.WP=0.
+When KVM gets the fault, it sets U=0 and W=1 in the shadow PTE and
+restarts execution.  This will still cause a user write to fault, while
+supervisor writes will succeed.  User reads will fault spuriously now,
+and KVM will then flip U and W again in the SPTE (U=1, W=0).  User reads
+will be enabled and supervisor writes disabled, going back to the
+originary situation where supervisor writes fault spuriously.
+
+When SMEP is in effect, however, U=0 will enable kernel execution of
+this page.  To avoid this, KVM also sets NX=1 in the shadow PTE together
+with U=0.  If the guest has not enabled NX, the result is a continuous
+stream of page faults due to the NX bit being reserved.
+
+The fix is to force EFER.NX=1 even if the CPU is taking care of the EFER
+switch.  (All machines with SMEP have the CPU_LOAD_IA32_EFER vm-entry
+control, so they do not use user-return notifiers for EFER---if they did,
+EFER.NX would be forced to the same value as the host).
+
+There is another bug in the reserved bit check, which I've split to a
+separate patch for easier application to stable kernels.
+
+Cc: Andy Lutomirski <luto@amacapital.net>
+Reviewed-by: Xiao Guangrong <guangrong.xiao@linux.intel.com>
+Fixes: f6577a5fa15d82217ca73c74cd2dcbc0f6c781dd
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ Documentation/virtual/kvm/mmu.txt |    3 ++-
+ arch/x86/kvm/vmx.c                |   36 +++++++++++++++++++++++-------------
+ 2 files changed, 25 insertions(+), 14 deletions(-)
+
+--- a/Documentation/virtual/kvm/mmu.txt
++++ b/Documentation/virtual/kvm/mmu.txt
+@@ -358,7 +358,8 @@ In the first case there are two addition
+ - if CR4.SMEP is enabled: since we've turned the page into a kernel page,
+   the kernel may now execute it.  We handle this by also setting spte.nx.
+   If we get a user fetch or read fault, we'll change spte.u=1 and
+-  spte.nx=gpte.nx back.
++  spte.nx=gpte.nx back.  For this to work, KVM forces EFER.NX to 1 when
++  shadow paging is in use.
+ - if CR4.SMAP is disabled: since the page has been changed to a kernel
+   page, it can not be reused when CR4.SMAP is enabled. We set
+   CR4.SMAP && !CR0.WP into shadow page's role to avoid this case. Note,
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -1792,26 +1792,31 @@ static void reload_tss(void)
+ 
+ static bool update_transition_efer(struct vcpu_vmx *vmx, int efer_offset)
+ {
+-	u64 guest_efer;
+-	u64 ignore_bits;
++	u64 guest_efer = vmx->vcpu.arch.efer;
++	u64 ignore_bits = 0;
+ 
+-	guest_efer = vmx->vcpu.arch.efer;
++	if (!enable_ept) {
++		/*
++		 * NX is needed to handle CR0.WP=1, CR4.SMEP=1.  Testing
++		 * host CPUID is more efficient than testing guest CPUID
++		 * or CR4.  Host SMEP is anyway a requirement for guest SMEP.
++		 */
++		if (boot_cpu_has(X86_FEATURE_SMEP))
++			guest_efer |= EFER_NX;
++		else if (!(guest_efer & EFER_NX))
++			ignore_bits |= EFER_NX;
++	}
+ 
+ 	/*
+-	 * NX is emulated; LMA and LME handled by hardware; SCE meaningless
+-	 * outside long mode
++	 * LMA and LME handled by hardware; SCE meaningless outside long mode.
+ 	 */
+-	ignore_bits = EFER_NX | EFER_SCE;
++	ignore_bits |= EFER_SCE;
+ #ifdef CONFIG_X86_64
+ 	ignore_bits |= EFER_LMA | EFER_LME;
+ 	/* SCE is meaningful only in long mode on Intel */
+ 	if (guest_efer & EFER_LMA)
+ 		ignore_bits &= ~(u64)EFER_SCE;
+ #endif
+-	guest_efer &= ~ignore_bits;
+-	guest_efer |= host_efer & ignore_bits;
+-	vmx->guest_msrs[efer_offset].data = guest_efer;
+-	vmx->guest_msrs[efer_offset].mask = ~ignore_bits;
+ 
+ 	clear_atomic_switch_msr(vmx, MSR_EFER);
+ 
+@@ -1822,16 +1827,21 @@ static bool update_transition_efer(struc
+ 	 */
+ 	if (cpu_has_load_ia32_efer ||
+ 	    (enable_ept && ((vmx->vcpu.arch.efer ^ host_efer) & EFER_NX))) {
+-		guest_efer = vmx->vcpu.arch.efer;
+ 		if (!(guest_efer & EFER_LMA))
+ 			guest_efer &= ~EFER_LME;
+ 		if (guest_efer != host_efer)
+ 			add_atomic_switch_msr(vmx, MSR_EFER,
+ 					      guest_efer, host_efer);
+ 		return false;
+-	}
++	} else {
++		guest_efer &= ~ignore_bits;
++		guest_efer |= host_efer & ignore_bits;
+ 
+-	return true;
++		vmx->guest_msrs[efer_offset].data = guest_efer;
++		vmx->guest_msrs[efer_offset].mask = ~ignore_bits;
++
++		return true;
++	}
+ }
+ 
+ static unsigned long segment_base(u16 selector)
