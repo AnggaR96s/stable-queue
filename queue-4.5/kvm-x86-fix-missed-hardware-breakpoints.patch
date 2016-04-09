@@ -1,0 +1,130 @@
+From 4e422bdd2f849d98fffccbc3295c2f0996097fb3 Mon Sep 17 00:00:00 2001
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Wed, 10 Feb 2016 17:50:23 +0100
+Subject: KVM: x86: fix missed hardware breakpoints
+
+From: Paolo Bonzini <pbonzini@redhat.com>
+
+commit 4e422bdd2f849d98fffccbc3295c2f0996097fb3 upstream.
+
+Sometimes when setting a breakpoint a process doesn't stop on it.
+This is because the debug registers are not loaded correctly on
+VCPU load.
+
+The following simple reproducer from Oleg Nesterov tries using debug
+registers in both the host and the guest, for example by running "./bp
+0 1" on the host and "./bp 14 15" under QEMU.
+
+    #include <unistd.h>
+    #include <signal.h>
+    #include <stdlib.h>
+    #include <stdio.h>
+    #include <sys/wait.h>
+    #include <sys/ptrace.h>
+    #include <sys/user.h>
+    #include <asm/debugreg.h>
+    #include <assert.h>
+
+    #define offsetof(TYPE, MEMBER) ((size_t) &((TYPE *)0)->MEMBER)
+
+    unsigned long encode_dr7(int drnum, int enable, unsigned int type, unsigned int len)
+    {
+        unsigned long dr7;
+
+        dr7 = ((len | type) & 0xf)
+            << (DR_CONTROL_SHIFT + drnum * DR_CONTROL_SIZE);
+        if (enable)
+            dr7 |= (DR_GLOBAL_ENABLE << (drnum * DR_ENABLE_SIZE));
+
+        return dr7;
+    }
+
+    int write_dr(int pid, int dr, unsigned long val)
+    {
+        return ptrace(PTRACE_POKEUSER, pid,
+                offsetof (struct user, u_debugreg[dr]),
+                val);
+    }
+
+    void set_bp(pid_t pid, void *addr)
+    {
+        unsigned long dr7;
+        assert(write_dr(pid, 0, (long)addr) == 0);
+        dr7 = encode_dr7(0, 1, DR_RW_EXECUTE, DR_LEN_1);
+        assert(write_dr(pid, 7, dr7) == 0);
+    }
+
+    void *get_rip(int pid)
+    {
+        return (void*)ptrace(PTRACE_PEEKUSER, pid,
+                offsetof(struct user, regs.rip), 0);
+    }
+
+    void test(int nr)
+    {
+        void *bp_addr = &&label + nr, *bp_hit;
+        int pid;
+
+        printf("test bp %d\n", nr);
+        assert(nr < 16); // see 16 asm nops below
+
+        pid = fork();
+        if (!pid) {
+            assert(ptrace(PTRACE_TRACEME, 0,0,0) == 0);
+            kill(getpid(), SIGSTOP);
+            for (;;) {
+                label: asm (
+                    "nop; nop; nop; nop;"
+                    "nop; nop; nop; nop;"
+                    "nop; nop; nop; nop;"
+                    "nop; nop; nop; nop;"
+                );
+            }
+        }
+
+        assert(pid == wait(NULL));
+        set_bp(pid, bp_addr);
+
+        for (;;) {
+            assert(ptrace(PTRACE_CONT, pid, 0, 0) == 0);
+            assert(pid == wait(NULL));
+
+            bp_hit = get_rip(pid);
+            if (bp_hit != bp_addr)
+                fprintf(stderr, "ERR!! hit wrong bp %ld != %d\n",
+                    bp_hit - &&label, nr);
+        }
+    }
+
+    int main(int argc, const char *argv[])
+    {
+        while (--argc) {
+            int nr = atoi(*++argv);
+            if (!fork())
+                test(nr);
+        }
+
+        while (wait(NULL) > 0)
+            ;
+        return 0;
+    }
+
+Suggested-by: Nadadv Amit <namit@cs.technion.ac.il>
+Reported-by: Andrey Wagin <avagin@gmail.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ arch/x86/kvm/x86.c |    1 +
+ 1 file changed, 1 insertion(+)
+
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -2752,6 +2752,7 @@ void kvm_arch_vcpu_load(struct kvm_vcpu
+ 	}
+ 
+ 	kvm_make_request(KVM_REQ_STEAL_UPDATE, vcpu);
++	vcpu->arch.switch_db_regs |= KVM_DEBUGREG_RELOAD;
+ }
+ 
+ void kvm_arch_vcpu_put(struct kvm_vcpu *vcpu)
