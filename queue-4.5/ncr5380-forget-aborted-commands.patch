@@ -1,0 +1,268 @@
+From dc183965282d28c82f192e39cbfa91da85505a6f Mon Sep 17 00:00:00 2001
+From: Finn Thain <fthain@telegraphics.com.au>
+Date: Tue, 23 Feb 2016 10:07:07 +1100
+Subject: ncr5380: Forget aborted commands
+
+From: Finn Thain <fthain@telegraphics.com.au>
+
+commit dc183965282d28c82f192e39cbfa91da85505a6f upstream.
+
+The list structures and related logic used in the NCR5380 driver mean that
+a command cannot be queued twice (i.e. can't appear on more than one queue
+and can't appear on the same queue more than once).
+
+The abort handler must forget the command so that the mid-layer can re-use
+it. E.g. the ML may send it back to the LLD via via scsi_eh_get_sense().
+
+Fix this and also fix two error paths, so that commands get forgotten iff
+completed.
+
+Fixes: 8b00c3d5d40d ("ncr5380: Implement new eh_abort_handler")
+Tested-by: Michael Schmitz <schmitzmic@gmail.com>
+Signed-off-by: Finn Thain <fthain@telegraphics.com.au>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/scsi/NCR5380.c       |   62 +++++++++++--------------------------------
+ drivers/scsi/atari_NCR5380.c |   62 +++++++++++--------------------------------
+ 2 files changed, 34 insertions(+), 90 deletions(-)
+
+--- a/drivers/scsi/NCR5380.c
++++ b/drivers/scsi/NCR5380.c
+@@ -1796,6 +1796,7 @@ static void NCR5380_information_transfer
+ 				do_abort(instance);
+ 				cmd->result = DID_ERROR << 16;
+ 				complete_cmd(instance, cmd);
++				hostdata->connected = NULL;
+ 				return;
+ #endif
+ 			case PHASE_DATAIN:
+@@ -1845,7 +1846,6 @@ static void NCR5380_information_transfer
+ 						sink = 1;
+ 						do_abort(instance);
+ 						cmd->result = DID_ERROR << 16;
+-						complete_cmd(instance, cmd);
+ 						/* XXX - need to source or sink data here, as appropriate */
+ 					} else
+ 						cmd->SCp.this_residual -= transfersize - len;
+@@ -2294,14 +2294,14 @@ static bool list_del_cmd(struct list_hea
+  * [disconnected -> connected ->]...
+  * [autosense -> connected ->] done
+  *
+- * If cmd is unissued then just remove it.
+- * If cmd is disconnected, try to select the target.
+- * If cmd is connected, try to send an abort message.
+- * If cmd is waiting for autosense, give it a chance to complete but check
+- * that it isn't left connected.
+  * If cmd was not found at all then presumably it has already been completed,
+  * in which case return SUCCESS to try to avoid further EH measures.
++ *
+  * If the command has not completed yet, we must not fail to find it.
++ * We have no option but to forget the aborted command (even if it still
++ * lacks sense data). The mid-layer may re-issue a command that is in error
++ * recovery (see scsi_send_eh_cmnd), but the logic and data structures in
++ * this driver are such that a command can appear on one queue only.
+  *
+  * The lock protects driver data structures, but EH handlers also use it
+  * to serialize their own execution and prevent their own re-entry.
+@@ -2327,6 +2327,7 @@ static int NCR5380_abort(struct scsi_cmn
+ 		         "abort: removed %p from issue queue\n", cmd);
+ 		cmd->result = DID_ABORT << 16;
+ 		cmd->scsi_done(cmd); /* No tag or busy flag to worry about */
++		goto out;
+ 	}
+ 
+ 	if (hostdata->selecting == cmd) {
+@@ -2344,6 +2345,8 @@ static int NCR5380_abort(struct scsi_cmn
+ 		/* Can't call NCR5380_select() and send ABORT because that
+ 		 * means releasing the lock. Need a bus reset.
+ 		 */
++		set_host_byte(cmd, DID_ERROR);
++		complete_cmd(instance, cmd);
+ 		result = FAILED;
+ 		goto out;
+ 	}
+@@ -2351,45 +2354,9 @@ static int NCR5380_abort(struct scsi_cmn
+ 	if (hostdata->connected == cmd) {
+ 		dsprintk(NDEBUG_ABORT, instance, "abort: cmd %p is connected\n", cmd);
+ 		hostdata->connected = NULL;
+-		if (do_abort(instance)) {
+-			set_host_byte(cmd, DID_ERROR);
+-			complete_cmd(instance, cmd);
+-			result = FAILED;
+-			goto out;
+-		}
+-		set_host_byte(cmd, DID_ABORT);
+ #ifdef REAL_DMA
+ 		hostdata->dma_len = 0;
+ #endif
+-		if (cmd->cmnd[0] == REQUEST_SENSE)
+-			complete_cmd(instance, cmd);
+-		else {
+-			struct NCR5380_cmd *ncmd = scsi_cmd_priv(cmd);
+-
+-			/* Perform autosense for this command */
+-			list_add(&ncmd->list, &hostdata->autosense);
+-		}
+-	}
+-
+-	if (list_find_cmd(&hostdata->autosense, cmd)) {
+-		dsprintk(NDEBUG_ABORT, instance,
+-		         "abort: found %p on sense queue\n", cmd);
+-		spin_unlock_irqrestore(&hostdata->lock, flags);
+-		queue_work(hostdata->work_q, &hostdata->main_task);
+-		msleep(1000);
+-		spin_lock_irqsave(&hostdata->lock, flags);
+-		if (list_del_cmd(&hostdata->autosense, cmd)) {
+-			dsprintk(NDEBUG_ABORT, instance,
+-			         "abort: removed %p from sense queue\n", cmd);
+-			set_host_byte(cmd, DID_ABORT);
+-			complete_cmd(instance, cmd);
+-			goto out;
+-		}
+-	}
+-
+-	if (hostdata->connected == cmd) {
+-		dsprintk(NDEBUG_ABORT, instance, "abort: cmd %p is connected\n", cmd);
+-		hostdata->connected = NULL;
+ 		if (do_abort(instance)) {
+ 			set_host_byte(cmd, DID_ERROR);
+ 			complete_cmd(instance, cmd);
+@@ -2397,9 +2364,14 @@ static int NCR5380_abort(struct scsi_cmn
+ 			goto out;
+ 		}
+ 		set_host_byte(cmd, DID_ABORT);
+-#ifdef REAL_DMA
+-		hostdata->dma_len = 0;
+-#endif
++		complete_cmd(instance, cmd);
++		goto out;
++	}
++
++	if (list_del_cmd(&hostdata->autosense, cmd)) {
++		dsprintk(NDEBUG_ABORT, instance,
++		         "abort: removed %p from sense queue\n", cmd);
++		set_host_byte(cmd, DID_ERROR);
+ 		complete_cmd(instance, cmd);
+ 	}
+ 
+--- a/drivers/scsi/atari_NCR5380.c
++++ b/drivers/scsi/atari_NCR5380.c
+@@ -1907,6 +1907,7 @@ static void NCR5380_information_transfer
+ 				do_abort(instance);
+ 				cmd->result = DID_ERROR << 16;
+ 				complete_cmd(instance, cmd);
++				hostdata->connected = NULL;
+ 				return;
+ #endif
+ 			case PHASE_DATAIN:
+@@ -1964,7 +1965,6 @@ static void NCR5380_information_transfer
+ 						sink = 1;
+ 						do_abort(instance);
+ 						cmd->result = DID_ERROR << 16;
+-						complete_cmd(instance, cmd);
+ 						/* XXX - need to source or sink data here, as appropriate */
+ 					} else {
+ #ifdef REAL_DMA
+@@ -2489,14 +2489,14 @@ static bool list_del_cmd(struct list_hea
+  * [disconnected -> connected ->]...
+  * [autosense -> connected ->] done
+  *
+- * If cmd is unissued then just remove it.
+- * If cmd is disconnected, try to select the target.
+- * If cmd is connected, try to send an abort message.
+- * If cmd is waiting for autosense, give it a chance to complete but check
+- * that it isn't left connected.
+  * If cmd was not found at all then presumably it has already been completed,
+  * in which case return SUCCESS to try to avoid further EH measures.
++ *
+  * If the command has not completed yet, we must not fail to find it.
++ * We have no option but to forget the aborted command (even if it still
++ * lacks sense data). The mid-layer may re-issue a command that is in error
++ * recovery (see scsi_send_eh_cmnd), but the logic and data structures in
++ * this driver are such that a command can appear on one queue only.
+  *
+  * The lock protects driver data structures, but EH handlers also use it
+  * to serialize their own execution and prevent their own re-entry.
+@@ -2522,6 +2522,7 @@ static int NCR5380_abort(struct scsi_cmn
+ 		         "abort: removed %p from issue queue\n", cmd);
+ 		cmd->result = DID_ABORT << 16;
+ 		cmd->scsi_done(cmd); /* No tag or busy flag to worry about */
++		goto out;
+ 	}
+ 
+ 	if (hostdata->selecting == cmd) {
+@@ -2539,6 +2540,8 @@ static int NCR5380_abort(struct scsi_cmn
+ 		/* Can't call NCR5380_select() and send ABORT because that
+ 		 * means releasing the lock. Need a bus reset.
+ 		 */
++		set_host_byte(cmd, DID_ERROR);
++		complete_cmd(instance, cmd);
+ 		result = FAILED;
+ 		goto out;
+ 	}
+@@ -2546,45 +2549,9 @@ static int NCR5380_abort(struct scsi_cmn
+ 	if (hostdata->connected == cmd) {
+ 		dsprintk(NDEBUG_ABORT, instance, "abort: cmd %p is connected\n", cmd);
+ 		hostdata->connected = NULL;
+-		if (do_abort(instance)) {
+-			set_host_byte(cmd, DID_ERROR);
+-			complete_cmd(instance, cmd);
+-			result = FAILED;
+-			goto out;
+-		}
+-		set_host_byte(cmd, DID_ABORT);
+ #ifdef REAL_DMA
+ 		hostdata->dma_len = 0;
+ #endif
+-		if (cmd->cmnd[0] == REQUEST_SENSE)
+-			complete_cmd(instance, cmd);
+-		else {
+-			struct NCR5380_cmd *ncmd = scsi_cmd_priv(cmd);
+-
+-			/* Perform autosense for this command */
+-			list_add(&ncmd->list, &hostdata->autosense);
+-		}
+-	}
+-
+-	if (list_find_cmd(&hostdata->autosense, cmd)) {
+-		dsprintk(NDEBUG_ABORT, instance,
+-		         "abort: found %p on sense queue\n", cmd);
+-		spin_unlock_irqrestore(&hostdata->lock, flags);
+-		queue_work(hostdata->work_q, &hostdata->main_task);
+-		msleep(1000);
+-		spin_lock_irqsave(&hostdata->lock, flags);
+-		if (list_del_cmd(&hostdata->autosense, cmd)) {
+-			dsprintk(NDEBUG_ABORT, instance,
+-			         "abort: removed %p from sense queue\n", cmd);
+-			set_host_byte(cmd, DID_ABORT);
+-			complete_cmd(instance, cmd);
+-			goto out;
+-		}
+-	}
+-
+-	if (hostdata->connected == cmd) {
+-		dsprintk(NDEBUG_ABORT, instance, "abort: cmd %p is connected\n", cmd);
+-		hostdata->connected = NULL;
+ 		if (do_abort(instance)) {
+ 			set_host_byte(cmd, DID_ERROR);
+ 			complete_cmd(instance, cmd);
+@@ -2592,9 +2559,14 @@ static int NCR5380_abort(struct scsi_cmn
+ 			goto out;
+ 		}
+ 		set_host_byte(cmd, DID_ABORT);
+-#ifdef REAL_DMA
+-		hostdata->dma_len = 0;
+-#endif
++		complete_cmd(instance, cmd);
++		goto out;
++	}
++
++	if (list_del_cmd(&hostdata->autosense, cmd)) {
++		dsprintk(NDEBUG_ABORT, instance,
++		         "abort: removed %p from sense queue\n", cmd);
++		set_host_byte(cmd, DID_ERROR);
+ 		complete_cmd(instance, cmd);
+ 	}
+ 

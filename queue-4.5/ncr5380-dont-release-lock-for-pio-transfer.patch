@@ -1,0 +1,117 @@
+From 1678847ec93040ae8280d19c42ae0ba8a4233e6d Mon Sep 17 00:00:00 2001
+From: Finn Thain <fthain@telegraphics.com.au>
+Date: Tue, 23 Feb 2016 10:07:05 +1100
+Subject: ncr5380: Dont release lock for PIO transfer
+
+From: Finn Thain <fthain@telegraphics.com.au>
+
+commit 1678847ec93040ae8280d19c42ae0ba8a4233e6d upstream.
+
+The calls to NCR5380_transfer_pio() for DATA IN and DATA OUT phases will
+modify cmd->SCp.this_residual, cmd->SCp.ptr and cmd->SCp.buffer. That
+works as long as EH does not intervene, which became possible in
+atari_NCR5380.c when I changed the locking to bring it closer to
+NCR5380.c.
+
+If error recovery aborts the command, the scsi_cmnd in question and its
+buffer will be returned to the mid-layer. So the transfer has to cease,
+but it can't be stopped by the initiator because the target controls the
+bus phase.
+
+The problem does not arise if the lock is not released. That was fine for
+atari_scsi, because it implements DMA. For the other drivers, we have to
+release the lock and re-enable interrupts for long PIO data transfers.
+
+The solution is to split the transfer into small chunks. In between chunks
+the main loop releases the lock and re-enables interrupts. Thus interrupts
+can be serviced and eh_bus_reset_handler can intervene if need be.
+
+This fixes an oops in NCR5380_transfer_pio() that can happen when the EH
+abort handler is invoked during DATA IN or DATA OUT phase.
+
+Fixes: 11d2f63b9cf5 ("ncr5380: Change instance->host_lock to hostdata->lock")
+Reported-and-tested-by: Michael Schmitz <schmitzmic@gmail.com>
+Signed-off-by: Finn Thain <fthain@telegraphics.com.au>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/scsi/NCR5380.c       |   16 +++++++++-------
+ drivers/scsi/atari_NCR5380.c |   16 +++++++++-------
+ 2 files changed, 18 insertions(+), 14 deletions(-)
+
+--- a/drivers/scsi/NCR5380.c
++++ b/drivers/scsi/NCR5380.c
+@@ -1759,9 +1759,7 @@ static void NCR5380_information_transfer
+ 	unsigned char msgout = NOP;
+ 	int sink = 0;
+ 	int len;
+-#if defined(PSEUDO_DMA) || defined(REAL_DMA_POLL)
+ 	int transfersize;
+-#endif
+ 	unsigned char *data;
+ 	unsigned char phase, tmp, extended_msg[10], old_phase = 0xff;
+ 	struct scsi_cmnd *cmd;
+@@ -1854,13 +1852,17 @@ static void NCR5380_information_transfer
+ 				} else
+ #endif				/* defined(PSEUDO_DMA) || defined(REAL_DMA_POLL) */
+ 				{
+-					spin_unlock_irq(&hostdata->lock);
+-					NCR5380_transfer_pio(instance, &phase,
+-					                     (int *)&cmd->SCp.this_residual,
++					/* Break up transfer into 3 ms chunks,
++					 * presuming 6 accesses per handshake.
++					 */
++					transfersize = min((unsigned long)cmd->SCp.this_residual,
++					                   hostdata->accesses_per_ms / 2);
++					len = transfersize;
++					NCR5380_transfer_pio(instance, &phase, &len,
+ 					                     (unsigned char **)&cmd->SCp.ptr);
+-					spin_lock_irq(&hostdata->lock);
++					cmd->SCp.this_residual -= transfersize - len;
+ 				}
+-				break;
++				return;
+ 			case PHASE_MSGIN:
+ 				len = 1;
+ 				data = &tmp;
+--- a/drivers/scsi/atari_NCR5380.c
++++ b/drivers/scsi/atari_NCR5380.c
+@@ -1838,9 +1838,7 @@ static void NCR5380_information_transfer
+ 	unsigned char msgout = NOP;
+ 	int sink = 0;
+ 	int len;
+-#if defined(REAL_DMA)
+ 	int transfersize;
+-#endif
+ 	unsigned char *data;
+ 	unsigned char phase, tmp, extended_msg[10], old_phase = 0xff;
+ 	struct scsi_cmnd *cmd;
+@@ -1983,18 +1981,22 @@ static void NCR5380_information_transfer
+ 				} else
+ #endif /* defined(REAL_DMA) */
+ 				{
+-					spin_unlock_irq(&hostdata->lock);
+-					NCR5380_transfer_pio(instance, &phase,
+-					                     (int *)&cmd->SCp.this_residual,
++					/* Break up transfer into 3 ms chunks,
++					 * presuming 6 accesses per handshake.
++					 */
++					transfersize = min((unsigned long)cmd->SCp.this_residual,
++					                   hostdata->accesses_per_ms / 2);
++					len = transfersize;
++					NCR5380_transfer_pio(instance, &phase, &len,
+ 					                     (unsigned char **)&cmd->SCp.ptr);
+-					spin_lock_irq(&hostdata->lock);
++					cmd->SCp.this_residual -= transfersize - len;
+ 				}
+ #if defined(CONFIG_SUN3) && defined(REAL_DMA)
+ 				/* if we had intended to dma that command clear it */
+ 				if (sun3_dma_setup_done == cmd)
+ 					sun3_dma_setup_done = NULL;
+ #endif
+-				break;
++				return;
+ 			case PHASE_MSGIN:
+ 				len = 1;
+ 				data = &tmp;
