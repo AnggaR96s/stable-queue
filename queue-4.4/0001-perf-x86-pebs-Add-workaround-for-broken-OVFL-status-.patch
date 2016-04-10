@@ -1,0 +1,90 @@
+From 804333ac935cfec53e96f1fc2264b373bdd7c923 Mon Sep 17 00:00:00 2001
+From: Stephane Eranian <eranian@google.com>
+Date: Thu, 3 Mar 2016 20:50:41 +0100
+Subject: perf/x86/pebs: Add workaround for broken OVFL status on HSW+
+
+From: Stephane Eranian <eranian@google.com>
+
+commit 8077eca079a212f26419c57226f28696b7100683 upstream.
+
+This patch fixes an issue with the GLOBAL_OVERFLOW_STATUS bits on
+Haswell, Broadwell and Skylake processors when using PEBS.
+
+The SDM stipulates that when the PEBS iterrupt threshold is crossed,
+an interrupt is posted and the kernel is interrupted. The kernel will
+find GLOBAL_OVF_SATUS bit 62 set indicating there are PEBS records to
+drain. But the bits corresponding to the actual counters should NOT be
+set. The kernel follows the SDM and assumes that all PEBS events are
+processed in the drain_pebs() callback. The kernel then checks for
+remaining overflows on any other (non-PEBS) events and processes these
+in the for_each_bit_set(&status) loop.
+
+As it turns out, under certain conditions on HSW and later processors,
+on PEBS buffer interrupt, bit 62 is set but the counter bits may be
+set as well. In that case, the kernel drains PEBS and generates
+SAMPLES with the EXACT tag, then it processes the counter bits, and
+generates normal (non-EXACT) SAMPLES.
+
+I ran into this problem by trying to understand why on HSW sampling on
+a PEBS event was sometimes returning SAMPLES without the EXACT tag.
+This should not happen on user level code because HSW has the
+eventing_ip which always point to the instruction that caused the
+event.
+
+The workaround in this patch simply ensures that the bits for the
+counters used for PEBS events are cleared after the PEBS buffer has
+been drained. With this fix 100% of the PEBS samples on my user code
+report the EXACT tag.
+
+Before:
+  $ perf record -e cpu/event=0xd0,umask=0x81/upp ./multichase
+  $ perf report -D | fgrep SAMPLES
+  PERF_RECORD_SAMPLE(IP, 0x2): 11775/11775: 0x406de5 period: 73469 addr: 0 exact=Y
+                           \--- EXACT tag is missing
+
+After:
+  $ perf record -e cpu/event=0xd0,umask=0x81/upp ./multichase
+  $ perf report -D | fgrep SAMPLES
+  PERF_RECORD_SAMPLE(IP, 0x4002): 11775/11775: 0x406de5 period: 73469 addr: 0 exact=Y
+                           \--- EXACT tag is set
+
+The problem tends to appear more often when multiple PEBS events are used.
+
+Signed-off-by: Stephane Eranian <eranian@google.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+Cc: Jiri Olsa <jolsa@redhat.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Vince Weaver <vincent.weaver@maine.edu>
+Cc: adrian.hunter@intel.com
+Cc: kan.liang@intel.com
+Cc: namhyung@kernel.org
+Link: http://lkml.kernel.org/r/1457034642-21837-3-git-send-email-eranian@google.com
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/x86/kernel/cpu/perf_event_intel.c |   10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+--- a/arch/x86/kernel/cpu/perf_event_intel.c
++++ b/arch/x86/kernel/cpu/perf_event_intel.c
+@@ -1840,6 +1840,16 @@ again:
+ 	if (__test_and_clear_bit(62, (unsigned long *)&status)) {
+ 		handled++;
+ 		x86_pmu.drain_pebs(regs);
++		/*
++		 * There are cases where, even though, the PEBS ovfl bit is set
++		 * in GLOBAL_OVF_STATUS, the PEBS events may also have their
++		 * overflow bits set for their counters. We must clear them
++		 * here because they have been processed as exact samples in
++		 * the drain_pebs() routine. They must not be processed again
++		 * in the for_each_bit_set() loop for regular samples below.
++		 */
++		status &= ~cpuc->pebs_enabled;
++		status &= x86_pmu.intel_ctrl | GLOBAL_STATUS_TRACE_TOPAPMI;
+ 	}
+ 
+ 	/*
