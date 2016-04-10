@@ -1,0 +1,104 @@
+From b6e6edcfa40561e9c8abe5eecf1c96f8e5fd9c6f Mon Sep 17 00:00:00 2001
+From: Johannes Weiner <hannes@cmpxchg.org>
+Date: Thu, 17 Mar 2016 14:20:28 -0700
+Subject: mm: memcontrol: reclaim and OOM kill when shrinking memory.max below usage
+
+From: Johannes Weiner <hannes@cmpxchg.org>
+
+commit b6e6edcfa40561e9c8abe5eecf1c96f8e5fd9c6f upstream.
+
+Setting the original memory.limit_in_bytes hardlimit is subject to a
+race condition when the desired value is below the current usage.  The
+code tries a few times to first reclaim and then see if the usage has
+dropped to where we would like it to be, but there is no locking, and
+the workload is free to continue making new charges up to the old limit.
+Thus, attempting to shrink a workload relies on pure luck and hope that
+the workload happens to cooperate.
+
+To fix this in the cgroup2 memory.max knob, do it the other way round:
+set the limit first, then try enforcement.  And if reclaim is not able
+to succeed, trigger OOM kills in the group.  Keep going until the new
+limit is met, we run out of OOM victims and there's only unreclaimable
+memory left, or the task writing to memory.max is killed.  This allows
+users to shrink groups reliably, and the behavior is consistent with
+what happens when new charges are attempted in excess of memory.max.
+
+Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Cc: Vladimir Davydov <vdavydov@virtuozzo.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ mm/memcontrol.c |   38 ++++++++++++++++++++++++++++++++++----
+ 1 file changed, 34 insertions(+), 4 deletions(-)
+
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -1332,7 +1332,7 @@ static unsigned long mem_cgroup_get_limi
+ 	return limit;
+ }
+ 
+-static void mem_cgroup_out_of_memory(struct mem_cgroup *memcg, gfp_t gfp_mask,
++static bool mem_cgroup_out_of_memory(struct mem_cgroup *memcg, gfp_t gfp_mask,
+ 				     int order)
+ {
+ 	struct oom_control oc = {
+@@ -1410,6 +1410,7 @@ static void mem_cgroup_out_of_memory(str
+ 	}
+ unlock:
+ 	mutex_unlock(&oom_lock);
++	return chosen;
+ }
+ 
+ #if MAX_NUMNODES > 1
+@@ -5158,6 +5159,8 @@ static ssize_t memory_max_write(struct k
+ 				char *buf, size_t nbytes, loff_t off)
+ {
+ 	struct mem_cgroup *memcg = mem_cgroup_from_css(of_css(of));
++	unsigned int nr_reclaims = MEM_CGROUP_RECLAIM_RETRIES;
++	bool drained = false;
+ 	unsigned long max;
+ 	int err;
+ 
+@@ -5166,9 +5169,36 @@ static ssize_t memory_max_write(struct k
+ 	if (err)
+ 		return err;
+ 
+-	err = mem_cgroup_resize_limit(memcg, max);
+-	if (err)
+-		return err;
++	xchg(&memcg->memory.limit, max);
++
++	for (;;) {
++		unsigned long nr_pages = page_counter_read(&memcg->memory);
++
++		if (nr_pages <= max)
++			break;
++
++		if (signal_pending(current)) {
++			err = -EINTR;
++			break;
++		}
++
++		if (!drained) {
++			drain_all_stock(memcg);
++			drained = true;
++			continue;
++		}
++
++		if (nr_reclaims) {
++			if (!try_to_free_mem_cgroup_pages(memcg, nr_pages - max,
++							  GFP_KERNEL, true))
++				nr_reclaims--;
++			continue;
++		}
++
++		mem_cgroup_events(memcg, MEMCG_OOM, 1);
++		if (!mem_cgroup_out_of_memory(memcg, GFP_KERNEL, 0))
++			break;
++	}
+ 
+ 	memcg_wb_domain_size_changed(memcg);
+ 	return nbytes;
