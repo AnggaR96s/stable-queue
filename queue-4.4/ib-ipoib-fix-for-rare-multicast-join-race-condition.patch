@@ -1,0 +1,134 @@
+From 08bc327629cbd63bb2f66677e4b33b643695097c Mon Sep 17 00:00:00 2001
+From: Alex Estrin <alex.estrin@intel.com>
+Date: Thu, 11 Feb 2016 16:30:51 -0500
+Subject: IB/ipoib: fix for rare multicast join race condition
+
+From: Alex Estrin <alex.estrin@intel.com>
+
+commit 08bc327629cbd63bb2f66677e4b33b643695097c upstream.
+
+A narrow window for race condition still exist between
+multicast join thread and *dev_flush workers.
+A kernel crash caused by prolong erratic link state changes
+was observed (most likely a faulty cabling):
+
+[167275.656270] BUG: unable to handle kernel NULL pointer dereference at
+0000000000000020
+[167275.665973] IP: [<ffffffffa05f8f2e>] ipoib_mcast_join+0xae/0x1d0 [ib_ipoib]
+[167275.674443] PGD 0
+[167275.677373] Oops: 0000 [#1] SMP
+...
+[167275.977530] Call Trace:
+[167275.982225]  [<ffffffffa05f92f0>] ? ipoib_mcast_free+0x200/0x200 [ib_ipoib]
+[167275.992024]  [<ffffffffa05fa1b7>] ipoib_mcast_join_task+0x2a7/0x490
+[ib_ipoib]
+[167276.002149]  [<ffffffff8109d5fb>] process_one_work+0x17b/0x470
+[167276.010754]  [<ffffffff8109e3cb>] worker_thread+0x11b/0x400
+[167276.019088]  [<ffffffff8109e2b0>] ? rescuer_thread+0x400/0x400
+[167276.027737]  [<ffffffff810a5aef>] kthread+0xcf/0xe0
+Here was a hit spot:
+ipoib_mcast_join() {
+..............
+      rec.qkey      = priv->broadcast->mcmember.qkey;
+                                       ^^^^^^^
+.....
+ }
+Proposed patch should prevent multicast join task to continue
+if link state change is detected.
+
+Signed-off-by: Alex Estrin <alex.estrin@intel.com>
+Changes from v4:
+- as suggested by Doug Ledford, optimized spinlock usage,
+i.e. ipoib_mcast_join() is called with lock held.
+Changes from v3:
+- sync with priv->lock before flag check.
+Chages from v2:
+- Move check for OPER_UP flag state to mcast_join() to
+ensure no event worker is in progress.
+- minor style fixes.
+Changes from v1:
+- No need to lock again if error detected.
+Signed-off-by: Doug Ledford <dledford@redhat.com>
+Cc: Nikolay Borisov <kernel@kyup.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/infiniband/ulp/ipoib/ipoib_multicast.c |   24 +++++++++++++++++-------
+ 1 file changed, 17 insertions(+), 7 deletions(-)
+
+--- a/drivers/infiniband/ulp/ipoib/ipoib_multicast.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_multicast.c
+@@ -456,7 +456,10 @@ out_locked:
+ 	return status;
+ }
+ 
+-static void ipoib_mcast_join(struct net_device *dev, struct ipoib_mcast *mcast)
++/*
++ * Caller must hold 'priv->lock'
++ */
++static int ipoib_mcast_join(struct net_device *dev, struct ipoib_mcast *mcast)
+ {
+ 	struct ipoib_dev_priv *priv = netdev_priv(dev);
+ 	struct ib_sa_multicast *multicast;
+@@ -466,6 +469,10 @@ static void ipoib_mcast_join(struct net_
+ 	ib_sa_comp_mask comp_mask;
+ 	int ret = 0;
+ 
++	if (!priv->broadcast ||
++	    !test_bit(IPOIB_FLAG_OPER_UP, &priv->flags))
++		return -EINVAL;
++
+ 	ipoib_dbg_mcast(priv, "joining MGID %pI6\n", mcast->mcmember.mgid.raw);
+ 
+ 	rec.mgid     = mcast->mcmember.mgid;
+@@ -525,20 +532,23 @@ static void ipoib_mcast_join(struct net_
+ 			rec.join_state = 4;
+ #endif
+ 	}
++	spin_unlock_irq(&priv->lock);
+ 
+ 	multicast = ib_sa_join_multicast(&ipoib_sa_client, priv->ca, priv->port,
+ 					 &rec, comp_mask, GFP_KERNEL,
+ 					 ipoib_mcast_join_complete, mcast);
++	spin_lock_irq(&priv->lock);
+ 	if (IS_ERR(multicast)) {
+ 		ret = PTR_ERR(multicast);
+ 		ipoib_warn(priv, "ib_sa_join_multicast failed, status %d\n", ret);
+-		spin_lock_irq(&priv->lock);
+ 		/* Requeue this join task with a backoff delay */
+ 		__ipoib_mcast_schedule_join_thread(priv, mcast, 1);
+ 		clear_bit(IPOIB_MCAST_FLAG_BUSY, &mcast->flags);
+ 		spin_unlock_irq(&priv->lock);
+ 		complete(&mcast->done);
++		spin_lock_irq(&priv->lock);
+ 	}
++	return 0;
+ }
+ 
+ void ipoib_mcast_join_task(struct work_struct *work)
+@@ -620,9 +630,10 @@ void ipoib_mcast_join_task(struct work_s
+ 				/* Found the next unjoined group */
+ 				init_completion(&mcast->done);
+ 				set_bit(IPOIB_MCAST_FLAG_BUSY, &mcast->flags);
+-				spin_unlock_irq(&priv->lock);
+-				ipoib_mcast_join(dev, mcast);
+-				spin_lock_irq(&priv->lock);
++				if (ipoib_mcast_join(dev, mcast)) {
++					spin_unlock_irq(&priv->lock);
++					return;
++				}
+ 			} else if (!delay_until ||
+ 				 time_before(mcast->delay_until, delay_until))
+ 				delay_until = mcast->delay_until;
+@@ -641,10 +652,9 @@ out:
+ 	if (mcast) {
+ 		init_completion(&mcast->done);
+ 		set_bit(IPOIB_MCAST_FLAG_BUSY, &mcast->flags);
++		ipoib_mcast_join(dev, mcast);
+ 	}
+ 	spin_unlock_irq(&priv->lock);
+-	if (mcast)
+-		ipoib_mcast_join(dev, mcast);
+ }
+ 
+ int ipoib_mcast_start_thread(struct net_device *dev)
