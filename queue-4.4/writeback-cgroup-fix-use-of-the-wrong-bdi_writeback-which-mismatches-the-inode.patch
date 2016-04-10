@@ -1,0 +1,136 @@
+From aaf2559332ba272671bb870464a99b909b29a3a1 Mon Sep 17 00:00:00 2001
+From: Tejun Heo <tj@kernel.org>
+Date: Fri, 18 Mar 2016 13:52:04 -0400
+Subject: writeback, cgroup: fix use of the wrong bdi_writeback which mismatches the inode
+
+From: Tejun Heo <tj@kernel.org>
+
+commit aaf2559332ba272671bb870464a99b909b29a3a1 upstream.
+
+When cgroup writeback is in use, there can be multiple wb's
+(bdi_writeback's) per bdi and an inode may switch among them
+dynamically.  In a couple places, the wrong wb was used leading to
+performing operations on the wrong list under the wrong lock
+corrupting the io lists.
+
+* writeback_single_inode() was taking @wb parameter and used it to
+  remove the inode from io lists if it becomes clean after writeback.
+  The callers of this function were always passing in the root wb
+  regardless of the actual wb that the inode was associated with,
+  which could also change while writeback is in progress.
+
+  Fix it by dropping the @wb parameter and using
+  inode_to_wb_and_lock_list() to determine and lock the associated wb.
+
+* After writeback_sb_inodes() writes out an inode, it re-locks @wb and
+  inode to remove it from or move it to the right io list.  It assumes
+  that the inode is still associated with @wb; however, the inode may
+  have switched to another wb while writeback was in progress.
+
+  Fix it by using inode_to_wb_and_lock_list() to determine and lock
+  the associated wb after writeback is complete.  As the function
+  requires the original @wb->list_lock locked for the next iteration,
+  in the unlikely case where the inode has changed association, switch
+  the locks.
+
+Kudos to Tahsin for pinpointing these subtle breakages.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Fixes: d10c80955265 ("writeback: implement foreign cgroup inode bdi_writeback switching")
+Link: http://lkml.kernel.org/g/CAAeU0aMYeM_39Y2+PaRvyB1nqAPYZSNngJ1eBRmrxn7gKAt2Mg@mail.gmail.com
+Reported-and-diagnosed-by: Tahsin Erdogan <tahsin@google.com>
+Tested-by: Tahsin Erdogan <tahsin@google.com>
+Signed-off-by: Jens Axboe <axboe@fb.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/fs-writeback.c |   29 +++++++++++++++++++----------
+ 1 file changed, 19 insertions(+), 10 deletions(-)
+
+--- a/fs/fs-writeback.c
++++ b/fs/fs-writeback.c
+@@ -1341,10 +1341,10 @@ __writeback_single_inode(struct inode *i
+  * we go e.g. from filesystem. Flusher thread uses __writeback_single_inode()
+  * and does more profound writeback list handling in writeback_sb_inodes().
+  */
+-static int
+-writeback_single_inode(struct inode *inode, struct bdi_writeback *wb,
+-		       struct writeback_control *wbc)
++static int writeback_single_inode(struct inode *inode,
++				  struct writeback_control *wbc)
+ {
++	struct bdi_writeback *wb;
+ 	int ret = 0;
+ 
+ 	spin_lock(&inode->i_lock);
+@@ -1382,7 +1382,8 @@ writeback_single_inode(struct inode *ino
+ 	ret = __writeback_single_inode(inode, wbc);
+ 
+ 	wbc_detach_inode(wbc);
+-	spin_lock(&wb->list_lock);
++
++	wb = inode_to_wb_and_lock_list(inode);
+ 	spin_lock(&inode->i_lock);
+ 	/*
+ 	 * If inode is clean, remove it from writeback lists. Otherwise don't
+@@ -1457,6 +1458,7 @@ static long writeback_sb_inodes(struct s
+ 
+ 	while (!list_empty(&wb->b_io)) {
+ 		struct inode *inode = wb_inode(wb->b_io.prev);
++		struct bdi_writeback *tmp_wb;
+ 
+ 		if (inode->i_sb != sb) {
+ 			if (work->sb) {
+@@ -1547,15 +1549,23 @@ static long writeback_sb_inodes(struct s
+ 			cond_resched();
+ 		}
+ 
+-
+-		spin_lock(&wb->list_lock);
++		/*
++		 * Requeue @inode if still dirty.  Be careful as @inode may
++		 * have been switched to another wb in the meantime.
++		 */
++		tmp_wb = inode_to_wb_and_lock_list(inode);
+ 		spin_lock(&inode->i_lock);
+ 		if (!(inode->i_state & I_DIRTY_ALL))
+ 			wrote++;
+-		requeue_inode(inode, wb, &wbc);
++		requeue_inode(inode, tmp_wb, &wbc);
+ 		inode_sync_complete(inode);
+ 		spin_unlock(&inode->i_lock);
+ 
++		if (unlikely(tmp_wb != wb)) {
++			spin_unlock(&tmp_wb->list_lock);
++			spin_lock(&wb->list_lock);
++		}
++
+ 		/*
+ 		 * bail out to wb_writeback() often enough to check
+ 		 * background threshold and other termination conditions.
+@@ -2342,7 +2352,6 @@ EXPORT_SYMBOL(sync_inodes_sb);
+  */
+ int write_inode_now(struct inode *inode, int sync)
+ {
+-	struct bdi_writeback *wb = &inode_to_bdi(inode)->wb;
+ 	struct writeback_control wbc = {
+ 		.nr_to_write = LONG_MAX,
+ 		.sync_mode = sync ? WB_SYNC_ALL : WB_SYNC_NONE,
+@@ -2354,7 +2363,7 @@ int write_inode_now(struct inode *inode,
+ 		wbc.nr_to_write = 0;
+ 
+ 	might_sleep();
+-	return writeback_single_inode(inode, wb, &wbc);
++	return writeback_single_inode(inode, &wbc);
+ }
+ EXPORT_SYMBOL(write_inode_now);
+ 
+@@ -2371,7 +2380,7 @@ EXPORT_SYMBOL(write_inode_now);
+  */
+ int sync_inode(struct inode *inode, struct writeback_control *wbc)
+ {
+-	return writeback_single_inode(inode, &inode_to_bdi(inode)->wb, wbc);
++	return writeback_single_inode(inode, wbc);
+ }
+ EXPORT_SYMBOL(sync_inode);
+ 
