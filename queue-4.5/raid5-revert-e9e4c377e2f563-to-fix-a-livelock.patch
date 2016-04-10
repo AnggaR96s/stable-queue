@@ -1,0 +1,128 @@
+From 6ab2a4b806ae21b6c3e47c5ff1285ec06d505325 Mon Sep 17 00:00:00 2001
+From: Shaohua Li <shli@fb.com>
+Date: Thu, 25 Feb 2016 16:24:42 -0800
+Subject: RAID5: revert e9e4c377e2f563 to fix a livelock
+
+From: Shaohua Li <shli@fb.com>
+
+commit 6ab2a4b806ae21b6c3e47c5ff1285ec06d505325 upstream.
+
+Revert commit
+e9e4c377e2f563(md/raid5: per hash value and exclusive wait_for_stripe)
+
+The problem is raid5_get_active_stripe waits on
+conf->wait_for_stripe[hash]. Assume hash is 0. My test release stripes
+in this order:
+- release all stripes with hash 0
+- raid5_get_active_stripe still sleeps since active_stripes >
+  max_nr_stripes * 3 / 4
+- release all stripes with hash other than 0. active_stripes becomes 0
+- raid5_get_active_stripe still sleeps, since nobody wakes up
+  wait_for_stripe[0]
+The system live locks. The problem is active_stripes isn't a per-hash
+count. Revert the patch makes the live lock go away.
+
+Cc: Yuanhan Liu <yuanhan.liu@linux.intel.com>
+Cc: NeilBrown <neilb@suse.de>
+Signed-off-by: Shaohua Li <shli@fb.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/md/raid5.c |   27 ++++++++-------------------
+ drivers/md/raid5.h |    2 +-
+ 2 files changed, 9 insertions(+), 20 deletions(-)
+
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -340,8 +340,7 @@ static void release_inactive_stripe_list
+ 					 int hash)
+ {
+ 	int size;
+-	unsigned long do_wakeup = 0;
+-	int i = 0;
++	bool do_wakeup = false;
+ 	unsigned long flags;
+ 
+ 	if (hash == NR_STRIPE_HASH_LOCKS) {
+@@ -362,19 +361,15 @@ static void release_inactive_stripe_list
+ 			    !list_empty(list))
+ 				atomic_dec(&conf->empty_inactive_list_nr);
+ 			list_splice_tail_init(list, conf->inactive_list + hash);
+-			do_wakeup |= 1 << hash;
++			do_wakeup = true;
+ 			spin_unlock_irqrestore(conf->hash_locks + hash, flags);
+ 		}
+ 		size--;
+ 		hash--;
+ 	}
+ 
+-	for (i = 0; i < NR_STRIPE_HASH_LOCKS; i++) {
+-		if (do_wakeup & (1 << i))
+-			wake_up(&conf->wait_for_stripe[i]);
+-	}
+-
+ 	if (do_wakeup) {
++		wake_up(&conf->wait_for_stripe);
+ 		if (atomic_read(&conf->active_stripes) == 0)
+ 			wake_up(&conf->wait_for_quiescent);
+ 		if (conf->retry_read_aligned)
+@@ -687,15 +682,14 @@ raid5_get_active_stripe(struct r5conf *c
+ 			if (!sh) {
+ 				set_bit(R5_INACTIVE_BLOCKED,
+ 					&conf->cache_state);
+-				wait_event_exclusive_cmd(
+-					conf->wait_for_stripe[hash],
++				wait_event_lock_irq(
++					conf->wait_for_stripe,
+ 					!list_empty(conf->inactive_list + hash) &&
+ 					(atomic_read(&conf->active_stripes)
+ 					 < (conf->max_nr_stripes * 3 / 4)
+ 					 || !test_bit(R5_INACTIVE_BLOCKED,
+ 						      &conf->cache_state)),
+-					spin_unlock_irq(conf->hash_locks + hash),
+-					spin_lock_irq(conf->hash_locks + hash));
++					*(conf->hash_locks + hash));
+ 				clear_bit(R5_INACTIVE_BLOCKED,
+ 					  &conf->cache_state);
+ 			} else {
+@@ -720,9 +714,6 @@ raid5_get_active_stripe(struct r5conf *c
+ 		}
+ 	} while (sh == NULL);
+ 
+-	if (!list_empty(conf->inactive_list + hash))
+-		wake_up(&conf->wait_for_stripe[hash]);
+-
+ 	spin_unlock_irq(conf->hash_locks + hash);
+ 	return sh;
+ }
+@@ -2202,7 +2193,7 @@ static int resize_stripes(struct r5conf
+ 	cnt = 0;
+ 	list_for_each_entry(nsh, &newstripes, lru) {
+ 		lock_device_hash_lock(conf, hash);
+-		wait_event_exclusive_cmd(conf->wait_for_stripe[hash],
++		wait_event_cmd(conf->wait_for_stripe,
+ 				    !list_empty(conf->inactive_list + hash),
+ 				    unlock_device_hash_lock(conf, hash),
+ 				    lock_device_hash_lock(conf, hash));
+@@ -6521,9 +6512,7 @@ static struct r5conf *setup_conf(struct
+ 	seqcount_init(&conf->gen_lock);
+ 	mutex_init(&conf->cache_size_mutex);
+ 	init_waitqueue_head(&conf->wait_for_quiescent);
+-	for (i = 0; i < NR_STRIPE_HASH_LOCKS; i++) {
+-		init_waitqueue_head(&conf->wait_for_stripe[i]);
+-	}
++	init_waitqueue_head(&conf->wait_for_stripe);
+ 	init_waitqueue_head(&conf->wait_for_overlap);
+ 	INIT_LIST_HEAD(&conf->handle_list);
+ 	INIT_LIST_HEAD(&conf->hold_list);
+--- a/drivers/md/raid5.h
++++ b/drivers/md/raid5.h
+@@ -524,7 +524,7 @@ struct r5conf {
+ 	atomic_t		empty_inactive_list_nr;
+ 	struct llist_head	released_stripes;
+ 	wait_queue_head_t	wait_for_quiescent;
+-	wait_queue_head_t	wait_for_stripe[NR_STRIPE_HASH_LOCKS];
++	wait_queue_head_t	wait_for_stripe;
+ 	wait_queue_head_t	wait_for_overlap;
+ 	unsigned long		cache_state;
+ #define R5_INACTIVE_BLOCKED	1	/* release of inactive stripes blocked,

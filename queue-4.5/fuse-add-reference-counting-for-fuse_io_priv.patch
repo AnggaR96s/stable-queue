@@ -1,0 +1,195 @@
+From 744742d692e37ad5c20630e57d526c8f2e2fe3c9 Mon Sep 17 00:00:00 2001
+From: Seth Forshee <seth.forshee@canonical.com>
+Date: Fri, 11 Mar 2016 10:35:34 -0600
+Subject: fuse: Add reference counting for fuse_io_priv
+
+From: Seth Forshee <seth.forshee@canonical.com>
+
+commit 744742d692e37ad5c20630e57d526c8f2e2fe3c9 upstream.
+
+The 'reqs' member of fuse_io_priv serves two purposes. First is to track
+the number of oustanding async requests to the server and to signal that
+the io request is completed. The second is to be a reference count on the
+structure to know when it can be freed.
+
+For sync io requests these purposes can be at odds.  fuse_direct_IO() wants
+to block until the request is done, and since the signal is sent when
+'reqs' reaches 0 it cannot keep a reference to the object. Yet it needs to
+use the object after the userspace server has completed processing
+requests. This leads to some handshaking and special casing that it
+needlessly complicated and responsible for at least one race condition.
+
+It's much cleaner and safer to maintain a separate reference count for the
+object lifecycle and to let 'reqs' just be a count of outstanding requests
+to the userspace server. Then we can know for sure when it is safe to free
+the object without any handshaking or special cases.
+
+The catch here is that most of the time these objects are stack allocated
+and should not be freed. Initializing these objects with a single reference
+that is never released prevents accidental attempts to free the objects.
+
+Fixes: 9d5722b7777e ("fuse: handle synchronous iocbs internally")
+Signed-off-by: Seth Forshee <seth.forshee@canonical.com>
+Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/fuse/cuse.c   |    4 ++--
+ fs/fuse/file.c   |   28 +++++++++++++++++++++-------
+ fs/fuse/fuse_i.h |    9 +++++++++
+ 3 files changed, 32 insertions(+), 9 deletions(-)
+
+--- a/fs/fuse/cuse.c
++++ b/fs/fuse/cuse.c
+@@ -90,7 +90,7 @@ static struct list_head *cuse_conntbl_he
+ 
+ static ssize_t cuse_read_iter(struct kiocb *kiocb, struct iov_iter *to)
+ {
+-	struct fuse_io_priv io = { .async = 0, .file = kiocb->ki_filp };
++	struct fuse_io_priv io = FUSE_IO_PRIV_SYNC(kiocb->ki_filp);
+ 	loff_t pos = 0;
+ 
+ 	return fuse_direct_io(&io, to, &pos, FUSE_DIO_CUSE);
+@@ -98,7 +98,7 @@ static ssize_t cuse_read_iter(struct kio
+ 
+ static ssize_t cuse_write_iter(struct kiocb *kiocb, struct iov_iter *from)
+ {
+-	struct fuse_io_priv io = { .async = 0, .file = kiocb->ki_filp };
++	struct fuse_io_priv io = FUSE_IO_PRIV_SYNC(kiocb->ki_filp);
+ 	loff_t pos = 0;
+ 	/*
+ 	 * No locking or generic_write_checks(), the server is
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@ -528,6 +528,11 @@ static void fuse_release_user_pages(stru
+ 	}
+ }
+ 
++static void fuse_io_release(struct kref *kref)
++{
++	kfree(container_of(kref, struct fuse_io_priv, refcnt));
++}
++
+ static ssize_t fuse_get_res_by_io(struct fuse_io_priv *io)
+ {
+ 	if (io->err)
+@@ -585,8 +590,9 @@ static void fuse_aio_complete(struct fus
+ 		}
+ 
+ 		io->iocb->ki_complete(io->iocb, res, 0);
+-		kfree(io);
+ 	}
++
++	kref_put(&io->refcnt, fuse_io_release);
+ }
+ 
+ static void fuse_aio_complete_req(struct fuse_conn *fc, struct fuse_req *req)
+@@ -613,6 +619,7 @@ static size_t fuse_async_req_send(struct
+ 		size_t num_bytes, struct fuse_io_priv *io)
+ {
+ 	spin_lock(&io->lock);
++	kref_get(&io->refcnt);
+ 	io->size += num_bytes;
+ 	io->reqs++;
+ 	spin_unlock(&io->lock);
+@@ -691,7 +698,7 @@ static void fuse_short_read(struct fuse_
+ 
+ static int fuse_do_readpage(struct file *file, struct page *page)
+ {
+-	struct fuse_io_priv io = { .async = 0, .file = file };
++	struct fuse_io_priv io = FUSE_IO_PRIV_SYNC(file);
+ 	struct inode *inode = page->mapping->host;
+ 	struct fuse_conn *fc = get_fuse_conn(inode);
+ 	struct fuse_req *req;
+@@ -984,7 +991,7 @@ static size_t fuse_send_write_pages(stru
+ 	size_t res;
+ 	unsigned offset;
+ 	unsigned i;
+-	struct fuse_io_priv io = { .async = 0, .file = file };
++	struct fuse_io_priv io = FUSE_IO_PRIV_SYNC(file);
+ 
+ 	for (i = 0; i < req->num_pages; i++)
+ 		fuse_wait_on_page_writeback(inode, req->pages[i]->index);
+@@ -1398,7 +1405,7 @@ static ssize_t __fuse_direct_read(struct
+ 
+ static ssize_t fuse_direct_read_iter(struct kiocb *iocb, struct iov_iter *to)
+ {
+-	struct fuse_io_priv io = { .async = 0, .file = iocb->ki_filp };
++	struct fuse_io_priv io = FUSE_IO_PRIV_SYNC(iocb->ki_filp);
+ 	return __fuse_direct_read(&io, to, &iocb->ki_pos);
+ }
+ 
+@@ -1406,7 +1413,7 @@ static ssize_t fuse_direct_write_iter(st
+ {
+ 	struct file *file = iocb->ki_filp;
+ 	struct inode *inode = file_inode(file);
+-	struct fuse_io_priv io = { .async = 0, .file = file };
++	struct fuse_io_priv io = FUSE_IO_PRIV_SYNC(file);
+ 	ssize_t res;
+ 
+ 	if (is_bad_inode(inode))
+@@ -2864,6 +2871,7 @@ fuse_direct_IO(struct kiocb *iocb, struc
+ 	if (!io)
+ 		return -ENOMEM;
+ 	spin_lock_init(&io->lock);
++	kref_init(&io->refcnt);
+ 	io->reqs = 1;
+ 	io->bytes = -1;
+ 	io->size = 0;
+@@ -2887,8 +2895,14 @@ fuse_direct_IO(struct kiocb *iocb, struc
+ 	    iov_iter_rw(iter) == WRITE)
+ 		io->async = false;
+ 
+-	if (io->async && is_sync)
++	if (io->async && is_sync) {
++		/*
++		 * Additional reference to keep io around after
++		 * calling fuse_aio_complete()
++		 */
++		kref_get(&io->refcnt);
+ 		io->done = &wait;
++	}
+ 
+ 	if (iov_iter_rw(iter) == WRITE) {
+ 		ret = fuse_direct_io(io, iter, &pos, FUSE_DIO_WRITE);
+@@ -2908,7 +2922,7 @@ fuse_direct_IO(struct kiocb *iocb, struc
+ 		ret = fuse_get_res_by_io(io);
+ 	}
+ 
+-	kfree(io);
++	kref_put(&io->refcnt, fuse_io_release);
+ 
+ 	if (iov_iter_rw(iter) == WRITE) {
+ 		if (ret > 0)
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@ -22,6 +22,7 @@
+ #include <linux/rbtree.h>
+ #include <linux/poll.h>
+ #include <linux/workqueue.h>
++#include <linux/kref.h>
+ 
+ /** Max number of pages that can be used in a single read request */
+ #define FUSE_MAX_PAGES_PER_REQ 32
+@@ -243,6 +244,7 @@ struct fuse_args {
+ 
+ /** The request IO state (for asynchronous processing) */
+ struct fuse_io_priv {
++	struct kref refcnt;
+ 	int async;
+ 	spinlock_t lock;
+ 	unsigned reqs;
+@@ -256,6 +258,13 @@ struct fuse_io_priv {
+ 	struct completion *done;
+ };
+ 
++#define FUSE_IO_PRIV_SYNC(f) \
++{					\
++	.refcnt = { ATOMIC_INIT(1) },	\
++	.async = 0,			\
++	.file = f,			\
++}
++
+ /**
+  * Request flags
+  *

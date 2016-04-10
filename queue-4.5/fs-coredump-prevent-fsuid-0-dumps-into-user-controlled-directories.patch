@@ -1,0 +1,165 @@
+From 378c6520e7d29280f400ef2ceaf155c86f05a71a Mon Sep 17 00:00:00 2001
+From: Jann Horn <jann@thejh.net>
+Date: Tue, 22 Mar 2016 14:25:36 -0700
+Subject: fs/coredump: prevent fsuid=0 dumps into user-controlled directories
+
+From: Jann Horn <jann@thejh.net>
+
+commit 378c6520e7d29280f400ef2ceaf155c86f05a71a upstream.
+
+This commit fixes the following security hole affecting systems where
+all of the following conditions are fulfilled:
+
+ - The fs.suid_dumpable sysctl is set to 2.
+ - The kernel.core_pattern sysctl's value starts with "/". (Systems
+   where kernel.core_pattern starts with "|/" are not affected.)
+ - Unprivileged user namespace creation is permitted. (This is
+   true on Linux >=3.8, but some distributions disallow it by
+   default using a distro patch.)
+
+Under these conditions, if a program executes under secure exec rules,
+causing it to run with the SUID_DUMP_ROOT flag, then unshares its user
+namespace, changes its root directory and crashes, the coredump will be
+written using fsuid=0 and a path derived from kernel.core_pattern - but
+this path is interpreted relative to the root directory of the process,
+allowing the attacker to control where a coredump will be written with
+root privileges.
+
+To fix the security issue, always interpret core_pattern for dumps that
+are written under SUID_DUMP_ROOT relative to the root directory of init.
+
+Signed-off-by: Jann Horn <jann@thejh.net>
+Acked-by: Kees Cook <keescook@chromium.org>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: "Eric W. Biederman" <ebiederm@xmission.com>
+Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Oleg Nesterov <oleg@redhat.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ arch/um/drivers/mconsole_kern.c |    2 +-
+ fs/coredump.c                   |   30 ++++++++++++++++++++++++++----
+ fs/fhandle.c                    |    2 +-
+ fs/open.c                       |    6 ++----
+ include/linux/fs.h              |    2 +-
+ kernel/sysctl_binary.c          |    2 +-
+ 6 files changed, 32 insertions(+), 12 deletions(-)
+
+--- a/arch/um/drivers/mconsole_kern.c
++++ b/arch/um/drivers/mconsole_kern.c
+@@ -133,7 +133,7 @@ void mconsole_proc(struct mc_request *re
+ 	ptr += strlen("proc");
+ 	ptr = skip_spaces(ptr);
+ 
+-	file = file_open_root(mnt->mnt_root, mnt, ptr, O_RDONLY);
++	file = file_open_root(mnt->mnt_root, mnt, ptr, O_RDONLY, 0);
+ 	if (IS_ERR(file)) {
+ 		mconsole_reply(req, "Failed to open file", 1, 0);
+ 		printk(KERN_ERR "open /proc/%s: %ld\n", ptr, PTR_ERR(file));
+--- a/fs/coredump.c
++++ b/fs/coredump.c
+@@ -32,6 +32,9 @@
+ #include <linux/pipe_fs_i.h>
+ #include <linux/oom.h>
+ #include <linux/compat.h>
++#include <linux/sched.h>
++#include <linux/fs.h>
++#include <linux/path.h>
+ #include <linux/timekeeping.h>
+ 
+ #include <asm/uaccess.h>
+@@ -649,6 +652,8 @@ void do_coredump(const siginfo_t *siginf
+ 		}
+ 	} else {
+ 		struct inode *inode;
++		int open_flags = O_CREAT | O_RDWR | O_NOFOLLOW |
++				 O_LARGEFILE | O_EXCL;
+ 
+ 		if (cprm.limit < binfmt->min_coredump)
+ 			goto fail_unlock;
+@@ -687,10 +692,27 @@ void do_coredump(const siginfo_t *siginf
+ 		 * what matters is that at least one of the two processes
+ 		 * writes its coredump successfully, not which one.
+ 		 */
+-		cprm.file = filp_open(cn.corename,
+-				 O_CREAT | 2 | O_NOFOLLOW |
+-				 O_LARGEFILE | O_EXCL,
+-				 0600);
++		if (need_suid_safe) {
++			/*
++			 * Using user namespaces, normal user tasks can change
++			 * their current->fs->root to point to arbitrary
++			 * directories. Since the intention of the "only dump
++			 * with a fully qualified path" rule is to control where
++			 * coredumps may be placed using root privileges,
++			 * current->fs->root must not be used. Instead, use the
++			 * root directory of init_task.
++			 */
++			struct path root;
++
++			task_lock(&init_task);
++			get_fs_root(init_task.fs, &root);
++			task_unlock(&init_task);
++			cprm.file = file_open_root(root.dentry, root.mnt,
++				cn.corename, open_flags, 0600);
++			path_put(&root);
++		} else {
++			cprm.file = filp_open(cn.corename, open_flags, 0600);
++		}
+ 		if (IS_ERR(cprm.file))
+ 			goto fail_unlock;
+ 
+--- a/fs/fhandle.c
++++ b/fs/fhandle.c
+@@ -228,7 +228,7 @@ long do_handle_open(int mountdirfd,
+ 		path_put(&path);
+ 		return fd;
+ 	}
+-	file = file_open_root(path.dentry, path.mnt, "", open_flag);
++	file = file_open_root(path.dentry, path.mnt, "", open_flag, 0);
+ 	if (IS_ERR(file)) {
+ 		put_unused_fd(fd);
+ 		retval =  PTR_ERR(file);
+--- a/fs/open.c
++++ b/fs/open.c
+@@ -992,14 +992,12 @@ struct file *filp_open(const char *filen
+ EXPORT_SYMBOL(filp_open);
+ 
+ struct file *file_open_root(struct dentry *dentry, struct vfsmount *mnt,
+-			    const char *filename, int flags)
++			    const char *filename, int flags, umode_t mode)
+ {
+ 	struct open_flags op;
+-	int err = build_open_flags(flags, 0, &op);
++	int err = build_open_flags(flags, mode, &op);
+ 	if (err)
+ 		return ERR_PTR(err);
+-	if (flags & O_CREAT)
+-		return ERR_PTR(-EINVAL);
+ 	return do_file_open_root(dentry, mnt, filename, &op);
+ }
+ EXPORT_SYMBOL(file_open_root);
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -2259,7 +2259,7 @@ extern long do_sys_open(int dfd, const c
+ extern struct file *file_open_name(struct filename *, int, umode_t);
+ extern struct file *filp_open(const char *, int, umode_t);
+ extern struct file *file_open_root(struct dentry *, struct vfsmount *,
+-				   const char *, int);
++				   const char *, int, umode_t);
+ extern struct file * dentry_open(const struct path *, int, const struct cred *);
+ extern int filp_close(struct file *, fl_owner_t id);
+ 
+--- a/kernel/sysctl_binary.c
++++ b/kernel/sysctl_binary.c
+@@ -1321,7 +1321,7 @@ static ssize_t binary_sysctl(const int *
+ 	}
+ 
+ 	mnt = task_active_pid_ns(current)->proc_mnt;
+-	file = file_open_root(mnt->mnt_root, mnt, pathname, flags);
++	file = file_open_root(mnt->mnt_root, mnt, pathname, flags, 0);
+ 	result = PTR_ERR(file);
+ 	if (IS_ERR(file))
+ 		goto out_putname;
