@@ -1,0 +1,116 @@
+From fc5b7f3bf1e1414bd4e91db6918c85ace0c873a5 Mon Sep 17 00:00:00 2001
+From: David Matlack <dmatlack@google.com>
+Date: Wed, 30 Mar 2016 12:24:47 -0700
+Subject: kvm: x86: do not leak guest xcr0 into host interrupt handlers
+
+From: David Matlack <dmatlack@google.com>
+
+commit fc5b7f3bf1e1414bd4e91db6918c85ace0c873a5 upstream.
+
+An interrupt handler that uses the fpu can kill a KVM VM, if it runs
+under the following conditions:
+ - the guest's xcr0 register is loaded on the cpu
+ - the guest's fpu context is not loaded
+ - the host is using eagerfpu
+
+Note that the guest's xcr0 register and fpu context are not loaded as
+part of the atomic world switch into "guest mode". They are loaded by
+KVM while the cpu is still in "host mode".
+
+Usage of the fpu in interrupt context is gated by irq_fpu_usable(). The
+interrupt handler will look something like this:
+
+if (irq_fpu_usable()) {
+        kernel_fpu_begin();
+
+        [... code that uses the fpu ...]
+
+        kernel_fpu_end();
+}
+
+As long as the guest's fpu is not loaded and the host is using eager
+fpu, irq_fpu_usable() returns true (interrupted_kernel_fpu_idle()
+returns true). The interrupt handler proceeds to use the fpu with
+the guest's xcr0 live.
+
+kernel_fpu_begin() saves the current fpu context. If this uses
+XSAVE[OPT], it may leave the xsave area in an undesirable state.
+According to the SDM, during XSAVE bit i of XSTATE_BV is not modified
+if bit i is 0 in xcr0. So it's possible that XSTATE_BV[i] == 1 and
+xcr0[i] == 0 following an XSAVE.
+
+kernel_fpu_end() restores the fpu context. Now if any bit i in
+XSTATE_BV == 1 while xcr0[i] == 0, XRSTOR generates a #GP. The
+fault is trapped and SIGSEGV is delivered to the current process.
+
+Only pre-4.2 kernels appear to be vulnerable to this sequence of
+events. Commit 653f52c ("kvm,x86: load guest FPU context more eagerly")
+from 4.2 forces the guest's fpu to always be loaded on eagerfpu hosts.
+
+This patch fixes the bug by keeping the host's xcr0 loaded outside
+of the interrupts-disabled region where KVM switches into guest mode.
+
+Suggested-by: Andy Lutomirski <luto@amacapital.net>
+Signed-off-by: David Matlack <dmatlack@google.com>
+[Move load after goto cancel_injection. - Paolo]
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ arch/x86/kvm/x86.c |   10 ++++------
+ 1 file changed, 4 insertions(+), 6 deletions(-)
+
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -697,7 +697,6 @@ static int __kvm_set_xcr(struct kvm_vcpu
+ 		if ((xcr0 & XFEATURE_MASK_AVX512) != XFEATURE_MASK_AVX512)
+ 			return 1;
+ 	}
+-	kvm_put_guest_xcr0(vcpu);
+ 	vcpu->arch.xcr0 = xcr0;
+ 
+ 	if ((xcr0 ^ old_xcr0) & XFEATURE_MASK_EXTEND)
+@@ -6495,8 +6494,6 @@ static int vcpu_enter_guest(struct kvm_v
+ 	kvm_x86_ops->prepare_guest_switch(vcpu);
+ 	if (vcpu->fpu_active)
+ 		kvm_load_guest_fpu(vcpu);
+-	kvm_load_guest_xcr0(vcpu);
+-
+ 	vcpu->mode = IN_GUEST_MODE;
+ 
+ 	srcu_read_unlock(&vcpu->kvm->srcu, vcpu->srcu_idx);
+@@ -6519,6 +6516,8 @@ static int vcpu_enter_guest(struct kvm_v
+ 		goto cancel_injection;
+ 	}
+ 
++	kvm_load_guest_xcr0(vcpu);
++
+ 	if (req_immediate_exit)
+ 		smp_send_reschedule(vcpu->cpu);
+ 
+@@ -6568,6 +6567,8 @@ static int vcpu_enter_guest(struct kvm_v
+ 	vcpu->mode = OUTSIDE_GUEST_MODE;
+ 	smp_wmb();
+ 
++	kvm_put_guest_xcr0(vcpu);
++
+ 	/* Interrupt is enabled by handle_external_intr() */
+ 	kvm_x86_ops->handle_external_intr(vcpu);
+ 
+@@ -7215,7 +7216,6 @@ void kvm_load_guest_fpu(struct kvm_vcpu
+ 	 * and assume host would use all available bits.
+ 	 * Guest xcr0 would be loaded later.
+ 	 */
+-	kvm_put_guest_xcr0(vcpu);
+ 	vcpu->guest_fpu_loaded = 1;
+ 	__kernel_fpu_begin();
+ 	__copy_kernel_to_fpregs(&vcpu->arch.guest_fpu.state);
+@@ -7224,8 +7224,6 @@ void kvm_load_guest_fpu(struct kvm_vcpu
+ 
+ void kvm_put_guest_fpu(struct kvm_vcpu *vcpu)
+ {
+-	kvm_put_guest_xcr0(vcpu);
+-
+ 	if (!vcpu->guest_fpu_loaded) {
+ 		vcpu->fpu_counter = 0;
+ 		return;
