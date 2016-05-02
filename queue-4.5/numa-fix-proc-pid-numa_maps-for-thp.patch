@@ -1,0 +1,171 @@
+From 28093f9f34cedeaea0f481c58446d9dac6dd620f Mon Sep 17 00:00:00 2001
+From: Gerald Schaefer <gerald.schaefer@de.ibm.com>
+Date: Thu, 28 Apr 2016 16:18:35 -0700
+Subject: numa: fix /proc/<pid>/numa_maps for THP
+
+From: Gerald Schaefer <gerald.schaefer@de.ibm.com>
+
+commit 28093f9f34cedeaea0f481c58446d9dac6dd620f upstream.
+
+In gather_pte_stats() a THP pmd is cast into a pte, which is wrong
+because the layouts may differ depending on the architecture.  On s390
+this will lead to inaccurate numa_maps accounting in /proc because of
+misguided pte_present() and pte_dirty() checks on the fake pte.
+
+On other architectures pte_present() and pte_dirty() may work by chance,
+but there may be an issue with direct-access (dax) mappings w/o
+underlying struct pages when HAVE_PTE_SPECIAL is set and THP is
+available.  In vm_normal_page() the fake pte will be checked with
+pte_special() and because there is no "special" bit in a pmd, this will
+always return false and the VM_PFNMAP | VM_MIXEDMAP checking will be
+skipped.  On dax mappings w/o struct pages, an invalid struct page
+pointer would then be returned that can crash the kernel.
+
+This patch fixes the numa_maps THP handling by introducing new "_pmd"
+variants of the can_gather_numa_stats() and vm_normal_page() functions.
+
+Signed-off-by: Gerald Schaefer <gerald.schaefer@de.ibm.com>
+Cc: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+Cc: "Kirill A . Shutemov" <kirill.shutemov@linux.intel.com>
+Cc: Konstantin Khlebnikov <koct9i@gmail.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Jerome Marchand <jmarchan@redhat.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Dave Hansen <dave.hansen@intel.com>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: Dan Williams <dan.j.williams@intel.com>
+Cc: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Cc: Heiko Carstens <heiko.carstens@de.ibm.com>
+Cc: Michael Holzheu <holzheu@linux.vnet.ibm.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/proc/task_mmu.c |   33 ++++++++++++++++++++++++++++++---
+ include/linux/mm.h |    2 ++
+ mm/memory.c        |   40 ++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 72 insertions(+), 3 deletions(-)
+
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -1504,6 +1504,32 @@ static struct page *can_gather_numa_stat
+ 	return page;
+ }
+ 
++#ifdef CONFIG_TRANSPARENT_HUGEPAGE
++static struct page *can_gather_numa_stats_pmd(pmd_t pmd,
++					      struct vm_area_struct *vma,
++					      unsigned long addr)
++{
++	struct page *page;
++	int nid;
++
++	if (!pmd_present(pmd))
++		return NULL;
++
++	page = vm_normal_page_pmd(vma, addr, pmd);
++	if (!page)
++		return NULL;
++
++	if (PageReserved(page))
++		return NULL;
++
++	nid = page_to_nid(page);
++	if (!node_isset(nid, node_states[N_MEMORY]))
++		return NULL;
++
++	return page;
++}
++#endif
++
+ static int gather_pte_stats(pmd_t *pmd, unsigned long addr,
+ 		unsigned long end, struct mm_walk *walk)
+ {
+@@ -1513,14 +1539,14 @@ static int gather_pte_stats(pmd_t *pmd,
+ 	pte_t *orig_pte;
+ 	pte_t *pte;
+ 
++#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ 	ptl = pmd_trans_huge_lock(pmd, vma);
+ 	if (ptl) {
+-		pte_t huge_pte = *(pte_t *)pmd;
+ 		struct page *page;
+ 
+-		page = can_gather_numa_stats(huge_pte, vma, addr);
++		page = can_gather_numa_stats_pmd(*pmd, vma, addr);
+ 		if (page)
+-			gather_stats(page, md, pte_dirty(huge_pte),
++			gather_stats(page, md, pmd_dirty(*pmd),
+ 				     HPAGE_PMD_SIZE/PAGE_SIZE);
+ 		spin_unlock(ptl);
+ 		return 0;
+@@ -1528,6 +1554,7 @@ static int gather_pte_stats(pmd_t *pmd,
+ 
+ 	if (pmd_trans_unstable(pmd))
+ 		return 0;
++#endif
+ 	orig_pte = pte = pte_offset_map_lock(walk->mm, pmd, addr, &ptl);
+ 	do {
+ 		struct page *page = can_gather_numa_stats(*pte, vma, addr);
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -1119,6 +1119,8 @@ struct zap_details {
+ 
+ struct page *vm_normal_page(struct vm_area_struct *vma, unsigned long addr,
+ 		pte_t pte);
++struct page *vm_normal_page_pmd(struct vm_area_struct *vma, unsigned long addr,
++				pmd_t pmd);
+ 
+ int zap_vma_ptes(struct vm_area_struct *vma, unsigned long address,
+ 		unsigned long size);
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -792,6 +792,46 @@ out:
+ 	return pfn_to_page(pfn);
+ }
+ 
++#ifdef CONFIG_TRANSPARENT_HUGEPAGE
++struct page *vm_normal_page_pmd(struct vm_area_struct *vma, unsigned long addr,
++				pmd_t pmd)
++{
++	unsigned long pfn = pmd_pfn(pmd);
++
++	/*
++	 * There is no pmd_special() but there may be special pmds, e.g.
++	 * in a direct-access (dax) mapping, so let's just replicate the
++	 * !HAVE_PTE_SPECIAL case from vm_normal_page() here.
++	 */
++	if (unlikely(vma->vm_flags & (VM_PFNMAP|VM_MIXEDMAP))) {
++		if (vma->vm_flags & VM_MIXEDMAP) {
++			if (!pfn_valid(pfn))
++				return NULL;
++			goto out;
++		} else {
++			unsigned long off;
++			off = (addr - vma->vm_start) >> PAGE_SHIFT;
++			if (pfn == vma->vm_pgoff + off)
++				return NULL;
++			if (!is_cow_mapping(vma->vm_flags))
++				return NULL;
++		}
++	}
++
++	if (is_zero_pfn(pfn))
++		return NULL;
++	if (unlikely(pfn > highest_memmap_pfn))
++		return NULL;
++
++	/*
++	 * NOTE! We still have PageReserved() pages in the page tables.
++	 * eg. VDSO mappings can cause them to exist.
++	 */
++out:
++	return pfn_to_page(pfn);
++}
++#endif
++
+ /*
+  * copy one vm_area from one task to the other. Assumes the page tables
+  * already present in the new task to be cleared in the whole range
