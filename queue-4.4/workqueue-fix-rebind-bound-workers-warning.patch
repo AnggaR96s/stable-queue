@@ -1,0 +1,140 @@
+From f7c17d26f43d5cc1b7a6b896cd2fa24a079739b9 Mon Sep 17 00:00:00 2001
+From: Wanpeng Li <wanpeng.li@hotmail.com>
+Date: Wed, 11 May 2016 17:55:18 +0800
+Subject: workqueue: fix rebind bound workers warning
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+From: Wanpeng Li <wanpeng.li@hotmail.com>
+
+commit f7c17d26f43d5cc1b7a6b896cd2fa24a079739b9 upstream.
+
+------------[ cut here ]------------
+WARNING: CPU: 0 PID: 16 at kernel/workqueue.c:4559 rebind_workers+0x1c0/0x1d0
+Modules linked in:
+CPU: 0 PID: 16 Comm: cpuhp/0 Not tainted 4.6.0-rc4+ #31
+Hardware name: IBM IBM System x3550 M4 Server -[7914IUW]-/00Y8603, BIOS -[D7E128FUS-1.40]- 07/23/2013
+ 0000000000000000 ffff881037babb58 ffffffff8139d885 0000000000000010
+ 0000000000000000 0000000000000000 0000000000000000 ffff881037babba8
+ ffffffff8108505d ffff881037ba0000 000011cf3e7d6e60 0000000000000046
+Call Trace:
+ dump_stack+0x89/0xd4
+ __warn+0xfd/0x120
+ warn_slowpath_null+0x1d/0x20
+ rebind_workers+0x1c0/0x1d0
+ workqueue_cpu_up_callback+0xf5/0x1d0
+ notifier_call_chain+0x64/0x90
+ ? trace_hardirqs_on_caller+0xf2/0x220
+ ? notify_prepare+0x80/0x80
+ __raw_notifier_call_chain+0xe/0x10
+ __cpu_notify+0x35/0x50
+ notify_down_prepare+0x5e/0x80
+ ? notify_prepare+0x80/0x80
+ cpuhp_invoke_callback+0x73/0x330
+ ? __schedule+0x33e/0x8a0
+ cpuhp_down_callbacks+0x51/0xc0
+ cpuhp_thread_fun+0xc1/0xf0
+ smpboot_thread_fn+0x159/0x2a0
+ ? smpboot_create_threads+0x80/0x80
+ kthread+0xef/0x110
+ ? wait_for_completion+0xf0/0x120
+ ? schedule_tail+0x35/0xf0
+ ret_from_fork+0x22/0x50
+ ? __init_kthread_worker+0x70/0x70
+---[ end trace eb12ae47d2382d8f ]---
+notify_down_prepare: attempt to take down CPU 0 failed
+
+This bug can be reproduced by below config w/ nohz_full= all cpus:
+
+CONFIG_BOOTPARAM_HOTPLUG_CPU0=y
+CONFIG_DEBUG_HOTPLUG_CPU0=y
+CONFIG_NO_HZ_FULL=y
+
+As Thomas pointed out:
+
+| If a down prepare callback fails, then DOWN_FAILED is invoked for all
+| callbacks which have successfully executed DOWN_PREPARE.
+|
+| But, workqueue has actually two notifiers. One which handles
+| UP/DOWN_FAILED/ONLINE and one which handles DOWN_PREPARE.
+|
+| Now look at the priorities of those callbacks:
+|
+| CPU_PRI_WORKQUEUE_UP        = 5
+| CPU_PRI_WORKQUEUE_DOWN      = -5
+|
+| So the call order on DOWN_PREPARE is:
+|
+| CB 1
+| CB ...
+| CB workqueue_up() -> Ignores DOWN_PREPARE
+| CB ...
+| CB X ---> Fails
+|
+| So we call up to CB X with DOWN_FAILED
+|
+| CB 1
+| CB ...
+| CB workqueue_up() -> Handles DOWN_FAILED
+| CB ...
+| CB X-1
+|
+| So the problem is that the workqueue stuff handles DOWN_FAILED in the up
+| callback, while it should do it in the down callback. Which is not a good idea
+| either because it wants to be called early on rollback...
+|
+| Brilliant stuff, isn't it? The hotplug rework will solve this problem because
+| the callbacks become symetric, but for the existing mess, we need some
+| workaround in the workqueue code.
+
+The boot CPU handles housekeeping duty(unbound timers, workqueues,
+timekeeping, ...) on behalf of full dynticks CPUs. It must remain
+online when nohz full is enabled. There is a priority set to every
+notifier_blocks:
+
+workqueue_cpu_up > tick_nohz_cpu_down > workqueue_cpu_down
+
+So tick_nohz_cpu_down callback failed when down prepare cpu 0, and
+notifier_blocks behind tick_nohz_cpu_down will not be called any
+more, which leads to workers are actually not unbound. Then hotplug
+state machine will fallback to undo and online cpu 0 again. Workers
+will be rebound unconditionally even if they are not unbound and
+trigger the warning in this progress.
+
+This patch fix it by catching !DISASSOCIATED to avoid rebind bound
+workers.
+
+Cc: Tejun Heo <tj@kernel.org>
+Cc: Lai Jiangshan <jiangshanlai@gmail.com>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Frédéric Weisbecker <fweisbec@gmail.com>
+Suggested-by: Lai Jiangshan <jiangshanlai@gmail.com>
+Signed-off-by: Wanpeng Li <wanpeng.li@hotmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ kernel/workqueue.c |   11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+--- a/kernel/workqueue.c
++++ b/kernel/workqueue.c
+@@ -4457,6 +4457,17 @@ static void rebind_workers(struct worker
+ 						  pool->attrs->cpumask) < 0);
+ 
+ 	spin_lock_irq(&pool->lock);
++
++	/*
++	 * XXX: CPU hotplug notifiers are weird and can call DOWN_FAILED
++	 * w/o preceding DOWN_PREPARE.  Work around it.  CPU hotplug is
++	 * being reworked and this can go away in time.
++	 */
++	if (!(pool->flags & POOL_DISASSOCIATED)) {
++		spin_unlock_irq(&pool->lock);
++		return;
++	}
++
+ 	pool->flags &= ~POOL_DISASSOCIATED;
+ 
+ 	for_each_pool_worker(worker, pool) {
