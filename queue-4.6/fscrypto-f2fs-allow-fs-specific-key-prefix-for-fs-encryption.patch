@@ -1,0 +1,249 @@
+From b5a7aef1ef436ec005fef0efe31a676ec5f4ab31 Mon Sep 17 00:00:00 2001
+From: Jaegeuk Kim <jaegeuk@kernel.org>
+Date: Wed, 4 May 2016 22:05:01 -0700
+Subject: fscrypto/f2fs: allow fs-specific key prefix for fs encryption
+
+From: Jaegeuk Kim <jaegeuk@kernel.org>
+
+commit b5a7aef1ef436ec005fef0efe31a676ec5f4ab31 upstream.
+
+This patch allows fscrypto to handle a second key prefix given by filesystem.
+The main reason is to provide backward compatibility, since previously f2fs
+used "f2fs:" as a crypto prefix instead of "fscrypt:".
+Later, ext4 should also provide key_prefix() to give "ext4:".
+
+One concern decribed by Ted would be kinda double check overhead of prefixes.
+In x86, for example, validate_user_key consumes 8 ms after boot-up, which turns
+out derive_key_aes() consumed most of the time to load specific crypto module.
+After such the cold miss, it shows almost zero latencies, which treats as a
+negligible overhead.
+Note that request_key() detects wrong prefix in prior to derive_key_aes() even.
+
+Cc: Ted Tso <tytso@mit.edu>
+Signed-off-by: Jaegeuk Kim <jaegeuk@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/crypto/keyinfo.c      |  120 +++++++++++++++++++++++++++++------------------
+ fs/f2fs/f2fs.h           |    8 +++
+ fs/f2fs/super.c          |   13 +++++
+ include/linux/fscrypto.h |    1 
+ 4 files changed, 98 insertions(+), 44 deletions(-)
+
+--- a/fs/crypto/keyinfo.c
++++ b/fs/crypto/keyinfo.c
+@@ -78,6 +78,67 @@ out:
+ 	return res;
+ }
+ 
++static int validate_user_key(struct fscrypt_info *crypt_info,
++			struct fscrypt_context *ctx, u8 *raw_key,
++			u8 *prefix, int prefix_size)
++{
++	u8 *full_key_descriptor;
++	struct key *keyring_key;
++	struct fscrypt_key *master_key;
++	const struct user_key_payload *ukp;
++	int full_key_len = prefix_size + (FS_KEY_DESCRIPTOR_SIZE * 2) + 1;
++	int res;
++
++	full_key_descriptor = kmalloc(full_key_len, GFP_NOFS);
++	if (!full_key_descriptor)
++		return -ENOMEM;
++
++	memcpy(full_key_descriptor, prefix, prefix_size);
++	sprintf(full_key_descriptor + prefix_size,
++			"%*phN", FS_KEY_DESCRIPTOR_SIZE,
++			ctx->master_key_descriptor);
++	full_key_descriptor[full_key_len - 1] = '\0';
++	keyring_key = request_key(&key_type_logon, full_key_descriptor, NULL);
++	kfree(full_key_descriptor);
++	if (IS_ERR(keyring_key))
++		return PTR_ERR(keyring_key);
++
++	if (keyring_key->type != &key_type_logon) {
++		printk_once(KERN_WARNING
++				"%s: key type must be logon\n", __func__);
++		res = -ENOKEY;
++		goto out;
++	}
++	down_read(&keyring_key->sem);
++	ukp = user_key_payload(keyring_key);
++	if (ukp->datalen != sizeof(struct fscrypt_key)) {
++		res = -EINVAL;
++		up_read(&keyring_key->sem);
++		goto out;
++	}
++	master_key = (struct fscrypt_key *)ukp->data;
++	BUILD_BUG_ON(FS_AES_128_ECB_KEY_SIZE != FS_KEY_DERIVATION_NONCE_SIZE);
++
++	if (master_key->size != FS_AES_256_XTS_KEY_SIZE) {
++		printk_once(KERN_WARNING
++				"%s: key size incorrect: %d\n",
++				__func__, master_key->size);
++		res = -ENOKEY;
++		up_read(&keyring_key->sem);
++		goto out;
++	}
++	res = derive_key_aes(ctx->nonce, master_key->raw, raw_key);
++	up_read(&keyring_key->sem);
++	if (res)
++		goto out;
++
++	crypt_info->ci_keyring_key = keyring_key;
++	return 0;
++out:
++	key_put(keyring_key);
++	return res;
++}
++
+ static void put_crypt_info(struct fscrypt_info *ci)
+ {
+ 	if (!ci)
+@@ -91,12 +152,7 @@ static void put_crypt_info(struct fscryp
+ int get_crypt_info(struct inode *inode)
+ {
+ 	struct fscrypt_info *crypt_info;
+-	u8 full_key_descriptor[FS_KEY_DESC_PREFIX_SIZE +
+-				(FS_KEY_DESCRIPTOR_SIZE * 2) + 1];
+-	struct key *keyring_key = NULL;
+-	struct fscrypt_key *master_key;
+ 	struct fscrypt_context ctx;
+-	const struct user_key_payload *ukp;
+ 	struct crypto_skcipher *ctfm;
+ 	const char *cipher_str;
+ 	u8 raw_key[FS_MAX_KEY_SIZE];
+@@ -167,48 +223,24 @@ retry:
+ 		memset(raw_key, 0x42, FS_AES_256_XTS_KEY_SIZE);
+ 		goto got_key;
+ 	}
+-	memcpy(full_key_descriptor, FS_KEY_DESC_PREFIX,
+-					FS_KEY_DESC_PREFIX_SIZE);
+-	sprintf(full_key_descriptor + FS_KEY_DESC_PREFIX_SIZE,
+-					"%*phN", FS_KEY_DESCRIPTOR_SIZE,
+-					ctx.master_key_descriptor);
+-	full_key_descriptor[FS_KEY_DESC_PREFIX_SIZE +
+-					(2 * FS_KEY_DESCRIPTOR_SIZE)] = '\0';
+-	keyring_key = request_key(&key_type_logon, full_key_descriptor, NULL);
+-	if (IS_ERR(keyring_key)) {
+-		res = PTR_ERR(keyring_key);
+-		keyring_key = NULL;
+-		goto out;
+-	}
+-	crypt_info->ci_keyring_key = keyring_key;
+-	if (keyring_key->type != &key_type_logon) {
+-		printk_once(KERN_WARNING
+-				"%s: key type must be logon\n", __func__);
+-		res = -ENOKEY;
+-		goto out;
+-	}
+-	down_read(&keyring_key->sem);
+-	ukp = user_key_payload(keyring_key);
+-	if (ukp->datalen != sizeof(struct fscrypt_key)) {
+-		res = -EINVAL;
+-		up_read(&keyring_key->sem);
+-		goto out;
+-	}
+-	master_key = (struct fscrypt_key *)ukp->data;
+-	BUILD_BUG_ON(FS_AES_128_ECB_KEY_SIZE != FS_KEY_DERIVATION_NONCE_SIZE);
+ 
+-	if (master_key->size != FS_AES_256_XTS_KEY_SIZE) {
+-		printk_once(KERN_WARNING
+-				"%s: key size incorrect: %d\n",
+-				__func__, master_key->size);
+-		res = -ENOKEY;
+-		up_read(&keyring_key->sem);
++	res = validate_user_key(crypt_info, &ctx, raw_key,
++			FS_KEY_DESC_PREFIX, FS_KEY_DESC_PREFIX_SIZE);
++	if (res && inode->i_sb->s_cop->key_prefix) {
++		u8 *prefix = NULL;
++		int prefix_size, res2;
++
++		prefix_size = inode->i_sb->s_cop->key_prefix(inode, &prefix);
++		res2 = validate_user_key(crypt_info, &ctx, raw_key,
++							prefix, prefix_size);
++		if (res2) {
++			if (res2 == -ENOKEY)
++				res = -ENOKEY;
++			goto out;
++		}
++	} else if (res) {
+ 		goto out;
+ 	}
+-	res = derive_key_aes(ctx.nonce, master_key->raw, raw_key);
+-	up_read(&keyring_key->sem);
+-	if (res)
+-		goto out;
+ got_key:
+ 	ctfm = crypto_alloc_skcipher(cipher_str, 0, 0);
+ 	if (!ctfm || IS_ERR(ctfm)) {
+--- a/fs/f2fs/f2fs.h
++++ b/fs/f2fs/f2fs.h
+@@ -680,6 +680,10 @@ enum {
+ 	MAX_TIME,
+ };
+ 
++#ifdef CONFIG_F2FS_FS_ENCRYPTION
++#define F2FS_KEY_DESC_PREFIX "f2fs:"
++#define F2FS_KEY_DESC_PREFIX_SIZE 5
++#endif
+ struct f2fs_sb_info {
+ 	struct super_block *sb;			/* pointer to VFS super block */
+ 	struct proc_dir_entry *s_proc;		/* proc entry */
+@@ -687,6 +691,10 @@ struct f2fs_sb_info {
+ 	int valid_super_block;			/* valid super block no */
+ 	int s_flag;				/* flags for sbi */
+ 
++#ifdef CONFIG_F2FS_FS_ENCRYPTION
++	u8 key_prefix[F2FS_KEY_DESC_PREFIX_SIZE];
++	u8 key_prefix_size;
++#endif
+ 	/* for node-related operations */
+ 	struct f2fs_nm_info *nm_info;		/* node manager */
+ 	struct inode *node_inode;		/* cache node blocks */
+--- a/fs/f2fs/super.c
++++ b/fs/f2fs/super.c
+@@ -893,6 +893,12 @@ static int f2fs_get_context(struct inode
+ 				ctx, len, NULL);
+ }
+ 
++static int f2fs_key_prefix(struct inode *inode, u8 **key)
++{
++	*key = F2FS_I_SB(inode)->key_prefix;
++	return F2FS_I_SB(inode)->key_prefix_size;
++}
++
+ static int f2fs_set_context(struct inode *inode, const void *ctx, size_t len,
+ 							void *fs_data)
+ {
+@@ -909,6 +915,7 @@ static unsigned f2fs_max_namelen(struct
+ 
+ static struct fscrypt_operations f2fs_cryptops = {
+ 	.get_context	= f2fs_get_context,
++	.key_prefix	= f2fs_key_prefix,
+ 	.set_context	= f2fs_set_context,
+ 	.is_encrypted	= f2fs_encrypted_inode,
+ 	.empty_dir	= f2fs_empty_dir,
+@@ -1231,6 +1238,12 @@ static void init_sb_info(struct f2fs_sb_
+ 
+ 	INIT_LIST_HEAD(&sbi->s_list);
+ 	mutex_init(&sbi->umount_mutex);
++
++#ifdef CONFIG_F2FS_FS_ENCRYPTION
++	memcpy(sbi->key_prefix, F2FS_KEY_DESC_PREFIX,
++				F2FS_KEY_DESC_PREFIX_SIZE);
++	sbi->key_prefix_size = F2FS_KEY_DESC_PREFIX_SIZE;
++#endif
+ }
+ 
+ /*
+--- a/include/linux/fscrypto.h
++++ b/include/linux/fscrypto.h
+@@ -175,6 +175,7 @@ struct fscrypt_name {
+  */
+ struct fscrypt_operations {
+ 	int (*get_context)(struct inode *, void *, size_t);
++	int (*key_prefix)(struct inode *, u8 **);
+ 	int (*prepare_context)(struct inode *);
+ 	int (*set_context)(struct inode *, const void *, size_t, void *);
+ 	int (*dummy_context)(struct inode *);
