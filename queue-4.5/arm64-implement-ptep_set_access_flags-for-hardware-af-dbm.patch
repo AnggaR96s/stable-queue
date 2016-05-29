@@ -1,0 +1,131 @@
+From 66dbd6e61a526ae7d11a208238ae2c17e5cacb6b Mon Sep 17 00:00:00 2001
+From: Catalin Marinas <catalin.marinas@arm.com>
+Date: Wed, 13 Apr 2016 16:01:22 +0100
+Subject: arm64: Implement ptep_set_access_flags() for hardware AF/DBM
+
+From: Catalin Marinas <catalin.marinas@arm.com>
+
+commit 66dbd6e61a526ae7d11a208238ae2c17e5cacb6b upstream.
+
+When hardware updates of the access and dirty states are enabled, the
+default ptep_set_access_flags() implementation based on calling
+set_pte_at() directly is potentially racy. This triggers the "racy dirty
+state clearing" warning in set_pte_at() because an existing writable PTE
+is overridden with a clean entry.
+
+There are two main scenarios for this situation:
+
+1. The CPU getting an access fault does not support hardware updates of
+   the access/dirty flags. However, a different agent in the system
+   (e.g. SMMU) can do this, therefore overriding a writable entry with a
+   clean one could potentially lose the automatically updated dirty
+   status
+
+2. A more complex situation is possible when all CPUs support hardware
+   AF/DBM:
+
+   a) Initial state: shareable + writable vma and pte_none(pte)
+   b) Read fault taken by two threads of the same process on different
+      CPUs
+   c) CPU0 takes the mmap_sem and proceeds to handling the fault. It
+      eventually reaches do_set_pte() which sets a writable + clean pte.
+      CPU0 releases the mmap_sem
+   d) CPU1 acquires the mmap_sem and proceeds to handle_pte_fault(). The
+      pte entry it reads is present, writable and clean and it continues
+      to pte_mkyoung()
+   e) CPU1 calls ptep_set_access_flags()
+
+   If between (d) and (e) the hardware (another CPU) updates the dirty
+   state (clears PTE_RDONLY), CPU1 will override the PTR_RDONLY bit
+   marking the entry clean again.
+
+This patch implements an arm64-specific ptep_set_access_flags() function
+to perform an atomic update of the PTE flags.
+
+Fixes: 2f4b829c625e ("arm64: Add support for hardware updates of the access and dirty pte bits")
+Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+Reported-by: Ming Lei <tom.leiming@gmail.com>
+Tested-by: Julien Grall <julien.grall@arm.com>
+Cc: Will Deacon <will.deacon@arm.com>
+[will: reworded comment]
+Signed-off-by: Will Deacon <will.deacon@arm.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ arch/arm64/include/asm/pgtable.h |    5 +++
+ arch/arm64/mm/fault.c            |   50 +++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 55 insertions(+)
+
+--- a/arch/arm64/include/asm/pgtable.h
++++ b/arch/arm64/include/asm/pgtable.h
+@@ -547,6 +547,11 @@ static inline pmd_t pmd_modify(pmd_t pmd
+ }
+ 
+ #ifdef CONFIG_ARM64_HW_AFDBM
++#define __HAVE_ARCH_PTEP_SET_ACCESS_FLAGS
++extern int ptep_set_access_flags(struct vm_area_struct *vma,
++				 unsigned long address, pte_t *ptep,
++				 pte_t entry, int dirty);
++
+ /*
+  * Atomic pte/pmd modifications.
+  */
+--- a/arch/arm64/mm/fault.c
++++ b/arch/arm64/mm/fault.c
+@@ -81,6 +81,56 @@ void show_pte(struct mm_struct *mm, unsi
+ 	printk("\n");
+ }
+ 
++#ifdef CONFIG_ARM64_HW_AFDBM
++/*
++ * This function sets the access flags (dirty, accessed), as well as write
++ * permission, and only to a more permissive setting.
++ *
++ * It needs to cope with hardware update of the accessed/dirty state by other
++ * agents in the system and can safely skip the __sync_icache_dcache() call as,
++ * like set_pte_at(), the PTE is never changed from no-exec to exec here.
++ *
++ * Returns whether or not the PTE actually changed.
++ */
++int ptep_set_access_flags(struct vm_area_struct *vma,
++			  unsigned long address, pte_t *ptep,
++			  pte_t entry, int dirty)
++{
++	pteval_t old_pteval;
++	unsigned int tmp;
++
++	if (pte_same(*ptep, entry))
++		return 0;
++
++	/* only preserve the access flags and write permission */
++	pte_val(entry) &= PTE_AF | PTE_WRITE | PTE_DIRTY;
++
++	/*
++	 * PTE_RDONLY is cleared by default in the asm below, so set it in
++	 * back if necessary (read-only or clean PTE).
++	 */
++	if (!pte_write(entry) || !dirty)
++		pte_val(entry) |= PTE_RDONLY;
++
++	/*
++	 * Setting the flags must be done atomically to avoid racing with the
++	 * hardware update of the access/dirty state.
++	 */
++	asm volatile("//	ptep_set_access_flags\n"
++	"	prfm	pstl1strm, %2\n"
++	"1:	ldxr	%0, %2\n"
++	"	and	%0, %0, %3		// clear PTE_RDONLY\n"
++	"	orr	%0, %0, %4		// set flags\n"
++	"	stxr	%w1, %0, %2\n"
++	"	cbnz	%w1, 1b\n"
++	: "=&r" (old_pteval), "=&r" (tmp), "+Q" (pte_val(*ptep))
++	: "L" (~PTE_RDONLY), "r" (pte_val(entry)));
++
++	flush_tlb_fix_spurious_fault(vma, address);
++	return 1;
++}
++#endif
++
+ /*
+  * The kernel tried to access some page that wasn't present.
+  */
