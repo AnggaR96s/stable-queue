@@ -1,0 +1,142 @@
+From 6fb650d43da3e7054984dc548eaa88765a94d49f Mon Sep 17 00:00:00 2001
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Fri, 29 Apr 2016 15:25:17 -0400
+Subject: USB: leave LPM alone if possible when binding/unbinding interface drivers
+
+From: Alan Stern <stern@rowland.harvard.edu>
+
+commit 6fb650d43da3e7054984dc548eaa88765a94d49f upstream.
+
+When a USB driver is bound to an interface (either through probing or
+by claiming it) or is unbound from an interface, the USB core always
+disables Link Power Management during the transition and then
+re-enables it afterward.  The reason is because the driver might want
+to prevent hub-initiated link power transitions, in which case the HCD
+would have to recalculate the various LPM parameters.  This
+recalculation takes place when LPM is re-enabled and the new
+parameters are sent to the device and its parent hub.
+
+However, if the driver does not want to prevent hub-initiated link
+power transitions then none of this work is necessary.  The parameters
+don't need to be recalculated, and LPM doesn't need to be disabled and
+re-enabled.
+
+It turns out that disabling and enabling LPM can be time-consuming,
+enough so that it interferes with user programs that want to claim and
+release interfaces rapidly via usbfs.  Since the usbfs kernel driver
+doesn't set the disable_hub_initiated_lpm flag, we can speed things up
+and get the user programs to work by leaving LPM alone whenever the
+flag isn't set.
+
+And while we're improving the way disable_hub_initiated_lpm gets used,
+let's also fix its kerneldoc.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Tested-by: Matthew Giassa <matthew@giassa.net>
+CC: Mathias Nyman <mathias.nyman@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/usb/core/driver.c |   40 +++++++++++++++++++++++-----------------
+ include/linux/usb.h       |    2 +-
+ 2 files changed, 24 insertions(+), 18 deletions(-)
+
+--- a/drivers/usb/core/driver.c
++++ b/drivers/usb/core/driver.c
+@@ -284,7 +284,7 @@ static int usb_probe_interface(struct de
+ 	struct usb_device *udev = interface_to_usbdev(intf);
+ 	const struct usb_device_id *id;
+ 	int error = -ENODEV;
+-	int lpm_disable_error;
++	int lpm_disable_error = -ENODEV;
+ 
+ 	dev_dbg(dev, "%s\n", __func__);
+ 
+@@ -336,12 +336,14 @@ static int usb_probe_interface(struct de
+ 	 * setting during probe, that should also be fine.  usb_set_interface()
+ 	 * will attempt to disable LPM, and fail if it can't disable it.
+ 	 */
+-	lpm_disable_error = usb_unlocked_disable_lpm(udev);
+-	if (lpm_disable_error && driver->disable_hub_initiated_lpm) {
+-		dev_err(&intf->dev, "%s Failed to disable LPM for driver %s\n.",
+-				__func__, driver->name);
+-		error = lpm_disable_error;
+-		goto err;
++	if (driver->disable_hub_initiated_lpm) {
++		lpm_disable_error = usb_unlocked_disable_lpm(udev);
++		if (lpm_disable_error) {
++			dev_err(&intf->dev, "%s Failed to disable LPM for driver %s\n.",
++					__func__, driver->name);
++			error = lpm_disable_error;
++			goto err;
++		}
+ 	}
+ 
+ 	/* Carry out a deferred switch to altsetting 0 */
+@@ -391,7 +393,8 @@ static int usb_unbind_interface(struct d
+ 	struct usb_interface *intf = to_usb_interface(dev);
+ 	struct usb_host_endpoint *ep, **eps = NULL;
+ 	struct usb_device *udev;
+-	int i, j, error, r, lpm_disable_error;
++	int i, j, error, r;
++	int lpm_disable_error = -ENODEV;
+ 
+ 	intf->condition = USB_INTERFACE_UNBINDING;
+ 
+@@ -399,12 +402,13 @@ static int usb_unbind_interface(struct d
+ 	udev = interface_to_usbdev(intf);
+ 	error = usb_autoresume_device(udev);
+ 
+-	/* Hub-initiated LPM policy may change, so attempt to disable LPM until
++	/* If hub-initiated LPM policy may change, attempt to disable LPM until
+ 	 * the driver is unbound.  If LPM isn't disabled, that's fine because it
+ 	 * wouldn't be enabled unless all the bound interfaces supported
+ 	 * hub-initiated LPM.
+ 	 */
+-	lpm_disable_error = usb_unlocked_disable_lpm(udev);
++	if (driver->disable_hub_initiated_lpm)
++		lpm_disable_error = usb_unlocked_disable_lpm(udev);
+ 
+ 	/*
+ 	 * Terminate all URBs for this interface unless the driver
+@@ -505,7 +509,7 @@ int usb_driver_claim_interface(struct us
+ 	struct device *dev;
+ 	struct usb_device *udev;
+ 	int retval = 0;
+-	int lpm_disable_error;
++	int lpm_disable_error = -ENODEV;
+ 
+ 	if (!iface)
+ 		return -ENODEV;
+@@ -526,12 +530,14 @@ int usb_driver_claim_interface(struct us
+ 
+ 	iface->condition = USB_INTERFACE_BOUND;
+ 
+-	/* Disable LPM until this driver is bound. */
+-	lpm_disable_error = usb_unlocked_disable_lpm(udev);
+-	if (lpm_disable_error && driver->disable_hub_initiated_lpm) {
+-		dev_err(&iface->dev, "%s Failed to disable LPM for driver %s\n.",
+-				__func__, driver->name);
+-		return -ENOMEM;
++	/* See the comment about disabling LPM in usb_probe_interface(). */
++	if (driver->disable_hub_initiated_lpm) {
++		lpm_disable_error = usb_unlocked_disable_lpm(udev);
++		if (lpm_disable_error) {
++			dev_err(&iface->dev, "%s Failed to disable LPM for driver %s\n.",
++					__func__, driver->name);
++			return -ENOMEM;
++		}
+ 	}
+ 
+ 	/* Claimed interfaces are initially inactive (suspended) and
+--- a/include/linux/usb.h
++++ b/include/linux/usb.h
+@@ -1069,7 +1069,7 @@ struct usbdrv_wrap {
+  *	for interfaces bound to this driver.
+  * @soft_unbind: if set to 1, the USB core will not kill URBs and disable
+  *	endpoints before calling the driver's disconnect method.
+- * @disable_hub_initiated_lpm: if set to 0, the USB core will not allow hubs
++ * @disable_hub_initiated_lpm: if set to 1, the USB core will not allow hubs
+  *	to initiate lower power link state transitions when an idle timeout
+  *	occurs.  Device-initiated USB 3.0 link PM will still be allowed.
+  *

@@ -1,0 +1,212 @@
+From f78bbcae86e676fad9e6c6bb6cd9d9868ba23696 Mon Sep 17 00:00:00 2001
+From: Michal Nazarewicz <mina86@mina86.com>
+Date: Fri, 8 Apr 2016 10:24:11 +0200
+Subject: usb: f_mass_storage: test whether thread is running before starting another
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+From: Michal Nazarewicz <mina86@mina86.com>
+
+commit f78bbcae86e676fad9e6c6bb6cd9d9868ba23696 upstream.
+
+When binding the function to usb_configuration, check whether the thread
+is running before starting another one.  Without that, when function
+instance is added to multiple configurations, fsg_bing starts multiple
+threads with all but the latest one being forgotten by the driver.  This
+leads to obvious thread leaks, possible lockups when trying to halt the
+machine and possible more issues.
+
+This fixes issues with legacy/multi¹ gadget as well as configfs gadgets
+when mass_storage function is added to multiple configurations.
+
+This change also simplifies API since the legacy gadgets no longer need
+to worry about starting the thread by themselves (which was where bug
+in legacy/multi was in the first place).
+
+N.B., this patch doesn’t address adding single mass_storage function
+instance to a single configuration twice.  Thankfully, there’s no
+legitimate reason for such setup plus, if I’m not mistaken, configfs
+gadget doesn’t even allow it to be expressed.
+
+¹ I have no example failure though.  Conclusion that legacy/multi has
+  a bug is based purely on me reading the code.
+
+Acked-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Michal Nazarewicz <mina86@mina86.com>
+Tested-by: Ivaylo Dimitrov <ivo.g.dimitrov.75@gmail.com>
+Cc: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Felipe Balbi <felipe.balbi@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/usb/gadget/function/f_mass_storage.c |   36 +++++++++++----------------
+ drivers/usb/gadget/function/f_mass_storage.h |    2 -
+ drivers/usb/gadget/legacy/acm_ms.c           |    4 ---
+ drivers/usb/gadget/legacy/mass_storage.c     |    4 ---
+ drivers/usb/gadget/legacy/multi.c            |   12 ---------
+ drivers/usb/gadget/legacy/nokia.c            |    7 -----
+ 6 files changed, 15 insertions(+), 50 deletions(-)
+
+--- a/drivers/usb/gadget/function/f_mass_storage.c
++++ b/drivers/usb/gadget/function/f_mass_storage.c
+@@ -2977,25 +2977,6 @@ void fsg_common_set_inquiry_string(struc
+ }
+ EXPORT_SYMBOL_GPL(fsg_common_set_inquiry_string);
+ 
+-int fsg_common_run_thread(struct fsg_common *common)
+-{
+-	common->state = FSG_STATE_IDLE;
+-	/* Tell the thread to start working */
+-	common->thread_task =
+-		kthread_create(fsg_main_thread, common, "file-storage");
+-	if (IS_ERR(common->thread_task)) {
+-		common->state = FSG_STATE_TERMINATED;
+-		return PTR_ERR(common->thread_task);
+-	}
+-
+-	DBG(common, "I/O thread pid: %d\n", task_pid_nr(common->thread_task));
+-
+-	wake_up_process(common->thread_task);
+-
+-	return 0;
+-}
+-EXPORT_SYMBOL_GPL(fsg_common_run_thread);
+-
+ static void fsg_common_release(struct kref *ref)
+ {
+ 	struct fsg_common *common = container_of(ref, struct fsg_common, ref);
+@@ -3005,6 +2986,7 @@ static void fsg_common_release(struct kr
+ 	if (common->state != FSG_STATE_TERMINATED) {
+ 		raise_exception(common, FSG_STATE_EXIT);
+ 		wait_for_completion(&common->thread_notifier);
++		common->thread_task = NULL;
+ 	}
+ 
+ 	for (i = 0; i < ARRAY_SIZE(common->luns); ++i) {
+@@ -3050,9 +3032,21 @@ static int fsg_bind(struct usb_configura
+ 		if (ret)
+ 			return ret;
+ 		fsg_common_set_inquiry_string(fsg->common, NULL, NULL);
+-		ret = fsg_common_run_thread(fsg->common);
+-		if (ret)
++	}
++
++	if (!common->thread_task) {
++		common->state = FSG_STATE_IDLE;
++		common->thread_task =
++			kthread_create(fsg_main_thread, common, "file-storage");
++		if (IS_ERR(common->thread_task)) {
++			int ret = PTR_ERR(common->thread_task);
++			common->thread_task = NULL;
++			common->state = FSG_STATE_TERMINATED;
+ 			return ret;
++		}
++		DBG(common, "I/O thread pid: %d\n",
++		    task_pid_nr(common->thread_task));
++		wake_up_process(common->thread_task);
+ 	}
+ 
+ 	fsg->gadget = gadget;
+--- a/drivers/usb/gadget/function/f_mass_storage.h
++++ b/drivers/usb/gadget/function/f_mass_storage.h
+@@ -153,8 +153,6 @@ int fsg_common_create_luns(struct fsg_co
+ void fsg_common_set_inquiry_string(struct fsg_common *common, const char *vn,
+ 				   const char *pn);
+ 
+-int fsg_common_run_thread(struct fsg_common *common);
+-
+ void fsg_config_from_params(struct fsg_config *cfg,
+ 			    const struct fsg_module_parameters *params,
+ 			    unsigned int fsg_num_buffers);
+--- a/drivers/usb/gadget/legacy/acm_ms.c
++++ b/drivers/usb/gadget/legacy/acm_ms.c
+@@ -133,10 +133,6 @@ static int acm_ms_do_config(struct usb_c
+ 	if (status < 0)
+ 		goto put_msg;
+ 
+-	status = fsg_common_run_thread(opts->common);
+-	if (status)
+-		goto remove_acm;
+-
+ 	status = usb_add_function(c, f_msg);
+ 	if (status)
+ 		goto remove_acm;
+--- a/drivers/usb/gadget/legacy/mass_storage.c
++++ b/drivers/usb/gadget/legacy/mass_storage.c
+@@ -132,10 +132,6 @@ static int msg_do_config(struct usb_conf
+ 	if (IS_ERR(f_msg))
+ 		return PTR_ERR(f_msg);
+ 
+-	ret = fsg_common_run_thread(opts->common);
+-	if (ret)
+-		goto put_func;
+-
+ 	ret = usb_add_function(c, f_msg);
+ 	if (ret)
+ 		goto put_func;
+--- a/drivers/usb/gadget/legacy/multi.c
++++ b/drivers/usb/gadget/legacy/multi.c
+@@ -137,7 +137,6 @@ static struct usb_function *f_msg_rndis;
+ 
+ static int rndis_do_config(struct usb_configuration *c)
+ {
+-	struct fsg_opts *fsg_opts;
+ 	int ret;
+ 
+ 	if (gadget_is_otg(c->cdev->gadget)) {
+@@ -169,11 +168,6 @@ static int rndis_do_config(struct usb_co
+ 		goto err_fsg;
+ 	}
+ 
+-	fsg_opts = fsg_opts_from_func_inst(fi_msg);
+-	ret = fsg_common_run_thread(fsg_opts->common);
+-	if (ret)
+-		goto err_run;
+-
+ 	ret = usb_add_function(c, f_msg_rndis);
+ 	if (ret)
+ 		goto err_run;
+@@ -225,7 +219,6 @@ static struct usb_function *f_msg_multi;
+ 
+ static int cdc_do_config(struct usb_configuration *c)
+ {
+-	struct fsg_opts *fsg_opts;
+ 	int ret;
+ 
+ 	if (gadget_is_otg(c->cdev->gadget)) {
+@@ -258,11 +251,6 @@ static int cdc_do_config(struct usb_conf
+ 		goto err_fsg;
+ 	}
+ 
+-	fsg_opts = fsg_opts_from_func_inst(fi_msg);
+-	ret = fsg_common_run_thread(fsg_opts->common);
+-	if (ret)
+-		goto err_run;
+-
+ 	ret = usb_add_function(c, f_msg_multi);
+ 	if (ret)
+ 		goto err_run;
+--- a/drivers/usb/gadget/legacy/nokia.c
++++ b/drivers/usb/gadget/legacy/nokia.c
+@@ -152,7 +152,6 @@ static int nokia_bind_config(struct usb_
+ 	struct usb_function *f_ecm;
+ 	struct usb_function *f_obex2 = NULL;
+ 	struct usb_function *f_msg;
+-	struct fsg_opts *fsg_opts;
+ 	int status = 0;
+ 	int obex1_stat = -1;
+ 	int obex2_stat = -1;
+@@ -222,12 +221,6 @@ static int nokia_bind_config(struct usb_
+ 		goto err_ecm;
+ 	}
+ 
+-	fsg_opts = fsg_opts_from_func_inst(fi_msg);
+-
+-	status = fsg_common_run_thread(fsg_opts->common);
+-	if (status)
+-		goto err_msg;
+-
+ 	status = usb_add_function(c, f_msg);
+ 	if (status)
+ 		goto err_msg;
