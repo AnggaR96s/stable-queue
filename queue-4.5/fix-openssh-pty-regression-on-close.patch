@@ -1,0 +1,286 @@
+From 0f40fbbcc34e093255a2b2d70b6b0fb48c3f39aa Mon Sep 17 00:00:00 2001
+From: Brian Bloniarz <brian.bloniarz@gmail.com>
+Date: Sun, 6 Mar 2016 13:16:30 -0800
+Subject: Fix OpenSSH pty regression on close
+
+From: Brian Bloniarz <brian.bloniarz@gmail.com>
+
+commit 0f40fbbcc34e093255a2b2d70b6b0fb48c3f39aa upstream.
+
+OpenSSH expects the (non-blocking) read() of pty master to return
+EAGAIN only if it has received all of the slave-side output after
+it has received SIGCHLD. This used to work on pre-3.12 kernels.
+
+This fix effectively forces non-blocking read() and poll() to
+block for parallel i/o to complete for all ttys. It also unwinds
+these changes:
+
+1) f8747d4a466ab2cafe56112c51b3379f9fdb7a12
+   tty: Fix pty master read() after slave closes
+
+2) 52bce7f8d4fc633c9a9d0646eef58ba6ae9a3b73
+   pty, n_tty: Simplify input processing on final close
+
+3) 1a48632ffed61352a7810ce089dc5a8bcd505a60
+   pty: Fix input race when closing
+
+Inspired by analysis and patch from Marc Aurele La France <tsi@tuyoix.net>
+
+Reported-by: Volth <openssh@volth.com>
+Reported-by: Marc Aurele La France <tsi@tuyoix.net>
+BugLink: https://bugzilla.mindrot.org/show_bug.cgi?id=52
+BugLink: https://bugzilla.mindrot.org/show_bug.cgi?id=2492
+Signed-off-by: Brian Bloniarz <brian.bloniarz@gmail.com>
+Reviewed-by: Peter Hurley <peter@hurleysoftware.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ Documentation/serial/tty.txt |    3 -
+ drivers/tty/n_hdlc.c         |    4 +-
+ drivers/tty/n_tty.c          |   70 ++++++++++++++++++++-----------------------
+ drivers/tty/pty.c            |    4 --
+ drivers/tty/tty_buffer.c     |   34 +++-----------------
+ include/linux/tty.h          |    2 -
+ 6 files changed, 43 insertions(+), 74 deletions(-)
+
+--- a/Documentation/serial/tty.txt
++++ b/Documentation/serial/tty.txt
+@@ -213,9 +213,6 @@ TTY_IO_ERROR		If set, causes all subsequ
+ 
+ TTY_OTHER_CLOSED	Device is a pty and the other side has closed.
+ 
+-TTY_OTHER_DONE		Device is a pty and the other side has closed and
+-			all pending input processing has been completed.
+-
+ TTY_NO_WRITE_SPLIT	Prevent driver from splitting up writes into
+ 			smaller chunks.
+ 
+--- a/drivers/tty/n_hdlc.c
++++ b/drivers/tty/n_hdlc.c
+@@ -600,7 +600,7 @@ static ssize_t n_hdlc_tty_read(struct tt
+ 	add_wait_queue(&tty->read_wait, &wait);
+ 
+ 	for (;;) {
+-		if (test_bit(TTY_OTHER_DONE, &tty->flags)) {
++		if (test_bit(TTY_OTHER_CLOSED, &tty->flags)) {
+ 			ret = -EIO;
+ 			break;
+ 		}
+@@ -828,7 +828,7 @@ static unsigned int n_hdlc_tty_poll(stru
+ 		/* set bits for operations that won't block */
+ 		if (n_hdlc->rx_buf_list.head)
+ 			mask |= POLLIN | POLLRDNORM;	/* readable */
+-		if (test_bit(TTY_OTHER_DONE, &tty->flags))
++		if (test_bit(TTY_OTHER_CLOSED, &tty->flags))
+ 			mask |= POLLHUP;
+ 		if (tty_hung_up_p(filp))
+ 			mask |= POLLHUP;
+--- a/drivers/tty/n_tty.c
++++ b/drivers/tty/n_tty.c
+@@ -1963,18 +1963,6 @@ static inline int input_available_p(stru
+ 		return ldata->commit_head - ldata->read_tail >= amt;
+ }
+ 
+-static inline int check_other_done(struct tty_struct *tty)
+-{
+-	int done = test_bit(TTY_OTHER_DONE, &tty->flags);
+-	if (done) {
+-		/* paired with cmpxchg() in check_other_closed(); ensures
+-		 * read buffer head index is not stale
+-		 */
+-		smp_mb__after_atomic();
+-	}
+-	return done;
+-}
+-
+ /**
+  *	copy_from_read_buf	-	copy read data directly
+  *	@tty: terminal device
+@@ -2170,7 +2158,7 @@ static ssize_t n_tty_read(struct tty_str
+ 	struct n_tty_data *ldata = tty->disc_data;
+ 	unsigned char __user *b = buf;
+ 	DEFINE_WAIT_FUNC(wait, woken_wake_function);
+-	int c, done;
++	int c;
+ 	int minimum, time;
+ 	ssize_t retval = 0;
+ 	long timeout;
+@@ -2238,32 +2226,35 @@ static ssize_t n_tty_read(struct tty_str
+ 		    ((minimum - (b - buf)) >= 1))
+ 			ldata->minimum_to_wake = (minimum - (b - buf));
+ 
+-		done = check_other_done(tty);
+-
+ 		if (!input_available_p(tty, 0)) {
+-			if (done) {
+-				retval = -EIO;
+-				break;
+-			}
+-			if (tty_hung_up_p(file))
+-				break;
+-			if (!timeout)
+-				break;
+-			if (file->f_flags & O_NONBLOCK) {
+-				retval = -EAGAIN;
+-				break;
+-			}
+-			if (signal_pending(current)) {
+-				retval = -ERESTARTSYS;
+-				break;
+-			}
+ 			up_read(&tty->termios_rwsem);
++			tty_buffer_flush_work(tty->port);
++			down_read(&tty->termios_rwsem);
++			if (!input_available_p(tty, 0)) {
++				if (test_bit(TTY_OTHER_CLOSED, &tty->flags)) {
++					retval = -EIO;
++					break;
++				}
++				if (tty_hung_up_p(file))
++					break;
++				if (!timeout)
++					break;
++				if (file->f_flags & O_NONBLOCK) {
++					retval = -EAGAIN;
++					break;
++				}
++				if (signal_pending(current)) {
++					retval = -ERESTARTSYS;
++					break;
++				}
++				up_read(&tty->termios_rwsem);
+ 
+-			timeout = wait_woken(&wait, TASK_INTERRUPTIBLE,
+-					     timeout);
++				timeout = wait_woken(&wait, TASK_INTERRUPTIBLE,
++						timeout);
+ 
+-			down_read(&tty->termios_rwsem);
+-			continue;
++				down_read(&tty->termios_rwsem);
++				continue;
++			}
+ 		}
+ 
+ 		if (ldata->icanon && !L_EXTPROC(tty)) {
+@@ -2445,12 +2436,17 @@ static unsigned int n_tty_poll(struct tt
+ 
+ 	poll_wait(file, &tty->read_wait, wait);
+ 	poll_wait(file, &tty->write_wait, wait);
+-	if (check_other_done(tty))
+-		mask |= POLLHUP;
+ 	if (input_available_p(tty, 1))
+ 		mask |= POLLIN | POLLRDNORM;
++	else {
++		tty_buffer_flush_work(tty->port);
++		if (input_available_p(tty, 1))
++			mask |= POLLIN | POLLRDNORM;
++	}
+ 	if (tty->packet && tty->link->ctrl_status)
+ 		mask |= POLLPRI | POLLIN | POLLRDNORM;
++	if (test_bit(TTY_OTHER_CLOSED, &tty->flags))
++		mask |= POLLHUP;
+ 	if (tty_hung_up_p(file))
+ 		mask |= POLLHUP;
+ 	if (!(mask & (POLLHUP | POLLIN | POLLRDNORM))) {
+--- a/drivers/tty/pty.c
++++ b/drivers/tty/pty.c
+@@ -59,7 +59,7 @@ static void pty_close(struct tty_struct
+ 	if (!tty->link)
+ 		return;
+ 	set_bit(TTY_OTHER_CLOSED, &tty->link->flags);
+-	tty_flip_buffer_push(tty->link->port);
++	wake_up_interruptible(&tty->link->read_wait);
+ 	wake_up_interruptible(&tty->link->write_wait);
+ 	if (tty->driver->subtype == PTY_TYPE_MASTER) {
+ 		set_bit(TTY_OTHER_CLOSED, &tty->flags);
+@@ -247,9 +247,7 @@ static int pty_open(struct tty_struct *t
+ 		goto out;
+ 
+ 	clear_bit(TTY_IO_ERROR, &tty->flags);
+-	/* TTY_OTHER_CLOSED must be cleared before TTY_OTHER_DONE */
+ 	clear_bit(TTY_OTHER_CLOSED, &tty->link->flags);
+-	clear_bit(TTY_OTHER_DONE, &tty->link->flags);
+ 	set_bit(TTY_THROTTLED, &tty->flags);
+ 	return 0;
+ 
+--- a/drivers/tty/tty_buffer.c
++++ b/drivers/tty/tty_buffer.c
+@@ -37,29 +37,6 @@
+ 
+ #define TTY_BUFFER_PAGE	(((PAGE_SIZE - sizeof(struct tty_buffer)) / 2) & ~0xFF)
+ 
+-/*
+- * If all tty flip buffers have been processed by flush_to_ldisc() or
+- * dropped by tty_buffer_flush(), check if the linked pty has been closed.
+- * If so, wake the reader/poll to process
+- */
+-static inline void check_other_closed(struct tty_struct *tty)
+-{
+-	unsigned long flags, old;
+-
+-	/* transition from TTY_OTHER_CLOSED => TTY_OTHER_DONE must be atomic */
+-	for (flags = ACCESS_ONCE(tty->flags);
+-	     test_bit(TTY_OTHER_CLOSED, &flags);
+-	     ) {
+-		old = flags;
+-		__set_bit(TTY_OTHER_DONE, &flags);
+-		flags = cmpxchg(&tty->flags, old, flags);
+-		if (old == flags) {
+-			wake_up_interruptible(&tty->read_wait);
+-			break;
+-		}
+-	}
+-}
+-
+ /**
+  *	tty_buffer_lock_exclusive	-	gain exclusive access to buffer
+  *	tty_buffer_unlock_exclusive	-	release exclusive access
+@@ -254,8 +231,6 @@ void tty_buffer_flush(struct tty_struct
+ 	if (ld && ld->ops->flush_buffer)
+ 		ld->ops->flush_buffer(tty);
+ 
+-	check_other_closed(tty);
+-
+ 	atomic_dec(&buf->priority);
+ 	mutex_unlock(&buf->lock);
+ }
+@@ -505,10 +480,8 @@ static void flush_to_ldisc(struct work_s
+ 		 */
+ 		count = smp_load_acquire(&head->commit) - head->read;
+ 		if (!count) {
+-			if (next == NULL) {
+-				check_other_closed(tty);
++			if (next == NULL)
+ 				break;
+-			}
+ 			buf->head = next;
+ 			tty_buffer_free(port, head);
+ 			continue;
+@@ -597,3 +570,8 @@ bool tty_buffer_cancel_work(struct tty_p
+ {
+ 	return cancel_work_sync(&port->buf.work);
+ }
++
++void tty_buffer_flush_work(struct tty_port *port)
++{
++	flush_work(&port->buf.work);
++}
+--- a/include/linux/tty.h
++++ b/include/linux/tty.h
+@@ -338,7 +338,6 @@ struct tty_file_private {
+ #define TTY_EXCLUSIVE 		3	/* Exclusive open mode */
+ #define TTY_DEBUG 		4	/* Debugging */
+ #define TTY_DO_WRITE_WAKEUP 	5	/* Call write_wakeup after queuing new */
+-#define TTY_OTHER_DONE		6	/* Closed pty has completed input processing */
+ #define TTY_LDISC_OPEN	 	11	/* Line discipline is open */
+ #define TTY_PTY_LOCK 		16	/* pty private */
+ #define TTY_NO_WRITE_SPLIT 	17	/* Preserve write boundaries to driver */
+@@ -464,6 +463,7 @@ extern void tty_buffer_init(struct tty_p
+ extern void tty_buffer_set_lock_subclass(struct tty_port *port);
+ extern bool tty_buffer_restart_work(struct tty_port *port);
+ extern bool tty_buffer_cancel_work(struct tty_port *port);
++extern void tty_buffer_flush_work(struct tty_port *port);
+ extern speed_t tty_termios_baud_rate(struct ktermios *termios);
+ extern speed_t tty_termios_input_baud_rate(struct ktermios *termios);
+ extern void tty_termios_encode_baud_rate(struct ktermios *termios,
