@@ -1,0 +1,165 @@
+From 93cd16817ae5ddcfc548784b51c76bf6d7923442 Mon Sep 17 00:00:00 2001
+From: Thomas Hellstrom <thellstrom@vmware.com>
+Date: Tue, 3 May 2016 11:24:35 +0200
+Subject: drm/vmwgfx: Kill some lockdep warnings
+
+From: Thomas Hellstrom <thellstrom@vmware.com>
+
+commit 93cd16817ae5ddcfc548784b51c76bf6d7923442 upstream.
+
+Some global KMS state that is elsewhere protected by the mode_config
+mutex here needs to be protected with a local mutex. Remove corresponding
+lockdep checks and introduce a new driver-private global_kms_state_mutex,
+and make sure its locking order is *after* the crtc locks in order to
+avoid having to release those when the new mutex is taken.
+
+Signed-off-by: Thomas Hellstrom <thellstrom@vmware.com>
+Reviewed-by: Brian Paul <brianp@vmware.com>
+Reviewed-by: Sinclair Yeh <syeh@vmware.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/gpu/drm/vmwgfx/vmwgfx_drv.c  |    1 +
+ drivers/gpu/drm/vmwgfx/vmwgfx_drv.h  |    1 +
+ drivers/gpu/drm/vmwgfx/vmwgfx_kms.c  |   27 +++++++++++++--------------
+ drivers/gpu/drm/vmwgfx/vmwgfx_scrn.c |    3 +++
+ drivers/gpu/drm/vmwgfx/vmwgfx_stdu.c |    3 +++
+ 5 files changed, 21 insertions(+), 14 deletions(-)
+
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
+@@ -628,6 +628,7 @@ static int vmw_driver_load(struct drm_de
+ 	mutex_init(&dev_priv->cmdbuf_mutex);
+ 	mutex_init(&dev_priv->release_mutex);
+ 	mutex_init(&dev_priv->binding_mutex);
++	mutex_init(&dev_priv->global_kms_state_mutex);
+ 	rwlock_init(&dev_priv->resource_lock);
+ 	ttm_lock_init(&dev_priv->reservation_sem);
+ 	spin_lock_init(&dev_priv->hw_lock);
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h
+@@ -412,6 +412,7 @@ struct vmw_private {
+ 	struct drm_property *implicit_placement_property;
+ 	unsigned num_implicit;
+ 	struct vmw_framebuffer *implicit_fb;
++	struct mutex global_kms_state_mutex;
+ 
+ 	/*
+ 	 * Context and surface management.
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
+@@ -2143,13 +2143,13 @@ int vmw_kms_fbdev_init_data(struct vmw_p
+ void vmw_kms_del_active(struct vmw_private *dev_priv,
+ 			struct vmw_display_unit *du)
+ {
+-	lockdep_assert_held_once(&dev_priv->dev->mode_config.mutex);
+-
++	mutex_lock(&dev_priv->global_kms_state_mutex);
+ 	if (du->active_implicit) {
+ 		if (--(dev_priv->num_implicit) == 0)
+ 			dev_priv->implicit_fb = NULL;
+ 		du->active_implicit = false;
+ 	}
++	mutex_unlock(&dev_priv->global_kms_state_mutex);
+ }
+ 
+ /**
+@@ -2165,8 +2165,7 @@ void vmw_kms_add_active(struct vmw_priva
+ 			struct vmw_display_unit *du,
+ 			struct vmw_framebuffer *vfb)
+ {
+-	lockdep_assert_held_once(&dev_priv->dev->mode_config.mutex);
+-
++	mutex_lock(&dev_priv->global_kms_state_mutex);
+ 	WARN_ON_ONCE(!dev_priv->num_implicit && dev_priv->implicit_fb);
+ 
+ 	if (!du->active_implicit && du->is_implicit) {
+@@ -2174,6 +2173,7 @@ void vmw_kms_add_active(struct vmw_priva
+ 		du->active_implicit = true;
+ 		dev_priv->num_implicit++;
+ 	}
++	mutex_unlock(&dev_priv->global_kms_state_mutex);
+ }
+ 
+ /**
+@@ -2190,16 +2190,13 @@ bool vmw_kms_crtc_flippable(struct vmw_p
+ 			    struct drm_crtc *crtc)
+ {
+ 	struct vmw_display_unit *du = vmw_crtc_to_du(crtc);
++	bool ret;
+ 
+-	lockdep_assert_held_once(&dev_priv->dev->mode_config.mutex);
+-
+-	if (!du->is_implicit)
+-		return true;
+-
+-	if (dev_priv->num_implicit != 1)
+-		return false;
++	mutex_lock(&dev_priv->global_kms_state_mutex);
++	ret = !du->is_implicit || dev_priv->num_implicit == 1;
++	mutex_unlock(&dev_priv->global_kms_state_mutex);
+ 
+-	return true;
++	return ret;
+ }
+ 
+ /**
+@@ -2214,16 +2211,18 @@ void vmw_kms_update_implicit_fb(struct v
+ 	struct vmw_display_unit *du = vmw_crtc_to_du(crtc);
+ 	struct vmw_framebuffer *vfb;
+ 
+-	lockdep_assert_held_once(&dev_priv->dev->mode_config.mutex);
++	mutex_lock(&dev_priv->global_kms_state_mutex);
+ 
+ 	if (!du->is_implicit)
+-		return;
++		goto out_unlock;
+ 
+ 	vfb = vmw_framebuffer_to_vfb(crtc->primary->fb);
+ 	WARN_ON_ONCE(dev_priv->num_implicit != 1 &&
+ 		     dev_priv->implicit_fb != vfb);
+ 
+ 	dev_priv->implicit_fb = vfb;
++out_unlock:
++	mutex_unlock(&dev_priv->global_kms_state_mutex);
+ }
+ 
+ /**
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_scrn.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_scrn.c
+@@ -285,14 +285,17 @@ static int vmw_sou_crtc_set_config(struc
+ 	}
+ 
+ 	/* Only one active implicit frame-buffer at a time. */
++	mutex_lock(&dev_priv->global_kms_state_mutex);
+ 	if (sou->base.is_implicit &&
+ 	    dev_priv->implicit_fb && vfb &&
+ 	    !(dev_priv->num_implicit == 1 &&
+ 	      sou->base.active_implicit) &&
+ 	    dev_priv->implicit_fb != vfb) {
++		mutex_unlock(&dev_priv->global_kms_state_mutex);
+ 		DRM_ERROR("Multiple implicit framebuffers not supported.\n");
+ 		return -EINVAL;
+ 	}
++	mutex_unlock(&dev_priv->global_kms_state_mutex);
+ 
+ 	/* since they always map one to one these are safe */
+ 	connector = &sou->base.connector;
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_stdu.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_stdu.c
+@@ -553,12 +553,15 @@ static int vmw_stdu_crtc_set_config(stru
+ 	}
+ 
+ 	/* Only one active implicit frame-buffer at a time. */
++	mutex_lock(&dev_priv->global_kms_state_mutex);
+ 	if (!turning_off && stdu->base.is_implicit && dev_priv->implicit_fb &&
+ 	    !(dev_priv->num_implicit == 1 && stdu->base.active_implicit)
+ 	    && dev_priv->implicit_fb != vfb) {
++		mutex_unlock(&dev_priv->global_kms_state_mutex);
+ 		DRM_ERROR("Multiple implicit framebuffers not supported.\n");
+ 		return -EINVAL;
+ 	}
++	mutex_unlock(&dev_priv->global_kms_state_mutex);
+ 
+ 	/* Since they always map one to one these are safe */
+ 	connector = &stdu->base.connector;
