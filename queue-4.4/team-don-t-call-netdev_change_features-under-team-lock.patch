@@ -1,0 +1,89 @@
+From foo@baz Fri Jun 17 11:18:18 PDT 2016
+From: Ivan Vecera <ivecera@redhat.com>
+Date: Wed, 25 May 2016 21:21:52 +0200
+Subject: team: don't call netdev_change_features under team->lock
+
+From: Ivan Vecera <ivecera@redhat.com>
+
+[ Upstream commit f6988cb63a4e698d8a62a1d085d263d1fcc351ea ]
+
+The team_device_event() notifier calls team_compute_features() to fix
+vlan_features under team->lock to protect team->port_list. The problem is
+that subsequent __team_compute_features() calls netdev_change_features()
+to propagate vlan_features to upper vlan devices while team->lock is still
+taken. This can lead to deadlock when NETIF_F_LRO is modified on lower
+devices or team device itself.
+
+Example:
+The team0 as active backup with eth0 and eth1 NICs. Both eth0 & eth1 are
+LRO capable and LRO is enabled. Thus LRO is also enabled on team0.
+
+The command 'ethtool -K team0 lro off' now hangs due to this deadlock:
+
+dev_ethtool()
+-> ethtool_set_features()
+ -> __netdev_update_features(team)
+  -> netdev_sync_lower_features()
+   -> netdev_update_features(lower_1)
+    -> __netdev_update_features(lower_1)
+    -> netdev_features_change(lower_1)
+     -> call_netdevice_notifiers(...)
+      -> team_device_event(lower_1)
+       -> team_compute_features(team) [TAKES team->lock]
+        -> netdev_change_features(team)
+         -> __netdev_update_features(team)
+          -> netdev_sync_lower_features()
+           -> netdev_update_features(lower_2)
+            -> __netdev_update_features(lower_2)
+            -> netdev_features_change(lower_2)
+             -> call_netdevice_notifiers(...)
+              -> team_device_event(lower_2)
+               -> team_compute_features(team) [DEADLOCK]
+
+The bug is present in team from the beginning but it appeared after the commit
+fd867d5 (net/core: generic support for disabling netdev features down stack)
+that adds synchronization of features with lower devices.
+
+Fixes: fd867d5 (net/core: generic support for disabling netdev features down stack)
+Cc: Jiri Pirko <jiri@resnulli.us>
+Signed-off-by: Ivan Vecera <ivecera@redhat.com>
+Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/team/team.c |    9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/team/team.c
++++ b/drivers/net/team/team.c
+@@ -969,7 +969,7 @@ static void team_port_disable(struct tea
+ 			    NETIF_F_FRAGLIST | NETIF_F_ALL_TSO | \
+ 			    NETIF_F_HIGHDMA | NETIF_F_LRO)
+ 
+-static void __team_compute_features(struct team *team)
++static void ___team_compute_features(struct team *team)
+ {
+ 	struct team_port *port;
+ 	u32 vlan_features = TEAM_VLAN_FEATURES & NETIF_F_ALL_FOR_ALL;
+@@ -993,15 +993,20 @@ static void __team_compute_features(stru
+ 	team->dev->priv_flags &= ~IFF_XMIT_DST_RELEASE;
+ 	if (dst_release_flag == (IFF_XMIT_DST_RELEASE | IFF_XMIT_DST_RELEASE_PERM))
+ 		team->dev->priv_flags |= IFF_XMIT_DST_RELEASE;
++}
+ 
++static void __team_compute_features(struct team *team)
++{
++	___team_compute_features(team);
+ 	netdev_change_features(team->dev);
+ }
+ 
+ static void team_compute_features(struct team *team)
+ {
+ 	mutex_lock(&team->lock);
+-	__team_compute_features(team);
++	___team_compute_features(team);
+ 	mutex_unlock(&team->lock);
++	netdev_change_features(team->dev);
+ }
+ 
+ static int team_port_enter(struct team *team, struct team_port *port)
