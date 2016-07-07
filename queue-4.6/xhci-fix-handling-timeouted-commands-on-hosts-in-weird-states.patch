@@ -1,0 +1,110 @@
+From 3425aa03f484d45dc21e0e791c2f6c74ea656421 Mon Sep 17 00:00:00 2001
+From: Mathias Nyman <mathias.nyman@linux.intel.com>
+Date: Wed, 1 Jun 2016 18:09:08 +0300
+Subject: xhci: Fix handling timeouted commands on hosts in weird states.
+
+From: Mathias Nyman <mathias.nyman@linux.intel.com>
+
+commit 3425aa03f484d45dc21e0e791c2f6c74ea656421 upstream.
+
+If commands timeout we mark them for abortion, then stop the command
+ring, and turn the commands to no-ops and finally restart the command
+ring.
+
+If the host is working properly the no-op commands will finish and
+pending completions are called.
+If we notice the host is failing, driver clears the command ring and
+completes, deletes and frees all pending commands.
+
+There are two separate cases reported where host is believed to work
+properly but is not. In the first case we successfully stop the ring
+but no abort or stop command ring event is ever sent and host locks up.
+
+The second case is if a host is removed, command times out and driver
+believes the ring is stopped, and assumes it will be restarted, but
+actually ends up timing out on the same command forever.
+If one of the pending commands has the xhci->mutex held it will block
+xhci_stop() in the remove codepath which otherwise would cleanup pending
+commands.
+
+Add a check that clears all pending commands in case host is removed,
+or we are stuck timing out on the same command. Also restart the
+command timeout timer when stopping the command ring to ensure we
+recive an ring stop/abort event.
+
+Tested-by: Joe Lawrence <joe.lawrence@stratus.com>
+Signed-off-by: Mathias Nyman <mathias.nyman@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/usb/host/xhci-ring.c |   27 ++++++++++++++++++++++-----
+ 1 file changed, 22 insertions(+), 5 deletions(-)
+
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@ -290,6 +290,14 @@ static int xhci_abort_cmd_ring(struct xh
+ 
+ 	temp_64 = xhci_read_64(xhci, &xhci->op_regs->cmd_ring);
+ 	xhci->cmd_ring_state = CMD_RING_STATE_ABORTED;
++
++	/*
++	 * Writing the CMD_RING_ABORT bit should cause a cmd completion event,
++	 * however on some host hw the CMD_RING_RUNNING bit is correctly cleared
++	 * but the completion event in never sent. Use the cmd timeout timer to
++	 * handle those cases. Use twice the time to cover the bit polling retry
++	 */
++	mod_timer(&xhci->cmd_timer, jiffies + (2 * XHCI_CMD_DEFAULT_TIMEOUT));
+ 	xhci_write_64(xhci, temp_64 | CMD_RING_ABORT,
+ 			&xhci->op_regs->cmd_ring);
+ 
+@@ -314,6 +322,7 @@ static int xhci_abort_cmd_ring(struct xh
+ 
+ 		xhci_err(xhci, "Stopped the command ring failed, "
+ 				"maybe the host is dead\n");
++		del_timer(&xhci->cmd_timer);
+ 		xhci->xhc_state |= XHCI_STATE_DYING;
+ 		xhci_quiesce(xhci);
+ 		xhci_halt(xhci);
+@@ -1253,22 +1262,21 @@ void xhci_handle_command_timeout(unsigne
+ 	int ret;
+ 	unsigned long flags;
+ 	u64 hw_ring_state;
+-	struct xhci_command *cur_cmd = NULL;
++	bool second_timeout = false;
+ 	xhci = (struct xhci_hcd *) data;
+ 
+ 	/* mark this command to be cancelled */
+ 	spin_lock_irqsave(&xhci->lock, flags);
+ 	if (xhci->current_cmd) {
+-		cur_cmd = xhci->current_cmd;
+-		cur_cmd->status = COMP_CMD_ABORT;
++		if (xhci->current_cmd->status == COMP_CMD_ABORT)
++			second_timeout = true;
++		xhci->current_cmd->status = COMP_CMD_ABORT;
+ 	}
+ 
+-
+ 	/* Make sure command ring is running before aborting it */
+ 	hw_ring_state = xhci_read_64(xhci, &xhci->op_regs->cmd_ring);
+ 	if ((xhci->cmd_ring_state & CMD_RING_STATE_RUNNING) &&
+ 	    (hw_ring_state & CMD_RING_RUNNING))  {
+-
+ 		spin_unlock_irqrestore(&xhci->lock, flags);
+ 		xhci_dbg(xhci, "Command timeout\n");
+ 		ret = xhci_abort_cmd_ring(xhci);
+@@ -1280,6 +1288,15 @@ void xhci_handle_command_timeout(unsigne
+ 		}
+ 		return;
+ 	}
++
++	/* command ring failed to restart, or host removed. Bail out */
++	if (second_timeout || xhci->xhc_state & XHCI_STATE_REMOVING) {
++		spin_unlock_irqrestore(&xhci->lock, flags);
++		xhci_dbg(xhci, "command timed out twice, ring start fail?\n");
++		xhci_cleanup_command_queue(xhci);
++		return;
++	}
++
+ 	/* command timeout on stopped ring, ring can't be aborted */
+ 	xhci_dbg(xhci, "Command timeout on stopped ring\n");
+ 	xhci_handle_stopped_cmd_ring(xhci, xhci->current_cmd);
