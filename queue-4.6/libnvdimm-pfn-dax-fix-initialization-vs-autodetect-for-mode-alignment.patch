@@ -1,0 +1,134 @@
+From 1ee6667cd8d183b2fed12f97285f184431d2caf9 Mon Sep 17 00:00:00 2001
+From: Dan Williams <dan.j.williams@intel.com>
+Date: Thu, 23 Jun 2016 17:50:39 -0700
+Subject: libnvdimm, pfn, dax: fix initialization vs autodetect for mode + alignment
+
+From: Dan Williams <dan.j.williams@intel.com>
+
+commit 1ee6667cd8d183b2fed12f97285f184431d2caf9 upstream.
+
+The updated ndctl unit tests discovered that if a pfn configuration with
+a 4K alignment is read from the namespace, that alignment will be
+ignored in favor of the default 2M alignment.  The result is that the
+configuration will fail initialization with a message like:
+
+    dax6.1: bad offset: 0x22000 dax disabled align: 0x200000
+
+Fix this by allowing the alignment read from the info block to override
+the default which is 2M not 0 in the autodetect path.  This also fixes a
+similar problem with the mode and alignment settings silently being
+overwritten by the kernel when userspace has changed it.  We now will
+either overwrite the info block if userspace changes the uuid or fail
+and warn if a live setting disagrees with the info block.
+
+Cc: Micah Parrish <micah.parrish@hpe.com>
+Cc: Toshi Kani <toshi.kani@hpe.com>
+Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+
+---
+ drivers/nvdimm/pfn_devs.c |   50 +++++++++++++++++++++++++++++++++++++---------
+ drivers/nvdimm/pmem.c     |    1 
+ 2 files changed, 41 insertions(+), 10 deletions(-)
+
+--- a/drivers/nvdimm/pfn_devs.c
++++ b/drivers/nvdimm/pfn_devs.c
+@@ -329,6 +329,8 @@ struct device *nd_pfn_create(struct nd_r
+ int nd_pfn_validate(struct nd_pfn *nd_pfn)
+ {
+ 	u64 checksum, offset;
++	unsigned long align;
++	enum nd_pfn_mode mode;
+ 	struct nd_namespace_io *nsio;
+ 	struct nd_pfn_sb *pfn_sb = nd_pfn->pfn_sb;
+ 	struct nd_namespace_common *ndns = nd_pfn->ndns;
+@@ -371,20 +373,50 @@ int nd_pfn_validate(struct nd_pfn *nd_pf
+ 		return -ENXIO;
+ 	}
+ 
++	align = le32_to_cpu(pfn_sb->align);
++	offset = le64_to_cpu(pfn_sb->dataoff);
++	if (align == 0)
++		align = 1UL << ilog2(offset);
++	mode = le32_to_cpu(pfn_sb->mode);
++
+ 	if (!nd_pfn->uuid) {
+-		/* from probe we allocate */
++		/*
++		 * When probing a namepace via nd_pfn_probe() the uuid
++		 * is NULL (see: nd_pfn_devinit()) we init settings from
++		 * pfn_sb
++		 */
+ 		nd_pfn->uuid = kmemdup(pfn_sb->uuid, 16, GFP_KERNEL);
+ 		if (!nd_pfn->uuid)
+ 			return -ENOMEM;
++		nd_pfn->align = align;
++		nd_pfn->mode = mode;
+ 	} else {
+-		/* from init we validate */
++		/*
++		 * When probing a pfn / dax instance we validate the
++		 * live settings against the pfn_sb
++		 */
+ 		if (memcmp(nd_pfn->uuid, pfn_sb->uuid, 16) != 0)
+ 			return -ENODEV;
++
++		/*
++		 * If the uuid validates, but other settings mismatch
++		 * return EINVAL because userspace has managed to change
++		 * the configuration without specifying new
++		 * identification.
++		 */
++		if (nd_pfn->align != align || nd_pfn->mode != mode) {
++			dev_err(&nd_pfn->dev,
++					"init failed, settings mismatch\n");
++			dev_dbg(&nd_pfn->dev, "align: %lx:%lx mode: %d:%d\n",
++					nd_pfn->align, align, nd_pfn->mode,
++					mode);
++			return -EINVAL;
++		}
+ 	}
+ 
+-	if (nd_pfn->align > nvdimm_namespace_capacity(ndns)) {
++	if (align > nvdimm_namespace_capacity(ndns)) {
+ 		dev_err(&nd_pfn->dev, "alignment: %lx exceeds capacity %llx\n",
+-				nd_pfn->align, nvdimm_namespace_capacity(ndns));
++				align, nvdimm_namespace_capacity(ndns));
+ 		return -EINVAL;
+ 	}
+ 
+@@ -394,7 +426,6 @@ int nd_pfn_validate(struct nd_pfn *nd_pf
+ 	 * namespace has changed since the pfn superblock was
+ 	 * established.
+ 	 */
+-	offset = le64_to_cpu(pfn_sb->dataoff);
+ 	nsio = to_nd_namespace_io(&ndns->dev);
+ 	if (offset >= resource_size(&nsio->res)) {
+ 		dev_err(&nd_pfn->dev, "pfn array size exceeds capacity of %s\n",
+@@ -402,10 +433,11 @@ int nd_pfn_validate(struct nd_pfn *nd_pf
+ 		return -EBUSY;
+ 	}
+ 
+-	nd_pfn->align = le32_to_cpu(pfn_sb->align);
+-	if (!is_power_of_2(offset) || offset < PAGE_SIZE) {
+-		dev_err(&nd_pfn->dev, "bad offset: %#llx dax disabled\n",
+-				offset);
++	if ((align && !IS_ALIGNED(offset, align))
++			|| !IS_ALIGNED(offset, PAGE_SIZE)) {
++		dev_err(&nd_pfn->dev,
++				"bad offset: %#llx dax disabled align: %#lx\n",
++				offset, align);
+ 		return -ENXIO;
+ 	}
+ 
+--- a/drivers/nvdimm/pmem.c
++++ b/drivers/nvdimm/pmem.c
+@@ -502,7 +502,6 @@ static int __nvdimm_namespace_attach_pfn
+ 	pmem = dev_get_drvdata(dev);
+ 	pmem->data_offset = le64_to_cpu(pfn_sb->dataoff);
+ 	pmem->pfn_pad = start_pad + end_trunc;
+-	nd_pfn->mode = le32_to_cpu(nd_pfn->pfn_sb->mode);
+ 	if (nd_pfn->mode == PFN_MODE_RAM) {
+ 		if (pmem->data_offset < SZ_8K)
+ 			return -EINVAL;
