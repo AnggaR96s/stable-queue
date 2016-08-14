@@ -1,0 +1,142 @@
+From 8d91f8b15361dfb438ab6eb3b319e2ded43458ff Mon Sep 17 00:00:00 2001
+From: Tejun Heo <tj@kernel.org>
+Date: Fri, 15 Jan 2016 16:58:24 -0800
+Subject: printk: do cond_resched() between lines while outputting to consoles
+
+From: Tejun Heo <tj@kernel.org>
+
+commit 8d91f8b15361dfb438ab6eb3b319e2ded43458ff upstream.
+
+@console_may_schedule tracks whether console_sem was acquired through
+lock or trylock.  If the former, we're inside a sleepable context and
+console_conditional_schedule() performs cond_resched().  This allows
+console drivers which use console_lock for synchronization to yield
+while performing time-consuming operations such as scrolling.
+
+However, the actual console outputting is performed while holding
+irq-safe logbuf_lock, so console_unlock() clears @console_may_schedule
+before starting outputting lines.  Also, only a few drivers call
+console_conditional_schedule() to begin with.  This means that when a
+lot of lines need to be output by console_unlock(), for example on a
+console registration, the task doing console_unlock() may not yield for
+a long time on a non-preemptible kernel.
+
+If this happens with a slow console devices, for example a serial
+console, the outputting task may occupy the cpu for a very long time.
+Long enough to trigger softlockup and/or RCU stall warnings, which in
+turn pile more messages, sometimes enough to trigger the next cycle of
+warnings incapacitating the system.
+
+Fix it by making console_unlock() insert cond_resched() between lines if
+@console_may_schedule.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Reported-by: Calvin Owens <calvinowens@fb.com>
+Acked-by: Jan Kara <jack@suse.com>
+Cc: Dave Jones <davej@codemonkey.org.uk>
+Cc: Kyle McMartin <kyle@kernel.org>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+[ciwillia@brocade.com: adjust context for 3.14.y]
+Signed-off-by: Chas Williams <ciwillia@brocade.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/linux/console.h |    1 +
+ kernel/panic.c          |    3 +++
+ kernel/printk/printk.c  |   35 ++++++++++++++++++++++++++++++++++-
+ 3 files changed, 38 insertions(+), 1 deletion(-)
+
+--- a/include/linux/console.h
++++ b/include/linux/console.h
+@@ -150,6 +150,7 @@ extern int console_trylock(void);
+ extern void console_unlock(void);
+ extern void console_conditional_schedule(void);
+ extern void console_unblank(void);
++extern void console_flush_on_panic(void);
+ extern struct tty_driver *console_device(int *);
+ extern void console_stop(struct console *);
+ extern void console_start(struct console *);
+--- a/kernel/panic.c
++++ b/kernel/panic.c
+@@ -23,6 +23,7 @@
+ #include <linux/sysrq.h>
+ #include <linux/init.h>
+ #include <linux/nmi.h>
++#include <linux/console.h>
+ 
+ #define PANIC_TIMER_STEP 100
+ #define PANIC_BLINK_SPD 18
+@@ -133,6 +134,8 @@ void panic(const char *fmt, ...)
+ 
+ 	bust_spinlocks(0);
+ 
++	console_flush_on_panic();
++
+ 	if (!panic_blink)
+ 		panic_blink = no_blink;
+ 
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@ -2011,13 +2011,24 @@ void console_unlock(void)
+ 	static u64 seen_seq;
+ 	unsigned long flags;
+ 	bool wake_klogd = false;
+-	bool retry;
++	bool do_cond_resched, retry;
+ 
+ 	if (console_suspended) {
+ 		up(&console_sem);
+ 		return;
+ 	}
+ 
++	/*
++	 * Console drivers are called under logbuf_lock, so
++	 * @console_may_schedule should be cleared before; however, we may
++	 * end up dumping a lot of lines, for example, if called from
++	 * console registration path, and should invoke cond_resched()
++	 * between lines if allowable.  Not doing so can cause a very long
++	 * scheduling stall on a slow console leading to RCU stall and
++	 * softlockup warnings which exacerbate the issue with more
++	 * messages practically incapacitating the system.
++	 */
++	do_cond_resched = console_may_schedule;
+ 	console_may_schedule = 0;
+ 
+ 	/* flush buffered message fragment immediately to console */
+@@ -2074,6 +2085,9 @@ skip:
+ 		call_console_drivers(level, text, len);
+ 		start_critical_timings();
+ 		local_irq_restore(flags);
++
++		if (do_cond_resched)
++			cond_resched();
+ 	}
+ 	console_locked = 0;
+ 	mutex_release(&console_lock_dep_map, 1, _RET_IP_);
+@@ -2142,6 +2156,25 @@ void console_unblank(void)
+ 	console_unlock();
+ }
+ 
++/**
++ * console_flush_on_panic - flush console content on panic
++ *
++ * Immediately output all pending messages no matter what.
++ */
++void console_flush_on_panic(void)
++{
++	/*
++	 * If someone else is holding the console lock, trylock will fail
++	 * and may_schedule may be set.  Ignore and proceed to unlock so
++	 * that messages are flushed out.  As this can be called from any
++	 * context and we don't want to get preempted while flushing,
++	 * ensure may_schedule is cleared.
++	 */
++	console_trylock();
++	console_may_schedule = 0;
++	console_unlock();
++}
++
+ /*
+  * Return the console tty driver structure and its associated index
+  */
