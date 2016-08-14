@@ -1,0 +1,123 @@
+From a47241cdeee2689ee7089ec95cadfcf66588fbdb Mon Sep 17 00:00:00 2001
+From: Alden Tondettar <alden.tondettar@gmail.com>
+Date: Mon, 25 Apr 2016 19:27:56 -0700
+Subject: udf: Prevent stack overflow on corrupted filesystem mount
+
+From: Alden Tondettar <alden.tondettar@gmail.com>
+
+commit a47241cdeee2689ee7089ec95cadfcf66588fbdb upstream.
+
+Presently, a corrupted or malicious UDF filesystem containing a very large
+number (or cycle) of Logical Volume Integrity Descriptor extent
+indirections may trigger a stack overflow and kernel panic in
+udf_load_logicalvolint() on mount.
+
+Replace the unnecessary recursion in udf_load_logicalvolint() with
+simple iteration. Set an arbitrary limit of 1000 indirections (which would
+have almost certainly overflowed the stack without this fix), and treat
+such cases as if there were no LVID.
+
+Signed-off-by: Alden Tondettar <alden.tondettar@gmail.com>
+Signed-off-by: Jan Kara <jack@suse.cz>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/udf/super.c |   69 ++++++++++++++++++++++++++++++++++++---------------------
+ 1 file changed, 44 insertions(+), 25 deletions(-)
+
+--- a/fs/udf/super.c
++++ b/fs/udf/super.c
+@@ -78,6 +78,15 @@
+ #define VSD_FIRST_SECTOR_OFFSET		32768
+ #define VSD_MAX_SECTOR_OFFSET		0x800000
+ 
++/*
++ * Maximum number of Terminating Descriptor / Logical Volume Integrity
++ * Descriptor redirections. The chosen numbers are arbitrary - just that we
++ * hopefully don't limit any real use of rewritten inode on write-once media
++ * but avoid looping for too long on corrupted media.
++ */
++#define UDF_MAX_TD_NESTING 64
++#define UDF_MAX_LVID_NESTING 1000
++
+ enum { UDF_MAX_LINKS = 0xffff };
+ 
+ /* These are the "meat" - everything else is stuffing */
+@@ -1541,42 +1550,52 @@ out_bh:
+ }
+ 
+ /*
+- * udf_load_logicalvolint
+- *
++ * Find the prevailing Logical Volume Integrity Descriptor.
+  */
+ static void udf_load_logicalvolint(struct super_block *sb, struct kernel_extent_ad loc)
+ {
+-	struct buffer_head *bh = NULL;
++	struct buffer_head *bh, *final_bh;
+ 	uint16_t ident;
+ 	struct udf_sb_info *sbi = UDF_SB(sb);
+ 	struct logicalVolIntegrityDesc *lvid;
++	int indirections = 0;
+ 
+-	while (loc.extLength > 0 &&
+-	       (bh = udf_read_tagged(sb, loc.extLocation,
+-				     loc.extLocation, &ident)) &&
+-	       ident == TAG_IDENT_LVID) {
+-		sbi->s_lvid_bh = bh;
+-		lvid = (struct logicalVolIntegrityDesc *)bh->b_data;
+-
+-		if (lvid->nextIntegrityExt.extLength)
+-			udf_load_logicalvolint(sb,
+-				leea_to_cpu(lvid->nextIntegrityExt));
++	while (++indirections <= UDF_MAX_LVID_NESTING) {
++		final_bh = NULL;
++		while (loc.extLength > 0 &&
++			(bh = udf_read_tagged(sb, loc.extLocation,
++					loc.extLocation, &ident))) {
++			if (ident != TAG_IDENT_LVID) {
++				brelse(bh);
++				break;
++			}
+ 
+-		if (sbi->s_lvid_bh != bh)
+-			brelse(bh);
+-		loc.extLength -= sb->s_blocksize;
+-		loc.extLocation++;
++			brelse(final_bh);
++			final_bh = bh;
++
++			loc.extLength -= sb->s_blocksize;
++			loc.extLocation++;
++		}
++
++		if (!final_bh)
++			return;
++
++		brelse(sbi->s_lvid_bh);
++		sbi->s_lvid_bh = final_bh;
++
++		lvid = (struct logicalVolIntegrityDesc *)final_bh->b_data;
++		if (lvid->nextIntegrityExt.extLength == 0)
++			return;
++
++		loc = leea_to_cpu(lvid->nextIntegrityExt);
+ 	}
+-	if (sbi->s_lvid_bh != bh)
+-		brelse(bh);
++
++	udf_warn(sb, "Too many LVID indirections (max %u), ignoring.\n",
++		UDF_MAX_LVID_NESTING);
++	brelse(sbi->s_lvid_bh);
++	sbi->s_lvid_bh = NULL;
+ }
+ 
+-/*
+- * Maximum number of Terminating Descriptor redirections. The chosen number is
+- * arbitrary - just that we hopefully don't limit any real use of rewritten
+- * inode on write-once media but avoid looping for too long on corrupted media.
+- */
+-#define UDF_MAX_TD_NESTING 64
+ 
+ /*
+  * Process a main/reserve volume descriptor sequence.
