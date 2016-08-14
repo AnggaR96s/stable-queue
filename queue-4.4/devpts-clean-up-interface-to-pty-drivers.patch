@@ -1,0 +1,386 @@
+From 67245ff332064c01b760afa7a384ccda024bfd24 Mon Sep 17 00:00:00 2001
+From: Linus Torvalds <torvalds@linux-foundation.org>
+Date: Sat, 16 Apr 2016 15:16:07 -0700
+Subject: devpts: clean up interface to pty drivers
+
+From: Linus Torvalds <torvalds@linux-foundation.org>
+
+commit 67245ff332064c01b760afa7a384ccda024bfd24 upstream.
+
+This gets rid of the horrible notion of having that
+
+    struct inode *ptmx_inode
+
+be the linchpin of the interface between the pty code and devpts.
+
+By de-emphasizing the ptmx inode, a lot of things actually get cleaner,
+and we will have a much saner way forward.  In particular, this will
+allow us to associate with any particular devpts instance at open-time,
+and not be artificially tied to one particular ptmx inode.
+
+The patch itself is actually fairly straightforward, and apart from some
+locking and return path cleanups it's pretty mechanical:
+
+ - the interfaces that devpts exposes all take "struct pts_fs_info *"
+   instead of "struct inode *ptmx_inode" now.
+
+   NOTE! The "struct pts_fs_info" thing is a completely opaque structure
+   as far as the pty driver is concerned: it's still declared entirely
+   internally to devpts. So the pty code can't actually access it in any
+   way, just pass it as a "cookie" to the devpts code.
+
+ - the "look up the pts fs info" is now a single clear operation, that
+   also does the reference count increment on the pts superblock.
+
+   So "devpts_add/del_ref()" is gone, and replaced by a "lookup and get
+   ref" operation (devpts_get_ref(inode)), along with a "put ref" op
+   (devpts_put_ref()).
+
+ - the pty master "tty->driver_data" field now contains the pts_fs_info,
+   not the ptmx inode.
+
+ - because we don't care about the ptmx inode any more as some kind of
+   base index, the ref counting can now drop the inode games - it just
+   gets the ref on the superblock.
+
+ - the pts_fs_info now has a back-pointer to the super_block. That's so
+   that we can easily look up the information we actually need. Although
+   quite often, the pts fs info was actually all we wanted, and not having
+   to look it up based on some magical inode makes things more
+   straightforward.
+
+In particular, now that "devpts_get_ref(inode)" operation should really
+be the *only* place we need to look up what devpts instance we're
+associated with, and we do it exactly once, at ptmx_open() time.
+
+The other side of this is that one ptmx node could now be associated
+with multiple different devpts instances - you could have a single
+/dev/ptmx node, and then have multiple mount namespaces with their own
+instances of devpts mounted on /dev/pts/.  And that's all perfectly sane
+in a model where we just look up the pts instance at open time.
+
+This will eventually allow us to get rid of our odd single-vs-multiple
+pts instance model, but this patch in itself changes no semantics, only
+an internal binding model.
+
+Cc: Eric Biederman <ebiederm@xmission.com>
+Cc: Peter Anvin <hpa@zytor.com>
+Cc: Andy Lutomirski <luto@amacapital.net>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Peter Hurley <peter@hurleysoftware.com>
+Cc: Serge Hallyn <serge.hallyn@ubuntu.com>
+Cc: Willy Tarreau <w@1wt.eu>
+Cc: Aurelien Jarno <aurelien@aurel32.net>
+Cc: Alan Cox <gnomes@lxorguk.ukuu.org.uk>
+Cc: Jann Horn <jann@thejh.net>
+Cc: Greg KH <greg@kroah.com>
+Cc: Jiri Slaby <jslaby@suse.com>
+Cc: Florian Weimer <fw@deneb.enyo.de>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Francesco Ruggeri <fruggeri@arista.com>
+Cc: "Herton R. Krzesinski" <herton@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/tty/pty.c         |   63 +++++++++++++++++++++-------------------------
+ fs/devpts/inode.c         |   49 +++++++++++++++++------------------
+ include/linux/devpts_fs.h |   34 +++++++-----------------
+ 3 files changed, 64 insertions(+), 82 deletions(-)
+
+--- a/drivers/tty/pty.c
++++ b/drivers/tty/pty.c
+@@ -679,14 +679,14 @@ static void pty_unix98_remove(struct tty
+ /* this is called once with whichever end is closed last */
+ static void pty_unix98_shutdown(struct tty_struct *tty)
+ {
+-	struct inode *ptmx_inode;
++	struct pts_fs_info *fsi;
+ 
+ 	if (tty->driver->subtype == PTY_TYPE_MASTER)
+-		ptmx_inode = tty->driver_data;
++		fsi = tty->driver_data;
+ 	else
+-		ptmx_inode = tty->link->driver_data;
+-	devpts_kill_index(ptmx_inode, tty->index);
+-	devpts_del_ref(ptmx_inode);
++		fsi = tty->link->driver_data;
++	devpts_kill_index(fsi, tty->index);
++	devpts_put_ref(fsi);
+ }
+ 
+ static const struct tty_operations ptm_unix98_ops = {
+@@ -738,6 +738,7 @@ static const struct tty_operations pty_u
+ 
+ static int ptmx_open(struct inode *inode, struct file *filp)
+ {
++	struct pts_fs_info *fsi;
+ 	struct tty_struct *tty;
+ 	struct inode *slave_inode;
+ 	int retval;
+@@ -752,47 +753,41 @@ static int ptmx_open(struct inode *inode
+ 	if (retval)
+ 		return retval;
+ 
++	fsi = devpts_get_ref(inode, filp);
++	retval = -ENODEV;
++	if (!fsi)
++		goto out_free_file;
++
+ 	/* find a device that is not in use. */
+ 	mutex_lock(&devpts_mutex);
+-	index = devpts_new_index(inode);
+-	if (index < 0) {
+-		retval = index;
+-		mutex_unlock(&devpts_mutex);
+-		goto err_file;
+-	}
+-
++	index = devpts_new_index(fsi);
+ 	mutex_unlock(&devpts_mutex);
+ 
+-	mutex_lock(&tty_mutex);
+-	tty = tty_init_dev(ptm_driver, index);
++	retval = index;
++	if (index < 0)
++		goto out_put_ref;
+ 
+-	if (IS_ERR(tty)) {
+-		retval = PTR_ERR(tty);
+-		goto out;
+-	}
+ 
++	mutex_lock(&tty_mutex);
++	tty = tty_init_dev(ptm_driver, index);
+ 	/* The tty returned here is locked so we can safely
+ 	   drop the mutex */
+ 	mutex_unlock(&tty_mutex);
+ 
+-	set_bit(TTY_PTY_LOCK, &tty->flags); /* LOCK THE SLAVE */
+-	tty->driver_data = inode;
++	retval = PTR_ERR(tty);
++	if (IS_ERR(tty))
++		goto out;
+ 
+ 	/*
+-	 * In the case where all references to ptmx inode are dropped and we
+-	 * still have /dev/tty opened pointing to the master/slave pair (ptmx
+-	 * is closed/released before /dev/tty), we must make sure that the inode
+-	 * is still valid when we call the final pty_unix98_shutdown, thus we
+-	 * hold an additional reference to the ptmx inode. For the same /dev/tty
+-	 * last close case, we also need to make sure the super_block isn't
+-	 * destroyed (devpts instance unmounted), before /dev/tty is closed and
+-	 * on its release devpts_kill_index is called.
++	 * From here on out, the tty is "live", and the index and
++	 * fsi will be killed/put by the tty_release()
+ 	 */
+-	devpts_add_ref(inode);
++	set_bit(TTY_PTY_LOCK, &tty->flags); /* LOCK THE SLAVE */
++	tty->driver_data = fsi;
+ 
+ 	tty_add_file(tty, filp);
+ 
+-	slave_inode = devpts_pty_new(inode,
++	slave_inode = devpts_pty_new(fsi,
+ 			MKDEV(UNIX98_PTY_SLAVE_MAJOR, index), index,
+ 			tty->link);
+ 	if (IS_ERR(slave_inode)) {
+@@ -811,12 +806,14 @@ static int ptmx_open(struct inode *inode
+ 	return 0;
+ err_release:
+ 	tty_unlock(tty);
++	// This will also put-ref the fsi
+ 	tty_release(inode, filp);
+ 	return retval;
+ out:
+-	mutex_unlock(&tty_mutex);
+-	devpts_kill_index(inode, index);
+-err_file:
++	devpts_kill_index(fsi, index);
++out_put_ref:
++	devpts_put_ref(fsi);
++out_free_file:
+ 	tty_free_file(filp);
+ 	return retval;
+ }
+--- a/fs/devpts/inode.c
++++ b/fs/devpts/inode.c
+@@ -128,6 +128,7 @@ static const match_table_t tokens = {
+ struct pts_fs_info {
+ 	struct ida allocated_ptys;
+ 	struct pts_mount_opts mount_opts;
++	struct super_block *sb;
+ 	struct dentry *ptmx_dentry;
+ };
+ 
+@@ -358,7 +359,7 @@ static const struct super_operations dev
+ 	.show_options	= devpts_show_options,
+ };
+ 
+-static void *new_pts_fs_info(void)
++static void *new_pts_fs_info(struct super_block *sb)
+ {
+ 	struct pts_fs_info *fsi;
+ 
+@@ -369,6 +370,7 @@ static void *new_pts_fs_info(void)
+ 	ida_init(&fsi->allocated_ptys);
+ 	fsi->mount_opts.mode = DEVPTS_DEFAULT_MODE;
+ 	fsi->mount_opts.ptmxmode = DEVPTS_DEFAULT_PTMX_MODE;
++	fsi->sb = sb;
+ 
+ 	return fsi;
+ }
+@@ -384,7 +386,7 @@ devpts_fill_super(struct super_block *s,
+ 	s->s_op = &devpts_sops;
+ 	s->s_time_gran = 1;
+ 
+-	s->s_fs_info = new_pts_fs_info();
++	s->s_fs_info = new_pts_fs_info(s);
+ 	if (!s->s_fs_info)
+ 		goto fail;
+ 
+@@ -524,17 +526,14 @@ static struct file_system_type devpts_fs
+  * to the System V naming convention
+  */
+ 
+-int devpts_new_index(struct inode *ptmx_inode)
++int devpts_new_index(struct pts_fs_info *fsi)
+ {
+-	struct super_block *sb = pts_sb_from_inode(ptmx_inode);
+-	struct pts_fs_info *fsi;
+ 	int index;
+ 	int ida_ret;
+ 
+-	if (!sb)
++	if (!fsi)
+ 		return -ENODEV;
+ 
+-	fsi = DEVPTS_SB(sb);
+ retry:
+ 	if (!ida_pre_get(&fsi->allocated_ptys, GFP_KERNEL))
+ 		return -ENOMEM;
+@@ -564,11 +563,8 @@ retry:
+ 	return index;
+ }
+ 
+-void devpts_kill_index(struct inode *ptmx_inode, int idx)
++void devpts_kill_index(struct pts_fs_info *fsi, int idx)
+ {
+-	struct super_block *sb = pts_sb_from_inode(ptmx_inode);
+-	struct pts_fs_info *fsi = DEVPTS_SB(sb);
+-
+ 	mutex_lock(&allocated_ptys_lock);
+ 	ida_remove(&fsi->allocated_ptys, idx);
+ 	pty_count--;
+@@ -578,21 +574,25 @@ void devpts_kill_index(struct inode *ptm
+ /*
+  * pty code needs to hold extra references in case of last /dev/tty close
+  */
+-
+-void devpts_add_ref(struct inode *ptmx_inode)
++struct pts_fs_info *devpts_get_ref(struct inode *ptmx_inode, struct file *file)
+ {
+-	struct super_block *sb = pts_sb_from_inode(ptmx_inode);
++	struct super_block *sb;
++	struct pts_fs_info *fsi;
++
++	sb = pts_sb_from_inode(ptmx_inode);
++	if (!sb)
++		return NULL;
++	fsi = DEVPTS_SB(sb);
++	if (!fsi)
++		return NULL;
+ 
+ 	atomic_inc(&sb->s_active);
+-	ihold(ptmx_inode);
++	return fsi;
+ }
+ 
+-void devpts_del_ref(struct inode *ptmx_inode)
++void devpts_put_ref(struct pts_fs_info *fsi)
+ {
+-	struct super_block *sb = pts_sb_from_inode(ptmx_inode);
+-
+-	iput(ptmx_inode);
+-	deactivate_super(sb);
++	deactivate_super(fsi->sb);
+ }
+ 
+ /**
+@@ -604,22 +604,21 @@ void devpts_del_ref(struct inode *ptmx_i
+  *
+  * The created inode is returned. Remove it from /dev/pts/ by devpts_pty_kill.
+  */
+-struct inode *devpts_pty_new(struct inode *ptmx_inode, dev_t device, int index,
++struct inode *devpts_pty_new(struct pts_fs_info *fsi, dev_t device, int index,
+ 		void *priv)
+ {
+ 	struct dentry *dentry;
+-	struct super_block *sb = pts_sb_from_inode(ptmx_inode);
++	struct super_block *sb;
+ 	struct inode *inode;
+ 	struct dentry *root;
+-	struct pts_fs_info *fsi;
+ 	struct pts_mount_opts *opts;
+ 	char s[12];
+ 
+-	if (!sb)
++	if (!fsi)
+ 		return ERR_PTR(-ENODEV);
+ 
++	sb = fsi->sb;
+ 	root = sb->s_root;
+-	fsi = DEVPTS_SB(sb);
+ 	opts = &fsi->mount_opts;
+ 
+ 	inode = new_inode(sb);
+--- a/include/linux/devpts_fs.h
++++ b/include/linux/devpts_fs.h
+@@ -15,38 +15,24 @@
+ 
+ #include <linux/errno.h>
+ 
++struct pts_fs_info;
++
+ #ifdef CONFIG_UNIX98_PTYS
+ 
+-int devpts_new_index(struct inode *ptmx_inode);
+-void devpts_kill_index(struct inode *ptmx_inode, int idx);
+-void devpts_add_ref(struct inode *ptmx_inode);
+-void devpts_del_ref(struct inode *ptmx_inode);
++/* Look up a pts fs info and get a ref to it */
++struct pts_fs_info *devpts_get_ref(struct inode *, struct file *);
++void devpts_put_ref(struct pts_fs_info *);
++
++int devpts_new_index(struct pts_fs_info *);
++void devpts_kill_index(struct pts_fs_info *, int);
++
+ /* mknod in devpts */
+-struct inode *devpts_pty_new(struct inode *ptmx_inode, dev_t device, int index,
+-		void *priv);
++struct inode *devpts_pty_new(struct pts_fs_info *, dev_t, int, void *);
+ /* get private structure */
+ void *devpts_get_priv(struct inode *pts_inode);
+ /* unlink */
+ void devpts_pty_kill(struct inode *inode);
+ 
+-#else
+-
+-/* Dummy stubs in the no-pty case */
+-static inline int devpts_new_index(struct inode *ptmx_inode) { return -EINVAL; }
+-static inline void devpts_kill_index(struct inode *ptmx_inode, int idx) { }
+-static inline void devpts_add_ref(struct inode *ptmx_inode) { }
+-static inline void devpts_del_ref(struct inode *ptmx_inode) { }
+-static inline struct inode *devpts_pty_new(struct inode *ptmx_inode,
+-		dev_t device, int index, void *priv)
+-{
+-	return ERR_PTR(-EINVAL);
+-}
+-static inline void *devpts_get_priv(struct inode *pts_inode)
+-{
+-	return NULL;
+-}
+-static inline void devpts_pty_kill(struct inode *inode) { }
+-
+ #endif
+ 
+ 
