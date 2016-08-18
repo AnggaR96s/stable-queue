@@ -1,0 +1,190 @@
+From f16c3ebfa64fdf0e2dc88e6baa72da95ab70ffd7 Mon Sep 17 00:00:00 2001
+From: Emmanuel Grumbach <emmanuel.grumbach@intel.com>
+Date: Mon, 13 Jun 2016 08:28:26 +0300
+Subject: iwlwifi: pcie: fix a race in firmware loading flow
+
+From: Emmanuel Grumbach <emmanuel.grumbach@intel.com>
+
+commit f16c3ebfa64fdf0e2dc88e6baa72da95ab70ffd7 upstream.
+
+Upon firmware load interrupt (FH_TX), the ISR re-enables the
+firmware load interrupt only to avoid races with other
+flows as described in the commit below. When the firmware
+is completely loaded, the thread that is loading the
+firmware will enable all the interrupts to make sure that
+the driver gets the ALIVE interrupt.
+The problem with that is that the thread that is loading
+the firmware is actually racing against the ISR and we can
+get to the following situation:
+
+CPU0					CPU1
+iwl_pcie_load_given_ucode
+	...
+	iwl_pcie_load_firmware_chunk
+		wait_for_interrupt
+					<interrupt>
+					ISR handles CSR_INT_BIT_FH_TX
+					ISR wakes up the thread on CPU0
+	/* enable all the interrupts
+	 * to get the ALIVE interrupt
+	 */
+	iwl_enable_interrupts
+					ISR re-enables CSR_INT_BIT_FH_TX only
+	/* start the firmware */
+	iwl_write32(trans, CSR_RESET, 0);
+
+BUG! ALIVE interrupt will never arrive since it has been
+masked by CPU1.
+
+In order to fix that, change the ISR to first check if
+STATUS_INT_ENABLED is set. If so, re-enable all the
+interrupts. If STATUS_INT_ENABLED is clear, then we can
+check what specific interrupt happened and re-enable only
+that specific interrupt (RFKILL or FH_TX).
+
+All the credit for the analysis goes to Kirtika who did the
+actual debugging work.
+
+Fixes: a6bd005fe92 ("iwlwifi: pcie: fix RF-Kill vs. firmware load race")
+Signed-off-by: Luca Coelho <luciano.coelho@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/net/wireless/intel/iwlwifi/pcie/internal.h |   21 +++++++++++++++++++--
+ drivers/net/wireless/intel/iwlwifi/pcie/rx.c       |   16 +++++++++-------
+ drivers/net/wireless/intel/iwlwifi/pcie/trans.c    |    8 --------
+ 3 files changed, 28 insertions(+), 17 deletions(-)
+
+--- a/drivers/net/wireless/intel/iwlwifi/pcie/internal.h
++++ b/drivers/net/wireless/intel/iwlwifi/pcie/internal.h
+@@ -496,7 +496,7 @@ void iwl_pcie_dump_csr(struct iwl_trans
+ /*****************************************************
+ * Helpers
+ ******************************************************/
+-static inline void iwl_disable_interrupts(struct iwl_trans *trans)
++static inline void _iwl_disable_interrupts(struct iwl_trans *trans)
+ {
+ 	struct iwl_trans_pcie *trans_pcie = IWL_TRANS_GET_PCIE_TRANS(trans);
+ 
+@@ -519,7 +519,16 @@ static inline void iwl_disable_interrupt
+ 	IWL_DEBUG_ISR(trans, "Disabled interrupts\n");
+ }
+ 
+-static inline void iwl_enable_interrupts(struct iwl_trans *trans)
++static inline void iwl_disable_interrupts(struct iwl_trans *trans)
++{
++	struct iwl_trans_pcie *trans_pcie = IWL_TRANS_GET_PCIE_TRANS(trans);
++
++	spin_lock(&trans_pcie->irq_lock);
++	_iwl_disable_interrupts(trans);
++	spin_unlock(&trans_pcie->irq_lock);
++}
++
++static inline void _iwl_enable_interrupts(struct iwl_trans *trans)
+ {
+ 	struct iwl_trans_pcie *trans_pcie = IWL_TRANS_GET_PCIE_TRANS(trans);
+ 
+@@ -542,6 +551,14 @@ static inline void iwl_enable_interrupts
+ 	}
+ }
+ 
++static inline void iwl_enable_interrupts(struct iwl_trans *trans)
++{
++	struct iwl_trans_pcie *trans_pcie = IWL_TRANS_GET_PCIE_TRANS(trans);
++
++	spin_lock(&trans_pcie->irq_lock);
++	_iwl_enable_interrupts(trans);
++	spin_unlock(&trans_pcie->irq_lock);
++}
+ static inline void iwl_enable_hw_int_msk_msix(struct iwl_trans *trans, u32 msk)
+ {
+ 	struct iwl_trans_pcie *trans_pcie = IWL_TRANS_GET_PCIE_TRANS(trans);
+--- a/drivers/net/wireless/intel/iwlwifi/pcie/rx.c
++++ b/drivers/net/wireless/intel/iwlwifi/pcie/rx.c
+@@ -1507,7 +1507,7 @@ irqreturn_t iwl_pcie_irq_handler(int irq
+ 		 * have anything to service
+ 		 */
+ 		if (test_bit(STATUS_INT_ENABLED, &trans->status))
+-			iwl_enable_interrupts(trans);
++			_iwl_enable_interrupts(trans);
+ 		spin_unlock(&trans_pcie->irq_lock);
+ 		lock_map_release(&trans->sync_cmd_lockdep_map);
+ 		return IRQ_NONE;
+@@ -1699,15 +1699,17 @@ irqreturn_t iwl_pcie_irq_handler(int irq
+ 			 inta & ~trans_pcie->inta_mask);
+ 	}
+ 
++	spin_lock(&trans_pcie->irq_lock);
++	/* only Re-enable all interrupt if disabled by irq */
++	if (test_bit(STATUS_INT_ENABLED, &trans->status))
++		_iwl_enable_interrupts(trans);
+ 	/* we are loading the firmware, enable FH_TX interrupt only */
+-	if (handled & CSR_INT_BIT_FH_TX)
++	else if (handled & CSR_INT_BIT_FH_TX)
+ 		iwl_enable_fw_load_int(trans);
+-	/* only Re-enable all interrupt if disabled by irq */
+-	else if (test_bit(STATUS_INT_ENABLED, &trans->status))
+-		iwl_enable_interrupts(trans);
+ 	/* Re-enable RF_KILL if it occurred */
+ 	else if (handled & CSR_INT_BIT_RF_KILL)
+ 		iwl_enable_rfkill_int(trans);
++	spin_unlock(&trans_pcie->irq_lock);
+ 
+ out:
+ 	lock_map_release(&trans->sync_cmd_lockdep_map);
+@@ -1771,7 +1773,7 @@ void iwl_pcie_reset_ict(struct iwl_trans
+ 		return;
+ 
+ 	spin_lock(&trans_pcie->irq_lock);
+-	iwl_disable_interrupts(trans);
++	_iwl_disable_interrupts(trans);
+ 
+ 	memset(trans_pcie->ict_tbl, 0, ICT_SIZE);
+ 
+@@ -1787,7 +1789,7 @@ void iwl_pcie_reset_ict(struct iwl_trans
+ 	trans_pcie->use_ict = true;
+ 	trans_pcie->ict_index = 0;
+ 	iwl_write32(trans, CSR_INT, trans_pcie->inta_mask);
+-	iwl_enable_interrupts(trans);
++	_iwl_enable_interrupts(trans);
+ 	spin_unlock(&trans_pcie->irq_lock);
+ }
+ 
+--- a/drivers/net/wireless/intel/iwlwifi/pcie/trans.c
++++ b/drivers/net/wireless/intel/iwlwifi/pcie/trans.c
+@@ -1037,9 +1037,7 @@ static void _iwl_trans_pcie_stop_device(
+ 	was_hw_rfkill = iwl_is_rfkill_set(trans);
+ 
+ 	/* tell the device to stop sending interrupts */
+-	spin_lock(&trans_pcie->irq_lock);
+ 	iwl_disable_interrupts(trans);
+-	spin_unlock(&trans_pcie->irq_lock);
+ 
+ 	/* device going down, Stop using ICT table */
+ 	iwl_pcie_disable_ict(trans);
+@@ -1083,9 +1081,7 @@ static void _iwl_trans_pcie_stop_device(
+ 	 * the time, unless the interrupt is ACKed even if the interrupt
+ 	 * should be masked. Re-ACK all the interrupts here.
+ 	 */
+-	spin_lock(&trans_pcie->irq_lock);
+ 	iwl_disable_interrupts(trans);
+-	spin_unlock(&trans_pcie->irq_lock);
+ 
+ 	/* clear all status bits */
+ 	clear_bit(STATUS_SYNC_HCMD_ACTIVE, &trans->status);
+@@ -1570,15 +1566,11 @@ static void iwl_trans_pcie_op_mode_leave
+ 	mutex_lock(&trans_pcie->mutex);
+ 
+ 	/* disable interrupts - don't enable HW RF kill interrupt */
+-	spin_lock(&trans_pcie->irq_lock);
+ 	iwl_disable_interrupts(trans);
+-	spin_unlock(&trans_pcie->irq_lock);
+ 
+ 	iwl_pcie_apm_stop(trans, true);
+ 
+-	spin_lock(&trans_pcie->irq_lock);
+ 	iwl_disable_interrupts(trans);
+-	spin_unlock(&trans_pcie->irq_lock);
+ 
+ 	iwl_pcie_disable_ict(trans);
+ 
