@@ -1,0 +1,166 @@
+From dff0ca9ea7dc8be2181a62df4a722c32ce68ff4a Mon Sep 17 00:00:00 2001
+From: Nicholas Bellinger <nab@linux-iscsi.org>
+Date: Tue, 17 May 2016 22:19:10 -0700
+Subject: target: Fix ordered task target_setup_cmd_from_cdb exception hang
+
+From: Nicholas Bellinger <nab@linux-iscsi.org>
+
+commit dff0ca9ea7dc8be2181a62df4a722c32ce68ff4a upstream.
+
+If a command with a Simple task attribute is failed due to a Unit
+Attention, then a subsequent command with an Ordered task attribute
+will hang forever.  The reason for this is that the Unit Attention
+status is checked for in target_setup_cmd_from_cdb, before the call
+to target_execute_cmd, which calls target_handle_task_attr, which
+in turn increments dev->simple_cmds.
+
+However, transport_generic_request_failure still calls
+transport_complete_task_attr, which will decrement dev->simple_cmds.
+In this case, simple_cmds is now -1.  So when a command with the
+Ordered task attribute is sent, target_handle_task_attr sees that
+dev->simple_cmds is not 0, so it decides it can't execute the
+command until all the (nonexistent) Simple commands have completed.
+
+Reported-by: Michael Cyr <mikecyr@linux.vnet.ibm.com>
+Tested-by: Michael Cyr <mikecyr@linux.vnet.ibm.com>
+Reported-by: Bryant G. Ly <bryantly@linux.vnet.ibm.com>
+Tested-by: Bryant G. Ly <bryantly@linux.vnet.ibm.com>
+Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/target/target_core_internal.h  |    1 
+ drivers/target/target_core_sbc.c       |    2 -
+ drivers/target/target_core_transport.c |   62 ++++++++++++++++++---------------
+ include/target/target_core_fabric.h    |    1 
+ 4 files changed, 37 insertions(+), 29 deletions(-)
+
+--- a/drivers/target/target_core_internal.h
++++ b/drivers/target/target_core_internal.h
+@@ -146,6 +146,7 @@ sense_reason_t	target_cmd_size_check(str
+ void	target_qf_do_work(struct work_struct *work);
+ bool	target_check_wce(struct se_device *dev);
+ bool	target_check_fua(struct se_device *dev);
++void	__target_execute_cmd(struct se_cmd *, bool);
+ 
+ /* target_core_stat.c */
+ void	target_stat_setup_dev_default_groups(struct se_device *);
+--- a/drivers/target/target_core_sbc.c
++++ b/drivers/target/target_core_sbc.c
+@@ -602,7 +602,7 @@ static sense_reason_t compare_and_write_
+ 	cmd->transport_state |= CMD_T_ACTIVE|CMD_T_BUSY|CMD_T_SENT;
+ 	spin_unlock_irq(&cmd->t_state_lock);
+ 
+-	__target_execute_cmd(cmd);
++	__target_execute_cmd(cmd, false);
+ 
+ 	kfree(buf);
+ 	return ret;
+--- a/drivers/target/target_core_transport.c
++++ b/drivers/target/target_core_transport.c
+@@ -1303,23 +1303,6 @@ target_setup_cmd_from_cdb(struct se_cmd
+ 
+ 	trace_target_sequencer_start(cmd);
+ 
+-	/*
+-	 * Check for an existing UNIT ATTENTION condition
+-	 */
+-	ret = target_scsi3_ua_check(cmd);
+-	if (ret)
+-		return ret;
+-
+-	ret = target_alua_state_check(cmd);
+-	if (ret)
+-		return ret;
+-
+-	ret = target_check_reservation(cmd);
+-	if (ret) {
+-		cmd->scsi_status = SAM_STAT_RESERVATION_CONFLICT;
+-		return ret;
+-	}
+-
+ 	ret = dev->transport->parse_cdb(cmd);
+ 	if (ret == TCM_UNSUPPORTED_SCSI_OPCODE)
+ 		pr_warn_ratelimited("%s/%s: Unsupported SCSI Opcode 0x%02x, sending CHECK_CONDITION.\n",
+@@ -1761,20 +1744,45 @@ queue_full:
+ }
+ EXPORT_SYMBOL(transport_generic_request_failure);
+ 
+-void __target_execute_cmd(struct se_cmd *cmd)
++void __target_execute_cmd(struct se_cmd *cmd, bool do_checks)
+ {
+ 	sense_reason_t ret;
+ 
+-	if (cmd->execute_cmd) {
+-		ret = cmd->execute_cmd(cmd);
+-		if (ret) {
+-			spin_lock_irq(&cmd->t_state_lock);
+-			cmd->transport_state &= ~(CMD_T_BUSY|CMD_T_SENT);
+-			spin_unlock_irq(&cmd->t_state_lock);
++	if (!cmd->execute_cmd) {
++		ret = TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
++		goto err;
++	}
++	if (do_checks) {
++		/*
++		 * Check for an existing UNIT ATTENTION condition after
++		 * target_handle_task_attr() has done SAM task attr
++		 * checking, and possibly have already defered execution
++		 * out to target_restart_delayed_cmds() context.
++		 */
++		ret = target_scsi3_ua_check(cmd);
++		if (ret)
++			goto err;
++
++		ret = target_alua_state_check(cmd);
++		if (ret)
++			goto err;
+ 
+-			transport_generic_request_failure(cmd, ret);
++		ret = target_check_reservation(cmd);
++		if (ret) {
++			cmd->scsi_status = SAM_STAT_RESERVATION_CONFLICT;
++			goto err;
+ 		}
+ 	}
++
++	ret = cmd->execute_cmd(cmd);
++	if (!ret)
++		return;
++err:
++	spin_lock_irq(&cmd->t_state_lock);
++	cmd->transport_state &= ~(CMD_T_BUSY|CMD_T_SENT);
++	spin_unlock_irq(&cmd->t_state_lock);
++
++	transport_generic_request_failure(cmd, ret);
+ }
+ 
+ static int target_write_prot_action(struct se_cmd *cmd)
+@@ -1899,7 +1907,7 @@ void target_execute_cmd(struct se_cmd *c
+ 		return;
+ 	}
+ 
+-	__target_execute_cmd(cmd);
++	__target_execute_cmd(cmd, true);
+ }
+ EXPORT_SYMBOL(target_execute_cmd);
+ 
+@@ -1923,7 +1931,7 @@ static void target_restart_delayed_cmds(
+ 		list_del(&cmd->se_delayed_node);
+ 		spin_unlock(&dev->delayed_cmd_lock);
+ 
+-		__target_execute_cmd(cmd);
++		__target_execute_cmd(cmd, true);
+ 
+ 		if (cmd->sam_task_attr == TCM_ORDERED_TAG)
+ 			break;
+--- a/include/target/target_core_fabric.h
++++ b/include/target/target_core_fabric.h
+@@ -163,7 +163,6 @@ int	core_tmr_alloc_req(struct se_cmd *,
+ void	core_tmr_release_req(struct se_tmr_req *);
+ int	transport_generic_handle_tmr(struct se_cmd *);
+ void	transport_generic_request_failure(struct se_cmd *, sense_reason_t);
+-void	__target_execute_cmd(struct se_cmd *);
+ int	transport_lookup_tmr_lun(struct se_cmd *, u64);
+ void	core_allocate_nexus_loss_ua(struct se_node_acl *acl);
+ 
