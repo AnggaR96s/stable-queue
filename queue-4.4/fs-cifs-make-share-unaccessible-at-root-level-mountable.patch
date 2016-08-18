@@ -1,0 +1,253 @@
+From a6b5058fafdf508904bbf16c29b24042cef3c496 Mon Sep 17 00:00:00 2001
+From: Aurelien Aptel <aaptel@suse.com>
+Date: Wed, 25 May 2016 19:59:09 +0200
+Subject: fs/cifs: make share unaccessible at root level mountable
+
+From: Aurelien Aptel <aaptel@suse.com>
+
+commit a6b5058fafdf508904bbf16c29b24042cef3c496 upstream.
+
+if, when mounting //HOST/share/sub/dir/foo we can query /sub/dir/foo but
+not any of the path components above:
+
+- store the /sub/dir/foo prefix in the cifs super_block info
+- in the superblock, set root dentry to the subpath dentry (instead of
+  the share root)
+- set a flag in the superblock to remember it
+- use prefixpath when building path from a dentry
+
+fixes bso#8950
+
+Signed-off-by: Aurelien Aptel <aaptel@suse.com>
+Reviewed-by: Pavel Shilovsky <pshilovsky@samba.org>
+Signed-off-by: Steve French <smfrench@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/cifs/cifs_fs_sb.h |    4 ++++
+ fs/cifs/cifsfs.c     |   14 +++++++++++++-
+ fs/cifs/connect.c    |   49 +++++++++++++++++++++++++++++++++++++++++++++++++
+ fs/cifs/dir.c        |   20 ++++++++++++++++++--
+ fs/cifs/inode.c      |   22 ++++++++++++++++++++--
+ 5 files changed, 104 insertions(+), 5 deletions(-)
+
+--- a/fs/cifs/cifs_fs_sb.h
++++ b/fs/cifs/cifs_fs_sb.h
+@@ -46,6 +46,9 @@
+ #define CIFS_MOUNT_CIFS_BACKUPUID 0x200000 /* backup intent bit for a user */
+ #define CIFS_MOUNT_CIFS_BACKUPGID 0x400000 /* backup intent bit for a group */
+ #define CIFS_MOUNT_MAP_SFM_CHR	0x800000 /* SFM/MAC mapping for illegal chars */
++#define CIFS_MOUNT_USE_PREFIX_PATH 0x1000000 /* make subpath with unaccessible
++					      * root mountable
++					      */
+ 
+ struct cifs_sb_info {
+ 	struct rb_root tlink_tree;
+@@ -67,5 +70,6 @@ struct cifs_sb_info {
+ 	struct backing_dev_info bdi;
+ 	struct delayed_work prune_tlinks;
+ 	struct rcu_head rcu;
++	char *prepath;
+ };
+ #endif				/* _CIFS_FS_SB_H */
+--- a/fs/cifs/cifsfs.c
++++ b/fs/cifs/cifsfs.c
+@@ -686,6 +686,14 @@ cifs_do_mount(struct file_system_type *f
+ 		goto out_cifs_sb;
+ 	}
+ 
++	if (volume_info->prepath) {
++		cifs_sb->prepath = kstrdup(volume_info->prepath, GFP_KERNEL);
++		if (cifs_sb->prepath == NULL) {
++			root = ERR_PTR(-ENOMEM);
++			goto out_cifs_sb;
++		}
++	}
++
+ 	cifs_setup_cifs_sb(volume_info, cifs_sb);
+ 
+ 	rc = cifs_mount(cifs_sb, volume_info);
+@@ -724,7 +732,11 @@ cifs_do_mount(struct file_system_type *f
+ 		sb->s_flags |= MS_ACTIVE;
+ 	}
+ 
+-	root = cifs_get_root(volume_info, sb);
++	if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_USE_PREFIX_PATH)
++		root = dget(sb->s_root);
++	else
++		root = cifs_get_root(volume_info, sb);
++
+ 	if (IS_ERR(root))
+ 		goto out_super;
+ 
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@ -3517,6 +3517,44 @@ cifs_get_volume_info(char *mount_data, c
+ 	return volume_info;
+ }
+ 
++static int
++cifs_are_all_path_components_accessible(struct TCP_Server_Info *server,
++					unsigned int xid,
++					struct cifs_tcon *tcon,
++					struct cifs_sb_info *cifs_sb,
++					char *full_path)
++{
++	int rc;
++	char *s;
++	char sep, tmp;
++
++	sep = CIFS_DIR_SEP(cifs_sb);
++	s = full_path;
++
++	rc = server->ops->is_path_accessible(xid, tcon, cifs_sb, "");
++	while (rc == 0) {
++		/* skip separators */
++		while (*s == sep)
++			s++;
++		if (!*s)
++			break;
++		/* next separator */
++		while (*s && *s != sep)
++			s++;
++
++		/*
++		 * temporarily null-terminate the path at the end of
++		 * the current component
++		 */
++		tmp = *s;
++		*s = 0;
++		rc = server->ops->is_path_accessible(xid, tcon, cifs_sb,
++						     full_path);
++		*s = tmp;
++	}
++	return rc;
++}
++
+ int
+ cifs_mount(struct cifs_sb_info *cifs_sb, struct smb_vol *volume_info)
+ {
+@@ -3654,6 +3692,16 @@ remote_path_check:
+ 			kfree(full_path);
+ 			goto mount_fail_check;
+ 		}
++
++		rc = cifs_are_all_path_components_accessible(server,
++							     xid, tcon, cifs_sb,
++							     full_path);
++		if (rc != 0) {
++			cifs_dbg(VFS, "cannot query dirs between root and final path, "
++				 "enabling CIFS_MOUNT_USE_PREFIX_PATH\n");
++			cifs_sb->mnt_cifs_flags |= CIFS_MOUNT_USE_PREFIX_PATH;
++			rc = 0;
++		}
+ 		kfree(full_path);
+ 	}
+ 
+@@ -3923,6 +3971,7 @@ cifs_umount(struct cifs_sb_info *cifs_sb
+ 
+ 	bdi_destroy(&cifs_sb->bdi);
+ 	kfree(cifs_sb->mountdata);
++	kfree(cifs_sb->prepath);
+ 	call_rcu(&cifs_sb->rcu, delayed_free);
+ }
+ 
+--- a/fs/cifs/dir.c
++++ b/fs/cifs/dir.c
+@@ -84,6 +84,7 @@ build_path_from_dentry(struct dentry *di
+ 	struct dentry *temp;
+ 	int namelen;
+ 	int dfsplen;
++	int pplen = 0;
+ 	char *full_path;
+ 	char dirsep;
+ 	struct cifs_sb_info *cifs_sb = CIFS_SB(direntry->d_sb);
+@@ -95,8 +96,12 @@ build_path_from_dentry(struct dentry *di
+ 		dfsplen = strnlen(tcon->treeName, MAX_TREE_SIZE + 1);
+ 	else
+ 		dfsplen = 0;
++
++	if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_USE_PREFIX_PATH)
++		pplen = cifs_sb->prepath ? strlen(cifs_sb->prepath) + 1 : 0;
++
+ cifs_bp_rename_retry:
+-	namelen = dfsplen;
++	namelen = dfsplen + pplen;
+ 	seq = read_seqbegin(&rename_lock);
+ 	rcu_read_lock();
+ 	for (temp = direntry; !IS_ROOT(temp);) {
+@@ -137,7 +142,7 @@ cifs_bp_rename_retry:
+ 		}
+ 	}
+ 	rcu_read_unlock();
+-	if (namelen != dfsplen || read_seqretry(&rename_lock, seq)) {
++	if (namelen != dfsplen + pplen || read_seqretry(&rename_lock, seq)) {
+ 		cifs_dbg(FYI, "did not end path lookup where expected. namelen=%ddfsplen=%d\n",
+ 			 namelen, dfsplen);
+ 		/* presumably this is only possible if racing with a rename
+@@ -153,6 +158,17 @@ cifs_bp_rename_retry:
+ 	   those safely to '/' if any are found in the middle of the prepath */
+ 	/* BB test paths to Windows with '/' in the midst of prepath */
+ 
++	if (pplen) {
++		int i;
++
++		cifs_dbg(FYI, "using cifs_sb prepath <%s>\n", cifs_sb->prepath);
++		memcpy(full_path+dfsplen+1, cifs_sb->prepath, pplen-1);
++		full_path[dfsplen] = '\\';
++		for (i = 0; i < pplen-1; i++)
++			if (full_path[dfsplen+1+i] == '/')
++				full_path[dfsplen+1+i] = CIFS_DIR_SEP(cifs_sb);
++	}
++
+ 	if (dfsplen) {
+ 		strncpy(full_path, tcon->treeName, dfsplen);
+ 		if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_POSIX_PATHS) {
+--- a/fs/cifs/inode.c
++++ b/fs/cifs/inode.c
+@@ -982,10 +982,26 @@ struct inode *cifs_root_iget(struct supe
+ 	struct inode *inode = NULL;
+ 	long rc;
+ 	struct cifs_tcon *tcon = cifs_sb_master_tcon(cifs_sb);
++	char *path = NULL;
++	int len;
++
++	if ((cifs_sb->mnt_cifs_flags & CIFS_MOUNT_USE_PREFIX_PATH)
++	    && cifs_sb->prepath) {
++		len = strlen(cifs_sb->prepath);
++		path = kzalloc(len + 2 /* leading sep + null */, GFP_KERNEL);
++		if (path == NULL)
++			return ERR_PTR(-ENOMEM);
++		path[0] = '/';
++		memcpy(path+1, cifs_sb->prepath, len);
++	} else {
++		path = kstrdup("", GFP_KERNEL);
++		if (path == NULL)
++			return ERR_PTR(-ENOMEM);
++	}
+ 
+ 	xid = get_xid();
+ 	if (tcon->unix_ext) {
+-		rc = cifs_get_inode_info_unix(&inode, "", sb, xid);
++		rc = cifs_get_inode_info_unix(&inode, path, sb, xid);
+ 		/* some servers mistakenly claim POSIX support */
+ 		if (rc != -EOPNOTSUPP)
+ 			goto iget_no_retry;
+@@ -993,7 +1009,8 @@ struct inode *cifs_root_iget(struct supe
+ 		tcon->unix_ext = false;
+ 	}
+ 
+-	rc = cifs_get_inode_info(&inode, "", NULL, sb, xid, NULL);
++	convert_delimiter(path, CIFS_DIR_SEP(cifs_sb));
++	rc = cifs_get_inode_info(&inode, path, NULL, sb, xid, NULL);
+ 
+ iget_no_retry:
+ 	if (!inode) {
+@@ -1022,6 +1039,7 @@ iget_no_retry:
+ 	}
+ 
+ out:
++	kfree(path);
+ 	/* can not call macro free_xid here since in a void func
+ 	 * TODO: This is no longer true
+ 	 */
