@@ -1,0 +1,123 @@
+From 6039892396d845b18228935561960441900cffca Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Wed, 10 Aug 2016 16:27:58 -0700
+Subject: mm/slub.c: run free_partial() outside of the kmem_cache_node->list_lock
+
+From: Chris Wilson <chris@chris-wilson.co.uk>
+
+commit 6039892396d845b18228935561960441900cffca upstream.
+
+With debugobjects enabled and using SLAB_DESTROY_BY_RCU, when a
+kmem_cache_node is destroyed the call_rcu() may trigger a slab
+allocation to fill the debug object pool (__debug_object_init:fill_pool).
+
+Everywhere but during kmem_cache_destroy(), discard_slab() is performed
+outside of the kmem_cache_node->list_lock and avoids a lockdep warning
+about potential recursion:
+
+  =============================================
+  [ INFO: possible recursive locking detected ]
+  4.8.0-rc1-gfxbench+ #1 Tainted: G     U
+  ---------------------------------------------
+  rmmod/8895 is trying to acquire lock:
+   (&(&n->list_lock)->rlock){-.-...}, at: [<ffffffff811c80d7>] get_partial_node.isra.63+0x47/0x430
+
+  but task is already holding lock:
+   (&(&n->list_lock)->rlock){-.-...}, at: [<ffffffff811cbda4>] __kmem_cache_shutdown+0x54/0x320
+
+  other info that might help us debug this:
+  Possible unsafe locking scenario:
+        CPU0
+        ----
+   lock(&(&n->list_lock)->rlock);
+   lock(&(&n->list_lock)->rlock);
+
+   *** DEADLOCK ***
+   May be due to missing lock nesting notation
+   5 locks held by rmmod/8895:
+   #0:  (&dev->mutex){......}, at: driver_detach+0x42/0xc0
+   #1:  (&dev->mutex){......}, at: driver_detach+0x50/0xc0
+   #2:  (cpu_hotplug.dep_map){++++++}, at: get_online_cpus+0x2d/0x80
+   #3:  (slab_mutex){+.+.+.}, at: kmem_cache_destroy+0x3c/0x220
+   #4:  (&(&n->list_lock)->rlock){-.-...}, at: __kmem_cache_shutdown+0x54/0x320
+
+  stack backtrace:
+  CPU: 6 PID: 8895 Comm: rmmod Tainted: G     U          4.8.0-rc1-gfxbench+ #1
+  Hardware name: Gigabyte Technology Co., Ltd. H87M-D3H/H87M-D3H, BIOS F11 08/18/2015
+  Call Trace:
+    __lock_acquire+0x1646/0x1ad0
+    lock_acquire+0xb2/0x200
+    _raw_spin_lock+0x36/0x50
+    get_partial_node.isra.63+0x47/0x430
+    ___slab_alloc.constprop.67+0x1a7/0x3b0
+    __slab_alloc.isra.64.constprop.66+0x43/0x80
+    kmem_cache_alloc+0x236/0x2d0
+    __debug_object_init+0x2de/0x400
+    debug_object_activate+0x109/0x1e0
+    __call_rcu.constprop.63+0x32/0x2f0
+    call_rcu+0x12/0x20
+    discard_slab+0x3d/0x40
+    __kmem_cache_shutdown+0xdb/0x320
+    shutdown_cache+0x19/0x60
+    kmem_cache_destroy+0x1ae/0x220
+    i915_gem_load_cleanup+0x14/0x40 [i915]
+    i915_driver_unload+0x151/0x180 [i915]
+    i915_pci_remove+0x14/0x20 [i915]
+    pci_device_remove+0x34/0xb0
+    __device_release_driver+0x95/0x140
+    driver_detach+0xb6/0xc0
+    bus_remove_driver+0x53/0xd0
+    driver_unregister+0x27/0x50
+    pci_unregister_driver+0x25/0x70
+    i915_exit+0x1a/0x1e2 [i915]
+    SyS_delete_module+0x193/0x1f0
+    entry_SYSCALL_64_fastpath+0x1c/0xac
+
+Fixes: 52b4b950b507 ("mm: slab: free kmem_cache_node after destroy sysfs file")
+Link: http://lkml.kernel.org/r/1470759070-18743-1-git-send-email-chris@chris-wilson.co.uk
+Reported-by: Dave Gordon <david.s.gordon@intel.com>
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Vladimir Davydov <vdavydov@virtuozzo.com>
+Acked-by: Christoph Lameter <cl@linux.com>
+Cc: Pekka Enberg <penberg@kernel.org>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+Cc: Dmitry Safonov <dsafonov@virtuozzo.com>
+Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+Cc: Dave Gordon <david.s.gordon@intel.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ mm/slub.c |    6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -3479,6 +3479,7 @@ static void list_slab_objects(struct kme
+  */
+ static void free_partial(struct kmem_cache *s, struct kmem_cache_node *n)
+ {
++	LIST_HEAD(discard);
+ 	struct page *page, *h;
+ 
+ 	BUG_ON(irqs_disabled());
+@@ -3486,13 +3487,16 @@ static void free_partial(struct kmem_cac
+ 	list_for_each_entry_safe(page, h, &n->partial, lru) {
+ 		if (!page->inuse) {
+ 			remove_partial(n, page);
+-			discard_slab(s, page);
++			list_add(&page->lru, &discard);
+ 		} else {
+ 			list_slab_objects(s, page,
+ 			"Objects remaining in %s on __kmem_cache_shutdown()");
+ 		}
+ 	}
+ 	spin_unlock_irq(&n->list_lock);
++
++	list_for_each_entry_safe(page, h, &discard, lru)
++		discard_slab(s, page);
+ }
+ 
+ /*
