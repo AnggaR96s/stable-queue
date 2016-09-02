@@ -1,0 +1,225 @@
+From b00a726a9fd82ddd4c10344e46f0d371e1674303 Mon Sep 17 00:00:00 2001
+From: Keith Busch <keith.busch@intel.com>
+Date: Wed, 24 Feb 2016 09:15:52 -0700
+Subject: NVMe: Don't unmap controller registers on reset
+
+From: Keith Busch <keith.busch@intel.com>
+
+Commit b00a726a9fd82ddd4c10344e46f0d371e1674303 upstream.
+
+Unmapping the registers on reset or shutdown is not necessary. Keeping
+the mapping simplifies reset handling.
+
+This was backported to 4.4 stable tree because it prevents a race
+between the reset_work and the shutdown hook, that may provoke the Oops
+below, in the nvme_wait_ready function.
+
+The Oops is easily reproducible on systems that will kexec/reboot
+immediately after booting, which is actually the common use case for
+kexec based bootloaders, like Petitboot.  This patch removes the
+unnecessary early unmapping of the PCI configuration in the shutdown
+hook, allowing a proper handling of the reset work.
+
+Unable to handle kernel paging request for data at address 0x0000001c
+Faulting instruction address: 0xd000000000720b38
+cpu 0x1b: Vector: 300 (Data Access) at [c000007f7a9a38a0]
+    pc: d000000000720b38: nvme_wait_ready+0x50/0x120 [nvme]
+    lr: d000000000720b7c: nvme_wait_ready+0x94/0x120 [nvme]
+    sp: c000007f7a9a3b20
+   msr: 9000000000009033
+   dar: 1c
+ dsisr: 40000000
+  current = 0xc000007f7a926c80
+  paca    = 0xc00000000fe85100   softe: 0        irq_happened: 0x01
+    pid   = 2608, comm = kworker/27:1
+enter ? for help
+[c000007f7a9a3bb0] d00000000072572c nvme_setup_io_queues+0xc08/0x1218 [nvme]
+[c000007f7a9a3c70] c00000000006bbd8 process_one_work+0x228/0x378
+[c000007f7a9a3d00] c00000000006c050 worker_thread+0x2e0/0x420
+[c000007f7a9a3d80] c00000000007161c kthread+0xfc/0x108
+[c000007f7a9a3e30] c0000000000094b4 ret_from_kernel_thread+0x5c/0xa8
+
+Signed-off-by: Keith Busch <keith.busch@intel.com>
+Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Jens Axboe <axboe@fb.com>
+Signed-off-by: Gabriel Krisman Bertazi <krisman@linux.vnet.ibm.com>
+	[Backport to v4.4.y]
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/nvme/host/pci.c |   71 +++++++++++++++++++++++++++++-------------------
+ 1 file changed, 43 insertions(+), 28 deletions(-)
+
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -2672,10 +2672,10 @@ static int nvme_dev_add(struct nvme_dev
+ 	return 0;
+ }
+ 
+-static int nvme_dev_map(struct nvme_dev *dev)
++static int nvme_pci_enable(struct nvme_dev *dev)
+ {
+ 	u64 cap;
+-	int bars, result = -ENOMEM;
++	int result = -ENOMEM;
+ 	struct pci_dev *pdev = to_pci_dev(dev->dev);
+ 
+ 	if (pci_enable_device_mem(pdev))
+@@ -2683,24 +2683,14 @@ static int nvme_dev_map(struct nvme_dev
+ 
+ 	dev->entry[0].vector = pdev->irq;
+ 	pci_set_master(pdev);
+-	bars = pci_select_bars(pdev, IORESOURCE_MEM);
+-	if (!bars)
+-		goto disable_pci;
+-
+-	if (pci_request_selected_regions(pdev, bars, "nvme"))
+-		goto disable_pci;
+ 
+ 	if (dma_set_mask_and_coherent(dev->dev, DMA_BIT_MASK(64)) &&
+ 	    dma_set_mask_and_coherent(dev->dev, DMA_BIT_MASK(32)))
+ 		goto disable;
+ 
+-	dev->bar = ioremap(pci_resource_start(pdev, 0), 8192);
+-	if (!dev->bar)
+-		goto disable;
+-
+ 	if (readl(&dev->bar->csts) == -1) {
+ 		result = -ENODEV;
+-		goto unmap;
++		goto disable;
+ 	}
+ 
+ 	/*
+@@ -2710,7 +2700,7 @@ static int nvme_dev_map(struct nvme_dev
+ 	if (!pdev->irq) {
+ 		result = pci_enable_msix(pdev, dev->entry, 1);
+ 		if (result < 0)
+-			goto unmap;
++			goto disable;
+ 	}
+ 
+ 	cap = lo_hi_readq(&dev->bar->cap);
+@@ -2734,18 +2724,21 @@ static int nvme_dev_map(struct nvme_dev
+ 
+ 	return 0;
+ 
+- unmap:
+-	iounmap(dev->bar);
+-	dev->bar = NULL;
+  disable:
+ 	pci_release_regions(pdev);
+- disable_pci:
+-	pci_disable_device(pdev);
++
+ 	return result;
+ }
+ 
+ static void nvme_dev_unmap(struct nvme_dev *dev)
+ {
++	if (dev->bar)
++		iounmap(dev->bar);
++	pci_release_regions(to_pci_dev(dev->dev));
++}
++
++static void nvme_pci_disable(struct nvme_dev *dev)
++{
+ 	struct pci_dev *pdev = to_pci_dev(dev->dev);
+ 
+ 	if (pdev->msi_enabled)
+@@ -2753,12 +2746,6 @@ static void nvme_dev_unmap(struct nvme_d
+ 	else if (pdev->msix_enabled)
+ 		pci_disable_msix(pdev);
+ 
+-	if (dev->bar) {
+-		iounmap(dev->bar);
+-		dev->bar = NULL;
+-		pci_release_regions(pdev);
+-	}
+-
+ 	if (pci_is_enabled(pdev))
+ 		pci_disable_device(pdev);
+ }
+@@ -2962,7 +2949,7 @@ static void nvme_dev_shutdown(struct nvm
+ 
+ 	nvme_dev_list_remove(dev);
+ 
+-	if (dev->bar) {
++	if (pci_is_enabled(to_pci_dev(dev->dev))) {
+ 		nvme_freeze_queues(dev);
+ 		csts = readl(&dev->bar->csts);
+ 	}
+@@ -2976,7 +2963,7 @@ static void nvme_dev_shutdown(struct nvm
+ 		nvme_shutdown_ctrl(dev);
+ 		nvme_disable_queue(dev, 0);
+ 	}
+-	nvme_dev_unmap(dev);
++	nvme_pci_disable(dev);
+ 
+ 	for (i = dev->queue_count - 1; i >= 0; i--)
+ 		nvme_clear_queue(dev->queues[i]);
+@@ -3136,7 +3123,7 @@ static void nvme_probe_work(struct work_
+ 	bool start_thread = false;
+ 	int result;
+ 
+-	result = nvme_dev_map(dev);
++	result = nvme_pci_enable(dev);
+ 	if (result)
+ 		goto out;
+ 
+@@ -3292,6 +3279,27 @@ static ssize_t nvme_sysfs_reset(struct d
+ }
+ static DEVICE_ATTR(reset_controller, S_IWUSR, NULL, nvme_sysfs_reset);
+ 
++static int nvme_dev_map(struct nvme_dev *dev)
++{
++	int bars;
++	struct pci_dev *pdev = to_pci_dev(dev->dev);
++
++	bars = pci_select_bars(pdev, IORESOURCE_MEM);
++	if (!bars)
++		return -ENODEV;
++	if (pci_request_selected_regions(pdev, bars, "nvme"))
++		return -ENODEV;
++
++	dev->bar = ioremap(pci_resource_start(pdev, 0), 8192);
++	if (!dev->bar)
++		goto release;
++
++	return 0;
++release:
++	pci_release_regions(pdev);
++	return -ENODEV;
++}
++
+ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ {
+ 	int node, result = -ENOMEM;
+@@ -3317,6 +3325,11 @@ static int nvme_probe(struct pci_dev *pd
+ 	INIT_WORK(&dev->reset_work, nvme_reset_work);
+ 	dev->dev = get_device(&pdev->dev);
+ 	pci_set_drvdata(pdev, dev);
++
++	result = nvme_dev_map(dev);
++	if (result)
++		goto free;
++
+ 	result = nvme_set_instance(dev);
+ 	if (result)
+ 		goto put_pci;
+@@ -3355,6 +3368,7 @@ static int nvme_probe(struct pci_dev *pd
+ 	nvme_release_instance(dev);
+  put_pci:
+ 	put_device(dev->dev);
++	nvme_dev_unmap(dev);
+  free:
+ 	kfree(dev->queues);
+ 	kfree(dev->entry);
+@@ -3398,6 +3412,7 @@ static void nvme_remove(struct pci_dev *
+ 	nvme_free_queues(dev, 0);
+ 	nvme_release_cmb(dev);
+ 	nvme_release_prp_pools(dev);
++	nvme_dev_unmap(dev);
+ 	kref_put(&dev->kref, nvme_free_dev);
+ }
+ 
