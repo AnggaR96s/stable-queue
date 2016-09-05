@@ -1,0 +1,176 @@
+From 403fe7f34e3327ddac2e06a15e76a293d613381e Mon Sep 17 00:00:00 2001
+From: Ian Abbott <abbotti@mev.co.uk>
+Date: Thu, 30 Jun 2016 19:58:32 +0100
+Subject: staging: comedi: comedi_test: fix timer race conditions
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+From: Ian Abbott <abbotti@mev.co.uk>
+
+commit 403fe7f34e3327ddac2e06a15e76a293d613381e upstream.
+
+Commit 73e0e4dfed4c ("staging: comedi: comedi_test: fix timer lock-up")
+fixed a lock-up in the timer routine `waveform_ai_timer()` (which was
+called `waveform_ai_interrupt()` at the time) caused by
+commit 240512474424 ("staging: comedi: comedi_test: use
+comedi_handle_events()").  However, it introduced a race condition that
+can result in the timer routine misbehaving, such as accessing freed
+memory or dereferencing a NULL pointer.
+
+73e0... changed the timer routine to do nothing unless a
+`WAVEFORM_AI_RUNNING` flag was set, and changed `waveform_ai_cancel()`
+to clear the flag and replace a call to `del_timer_sync()` with a call
+to `del_timer()`.  `waveform_ai_cancel()` may be called from the timer
+routine itself (via `comedi_handle_events()`), or from `do_cancel()`.
+(`do_cancel()` is called as a result of a file operation (usually a
+`COMEDI_CANCEL` ioctl command, or a release), or during device removal.)
+When called from `do_cancel()`, the call to `waveform_ai_cancel()` is
+followed by a call to `do_become_nonbusy()`, which frees up stuff for
+the current asynchronous command under the assumption that it is now
+safe to do so.  The race condition occurs when the timer routine
+`waveform_ai_timer()` checks the `WAVEFORM_AI_RUNNING` flag just before
+it is cleared by `waveform_ai_cancel()`, and is still running during the
+call to `do_become_nonbusy()`.  In particular, it can lead to a NULL
+pointer dereference:
+
+BUG: unable to handle kernel NULL pointer dereference at (null)
+IP: [<ffffffffc0c63add>] waveform_ai_timer+0x17d/0x290 [comedi_test]
+
+That corresponds to this line in `waveform_ai_timer()`:
+
+		unsigned int chanspec = cmd->chanlist[async->cur_chan];
+
+but `do_become_nonbusy()` frees `cmd->chanlist` and sets it to `NULL`.
+
+Fix the race by calling `del_timer_sync()` instead of `del_timer()` in
+`waveform_ai_cancel()` when not in an interrupt context.  The only time
+`waveform_ai_cancel()` is called in an interrupt context is when it is
+called from the timer routine itself, via `comedi_handle_events()`.
+
+There is no longer any need for the `WAVEFORM_AI_RUNNING` flag, so get
+rid of it.
+
+The bug was copied from the AI subdevice to the AO when support for
+commands on the AO subdevice was added by commit 0cf55bbef2f9 ("staging:
+comedi: comedi_test: implement commands on AO subdevice").  That
+involves the timer routine `waveform_ao_timer()`, the comedi "cancel"
+routine `waveform_ao_cancel()`, and the flag `WAVEFORM_AO_RUNNING`.  Fix
+it in the same way as for the AI subdevice.
+
+Fixes: 73e0e4dfed4c ("staging: comedi: comedi_test: fix timer lock-up")
+Fixes: 0cf55bbef2f9 ("staging: comedi: comedi_test: implement commands
+ on AO subdevice")
+Reported-by: Éric Piel <piel@delmic.com>
+Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+Cc: Éric Piel <piel@delmic.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/staging/comedi/drivers/comedi_test.c |   46 +++++++--------------------
+ 1 file changed, 12 insertions(+), 34 deletions(-)
+
+--- a/drivers/staging/comedi/drivers/comedi_test.c
++++ b/drivers/staging/comedi/drivers/comedi_test.c
+@@ -56,11 +56,6 @@
+ 
+ #define N_CHANS 8
+ 
+-enum waveform_state_bits {
+-	WAVEFORM_AI_RUNNING,
+-	WAVEFORM_AO_RUNNING
+-};
+-
+ /* Data unique to this driver */
+ struct waveform_private {
+ 	struct timer_list ai_timer;	/* timer for AI commands */
+@@ -68,7 +63,6 @@ struct waveform_private {
+ 	unsigned int wf_amplitude;	/* waveform amplitude in microvolts */
+ 	unsigned int wf_period;		/* waveform period in microseconds */
+ 	unsigned int wf_current;	/* current time in waveform period */
+-	unsigned long state_bits;
+ 	unsigned int ai_scan_period;	/* AI scan period in usec */
+ 	unsigned int ai_convert_period;	/* AI conversion period in usec */
+ 	struct timer_list ao_timer;	/* timer for AO commands */
+@@ -191,10 +185,6 @@ static void waveform_ai_timer(unsigned l
+ 	unsigned int nsamples;
+ 	unsigned int time_increment;
+ 
+-	/* check command is still active */
+-	if (!test_bit(WAVEFORM_AI_RUNNING, &devpriv->state_bits))
+-		return;
+-
+ 	now = ktime_to_us(ktime_get());
+ 	nsamples = comedi_nsamples_left(s, UINT_MAX);
+ 
+@@ -386,11 +376,6 @@ static int waveform_ai_cmd(struct comedi
+ 	 */
+ 	devpriv->ai_timer.expires =
+ 		jiffies + usecs_to_jiffies(devpriv->ai_convert_period) + 1;
+-
+-	/* mark command as active */
+-	smp_mb__before_atomic();
+-	set_bit(WAVEFORM_AI_RUNNING, &devpriv->state_bits);
+-	smp_mb__after_atomic();
+ 	add_timer(&devpriv->ai_timer);
+ 	return 0;
+ }
+@@ -400,11 +385,12 @@ static int waveform_ai_cancel(struct com
+ {
+ 	struct waveform_private *devpriv = dev->private;
+ 
+-	/* mark command as no longer active */
+-	clear_bit(WAVEFORM_AI_RUNNING, &devpriv->state_bits);
+-	smp_mb__after_atomic();
+-	/* cannot call del_timer_sync() as may be called from timer routine */
+-	del_timer(&devpriv->ai_timer);
++	if (in_softirq()) {
++		/* Assume we were called from the timer routine itself. */
++		del_timer(&devpriv->ai_timer);
++	} else {
++		del_timer_sync(&devpriv->ai_timer);
++	}
+ 	return 0;
+ }
+ 
+@@ -436,10 +422,6 @@ static void waveform_ao_timer(unsigned l
+ 	u64 scans_since;
+ 	unsigned int scans_avail = 0;
+ 
+-	/* check command is still active */
+-	if (!test_bit(WAVEFORM_AO_RUNNING, &devpriv->state_bits))
+-		return;
+-
+ 	/* determine number of scan periods since last time */
+ 	now = ktime_to_us(ktime_get());
+ 	scans_since = now - devpriv->ao_last_scan_time;
+@@ -518,11 +500,6 @@ static int waveform_ao_inttrig_start(str
+ 	devpriv->ao_last_scan_time = ktime_to_us(ktime_get());
+ 	devpriv->ao_timer.expires =
+ 		jiffies + usecs_to_jiffies(devpriv->ao_scan_period);
+-
+-	/* mark command as active */
+-	smp_mb__before_atomic();
+-	set_bit(WAVEFORM_AO_RUNNING, &devpriv->state_bits);
+-	smp_mb__after_atomic();
+ 	add_timer(&devpriv->ao_timer);
+ 
+ 	return 1;
+@@ -608,11 +585,12 @@ static int waveform_ao_cancel(struct com
+ 	struct waveform_private *devpriv = dev->private;
+ 
+ 	s->async->inttrig = NULL;
+-	/* mark command as no longer active */
+-	clear_bit(WAVEFORM_AO_RUNNING, &devpriv->state_bits);
+-	smp_mb__after_atomic();
+-	/* cannot call del_timer_sync() as may be called from timer routine */
+-	del_timer(&devpriv->ao_timer);
++	if (in_softirq()) {
++		/* Assume we were called from the timer routine itself. */
++		del_timer(&devpriv->ao_timer);
++	} else {
++		del_timer_sync(&devpriv->ao_timer);
++	}
+ 	return 0;
+ }
+ 
