@@ -1,0 +1,270 @@
+From 8670bd6f526d0953e614d6d3bb1652b4a26587c0 Mon Sep 17 00:00:00 2001
+From: Olaf Hering <olaf@aepfle.de>
+Date: Mon, 14 Dec 2015 16:01:33 -0800
+Subject: [PATCH 035/135] Drivers: hv: utils: run polling callback always in
+ interrupt context
+
+[ Upstream commit 3cace4a616108539e2730f8dc21a636474395e0f ]
+
+All channel interrupts are bound to specific VCPUs in the guest
+at the point channel is created. While currently, we invoke the
+polling function on the correct CPU (the CPU to which the channel
+is bound to) in some cases we may run the polling function in
+a non-interrupt context. This  potentially can cause an issue as the
+polling function can be interrupted by the channel callback function.
+Fix the issue by running the polling function on the appropriate CPU
+at interrupt level. Additional details of the issue being addressed by
+this patch are given below:
+
+Currently hv_fcopy_onchannelcallback is called from interrupts and also
+via the ->write function of hv_utils. Since the used global variables to
+maintain state are not thread safe the state can get out of sync.
+This affects the variable state as well as the channel inbound buffer.
+
+As suggested by KY adjust hv_poll_channel to always run the given
+callback on the cpu which the channel is bound to. This avoids the need
+for locking because all the util services are single threaded and only
+one transaction is active at any given point in time.
+
+Additionally, remove the context variable, they will always be the same as
+recv_channel.
+
+Signed-off-by: Olaf Hering <olaf@aepfle.de>
+Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/hv/hv_fcopy.c     |   34 ++++++++++++----------------------
+ drivers/hv/hv_kvp.c       |   28 ++++++++++------------------
+ drivers/hv/hv_snapshot.c  |   29 +++++++++++------------------
+ drivers/hv/hyperv_vmbus.h |    6 +-----
+ 4 files changed, 34 insertions(+), 63 deletions(-)
+
+--- a/drivers/hv/hv_fcopy.c
++++ b/drivers/hv/hv_fcopy.c
+@@ -51,7 +51,6 @@ static struct {
+ 	struct hv_fcopy_hdr  *fcopy_msg; /* current message */
+ 	struct vmbus_channel *recv_channel; /* chn we got the request */
+ 	u64 recv_req_id; /* request ID. */
+-	void *fcopy_context; /* for the channel callback */
+ } fcopy_transaction;
+ 
+ static void fcopy_respond_to_host(int error);
+@@ -67,6 +66,13 @@ static struct hvutil_transport *hvt;
+  */
+ static int dm_reg_value;
+ 
++static void fcopy_poll_wrapper(void *channel)
++{
++	/* Transaction is finished, reset the state here to avoid races. */
++	fcopy_transaction.state = HVUTIL_READY;
++	hv_fcopy_onchannelcallback(channel);
++}
++
+ static void fcopy_timeout_func(struct work_struct *dummy)
+ {
+ 	/*
+@@ -74,13 +80,7 @@ static void fcopy_timeout_func(struct wo
+ 	 * process the pending transaction.
+ 	 */
+ 	fcopy_respond_to_host(HV_E_FAIL);
+-
+-	/* Transaction is finished, reset the state. */
+-	if (fcopy_transaction.state > HVUTIL_READY)
+-		fcopy_transaction.state = HVUTIL_READY;
+-
+-	hv_poll_channel(fcopy_transaction.fcopy_context,
+-			hv_fcopy_onchannelcallback);
++	hv_poll_channel(fcopy_transaction.recv_channel, fcopy_poll_wrapper);
+ }
+ 
+ static int fcopy_handle_handshake(u32 version)
+@@ -108,9 +108,7 @@ static int fcopy_handle_handshake(u32 ve
+ 		return -EINVAL;
+ 	}
+ 	pr_debug("FCP: userspace daemon ver. %d registered\n", version);
+-	fcopy_transaction.state = HVUTIL_READY;
+-	hv_poll_channel(fcopy_transaction.fcopy_context,
+-			hv_fcopy_onchannelcallback);
++	hv_poll_channel(fcopy_transaction.recv_channel, fcopy_poll_wrapper);
+ 	return 0;
+ }
+ 
+@@ -227,15 +225,8 @@ void hv_fcopy_onchannelcallback(void *co
+ 	int util_fw_version;
+ 	int fcopy_srv_version;
+ 
+-	if (fcopy_transaction.state > HVUTIL_READY) {
+-		/*
+-		 * We will defer processing this callback once
+-		 * the current transaction is complete.
+-		 */
+-		fcopy_transaction.fcopy_context = context;
++	if (fcopy_transaction.state > HVUTIL_READY)
+ 		return;
+-	}
+-	fcopy_transaction.fcopy_context = NULL;
+ 
+ 	vmbus_recvpacket(channel, recv_buffer, PAGE_SIZE * 2, &recvlen,
+ 			 &requestid);
+@@ -305,9 +296,8 @@ static int fcopy_on_msg(void *msg, int l
+ 	if (cancel_delayed_work_sync(&fcopy_timeout_work)) {
+ 		fcopy_transaction.state = HVUTIL_USERSPACE_RECV;
+ 		fcopy_respond_to_host(*val);
+-		fcopy_transaction.state = HVUTIL_READY;
+-		hv_poll_channel(fcopy_transaction.fcopy_context,
+-				hv_fcopy_onchannelcallback);
++		hv_poll_channel(fcopy_transaction.recv_channel,
++				fcopy_poll_wrapper);
+ 	}
+ 
+ 	return 0;
+--- a/drivers/hv/hv_kvp.c
++++ b/drivers/hv/hv_kvp.c
+@@ -66,7 +66,6 @@ static struct {
+ 	struct hv_kvp_msg  *kvp_msg; /* current message */
+ 	struct vmbus_channel *recv_channel; /* chn we got the request */
+ 	u64 recv_req_id; /* request ID. */
+-	void *kvp_context; /* for the channel callback */
+ } kvp_transaction;
+ 
+ /*
+@@ -94,6 +93,13 @@ static struct hvutil_transport *hvt;
+  */
+ #define HV_DRV_VERSION           "3.1"
+ 
++static void kvp_poll_wrapper(void *channel)
++{
++	/* Transaction is finished, reset the state here to avoid races. */
++	kvp_transaction.state = HVUTIL_READY;
++	hv_kvp_onchannelcallback(channel);
++}
++
+ static void
+ kvp_register(int reg_value)
+ {
+@@ -121,12 +127,7 @@ static void kvp_timeout_func(struct work
+ 	 */
+ 	kvp_respond_to_host(NULL, HV_E_FAIL);
+ 
+-	/* Transaction is finished, reset the state. */
+-	if (kvp_transaction.state > HVUTIL_READY)
+-		kvp_transaction.state = HVUTIL_READY;
+-
+-	hv_poll_channel(kvp_transaction.kvp_context,
+-			hv_kvp_onchannelcallback);
++	hv_poll_channel(kvp_transaction.recv_channel, kvp_poll_wrapper);
+ }
+ 
+ static int kvp_handle_handshake(struct hv_kvp_msg *msg)
+@@ -218,9 +219,7 @@ static int kvp_on_msg(void *msg, int len
+ 	 */
+ 	if (cancel_delayed_work_sync(&kvp_timeout_work)) {
+ 		kvp_respond_to_host(message, error);
+-		kvp_transaction.state = HVUTIL_READY;
+-		hv_poll_channel(kvp_transaction.kvp_context,
+-				hv_kvp_onchannelcallback);
++		hv_poll_channel(kvp_transaction.recv_channel, kvp_poll_wrapper);
+ 	}
+ 
+ 	return 0;
+@@ -596,15 +595,8 @@ void hv_kvp_onchannelcallback(void *cont
+ 	int util_fw_version;
+ 	int kvp_srv_version;
+ 
+-	if (kvp_transaction.state > HVUTIL_READY) {
+-		/*
+-		 * We will defer processing this callback once
+-		 * the current transaction is complete.
+-		 */
+-		kvp_transaction.kvp_context = context;
++	if (kvp_transaction.state > HVUTIL_READY)
+ 		return;
+-	}
+-	kvp_transaction.kvp_context = NULL;
+ 
+ 	vmbus_recvpacket(channel, recv_buffer, PAGE_SIZE * 4, &recvlen,
+ 			 &requestid);
+--- a/drivers/hv/hv_snapshot.c
++++ b/drivers/hv/hv_snapshot.c
+@@ -53,7 +53,6 @@ static struct {
+ 	struct vmbus_channel *recv_channel; /* chn we got the request */
+ 	u64 recv_req_id; /* request ID. */
+ 	struct hv_vss_msg  *msg; /* current message */
+-	void *vss_context; /* for the channel callback */
+ } vss_transaction;
+ 
+ 
+@@ -74,6 +73,13 @@ static void vss_timeout_func(struct work
+ static DECLARE_DELAYED_WORK(vss_timeout_work, vss_timeout_func);
+ static DECLARE_WORK(vss_send_op_work, vss_send_op);
+ 
++static void vss_poll_wrapper(void *channel)
++{
++	/* Transaction is finished, reset the state here to avoid races. */
++	vss_transaction.state = HVUTIL_READY;
++	hv_vss_onchannelcallback(channel);
++}
++
+ /*
+  * Callback when data is received from user mode.
+  */
+@@ -86,12 +92,7 @@ static void vss_timeout_func(struct work
+ 	pr_warn("VSS: timeout waiting for daemon to reply\n");
+ 	vss_respond_to_host(HV_E_FAIL);
+ 
+-	/* Transaction is finished, reset the state. */
+-	if (vss_transaction.state > HVUTIL_READY)
+-		vss_transaction.state = HVUTIL_READY;
+-
+-	hv_poll_channel(vss_transaction.vss_context,
+-			hv_vss_onchannelcallback);
++	hv_poll_channel(vss_transaction.recv_channel, vss_poll_wrapper);
+ }
+ 
+ static int vss_handle_handshake(struct hv_vss_msg *vss_msg)
+@@ -138,9 +139,8 @@ static int vss_on_msg(void *msg, int len
+ 		if (cancel_delayed_work_sync(&vss_timeout_work)) {
+ 			vss_respond_to_host(vss_msg->error);
+ 			/* Transaction is finished, reset the state. */
+-			vss_transaction.state = HVUTIL_READY;
+-			hv_poll_channel(vss_transaction.vss_context,
+-					hv_vss_onchannelcallback);
++			hv_poll_channel(vss_transaction.recv_channel,
++					vss_poll_wrapper);
+ 		}
+ 	} else {
+ 		/* This is a spurious call! */
+@@ -238,15 +238,8 @@ void hv_vss_onchannelcallback(void *cont
+ 	struct icmsg_hdr *icmsghdrp;
+ 	struct icmsg_negotiate *negop = NULL;
+ 
+-	if (vss_transaction.state > HVUTIL_READY) {
+-		/*
+-		 * We will defer processing this callback once
+-		 * the current transaction is complete.
+-		 */
+-		vss_transaction.vss_context = context;
++	if (vss_transaction.state > HVUTIL_READY)
+ 		return;
+-	}
+-	vss_transaction.vss_context = NULL;
+ 
+ 	vmbus_recvpacket(channel, recv_buffer, PAGE_SIZE * 2, &recvlen,
+ 			 &requestid);
+--- a/drivers/hv/hyperv_vmbus.h
++++ b/drivers/hv/hyperv_vmbus.h
+@@ -764,11 +764,7 @@ static inline void hv_poll_channel(struc
+ 	if (!channel)
+ 		return;
+ 
+-	if (channel->target_cpu != smp_processor_id())
+-		smp_call_function_single(channel->target_cpu,
+-					 cb, channel, true);
+-	else
+-		cb(channel);
++	smp_call_function_single(channel->target_cpu, cb, channel, true);
+ }
+ 
+ enum hvutil_device_state {

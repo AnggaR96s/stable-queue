@@ -1,0 +1,164 @@
+From 1e890bc033d06da1bae241e5cd6d29dae98131e6 Mon Sep 17 00:00:00 2001
+From: Vaibhav Jain <vaibhav@linux.vnet.ibm.com>
+Date: Mon, 16 Nov 2015 09:33:45 +0530
+Subject: [PATCH 042/135] cxl: Fix possible idr warning when contexts are
+ released
+
+[ Upstream commit 1b5df59e50874b9034c0fa389cd52b65f1f93292 ]
+
+An idr warning is reported when a context is release after the capi card
+is unbound from the cxl driver via sysfs. Below are the steps to
+reproduce:
+
+1. Create multiple afu contexts in an user-space application using libcxl.
+2. Unbind capi card from cxl using command of form
+   echo <capi-card-pci-addr> > /sys/bus/pci/drivers/cxl-pci/unbind
+3. Exit/kill the application owning afu contexts.
+
+After above steps a warning message is usually seen in the kernel logs
+of the form "idr_remove called for id=<context-id> which is not
+allocated."
+
+This is caused by the function cxl_release_afu which destroys the
+contexts_idr table. So when a context is release no entry for context pe
+is found in the contexts_idr table and idr code prints this warning.
+
+This patch fixes this issue by increasing & decreasing the ref-count on
+the afu device when a context is initialized or when its freed
+respectively. This prevents the afu from being released until all the
+afu contexts have been released. The patch introduces two new functions
+namely cxl_afu_get/put that manage the ref-count on the afu device.
+
+Also the patch removes code inside cxl_dev_context_init that increases ref
+on the afu device as its guaranteed to be alive during this function.
+
+Reported-by: Ian Munsie <imunsie@au1.ibm.com>
+Signed-off-by: Vaibhav Jain <vaibhav@linux.vnet.ibm.com>
+Acked-by: Ian Munsie <imunsie@au1.ibm.com>
+Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/misc/cxl/api.c     |    4 ----
+ drivers/misc/cxl/context.c |    9 +++++++++
+ drivers/misc/cxl/cxl.h     |   12 ++++++++++++
+ drivers/misc/cxl/file.c    |   19 +++++++++++--------
+ 4 files changed, 32 insertions(+), 12 deletions(-)
+
+--- a/drivers/misc/cxl/api.c
++++ b/drivers/misc/cxl/api.c
+@@ -25,7 +25,6 @@ struct cxl_context *cxl_dev_context_init
+ 
+ 	afu = cxl_pci_to_afu(dev);
+ 
+-	get_device(&afu->dev);
+ 	ctx = cxl_context_alloc();
+ 	if (IS_ERR(ctx)) {
+ 		rc = PTR_ERR(ctx);
+@@ -61,7 +60,6 @@ err_mapping:
+ err_ctx:
+ 	kfree(ctx);
+ err_dev:
+-	put_device(&afu->dev);
+ 	return ERR_PTR(rc);
+ }
+ EXPORT_SYMBOL_GPL(cxl_dev_context_init);
+@@ -87,8 +85,6 @@ int cxl_release_context(struct cxl_conte
+ 	if (ctx->status >= STARTED)
+ 		return -EBUSY;
+ 
+-	put_device(&ctx->afu->dev);
+-
+ 	cxl_context_free(ctx);
+ 
+ 	return 0;
+--- a/drivers/misc/cxl/context.c
++++ b/drivers/misc/cxl/context.c
+@@ -97,6 +97,12 @@ int cxl_context_init(struct cxl_context
+ 	ctx->pe = i;
+ 	ctx->elem = &ctx->afu->spa[i];
+ 	ctx->pe_inserted = false;
++
++	/*
++	 * take a ref on the afu so that it stays alive at-least till
++	 * this context is reclaimed inside reclaim_ctx.
++	 */
++	cxl_afu_get(afu);
+ 	return 0;
+ }
+ 
+@@ -278,6 +284,9 @@ static void reclaim_ctx(struct rcu_head
+ 	if (ctx->irq_bitmap)
+ 		kfree(ctx->irq_bitmap);
+ 
++	/* Drop ref to the afu device taken during cxl_context_init */
++	cxl_afu_put(ctx->afu);
++
+ 	kfree(ctx);
+ }
+ 
+--- a/drivers/misc/cxl/cxl.h
++++ b/drivers/misc/cxl/cxl.h
+@@ -403,6 +403,18 @@ struct cxl_afu {
+ 	bool enabled;
+ };
+ 
++/* AFU refcount management */
++static inline struct cxl_afu *cxl_afu_get(struct cxl_afu *afu)
++{
++
++	return (get_device(&afu->dev) == NULL) ? NULL : afu;
++}
++
++static inline void  cxl_afu_put(struct cxl_afu *afu)
++{
++	put_device(&afu->dev);
++}
++
+ 
+ struct cxl_irq_name {
+ 	struct list_head list;
+--- a/drivers/misc/cxl/file.c
++++ b/drivers/misc/cxl/file.c
+@@ -67,7 +67,13 @@ static int __afu_open(struct inode *inod
+ 		spin_unlock(&adapter->afu_list_lock);
+ 		goto err_put_adapter;
+ 	}
+-	get_device(&afu->dev);
++
++	/*
++	 * taking a ref to the afu so that it doesn't go away
++	 * for rest of the function. This ref is released before
++	 * we return.
++	 */
++	cxl_afu_get(afu);
+ 	spin_unlock(&adapter->afu_list_lock);
+ 
+ 	if (!afu->current_mode)
+@@ -90,13 +96,12 @@ static int __afu_open(struct inode *inod
+ 	file->private_data = ctx;
+ 	cxl_ctx_get();
+ 
+-	/* Our ref on the AFU will now hold the adapter */
+-	put_device(&adapter->dev);
+-
+-	return 0;
++	/* indicate success */
++	rc = 0;
+ 
+ err_put_afu:
+-	put_device(&afu->dev);
++	/* release the ref taken earlier */
++	cxl_afu_put(afu);
+ err_put_adapter:
+ 	put_device(&adapter->dev);
+ 	return rc;
+@@ -131,8 +136,6 @@ int afu_release(struct inode *inode, str
+ 		mutex_unlock(&ctx->mapping_lock);
+ 	}
+ 
+-	put_device(&ctx->afu->dev);
+-
+ 	/*
+ 	 * At this this point all bottom halfs have finished and we should be
+ 	 * getting no more IRQs from the hardware for this context.  Once it's
