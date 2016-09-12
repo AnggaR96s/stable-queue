@@ -1,0 +1,136 @@
+From e43e94c1eda76dabd686ddf6f7825f54d747b310 Mon Sep 17 00:00:00 2001
+From: Sai Gurrappadi <sgurrappadi@nvidia.com>
+Date: Fri, 29 Apr 2016 14:44:37 -0700
+Subject: cpufreq: Fix GOV_LIMITS handling for the userspace governor
+
+From: Sai Gurrappadi <sgurrappadi@nvidia.com>
+
+commit e43e94c1eda76dabd686ddf6f7825f54d747b310 upstream.
+
+Currently, the userspace governor only updates frequency on GOV_LIMITS
+if policy->cur falls outside policy->{min/max}. However, it is also
+necessary to update current frequency on GOV_LIMITS to match the user
+requested value if it can be achieved within the new policy->{max/min}.
+
+This was previously the behaviour in the governor until commit d1922f0
+("cpufreq: Simplify userspace governor") which incorrectly assumed that
+policy->cur == user requested frequency via scaling_setspeed. This won't
+be true if the user requested frequency falls outside policy->{min/max}.
+Ex: a temporary thermal cap throttled the user requested frequency.
+
+Fix this by storing the user requested frequency in a seperate variable.
+The governor will then try to achieve this request on every GOV_LIMITS
+change.
+
+Fixes: d1922f02562f (cpufreq: Simplify userspace governor)
+Signed-off-by: Sai Gurrappadi <sgurrappadi@nvidia.com>
+Acked-by: Viresh Kumar <viresh.kumar@linaro.org>
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/cpufreq/cpufreq_userspace.c |   43 +++++++++++++++++++++++++++++++-----
+ 1 file changed, 38 insertions(+), 5 deletions(-)
+
+--- a/drivers/cpufreq/cpufreq_userspace.c
++++ b/drivers/cpufreq/cpufreq_userspace.c
+@@ -17,6 +17,7 @@
+ #include <linux/init.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
++#include <linux/slab.h>
+ 
+ static DEFINE_PER_CPU(unsigned int, cpu_is_managed);
+ static DEFINE_MUTEX(userspace_mutex);
+@@ -31,6 +32,7 @@ static DEFINE_MUTEX(userspace_mutex);
+ static int cpufreq_set(struct cpufreq_policy *policy, unsigned int freq)
+ {
+ 	int ret = -EINVAL;
++	unsigned int *setspeed = policy->governor_data;
+ 
+ 	pr_debug("cpufreq_set for cpu %u, freq %u kHz\n", policy->cpu, freq);
+ 
+@@ -38,6 +40,8 @@ static int cpufreq_set(struct cpufreq_po
+ 	if (!per_cpu(cpu_is_managed, policy->cpu))
+ 		goto err;
+ 
++	*setspeed = freq;
++
+ 	ret = __cpufreq_driver_target(policy, freq, CPUFREQ_RELATION_L);
+  err:
+ 	mutex_unlock(&userspace_mutex);
+@@ -49,19 +53,45 @@ static ssize_t show_speed(struct cpufreq
+ 	return sprintf(buf, "%u\n", policy->cur);
+ }
+ 
++static int cpufreq_userspace_policy_init(struct cpufreq_policy *policy)
++{
++	unsigned int *setspeed;
++
++	setspeed = kzalloc(sizeof(*setspeed), GFP_KERNEL);
++	if (!setspeed)
++		return -ENOMEM;
++
++	policy->governor_data = setspeed;
++	return 0;
++}
++
+ static int cpufreq_governor_userspace(struct cpufreq_policy *policy,
+ 				   unsigned int event)
+ {
++	unsigned int *setspeed = policy->governor_data;
+ 	unsigned int cpu = policy->cpu;
+ 	int rc = 0;
+ 
++	if (event == CPUFREQ_GOV_POLICY_INIT)
++		return cpufreq_userspace_policy_init(policy);
++
++	if (!setspeed)
++		return -EINVAL;
++
+ 	switch (event) {
++	case CPUFREQ_GOV_POLICY_EXIT:
++		mutex_lock(&userspace_mutex);
++		policy->governor_data = NULL;
++		kfree(setspeed);
++		mutex_unlock(&userspace_mutex);
++		break;
+ 	case CPUFREQ_GOV_START:
+ 		BUG_ON(!policy->cur);
+ 		pr_debug("started managing cpu %u\n", cpu);
+ 
+ 		mutex_lock(&userspace_mutex);
+ 		per_cpu(cpu_is_managed, cpu) = 1;
++		*setspeed = policy->cur;
+ 		mutex_unlock(&userspace_mutex);
+ 		break;
+ 	case CPUFREQ_GOV_STOP:
+@@ -69,20 +99,23 @@ static int cpufreq_governor_userspace(st
+ 
+ 		mutex_lock(&userspace_mutex);
+ 		per_cpu(cpu_is_managed, cpu) = 0;
++		*setspeed = 0;
+ 		mutex_unlock(&userspace_mutex);
+ 		break;
+ 	case CPUFREQ_GOV_LIMITS:
+ 		mutex_lock(&userspace_mutex);
+-		pr_debug("limit event for cpu %u: %u - %u kHz, currently %u kHz\n",
+-			cpu, policy->min, policy->max,
+-			policy->cur);
++		pr_debug("limit event for cpu %u: %u - %u kHz, currently %u kHz, last set to %u kHz\n",
++			cpu, policy->min, policy->max, policy->cur, *setspeed);
+ 
+-		if (policy->max < policy->cur)
++		if (policy->max < *setspeed)
+ 			__cpufreq_driver_target(policy, policy->max,
+ 						CPUFREQ_RELATION_H);
+-		else if (policy->min > policy->cur)
++		else if (policy->min > *setspeed)
+ 			__cpufreq_driver_target(policy, policy->min,
+ 						CPUFREQ_RELATION_L);
++		else
++			__cpufreq_driver_target(policy, *setspeed,
++						CPUFREQ_RELATION_L);
+ 		mutex_unlock(&userspace_mutex);
+ 		break;
+ 	}
