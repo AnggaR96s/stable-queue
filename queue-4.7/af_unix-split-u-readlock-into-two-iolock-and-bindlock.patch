@@ -1,0 +1,232 @@
+From foo@baz Wed Sep 21 10:05:18 CEST 2016
+From: Linus Torvalds <torvalds@linux-foundation.org>
+Date: Thu, 1 Sep 2016 14:43:53 -0700
+Subject: af_unix: split 'u->readlock' into two: 'iolock' and 'bindlock'
+
+From: Linus Torvalds <torvalds@linux-foundation.org>
+
+
+[ Upstream commit 6e1ce3c3451291142a57c4f3f6f999a29fb5b3bc ]
+
+Right now we use the 'readlock' both for protecting some of the af_unix
+IO path and for making the bind be single-threaded.
+
+The two are independent, but using the same lock makes for a nasty
+deadlock due to ordering with regards to filesystem locking.  The bind
+locking would want to nest outside the VSF pathname locking, but the IO
+locking wants to nest inside some of those same locks.
+
+We tried to fix this earlier with commit c845acb324aa ("af_unix: Fix
+splice-bind deadlock") which moved the readlock inside the vfs locks,
+but that caused problems with overlayfs that will then call back into
+filesystem routines that take the lock in the wrong order anyway.
+
+Splitting the locks means that we can go back to having the bind lock be
+the outermost lock, and we don't have any deadlocks with lock ordering.
+
+Acked-by: Rainer Weikusat <rweikusat@cyberadapt.com>
+Acked-by: Al Viro <viro@zeniv.linux.org.uk>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Acked-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/net/af_unix.h |    2 +-
+ net/unix/af_unix.c    |   45 +++++++++++++++++++++++----------------------
+ 2 files changed, 24 insertions(+), 23 deletions(-)
+
+--- a/include/net/af_unix.h
++++ b/include/net/af_unix.h
+@@ -52,7 +52,7 @@ struct unix_sock {
+ 	struct sock		sk;
+ 	struct unix_address     *addr;
+ 	struct path		path;
+-	struct mutex		readlock;
++	struct mutex		iolock, bindlock;
+ 	struct sock		*peer;
+ 	struct list_head	link;
+ 	atomic_long_t		inflight;
+--- a/net/unix/af_unix.c
++++ b/net/unix/af_unix.c
+@@ -661,11 +661,11 @@ static int unix_set_peek_off(struct sock
+ {
+ 	struct unix_sock *u = unix_sk(sk);
+ 
+-	if (mutex_lock_interruptible(&u->readlock))
++	if (mutex_lock_interruptible(&u->iolock))
+ 		return -EINTR;
+ 
+ 	sk->sk_peek_off = val;
+-	mutex_unlock(&u->readlock);
++	mutex_unlock(&u->iolock);
+ 
+ 	return 0;
+ }
+@@ -778,7 +778,8 @@ static struct sock *unix_create1(struct
+ 	spin_lock_init(&u->lock);
+ 	atomic_long_set(&u->inflight, 0);
+ 	INIT_LIST_HEAD(&u->link);
+-	mutex_init(&u->readlock); /* single task reading lock */
++	mutex_init(&u->iolock); /* single task reading lock */
++	mutex_init(&u->bindlock); /* single task binding lock */
+ 	init_waitqueue_head(&u->peer_wait);
+ 	init_waitqueue_func_entry(&u->peer_wake, unix_dgram_peer_wake_relay);
+ 	unix_insert_socket(unix_sockets_unbound(sk), sk);
+@@ -847,7 +848,7 @@ static int unix_autobind(struct socket *
+ 	int err;
+ 	unsigned int retries = 0;
+ 
+-	err = mutex_lock_interruptible(&u->readlock);
++	err = mutex_lock_interruptible(&u->bindlock);
+ 	if (err)
+ 		return err;
+ 
+@@ -894,7 +895,7 @@ retry:
+ 	spin_unlock(&unix_table_lock);
+ 	err = 0;
+ 
+-out:	mutex_unlock(&u->readlock);
++out:	mutex_unlock(&u->bindlock);
+ 	return err;
+ }
+ 
+@@ -1008,7 +1009,7 @@ static int unix_bind(struct socket *sock
+ 		goto out;
+ 	addr_len = err;
+ 
+-	err = mutex_lock_interruptible(&u->readlock);
++	err = mutex_lock_interruptible(&u->bindlock);
+ 	if (err)
+ 		goto out;
+ 
+@@ -1062,7 +1063,7 @@ static int unix_bind(struct socket *sock
+ out_unlock:
+ 	spin_unlock(&unix_table_lock);
+ out_up:
+-	mutex_unlock(&u->readlock);
++	mutex_unlock(&u->bindlock);
+ out:
+ 	return err;
+ }
+@@ -1954,17 +1955,17 @@ static ssize_t unix_stream_sendpage(stru
+ 	if (false) {
+ alloc_skb:
+ 		unix_state_unlock(other);
+-		mutex_unlock(&unix_sk(other)->readlock);
++		mutex_unlock(&unix_sk(other)->iolock);
+ 		newskb = sock_alloc_send_pskb(sk, 0, 0, flags & MSG_DONTWAIT,
+ 					      &err, 0);
+ 		if (!newskb)
+ 			goto err;
+ 	}
+ 
+-	/* we must acquire readlock as we modify already present
++	/* we must acquire iolock as we modify already present
+ 	 * skbs in the sk_receive_queue and mess with skb->len
+ 	 */
+-	err = mutex_lock_interruptible(&unix_sk(other)->readlock);
++	err = mutex_lock_interruptible(&unix_sk(other)->iolock);
+ 	if (err) {
+ 		err = flags & MSG_DONTWAIT ? -EAGAIN : -ERESTARTSYS;
+ 		goto err;
+@@ -2031,7 +2032,7 @@ alloc_skb:
+ 	}
+ 
+ 	unix_state_unlock(other);
+-	mutex_unlock(&unix_sk(other)->readlock);
++	mutex_unlock(&unix_sk(other)->iolock);
+ 
+ 	other->sk_data_ready(other);
+ 	scm_destroy(&scm);
+@@ -2040,7 +2041,7 @@ alloc_skb:
+ err_state_unlock:
+ 	unix_state_unlock(other);
+ err_unlock:
+-	mutex_unlock(&unix_sk(other)->readlock);
++	mutex_unlock(&unix_sk(other)->iolock);
+ err:
+ 	kfree_skb(newskb);
+ 	if (send_sigpipe && !(flags & MSG_NOSIGNAL))
+@@ -2108,7 +2109,7 @@ static int unix_dgram_recvmsg(struct soc
+ 	timeo = sock_rcvtimeo(sk, flags & MSG_DONTWAIT);
+ 
+ 	do {
+-		mutex_lock(&u->readlock);
++		mutex_lock(&u->iolock);
+ 
+ 		skip = sk_peek_offset(sk, flags);
+ 		skb = __skb_try_recv_datagram(sk, flags, &peeked, &skip, &err,
+@@ -2116,14 +2117,14 @@ static int unix_dgram_recvmsg(struct soc
+ 		if (skb)
+ 			break;
+ 
+-		mutex_unlock(&u->readlock);
++		mutex_unlock(&u->iolock);
+ 
+ 		if (err != -EAGAIN)
+ 			break;
+ 	} while (timeo &&
+ 		 !__skb_wait_for_more_packets(sk, &err, &timeo, last));
+ 
+-	if (!skb) { /* implies readlock unlocked */
++	if (!skb) { /* implies iolock unlocked */
+ 		unix_state_lock(sk);
+ 		/* Signal EOF on disconnected non-blocking SEQPACKET socket. */
+ 		if (sk->sk_type == SOCK_SEQPACKET && err == -EAGAIN &&
+@@ -2188,7 +2189,7 @@ static int unix_dgram_recvmsg(struct soc
+ 
+ out_free:
+ 	skb_free_datagram(sk, skb);
+-	mutex_unlock(&u->readlock);
++	mutex_unlock(&u->iolock);
+ out:
+ 	return err;
+ }
+@@ -2283,7 +2284,7 @@ static int unix_stream_read_generic(stru
+ 	/* Lock the socket to prevent queue disordering
+ 	 * while sleeps in memcpy_tomsg
+ 	 */
+-	mutex_lock(&u->readlock);
++	mutex_lock(&u->iolock);
+ 
+ 	if (flags & MSG_PEEK)
+ 		skip = sk_peek_offset(sk, flags);
+@@ -2325,7 +2326,7 @@ again:
+ 				break;
+ 			}
+ 
+-			mutex_unlock(&u->readlock);
++			mutex_unlock(&u->iolock);
+ 
+ 			timeo = unix_stream_data_wait(sk, timeo, last,
+ 						      last_len);
+@@ -2336,7 +2337,7 @@ again:
+ 				goto out;
+ 			}
+ 
+-			mutex_lock(&u->readlock);
++			mutex_lock(&u->iolock);
+ 			goto redo;
+ unlock:
+ 			unix_state_unlock(sk);
+@@ -2439,7 +2440,7 @@ unlock:
+ 		}
+ 	} while (size);
+ 
+-	mutex_unlock(&u->readlock);
++	mutex_unlock(&u->iolock);
+ 	if (state->msg)
+ 		scm_recv(sock, state->msg, &scm, flags);
+ 	else
+@@ -2480,9 +2481,9 @@ static ssize_t skb_unix_socket_splice(st
+ 	int ret;
+ 	struct unix_sock *u = unix_sk(sk);
+ 
+-	mutex_unlock(&u->readlock);
++	mutex_unlock(&u->iolock);
+ 	ret = splice_to_pipe(pipe, spd);
+-	mutex_lock(&u->readlock);
++	mutex_lock(&u->iolock);
+ 
+ 	return ret;
+ }
