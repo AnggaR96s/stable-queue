@@ -1,0 +1,88 @@
+From df6a58c5c5aa8ecb1e088ecead3fa33ae70181f1 Mon Sep 17 00:00:00 2001
+From: Tejun Heo <tj@kernel.org>
+Date: Fri, 17 Jun 2016 17:51:17 -0400
+Subject: kernfs: don't depend on d_find_any_alias() when generating notifications
+
+From: Tejun Heo <tj@kernel.org>
+
+commit df6a58c5c5aa8ecb1e088ecead3fa33ae70181f1 upstream.
+
+kernfs_notify_workfn() sends out file modified events for the
+scheduled kernfs_nodes.  Because the modifications aren't from
+userland, it doesn't have the matching file struct at hand and can't
+use fsnotify_modify().  Instead, it looked up the inode and then used
+d_find_any_alias() to find the dentry and used fsnotify_parent() and
+fsnotify() directly to generate notifications.
+
+The assumption was that the relevant dentries would have been pinned
+if there are listeners, which isn't true as inotify doesn't pin
+dentries at all and watching the parent doesn't pin the child dentries
+even for dnotify.  This led to, for example, inotify watchers not
+getting notifications if the system is under memory pressure and the
+matching dentries got reclaimed.  It can also be triggered through
+/proc/sys/vm/drop_caches or a remount attempt which involves shrinking
+dcache.
+
+fsnotify_parent() only uses the dentry to access the parent inode,
+which kernfs can do easily.  Update kernfs_notify_workfn() so that it
+uses fsnotify() directly for both the parent and target inodes without
+going through d_find_any_alias().  While at it, supply the target file
+name to fsnotify() from kernfs_node->name.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Reported-by: Evgeny Vereshchagin <evvers@ya.ru>
+Fixes: d911d9874801 ("kernfs: make kernfs_notify() trigger inotify events too")
+Cc: John McCutchan <john@johnmccutchan.com>
+Cc: Robert Love <rlove@rlove.org>
+Cc: Eric Paris <eparis@parisplace.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/kernfs/file.c |   28 +++++++++++++++++++++-------
+ 1 file changed, 21 insertions(+), 7 deletions(-)
+
+--- a/fs/kernfs/file.c
++++ b/fs/kernfs/file.c
+@@ -840,21 +840,35 @@ repeat:
+ 	mutex_lock(&kernfs_mutex);
+ 
+ 	list_for_each_entry(info, &kernfs_root(kn)->supers, node) {
++		struct kernfs_node *parent;
+ 		struct inode *inode;
+-		struct dentry *dentry;
+ 
++		/*
++		 * We want fsnotify_modify() on @kn but as the
++		 * modifications aren't originating from userland don't
++		 * have the matching @file available.  Look up the inodes
++		 * and generate the events manually.
++		 */
+ 		inode = ilookup(info->sb, kn->ino);
+ 		if (!inode)
+ 			continue;
+ 
+-		dentry = d_find_any_alias(inode);
+-		if (dentry) {
+-			fsnotify_parent(NULL, dentry, FS_MODIFY);
+-			fsnotify(inode, FS_MODIFY, inode, FSNOTIFY_EVENT_INODE,
+-				 NULL, 0);
+-			dput(dentry);
++		parent = kernfs_get_parent(kn);
++		if (parent) {
++			struct inode *p_inode;
++
++			p_inode = ilookup(info->sb, parent->ino);
++			if (p_inode) {
++				fsnotify(p_inode, FS_MODIFY | FS_EVENT_ON_CHILD,
++					 inode, FSNOTIFY_EVENT_INODE, kn->name, 0);
++				iput(p_inode);
++			}
++
++			kernfs_put(parent);
+ 		}
+ 
++		fsnotify(inode, FS_MODIFY, inode, FSNOTIFY_EVENT_INODE,
++			 kn->name, 0);
+ 		iput(inode);
+ 	}
+ 

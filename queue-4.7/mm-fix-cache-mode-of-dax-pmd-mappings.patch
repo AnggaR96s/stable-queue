@@ -1,0 +1,125 @@
+From 9049771f7d5490a302589976984810064c83ab40 Mon Sep 17 00:00:00 2001
+From: Dan Williams <dan.j.williams@intel.com>
+Date: Wed, 7 Sep 2016 08:51:21 -0700
+Subject: mm: fix cache mode of dax pmd mappings
+
+From: Dan Williams <dan.j.williams@intel.com>
+
+commit 9049771f7d5490a302589976984810064c83ab40 upstream.
+
+track_pfn_insert() in vmf_insert_pfn_pmd() is marking dax mappings as
+uncacheable rendering them impractical for application usage.  DAX-pte
+mappings are cached and the goal of establishing DAX-pmd mappings is to
+attain more performance, not dramatically less (3 orders of magnitude).
+
+track_pfn_insert() relies on a previous call to reserve_memtype() to
+establish the expected page_cache_mode for the range.  While memremap()
+arranges for reserve_memtype() to be called, devm_memremap_pages() does
+not.  So, teach track_pfn_insert() and untrack_pfn() how to handle
+tracking without a vma, and arrange for devm_memremap_pages() to
+establish the write-back-cache reservation in the memtype tree.
+
+Cc: Matthew Wilcox <mawilcox@microsoft.com>
+Cc: Ross Zwisler <ross.zwisler@linux.intel.com>
+Cc: Nilesh Choudhury <nilesh.choudhury@oracle.com>
+Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Reported-by: Toshi Kani <toshi.kani@hpe.com>
+Reported-by: Kai Zhang <kai.ka.zhang@oracle.com>
+Acked-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ arch/x86/mm/pat.c |   17 ++++++++++-------
+ kernel/memremap.c |    9 +++++++++
+ 2 files changed, 19 insertions(+), 7 deletions(-)
+
+--- a/arch/x86/mm/pat.c
++++ b/arch/x86/mm/pat.c
+@@ -931,9 +931,10 @@ int track_pfn_copy(struct vm_area_struct
+ }
+ 
+ /*
+- * prot is passed in as a parameter for the new mapping. If the vma has a
+- * linear pfn mapping for the entire range reserve the entire vma range with
+- * single reserve_pfn_range call.
++ * prot is passed in as a parameter for the new mapping. If the vma has
++ * a linear pfn mapping for the entire range, or no vma is provided,
++ * reserve the entire pfn + size range with single reserve_pfn_range
++ * call.
+  */
+ int track_pfn_remap(struct vm_area_struct *vma, pgprot_t *prot,
+ 		    unsigned long pfn, unsigned long addr, unsigned long size)
+@@ -942,11 +943,12 @@ int track_pfn_remap(struct vm_area_struc
+ 	enum page_cache_mode pcm;
+ 
+ 	/* reserve the whole chunk starting from paddr */
+-	if (addr == vma->vm_start && size == (vma->vm_end - vma->vm_start)) {
++	if (!vma || (addr == vma->vm_start
++				&& size == (vma->vm_end - vma->vm_start))) {
+ 		int ret;
+ 
+ 		ret = reserve_pfn_range(paddr, size, prot, 0);
+-		if (!ret)
++		if (ret == 0 && vma)
+ 			vma->vm_flags |= VM_PAT;
+ 		return ret;
+ 	}
+@@ -1001,7 +1003,7 @@ void untrack_pfn(struct vm_area_struct *
+ 	resource_size_t paddr;
+ 	unsigned long prot;
+ 
+-	if (!(vma->vm_flags & VM_PAT))
++	if (vma && !(vma->vm_flags & VM_PAT))
+ 		return;
+ 
+ 	/* free the chunk starting from pfn or the whole chunk */
+@@ -1015,7 +1017,8 @@ void untrack_pfn(struct vm_area_struct *
+ 		size = vma->vm_end - vma->vm_start;
+ 	}
+ 	free_pfn_range(paddr, size);
+-	vma->vm_flags &= ~VM_PAT;
++	if (vma)
++		vma->vm_flags &= ~VM_PAT;
+ }
+ 
+ /*
+--- a/kernel/memremap.c
++++ b/kernel/memremap.c
+@@ -253,6 +253,7 @@ static void devm_memremap_pages_release(
+ 	align_start = res->start & ~(SECTION_SIZE - 1);
+ 	align_size = ALIGN(resource_size(res), SECTION_SIZE);
+ 	arch_remove_memory(align_start, align_size);
++	untrack_pfn(NULL, PHYS_PFN(align_start), align_size);
+ 	pgmap_radix_release(res);
+ 	dev_WARN_ONCE(dev, pgmap->altmap && pgmap->altmap->alloc,
+ 			"%s: failed to free all reserved pages\n", __func__);
+@@ -288,6 +289,7 @@ void *devm_memremap_pages(struct device
+ 		struct percpu_ref *ref, struct vmem_altmap *altmap)
+ {
+ 	resource_size_t key, align_start, align_size, align_end;
++	pgprot_t pgprot = PAGE_KERNEL;
+ 	struct dev_pagemap *pgmap;
+ 	struct page_map *page_map;
+ 	int error, nid, is_ram;
+@@ -363,6 +365,11 @@ void *devm_memremap_pages(struct device
+ 	if (nid < 0)
+ 		nid = numa_mem_id();
+ 
++	error = track_pfn_remap(NULL, &pgprot, PHYS_PFN(align_start), 0,
++			align_size);
++	if (error)
++		goto err_pfn_remap;
++
+ 	error = arch_add_memory(nid, align_start, align_size, true);
+ 	if (error)
+ 		goto err_add_memory;
+@@ -383,6 +390,8 @@ void *devm_memremap_pages(struct device
+ 	return __va(res->start);
+ 
+  err_add_memory:
++	untrack_pfn(NULL, PHYS_PFN(align_start), align_size);
++ err_pfn_remap:
+  err_radix:
+ 	pgmap_radix_release(res);
+ 	devres_free(page_map);
