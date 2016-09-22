@@ -1,0 +1,97 @@
+From 885848186fbc2d1d8fb6d2fdc2156638ae289a46 Mon Sep 17 00:00:00 2001
+From: Chuck Lever <chuck.lever@oracle.com>
+Date: Wed, 13 Jul 2016 16:40:14 -0400
+Subject: nfsd: Close race between nfsd4_release_lockowner and nfsd4_lock
+
+From: Chuck Lever <chuck.lever@oracle.com>
+
+commit 885848186fbc2d1d8fb6d2fdc2156638ae289a46 upstream.
+
+nfsd4_release_lockowner finds a lock owner that has no lock state,
+and drops cl_lock. Then release_lockowner picks up cl_lock and
+unhashes the lock owner.
+
+During the window where cl_lock is dropped, I don't see anything
+preventing a concurrent nfsd4_lock from finding that same lock owner
+and adding lock state to it.
+
+Move release_lockowner() into nfsd4_release_lockowner and hang onto
+the cl_lock until after the lock owner's state cannot be found
+again.
+
+Found by inspection, we don't currently have a reproducer.
+
+Fixes: 2c41beb0e5cf ("nfsd: reduce cl_lock thrashing in ... ")
+Reviewed-by: Jeff Layton <jlayton@redhat.com>
+Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/nfsd/nfs4state.c |   40 +++++++++++++++++-----------------------
+ 1 file changed, 17 insertions(+), 23 deletions(-)
+
+--- a/fs/nfsd/nfs4state.c
++++ b/fs/nfsd/nfs4state.c
+@@ -1200,27 +1200,6 @@ free_ol_stateid_reaplist(struct list_hea
+ 	}
+ }
+ 
+-static void release_lockowner(struct nfs4_lockowner *lo)
+-{
+-	struct nfs4_client *clp = lo->lo_owner.so_client;
+-	struct nfs4_ol_stateid *stp;
+-	struct list_head reaplist;
+-
+-	INIT_LIST_HEAD(&reaplist);
+-
+-	spin_lock(&clp->cl_lock);
+-	unhash_lockowner_locked(lo);
+-	while (!list_empty(&lo->lo_owner.so_stateids)) {
+-		stp = list_first_entry(&lo->lo_owner.so_stateids,
+-				struct nfs4_ol_stateid, st_perstateowner);
+-		WARN_ON(!unhash_lock_stateid(stp));
+-		put_ol_stateid_locked(stp, &reaplist);
+-	}
+-	spin_unlock(&clp->cl_lock);
+-	free_ol_stateid_reaplist(&reaplist);
+-	nfs4_put_stateowner(&lo->lo_owner);
+-}
+-
+ static void release_open_stateid_locks(struct nfs4_ol_stateid *open_stp,
+ 				       struct list_head *reaplist)
+ {
+@@ -5952,6 +5931,7 @@ nfsd4_release_lockowner(struct svc_rqst
+ 	__be32 status;
+ 	struct nfsd_net *nn = net_generic(SVC_NET(rqstp), nfsd_net_id);
+ 	struct nfs4_client *clp;
++	LIST_HEAD (reaplist);
+ 
+ 	dprintk("nfsd4_release_lockowner clientid: (%08x/%08x):\n",
+ 		clid->cl_boot, clid->cl_id);
+@@ -5982,9 +5962,23 @@ nfsd4_release_lockowner(struct svc_rqst
+ 		nfs4_get_stateowner(sop);
+ 		break;
+ 	}
++	if (!lo) {
++		spin_unlock(&clp->cl_lock);
++		return status;
++	}
++
++	unhash_lockowner_locked(lo);
++	while (!list_empty(&lo->lo_owner.so_stateids)) {
++		stp = list_first_entry(&lo->lo_owner.so_stateids,
++				       struct nfs4_ol_stateid,
++				       st_perstateowner);
++		WARN_ON(!unhash_lock_stateid(stp));
++		put_ol_stateid_locked(stp, &reaplist);
++	}
+ 	spin_unlock(&clp->cl_lock);
+-	if (lo)
+-		release_lockowner(lo);
++	free_ol_stateid_reaplist(&reaplist);
++	nfs4_put_stateowner(&lo->lo_owner);
++
+ 	return status;
+ }
+ 
