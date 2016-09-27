@@ -1,0 +1,154 @@
+From ea01a18494b3d7a91b2f1f2a6a5aaef4741bc294 Mon Sep 17 00:00:00 2001
+From: Al Viro <viro@zeniv.linux.org.uk>
+Date: Sun, 12 Jun 2016 11:24:46 -0400
+Subject: autofs races
+
+From: Al Viro <viro@zeniv.linux.org.uk>
+
+commit ea01a18494b3d7a91b2f1f2a6a5aaef4741bc294 upstream.
+
+* make autofs4_expire_indirect() skip the dentries being in process of
+expiry
+* do *not* mess with list_move(); making sure that dentry with
+AUTOFS_INF_EXPIRING are not picked for expiry is enough.
+* do not remove NO_RCU when we set EXPIRING, don't bother with smp_mb()
+there.  Clear it at the same time we clear EXPIRING.  Makes a bunch of
+tests simpler.
+* rename NO_RCU to WANT_EXPIRE, which is what it really is.
+
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Ian Kent <raven@themaw.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+
+---
+ fs/autofs4/autofs_i.h |    8 ++++++--
+ fs/autofs4/expire.c   |   27 ++++++++-------------------
+ fs/autofs4/root.c     |    2 +-
+ 3 files changed, 15 insertions(+), 22 deletions(-)
+
+--- a/fs/autofs4/autofs_i.h
++++ b/fs/autofs4/autofs_i.h
+@@ -79,9 +79,13 @@ struct autofs_info {
+ };
+ 
+ #define AUTOFS_INF_EXPIRING	(1<<0) /* dentry is in the process of expiring */
+-#define AUTOFS_INF_NO_RCU	(1<<1) /* the dentry is being considered
++#define AUTOFS_INF_WANT_EXPIRE	(1<<1) /* the dentry is being considered
+ 					* for expiry, so RCU_walk is
+-					* not permitted
++					* not permitted.  If it progresses to
++					* actual expiry attempt, the flag is
++					* not cleared when EXPIRING is set -
++					* in that case it gets cleared only
++					* when it comes to clearing EXPIRING.
+ 					*/
+ #define AUTOFS_INF_PENDING	(1<<2) /* dentry pending mount */
+ 
+--- a/fs/autofs4/expire.c
++++ b/fs/autofs4/expire.c
+@@ -315,19 +315,17 @@ struct dentry *autofs4_expire_direct(str
+ 	if (ino->flags & AUTOFS_INF_PENDING)
+ 		goto out;
+ 	if (!autofs4_direct_busy(mnt, root, timeout, do_now)) {
+-		ino->flags |= AUTOFS_INF_NO_RCU;
++		ino->flags |= AUTOFS_INF_WANT_EXPIRE;
+ 		spin_unlock(&sbi->fs_lock);
+ 		synchronize_rcu();
+ 		spin_lock(&sbi->fs_lock);
+ 		if (!autofs4_direct_busy(mnt, root, timeout, do_now)) {
+ 			ino->flags |= AUTOFS_INF_EXPIRING;
+-			smp_mb();
+-			ino->flags &= ~AUTOFS_INF_NO_RCU;
+ 			init_completion(&ino->expire_complete);
+ 			spin_unlock(&sbi->fs_lock);
+ 			return root;
+ 		}
+-		ino->flags &= ~AUTOFS_INF_NO_RCU;
++		ino->flags &= ~AUTOFS_INF_WANT_EXPIRE;
+ 	}
+ out:
+ 	spin_unlock(&sbi->fs_lock);
+@@ -444,7 +442,7 @@ struct dentry *autofs4_expire_indirect(s
+ 	while ((dentry = get_next_positive_subdir(dentry, root))) {
+ 		spin_lock(&sbi->fs_lock);
+ 		ino = autofs4_dentry_ino(dentry);
+-		if (ino->flags & AUTOFS_INF_NO_RCU)
++		if (ino->flags & AUTOFS_INF_WANT_EXPIRE)
+ 			expired = NULL;
+ 		else
+ 			expired = should_expire(dentry, mnt, timeout, how);
+@@ -453,7 +451,7 @@ struct dentry *autofs4_expire_indirect(s
+ 			continue;
+ 		}
+ 		ino = autofs4_dentry_ino(expired);
+-		ino->flags |= AUTOFS_INF_NO_RCU;
++		ino->flags |= AUTOFS_INF_WANT_EXPIRE;
+ 		spin_unlock(&sbi->fs_lock);
+ 		synchronize_rcu();
+ 		spin_lock(&sbi->fs_lock);
+@@ -463,7 +461,7 @@ struct dentry *autofs4_expire_indirect(s
+ 			goto found;
+ 		}
+ 
+-		ino->flags &= ~AUTOFS_INF_NO_RCU;
++		ino->flags &= ~AUTOFS_INF_WANT_EXPIRE;
+ 		if (expired != dentry)
+ 			dput(expired);
+ 		spin_unlock(&sbi->fs_lock);
+@@ -473,17 +471,8 @@ struct dentry *autofs4_expire_indirect(s
+ found:
+ 	DPRINTK("returning %p %pd", expired, expired);
+ 	ino->flags |= AUTOFS_INF_EXPIRING;
+-	smp_mb();
+-	ino->flags &= ~AUTOFS_INF_NO_RCU;
+ 	init_completion(&ino->expire_complete);
+ 	spin_unlock(&sbi->fs_lock);
+-	spin_lock(&sbi->lookup_lock);
+-	spin_lock(&expired->d_parent->d_lock);
+-	spin_lock_nested(&expired->d_lock, DENTRY_D_LOCK_NESTED);
+-	list_move(&expired->d_parent->d_subdirs, &expired->d_child);
+-	spin_unlock(&expired->d_lock);
+-	spin_unlock(&expired->d_parent->d_lock);
+-	spin_unlock(&sbi->lookup_lock);
+ 	return expired;
+ }
+ 
+@@ -494,7 +483,7 @@ int autofs4_expire_wait(struct dentry *d
+ 	int status;
+ 
+ 	/* Block on any pending expire */
+-	if (!(ino->flags & (AUTOFS_INF_EXPIRING | AUTOFS_INF_NO_RCU)))
++	if (!(ino->flags & AUTOFS_INF_WANT_EXPIRE))
+ 		return 0;
+ 	if (rcu_walk)
+ 		return -ECHILD;
+@@ -551,7 +540,7 @@ int autofs4_expire_run(struct super_bloc
+ 	ino = autofs4_dentry_ino(dentry);
+ 	/* avoid rapid-fire expire attempts if expiry fails */
+ 	ino->last_used = now;
+-	ino->flags &= ~AUTOFS_INF_EXPIRING;
++	ino->flags &= ~(AUTOFS_INF_EXPIRING|AUTOFS_INF_WANT_EXPIRE);
+ 	complete_all(&ino->expire_complete);
+ 	spin_unlock(&sbi->fs_lock);
+ 
+@@ -579,7 +568,7 @@ int autofs4_do_expire_multi(struct super
+ 		spin_lock(&sbi->fs_lock);
+ 		/* avoid rapid-fire expire attempts if expiry fails */
+ 		ino->last_used = now;
+-		ino->flags &= ~AUTOFS_INF_EXPIRING;
++		ino->flags &= ~(AUTOFS_INF_EXPIRING|AUTOFS_INF_WANT_EXPIRE);
+ 		complete_all(&ino->expire_complete);
+ 		spin_unlock(&sbi->fs_lock);
+ 		dput(dentry);
+--- a/fs/autofs4/root.c
++++ b/fs/autofs4/root.c
+@@ -455,7 +455,7 @@ static int autofs4_d_manage(struct dentr
+ 		 * a mount-trap.
+ 		 */
+ 		struct inode *inode;
+-		if (ino->flags & (AUTOFS_INF_EXPIRING | AUTOFS_INF_NO_RCU))
++		if (ino->flags & AUTOFS_INF_WANT_EXPIRE)
+ 			return 0;
+ 		if (d_mountpoint(dentry))
+ 			return 0;
