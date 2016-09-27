@@ -1,0 +1,113 @@
+From db2ba40c277dc545bab531671c3f45ac0afea6f8 Mon Sep 17 00:00:00 2001
+From: Johannes Weiner <jweiner@fb.com>
+Date: Mon, 19 Sep 2016 14:44:36 -0700
+Subject: mm: memcontrol: make per-cpu charge cache IRQ-safe for socket accounting
+
+From: Johannes Weiner <jweiner@fb.com>
+
+commit db2ba40c277dc545bab531671c3f45ac0afea6f8 upstream.
+
+During cgroup2 rollout into production, we started encountering css
+refcount underflows and css access crashes in the memory controller.
+Splitting the heavily shared css reference counter into logical users
+narrowed the imbalance down to the cgroup2 socket memory accounting.
+
+The problem turns out to be the per-cpu charge cache.  Cgroup1 had a
+separate socket counter, but the new cgroup2 socket accounting goes
+through the common charge path that uses a shared per-cpu cache for all
+memory that is being tracked.  Those caches are safe against scheduling
+preemption, but not against interrupts - such as the newly added packet
+receive path.  When cache draining is interrupted by network RX taking
+pages out of the cache, the resuming drain operation will put references
+of in-use pages, thus causing the imbalance.
+
+Disable IRQs during all per-cpu charge cache operations.
+
+Fixes: f7e1cb6ec51b ("mm: memcontrol: account socket memory in unified hierarchy memory controller")
+Link: http://lkml.kernel.org/r/20160914194846.11153-1-hannes@cmpxchg.org
+Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+Acked-by: Tejun Heo <tj@kernel.org>
+Cc: "David S. Miller" <davem@davemloft.net>
+Cc: Michal Hocko <mhocko@suse.cz>
+Cc: Vladimir Davydov <vdavydov@virtuozzo.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ mm/memcontrol.c |   31 ++++++++++++++++++++++---------
+ 1 file changed, 22 insertions(+), 9 deletions(-)
+
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -1797,17 +1797,22 @@ static DEFINE_MUTEX(percpu_charge_mutex)
+ static bool consume_stock(struct mem_cgroup *memcg, unsigned int nr_pages)
+ {
+ 	struct memcg_stock_pcp *stock;
++	unsigned long flags;
+ 	bool ret = false;
+ 
+ 	if (nr_pages > CHARGE_BATCH)
+ 		return ret;
+ 
+-	stock = &get_cpu_var(memcg_stock);
++	local_irq_save(flags);
++
++	stock = this_cpu_ptr(&memcg_stock);
+ 	if (memcg == stock->cached && stock->nr_pages >= nr_pages) {
+ 		stock->nr_pages -= nr_pages;
+ 		ret = true;
+ 	}
+-	put_cpu_var(memcg_stock);
++
++	local_irq_restore(flags);
++
+ 	return ret;
+ }
+ 
+@@ -1828,15 +1833,18 @@ static void drain_stock(struct memcg_sto
+ 	stock->cached = NULL;
+ }
+ 
+-/*
+- * This must be called under preempt disabled or must be called by
+- * a thread which is pinned to local cpu.
+- */
+ static void drain_local_stock(struct work_struct *dummy)
+ {
+-	struct memcg_stock_pcp *stock = this_cpu_ptr(&memcg_stock);
++	struct memcg_stock_pcp *stock;
++	unsigned long flags;
++
++	local_irq_save(flags);
++
++	stock = this_cpu_ptr(&memcg_stock);
+ 	drain_stock(stock);
+ 	clear_bit(FLUSHING_CACHED_CHARGE, &stock->flags);
++
++	local_irq_restore(flags);
+ }
+ 
+ /*
+@@ -1845,14 +1853,19 @@ static void drain_local_stock(struct wor
+  */
+ static void refill_stock(struct mem_cgroup *memcg, unsigned int nr_pages)
+ {
+-	struct memcg_stock_pcp *stock = &get_cpu_var(memcg_stock);
++	struct memcg_stock_pcp *stock;
++	unsigned long flags;
++
++	local_irq_save(flags);
+ 
++	stock = this_cpu_ptr(&memcg_stock);
+ 	if (stock->cached != memcg) { /* reset if necessary */
+ 		drain_stock(stock);
+ 		stock->cached = memcg;
+ 	}
+ 	stock->nr_pages += nr_pages;
+-	put_cpu_var(memcg_stock);
++
++	local_irq_restore(flags);
+ }
+ 
+ /*
