@@ -1,0 +1,105 @@
+From 2c81a6477081966fe80b8c6daa68459bca896774 Mon Sep 17 00:00:00 2001
+From: Mark Rutland <mark.rutland@arm.com>
+Date: Tue, 14 Jun 2016 16:10:41 +0100
+Subject: perf/core: Fix pmu::filter_match for SW-led groups
+
+From: Mark Rutland <mark.rutland@arm.com>
+
+commit 2c81a6477081966fe80b8c6daa68459bca896774 upstream.
+
+The following commit:
+
+  66eb579e66ec ("perf: allow for PMU-specific event filtering")
+
+added the pmu::filter_match() callback. This was intended to
+avoid HW constraints on events from resulting in extremely
+pessimistic scheduling.
+
+However, pmu::filter_match() is only called for the leader of each event
+group. When the leader is a SW event, we do not filter the groups, and
+may fail at pmu::add() time, and when this happens we'll give up on
+scheduling any event groups later in the list until they are rotated
+ahead of the failing group.
+
+This can result in extremely sub-optimal event scheduling behaviour,
+e.g. if running the following on a big.LITTLE platform:
+
+$ taskset -c 0 ./perf stat \
+ -e 'a57{context-switches,armv8_cortex_a57/config=0x11/}' \
+ -e 'a53{context-switches,armv8_cortex_a53/config=0x11/}' \
+ ls
+
+     <not counted>      context-switches                                              (0.00%)
+     <not counted>      armv8_cortex_a57/config=0x11/                                 (0.00%)
+                24      context-switches                                              (37.36%)
+          57589154      armv8_cortex_a53/config=0x11/                                 (37.36%)
+
+Here the 'a53' event group was always eligible to be scheduled, but
+the 'a57' group never eligible to be scheduled, as the task was always
+affine to a Cortex-A53 CPU. The SW (group leader) event in the 'a57'
+group was eligible, but the HW event failed at pmu::add() time,
+resulting in ctx_flexible_sched_in giving up on scheduling further
+groups with HW events.
+
+One way of avoiding this is to check pmu::filter_match() on siblings
+as well as the group leader. If any of these fail their
+pmu::filter_match() call, we must skip the entire group before
+attempting to add any events.
+
+Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Cc: Arnaldo Carvalho de Melo <acme@kernel.org>
+Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+Cc: Jiri Olsa <jolsa@redhat.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Will Deacon <will.deacon@arm.com>
+Fixes: 66eb579e66ec ("perf: allow for PMU-specific event filtering")
+Link: http://lkml.kernel.org/r/1465917041-15339-1-git-send-email-mark.rutland@arm.com
+[ Small readability edits. ]
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ kernel/events/core.c |   23 ++++++++++++++++++++++-
+ 1 file changed, 22 insertions(+), 1 deletion(-)
+
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -1539,12 +1539,33 @@ static int __init perf_workqueue_init(vo
+ 
+ core_initcall(perf_workqueue_init);
+ 
+-static inline int pmu_filter_match(struct perf_event *event)
++static inline int __pmu_filter_match(struct perf_event *event)
+ {
+ 	struct pmu *pmu = event->pmu;
+ 	return pmu->filter_match ? pmu->filter_match(event) : 1;
+ }
+ 
++/*
++ * Check whether we should attempt to schedule an event group based on
++ * PMU-specific filtering. An event group can consist of HW and SW events,
++ * potentially with a SW leader, so we must check all the filters, to
++ * determine whether a group is schedulable:
++ */
++static inline int pmu_filter_match(struct perf_event *event)
++{
++	struct perf_event *child;
++
++	if (!__pmu_filter_match(event))
++		return 0;
++
++	list_for_each_entry(child, &event->sibling_list, group_entry) {
++		if (!__pmu_filter_match(child))
++			return 0;
++	}
++
++	return 1;
++}
++
+ static inline int
+ event_filter_match(struct perf_event *event)
+ {
