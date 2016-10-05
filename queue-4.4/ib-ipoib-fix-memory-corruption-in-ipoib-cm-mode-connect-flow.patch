@@ -1,0 +1,111 @@
+From 546481c2816ea3c061ee9d5658eb48070f69212e Mon Sep 17 00:00:00 2001
+From: Erez Shitrit <erezsh@mellanox.com>
+Date: Sun, 28 Aug 2016 10:58:31 +0300
+Subject: IB/ipoib: Fix memory corruption in ipoib cm mode connect flow
+
+From: Erez Shitrit <erezsh@mellanox.com>
+
+commit 546481c2816ea3c061ee9d5658eb48070f69212e upstream.
+
+When a new CM connection is being requested, ipoib driver copies data
+from the path pointer in the CM/tx object, the path object might be
+invalid at the point and memory corruption will happened later when now
+the CM driver will try using that data.
+
+The next scenario demonstrates it:
+	neigh_add_path --> ipoib_cm_create_tx -->
+	queue_work (pointer to path is in the cm/tx struct)
+	#while the work is still in the queue,
+	#the port goes down and causes the ipoib_flush_paths:
+	ipoib_flush_paths --> path_free --> kfree(path)
+	#at this point the work scheduled starts.
+	ipoib_cm_tx_start --> copy from the (invalid)path pointer:
+	(memcpy(&pathrec, &p->path->pathrec, sizeof pathrec);)
+	 -> memory corruption.
+
+To fix that the driver now starts the CM/tx connection only if that
+specific path exists in the general paths database.
+This check is protected with the relevant locks, and uses the gid from
+the neigh member in the CM/tx object which is valid according to the ref
+count that was taken by the CM/tx.
+
+Fixes: 839fcaba35 ('IPoIB: Connected mode experimental support')
+Signed-off-by: Erez Shitrit <erezsh@mellanox.com>
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Signed-off-by: Doug Ledford <dledford@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/infiniband/ulp/ipoib/ipoib.h      |    1 +
+ drivers/infiniband/ulp/ipoib/ipoib_cm.c   |   16 ++++++++++++++++
+ drivers/infiniband/ulp/ipoib/ipoib_main.c |    2 +-
+ 3 files changed, 18 insertions(+), 1 deletion(-)
+
+--- a/drivers/infiniband/ulp/ipoib/ipoib.h
++++ b/drivers/infiniband/ulp/ipoib/ipoib.h
+@@ -472,6 +472,7 @@ void ipoib_send(struct net_device *dev,
+ 		struct ipoib_ah *address, u32 qpn);
+ void ipoib_reap_ah(struct work_struct *work);
+ 
++struct ipoib_path *__path_find(struct net_device *dev, void *gid);
+ void ipoib_mark_paths_invalid(struct net_device *dev);
+ void ipoib_flush_paths(struct net_device *dev);
+ struct ipoib_dev_priv *ipoib_intf_alloc(const char *format);
+--- a/drivers/infiniband/ulp/ipoib/ipoib_cm.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_cm.c
+@@ -1299,6 +1299,8 @@ void ipoib_cm_destroy_tx(struct ipoib_cm
+ 	}
+ }
+ 
++#define QPN_AND_OPTIONS_OFFSET	4
++
+ static void ipoib_cm_tx_start(struct work_struct *work)
+ {
+ 	struct ipoib_dev_priv *priv = container_of(work, struct ipoib_dev_priv,
+@@ -1307,6 +1309,7 @@ static void ipoib_cm_tx_start(struct wor
+ 	struct ipoib_neigh *neigh;
+ 	struct ipoib_cm_tx *p;
+ 	unsigned long flags;
++	struct ipoib_path *path;
+ 	int ret;
+ 
+ 	struct ib_sa_path_rec pathrec;
+@@ -1319,7 +1322,19 @@ static void ipoib_cm_tx_start(struct wor
+ 		p = list_entry(priv->cm.start_list.next, typeof(*p), list);
+ 		list_del_init(&p->list);
+ 		neigh = p->neigh;
++
+ 		qpn = IPOIB_QPN(neigh->daddr);
++		/*
++		 * As long as the search is with these 2 locks,
++		 * path existence indicates its validity.
++		 */
++		path = __path_find(dev, neigh->daddr + QPN_AND_OPTIONS_OFFSET);
++		if (!path) {
++			pr_info("%s ignore not valid path %pI6\n",
++				__func__,
++				neigh->daddr + QPN_AND_OPTIONS_OFFSET);
++			goto free_neigh;
++		}
+ 		memcpy(&pathrec, &p->path->pathrec, sizeof pathrec);
+ 
+ 		spin_unlock_irqrestore(&priv->lock, flags);
+@@ -1331,6 +1346,7 @@ static void ipoib_cm_tx_start(struct wor
+ 		spin_lock_irqsave(&priv->lock, flags);
+ 
+ 		if (ret) {
++free_neigh:
+ 			neigh = p->neigh;
+ 			if (neigh) {
+ 				neigh->cm = NULL;
+--- a/drivers/infiniband/ulp/ipoib/ipoib_main.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+@@ -481,7 +481,7 @@ int ipoib_set_mode(struct net_device *de
+ 	return -EINVAL;
+ }
+ 
+-static struct ipoib_path *__path_find(struct net_device *dev, void *gid)
++struct ipoib_path *__path_find(struct net_device *dev, void *gid)
+ {
+ 	struct ipoib_dev_priv *priv = netdev_priv(dev);
+ 	struct rb_node *n = priv->path_tree.rb_node;
