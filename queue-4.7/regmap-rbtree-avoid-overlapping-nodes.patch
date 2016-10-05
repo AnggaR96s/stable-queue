@@ -1,0 +1,118 @@
+From 1bc8da4e143c0fd8807e061a66d91d5972601ab1 Mon Sep 17 00:00:00 2001
+From: Lars-Peter Clausen <lars@metafoo.de>
+Date: Thu, 4 Aug 2016 17:22:16 +0200
+Subject: regmap: rbtree: Avoid overlapping nodes
+
+From: Lars-Peter Clausen <lars@metafoo.de>
+
+commit 1bc8da4e143c0fd8807e061a66d91d5972601ab1 upstream.
+
+When searching for a suitable node that should be used for inserting a new
+register, which does not fall within the range of any existing node, we not
+only looks for nodes which are directly adjacent to the new register, but
+for nodes within a certain proximity. This is done to avoid creating lots
+of small nodes with just a few registers spacing in between, which would
+increase memory usage as well as tree traversal time.
+
+This means there might be multiple node candidates which fall within the
+proximity range of the new register. If we choose the first node we
+encounter, under certain register insertion patterns it is possible to end
+up with overlapping ranges. This will break order in the rbtree and can
+cause the cached register value to become corrupted.
+
+E.g. take the simplified example where the proximity range is 2 and the
+register insertion sequence is 1, 4, 2, 3, 5.
+ * Insert of register 1 creates a new node, this is the root of the rbtree
+ * Insert of register 4 creates a new node, which is inserted to the right
+   of the root.
+ * Insert of register 2 gets inserted to the first node
+ * Insert of register 3 gets inserted to the first node
+ * Insert of register 5 also gets inserted into the first node since
+   this is the first node encountered and it is within the proximity range.
+   Now there are two overlapping nodes.
+
+To avoid this always choose the node that is closest to the new register.
+This will ensure that nodes will not overlap. The tree traversal is still
+done as a binary search, we just don't stop at the first node found. So the
+complexity of the algorithm stays within the same order.
+
+Ideally if a new register is in the range of two adjacent blocks those
+blocks should be merged, but that is a much more invasive change and left
+for later.
+
+The issue was initially introduced in commit 472fdec7380c ("regmap: rbtree:
+Reduce number of nodes, take 2"), but became much more exposed by commit
+6399aea629b0 ("regmap: rbtree: When adding a reg do a bsearch for target
+node") which changed the order in which nodes are looked-up.
+
+Fixes: 6399aea629b0 ("regmap: rbtree: When adding a reg do a bsearch for target node")
+Signed-off-by: Lars-Peter Clausen <lars@metafoo.de>
+Signed-off-by: Mark Brown <broonie@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/base/regmap/regcache-rbtree.c |   38 +++++++++++++++++++++++++---------
+ 1 file changed, 28 insertions(+), 10 deletions(-)
+
+--- a/drivers/base/regmap/regcache-rbtree.c
++++ b/drivers/base/regmap/regcache-rbtree.c
+@@ -404,6 +404,7 @@ static int regcache_rbtree_write(struct
+ 		unsigned int new_base_reg, new_top_reg;
+ 		unsigned int min, max;
+ 		unsigned int max_dist;
++		unsigned int dist, best_dist = UINT_MAX;
+ 
+ 		max_dist = map->reg_stride * sizeof(*rbnode_tmp) /
+ 			map->cache_word_size;
+@@ -423,24 +424,41 @@ static int regcache_rbtree_write(struct
+ 				&base_reg, &top_reg);
+ 
+ 			if (base_reg <= max && top_reg >= min) {
+-				new_base_reg = min(reg, base_reg);
+-				new_top_reg = max(reg, top_reg);
+-			} else {
+-				if (max < base_reg)
+-					node = node->rb_left;
++				if (reg < base_reg)
++					dist = base_reg - reg;
++				else if (reg > top_reg)
++					dist = reg - top_reg;
+ 				else
+-					node = node->rb_right;
+-
+-				continue;
++					dist = 0;
++				if (dist < best_dist) {
++					rbnode = rbnode_tmp;
++					best_dist = dist;
++					new_base_reg = min(reg, base_reg);
++					new_top_reg = max(reg, top_reg);
++				}
+ 			}
+ 
+-			ret = regcache_rbtree_insert_to_block(map, rbnode_tmp,
++			/*
++			 * Keep looking, we want to choose the closest block,
++			 * otherwise we might end up creating overlapping
++			 * blocks, which breaks the rbtree.
++			 */
++			if (reg < base_reg)
++				node = node->rb_left;
++			else if (reg > top_reg)
++				node = node->rb_right;
++			else
++				break;
++		}
++
++		if (rbnode) {
++			ret = regcache_rbtree_insert_to_block(map, rbnode,
+ 							      new_base_reg,
+ 							      new_top_reg, reg,
+ 							      value);
+ 			if (ret)
+ 				return ret;
+-			rbtree_ctx->cached_rbnode = rbnode_tmp;
++			rbtree_ctx->cached_rbnode = rbnode;
+ 			return 0;
+ 		}
+ 
