@@ -1,0 +1,180 @@
+From 2dd9c11b9d4dfbd6c070eab7b81197f65e82f1a0 Mon Sep 17 00:00:00 2001
+From: Mauricio Faria de Oliveira <mauricfo@linux.vnet.ibm.com>
+Date: Thu, 11 Aug 2016 17:25:40 -0300
+Subject: powerpc/pseries: use pci_host_bridge.release_fn() to kfree(phb)
+
+From: Mauricio Faria de Oliveira <mauricfo@linux.vnet.ibm.com>
+
+commit 2dd9c11b9d4dfbd6c070eab7b81197f65e82f1a0 upstream.
+
+This patch leverages 'struct pci_host_bridge' from the PCI subsystem
+in order to free the pci_controller only after the last reference to
+its devices is dropped (avoiding an oops in pcibios_release_device()
+if the last reference is dropped after pcibios_free_controller()).
+
+The patch relies on pci_host_bridge.release_fn() (and .release_data),
+which is called automatically by the PCI subsystem when the root bus
+is released (i.e., the last reference is dropped).  Those fields are
+set via pci_set_host_bridge_release() (e.g. in the platform-specific
+implementation of pcibios_root_bridge_prepare()).
+
+It introduces the 'pcibios_free_controller_deferred()' .release_fn()
+and it expects .release_data to hold a pointer to the pci_controller.
+
+The function implictly calls 'pcibios_free_controller()', so an user
+must *NOT* explicitly call it if using the new _deferred() callback.
+
+The functionality is enabled for pseries (although it isn't platform
+specific, and may be used by cxl).
+
+Details on not-so-elegant design choices:
+
+ - Use 'pci_host_bridge.release_data' field as pointer to associated
+   'struct pci_controller' so *not* to 'pci_bus_to_host(bridge->bus)'
+   in pcibios_free_controller_deferred().
+
+   That's because pci_remove_root_bus() sets 'host_bridge->bus = NULL'
+   (so, if the last reference is released after pci_remove_root_bus()
+   runs, which eventually reaches pcibios_free_controller_deferred(),
+   that would hit a null pointer dereference).
+
+   The cxl/vphb.c code calls pci_remove_root_bus(), and the cxl folks
+   are interested in this fix.
+
+Test-case #1 (hold references)
+
+  # ls -ld /sys/block/sd* | grep -m1 0021:01:00.0
+  <...> /sys/block/sdaa -> ../devices/pci0021:01/0021:01:00.0/<...>
+
+  # ls -ld /sys/block/sd* | grep -m1 0021:01:00.1
+  <...> /sys/block/sdab -> ../devices/pci0021:01/0021:01:00.1/<...>
+
+  # cat >/dev/sdaa & pid1=$!
+  # cat >/dev/sdab & pid2=$!
+
+  # drmgr -w 5 -d 1 -c phb -s 'PHB 33' -r
+  Validating PHB DLPAR capability...yes.
+  [  594.306719] pci_hp_remove_devices: PCI: Removing devices on bus 0021:01
+  [  594.306738] pci_hp_remove_devices:    Removing 0021:01:00.0...
+  ...
+  [  598.236381] pci_hp_remove_devices:    Removing 0021:01:00.1...
+  ...
+  [  611.972077] pci_bus 0021:01: busn_res: [bus 01-ff] is released
+  [  611.972140] rpadlpar_io: slot PHB 33 removed
+
+  # kill -9 $pid1
+  # kill -9 $pid2
+  [  632.918088] pcibios_free_controller_deferred: domain 33, dynamic 1
+
+Test-case #2 (don't hold references)
+
+  # drmgr -w 5 -d 1 -c phb -s 'PHB 33' -r
+  Validating PHB DLPAR capability...yes.
+  [  916.357363] pci_hp_remove_devices: PCI: Removing devices on bus 0021:01
+  [  916.357386] pci_hp_remove_devices:    Removing 0021:01:00.0...
+  ...
+  [  920.566527] pci_hp_remove_devices:    Removing 0021:01:00.1...
+  ...
+  [  933.955873] pci_bus 0021:01: busn_res: [bus 01-ff] is released
+  [  933.955977] pcibios_free_controller_deferred: domain 33, dynamic 1
+  [  933.955999] rpadlpar_io: slot PHB 33 removed
+
+Suggested-By: Gavin Shan <gwshan@linux.vnet.ibm.com>
+Signed-off-by: Mauricio Faria de Oliveira <mauricfo@linux.vnet.ibm.com>
+Reviewed-by: Gavin Shan <gwshan@linux.vnet.ibm.com>
+Reviewed-by: Andrew Donnellan <andrew.donnellan@au1.ibm.com>
+Tested-by: Andrew Donnellan <andrew.donnellan@au1.ibm.com> # cxl
+Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ arch/powerpc/include/asm/pci-bridge.h      |    1 
+ arch/powerpc/kernel/pci-common.c           |   36 +++++++++++++++++++++++++++++
+ arch/powerpc/platforms/pseries/pci.c       |    4 +++
+ arch/powerpc/platforms/pseries/pci_dlpar.c |    7 ++++-
+ 4 files changed, 46 insertions(+), 2 deletions(-)
+
+--- a/arch/powerpc/include/asm/pci-bridge.h
++++ b/arch/powerpc/include/asm/pci-bridge.h
+@@ -299,6 +299,7 @@ extern void pci_process_bridge_OF_ranges
+ /* Allocate & free a PCI host bridge structure */
+ extern struct pci_controller *pcibios_alloc_controller(struct device_node *dev);
+ extern void pcibios_free_controller(struct pci_controller *phb);
++extern void pcibios_free_controller_deferred(struct pci_host_bridge *bridge);
+ 
+ #ifdef CONFIG_PCI
+ extern int pcibios_vaddr_is_ioport(void __iomem *address);
+--- a/arch/powerpc/kernel/pci-common.c
++++ b/arch/powerpc/kernel/pci-common.c
+@@ -103,6 +103,42 @@ void pcibios_free_controller(struct pci_
+ EXPORT_SYMBOL_GPL(pcibios_free_controller);
+ 
+ /*
++ * This function is used to call pcibios_free_controller()
++ * in a deferred manner: a callback from the PCI subsystem.
++ *
++ * _*DO NOT*_ call pcibios_free_controller() explicitly if
++ * this is used (or it may access an invalid *phb pointer).
++ *
++ * The callback occurs when all references to the root bus
++ * are dropped (e.g., child buses/devices and their users).
++ *
++ * It's called as .release_fn() of 'struct pci_host_bridge'
++ * which is associated with the 'struct pci_controller.bus'
++ * (root bus) - it expects .release_data to hold a pointer
++ * to 'struct pci_controller'.
++ *
++ * In order to use it, register .release_fn()/release_data
++ * like this:
++ *
++ * pci_set_host_bridge_release(bridge,
++ *                             pcibios_free_controller_deferred
++ *                             (void *) phb);
++ *
++ * e.g. in the pcibios_root_bridge_prepare() callback from
++ * pci_create_root_bus().
++ */
++void pcibios_free_controller_deferred(struct pci_host_bridge *bridge)
++{
++	struct pci_controller *phb = (struct pci_controller *)
++					 bridge->release_data;
++
++	pr_debug("domain %d, dynamic %d\n", phb->global_number, phb->is_dynamic);
++
++	pcibios_free_controller(phb);
++}
++EXPORT_SYMBOL_GPL(pcibios_free_controller_deferred);
++
++/*
+  * The function is used to return the minimal alignment
+  * for memory or I/O windows of the associated P2P bridge.
+  * By default, 4KiB alignment for I/O windows and 1MiB for
+--- a/arch/powerpc/platforms/pseries/pci.c
++++ b/arch/powerpc/platforms/pseries/pci.c
+@@ -119,6 +119,10 @@ int pseries_root_bridge_prepare(struct p
+ 
+ 	bus = bridge->bus;
+ 
++	/* Rely on the pcibios_free_controller_deferred() callback. */
++	pci_set_host_bridge_release(bridge, pcibios_free_controller_deferred,
++					(void *) pci_bus_to_host(bus));
++
+ 	dn = pcibios_get_phb_of_node(bus);
+ 	if (!dn)
+ 		return 0;
+--- a/arch/powerpc/platforms/pseries/pci_dlpar.c
++++ b/arch/powerpc/platforms/pseries/pci_dlpar.c
+@@ -106,8 +106,11 @@ int remove_phb_dynamic(struct pci_contro
+ 		release_resource(res);
+ 	}
+ 
+-	/* Free pci_controller data structure */
+-	pcibios_free_controller(phb);
++	/*
++	 * The pci_controller data structure is freed by
++	 * the pcibios_free_controller_deferred() callback;
++	 * see pseries_root_bridge_prepare().
++	 */
+ 
+ 	return 0;
+ }
