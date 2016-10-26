@@ -1,0 +1,84 @@
+From d3798ae8c6f3767c726403c2ca6ecc317752c9dd Mon Sep 17 00:00:00 2001
+From: Johannes Weiner <hannes@cmpxchg.org>
+Date: Tue, 4 Oct 2016 22:02:08 +0200
+Subject: mm: filemap: don't plant shadow entries without radix tree node
+
+From: Johannes Weiner <hannes@cmpxchg.org>
+
+commit d3798ae8c6f3767c726403c2ca6ecc317752c9dd upstream.
+
+When the underflow checks were added to workingset_node_shadow_dec(),
+they triggered immediately:
+
+  kernel BUG at ./include/linux/swap.h:276!
+  invalid opcode: 0000 [#1] SMP
+  Modules linked in: isofs usb_storage fuse xt_CHECKSUM ipt_MASQUERADE nf_nat_masquerade_ipv4 tun nf_conntrack_netbios_ns nf_conntrack_broadcast ip6t_REJECT nf_reject_ipv6
+   soundcore wmi acpi_als pinctrl_sunrisepoint kfifo_buf tpm_tis industrialio acpi_pad pinctrl_intel tpm_tis_core tpm nfsd auth_rpcgss nfs_acl lockd grace sunrpc dm_crypt
+  CPU: 0 PID: 20929 Comm: blkid Not tainted 4.8.0-rc8-00087-gbe67d60ba944 #1
+  Hardware name: System manufacturer System Product Name/Z170-K, BIOS 1803 05/06/2016
+  task: ffff8faa93ecd940 task.stack: ffff8faa7f478000
+  RIP: page_cache_tree_insert+0xf1/0x100
+  Call Trace:
+    __add_to_page_cache_locked+0x12e/0x270
+    add_to_page_cache_lru+0x4e/0xe0
+    mpage_readpages+0x112/0x1d0
+    blkdev_readpages+0x1d/0x20
+    __do_page_cache_readahead+0x1ad/0x290
+    force_page_cache_readahead+0xaa/0x100
+    page_cache_sync_readahead+0x3f/0x50
+    generic_file_read_iter+0x5af/0x740
+    blkdev_read_iter+0x35/0x40
+    __vfs_read+0xe1/0x130
+    vfs_read+0x96/0x130
+    SyS_read+0x55/0xc0
+    entry_SYSCALL_64_fastpath+0x13/0x8f
+  Code: 03 00 48 8b 5d d8 65 48 33 1c 25 28 00 00 00 44 89 e8 75 19 48 83 c4 18 5b 41 5c 41 5d 41 5e 5d c3 0f 0b 41 bd ef ff ff ff eb d7 <0f> 0b e8 88 68 ef ff 0f 1f 84 00
+  RIP  page_cache_tree_insert+0xf1/0x100
+
+This is a long-standing bug in the way shadow entries are accounted in
+the radix tree nodes. The shrinker needs to know when radix tree nodes
+contain only shadow entries, no pages, so node->count is split in half
+to count shadows in the upper bits and pages in the lower bits.
+
+Unfortunately, the radix tree implementation doesn't know of this and
+assumes all entries are in node->count. When there is a shadow entry
+directly in root->rnode and the tree is later extended, the radix tree
+implementation will copy that entry into the new node and and bump its
+node->count, i.e. increases the page count bits. Once the shadow gets
+removed and we subtract from the upper counter, node->count underflows
+and triggers the warning. Afterwards, without node->count reaching 0
+again, the radix tree node is leaked.
+
+Limit shadow entries to when we have actual radix tree nodes and can
+count them properly. That means we lose the ability to detect refaults
+from files that had only the first page faulted in at eviction time.
+
+Fixes: 449dd6984d0e ("mm: keep page cache radix tree nodes in check")
+Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+Reported-and-tested-by: Linus Torvalds <torvalds@linux-foundation.org>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ mm/filemap.c |    8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -122,6 +122,14 @@ static void page_cache_tree_delete(struc
+ 
+ 	__radix_tree_lookup(&mapping->page_tree, page->index, &node, &slot);
+ 
++	if (!node) {
++		/*
++		 * We need a node to properly account shadow
++		 * entries. Don't plant any without. XXX
++		 */
++		shadow = NULL;
++	}
++
+ 	if (shadow) {
+ 		mapping->nrshadows++;
+ 		/*
