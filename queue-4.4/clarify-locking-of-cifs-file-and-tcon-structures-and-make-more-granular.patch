@@ -1,0 +1,517 @@
+From 3afca265b5f53a0b15b79531c13858049505582d Mon Sep 17 00:00:00 2001
+From: Steve French <smfrench@gmail.com>
+Date: Thu, 22 Sep 2016 18:58:16 -0500
+Subject: Clarify locking of cifs file and tcon structures and make more granular
+
+From: Steve French <smfrench@gmail.com>
+
+commit 3afca265b5f53a0b15b79531c13858049505582d upstream.
+
+Remove the global file_list_lock to simplify cifs/smb3 locking and
+have spinlocks that more closely match the information they are
+protecting.
+
+Add new tcon->open_file_lock and file->file_info_lock spinlocks.
+Locks continue to follow a heirachy,
+	cifs_socket --> cifs_ses --> cifs_tcon --> cifs_file
+where global tcp_ses_lock still protects socket and cifs_ses, while the
+the newer locks protect the lower level structure's information
+(tcon and cifs_file respectively).
+
+Signed-off-by: Steve French <steve.french@primarydata.com>
+Signed-off-by: Pavel Shilovsky <pshilov@microsoft.com>
+Reviewed-by: Aurelien Aptel <aaptel@suse.com>
+Reviewed-by: Germano Percossi <germano.percossi@citrix.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/cifs/cifsfs.c   |    1 
+ fs/cifs/cifsglob.h |   30 ++++++++++++------------
+ fs/cifs/cifssmb.c  |    4 +--
+ fs/cifs/file.c     |   66 +++++++++++++++++++++++++++++++----------------------
+ fs/cifs/misc.c     |   15 ++++++------
+ fs/cifs/readdir.c  |    6 ++--
+ fs/cifs/smb2misc.c |   16 ++++++------
+ 7 files changed, 75 insertions(+), 63 deletions(-)
+
+--- a/fs/cifs/cifsfs.c
++++ b/fs/cifs/cifsfs.c
+@@ -1210,7 +1210,6 @@ init_cifs(void)
+ 	GlobalTotalActiveXid = 0;
+ 	GlobalMaxActiveXid = 0;
+ 	spin_lock_init(&cifs_tcp_ses_lock);
+-	spin_lock_init(&cifs_file_list_lock);
+ 	spin_lock_init(&GlobalMid_Lock);
+ 
+ 	if (cifs_max_pending < 2) {
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@ -827,6 +827,7 @@ struct cifs_tcon {
+ 	struct list_head tcon_list;
+ 	int tc_count;
+ 	struct list_head openFileList;
++	spinlock_t open_file_lock; /* protects list above */
+ 	struct cifs_ses *ses;	/* pointer to session associated with */
+ 	char treeName[MAX_TREE_SIZE + 1]; /* UNC name of resource in ASCII */
+ 	char *nativeFileSystem;
+@@ -883,7 +884,7 @@ struct cifs_tcon {
+ #endif /* CONFIG_CIFS_STATS2 */
+ 	__u64    bytes_read;
+ 	__u64    bytes_written;
+-	spinlock_t stat_lock;
++	spinlock_t stat_lock;  /* protects the two fields above */
+ #endif /* CONFIG_CIFS_STATS */
+ 	FILE_SYSTEM_DEVICE_INFO fsDevInfo;
+ 	FILE_SYSTEM_ATTRIBUTE_INFO fsAttrInfo; /* ok if fs name truncated */
+@@ -1034,8 +1035,10 @@ struct cifs_fid_locks {
+ };
+ 
+ struct cifsFileInfo {
++	/* following two lists are protected by tcon->open_file_lock */
+ 	struct list_head tlist;	/* pointer to next fid owned by tcon */
+ 	struct list_head flist;	/* next fid (file instance) for this inode */
++	/* lock list below protected by cifsi->lock_sem */
+ 	struct cifs_fid_locks *llist;	/* brlocks held by this fid */
+ 	kuid_t uid;		/* allows finding which FileInfo structure */
+ 	__u32 pid;		/* process id who opened file */
+@@ -1043,11 +1046,12 @@ struct cifsFileInfo {
+ 	/* BB add lock scope info here if needed */ ;
+ 	/* lock scope id (0 if none) */
+ 	struct dentry *dentry;
+-	unsigned int f_flags;
+ 	struct tcon_link *tlink;
++	unsigned int f_flags;
+ 	bool invalidHandle:1;	/* file closed via session abend */
+ 	bool oplock_break_cancelled:1;
+-	int count;		/* refcount protected by cifs_file_list_lock */
++	int count;
++	spinlock_t file_info_lock; /* protects four flag/count fields above */
+ 	struct mutex fh_mutex; /* prevents reopen race after dead ses*/
+ 	struct cifs_search_info srch_inf;
+ 	struct work_struct oplock_break; /* work for oplock breaks */
+@@ -1114,7 +1118,7 @@ struct cifs_writedata {
+ 
+ /*
+  * Take a reference on the file private data. Must be called with
+- * cifs_file_list_lock held.
++ * cfile->file_info_lock held.
+  */
+ static inline void
+ cifsFileInfo_get_locked(struct cifsFileInfo *cifs_file)
+@@ -1508,8 +1512,10 @@ require use of the stronger protocol */
+  *  GlobalMid_Lock protects:
+  *	list operations on pending_mid_q and oplockQ
+  *      updates to XID counters, multiplex id  and SMB sequence numbers
+- *  cifs_file_list_lock protects:
+- *	list operations on tcp and SMB session lists and tCon lists
++ *  tcp_ses_lock protects:
++ *	list operations on tcp and SMB session lists
++ *  tcon->open_file_lock protects the list of open files hanging off the tcon
++ *  cfile->file_info_lock protects counters and fields in cifs file struct
+  *  f_owner.lock protects certain per file struct operations
+  *  mapping->page_lock protects certain per page operations
+  *
+@@ -1541,18 +1547,12 @@ GLOBAL_EXTERN struct list_head		cifs_tcp
+  * tcp session, and the list of tcon's per smb session. It also protects
+  * the reference counters for the server, smb session, and tcon. Finally,
+  * changes to the tcon->tidStatus should be done while holding this lock.
++ * generally the locks should be taken in order tcp_ses_lock before
++ * tcon->open_file_lock and that before file->file_info_lock since the
++ * structure order is cifs_socket-->cifs_ses-->cifs_tcon-->cifs_file
+  */
+ GLOBAL_EXTERN spinlock_t		cifs_tcp_ses_lock;
+ 
+-/*
+- * This lock protects the cifs_file->llist and cifs_file->flist
+- * list operations, and updates to some flags (cifs_file->invalidHandle)
+- * It will be moved to either use the tcon->stat_lock or equivalent later.
+- * If cifs_tcp_ses_lock and the lock below are both needed to be held, then
+- * the cifs_tcp_ses_lock must be grabbed first and released last.
+- */
+-GLOBAL_EXTERN spinlock_t	cifs_file_list_lock;
+-
+ #ifdef CONFIG_CIFS_DNOTIFY_EXPERIMENTAL /* unused temporarily */
+ /* Outstanding dir notify requests */
+ GLOBAL_EXTERN struct list_head GlobalDnotifyReqList;
+--- a/fs/cifs/cifssmb.c
++++ b/fs/cifs/cifssmb.c
+@@ -98,13 +98,13 @@ cifs_mark_open_files_invalid(struct cifs
+ 	struct list_head *tmp1;
+ 
+ 	/* list all files open on tree connection and mark them invalid */
+-	spin_lock(&cifs_file_list_lock);
++	spin_lock(&tcon->open_file_lock);
+ 	list_for_each_safe(tmp, tmp1, &tcon->openFileList) {
+ 		open_file = list_entry(tmp, struct cifsFileInfo, tlist);
+ 		open_file->invalidHandle = true;
+ 		open_file->oplock_break_cancelled = true;
+ 	}
+-	spin_unlock(&cifs_file_list_lock);
++	spin_unlock(&tcon->open_file_lock);
+ 	/*
+ 	 * BB Add call to invalidate_inodes(sb) for all superblocks mounted
+ 	 * to this tcon.
+--- a/fs/cifs/file.c
++++ b/fs/cifs/file.c
+@@ -305,6 +305,7 @@ cifs_new_fileinfo(struct cifs_fid *fid,
+ 	cfile->tlink = cifs_get_tlink(tlink);
+ 	INIT_WORK(&cfile->oplock_break, cifs_oplock_break);
+ 	mutex_init(&cfile->fh_mutex);
++	spin_lock_init(&cfile->file_info_lock);
+ 
+ 	cifs_sb_active(inode->i_sb);
+ 
+@@ -317,7 +318,7 @@ cifs_new_fileinfo(struct cifs_fid *fid,
+ 		oplock = 0;
+ 	}
+ 
+-	spin_lock(&cifs_file_list_lock);
++	spin_lock(&tcon->open_file_lock);
+ 	if (fid->pending_open->oplock != CIFS_OPLOCK_NO_CHANGE && oplock)
+ 		oplock = fid->pending_open->oplock;
+ 	list_del(&fid->pending_open->olist);
+@@ -326,12 +327,13 @@ cifs_new_fileinfo(struct cifs_fid *fid,
+ 	server->ops->set_fid(cfile, fid, oplock);
+ 
+ 	list_add(&cfile->tlist, &tcon->openFileList);
++
+ 	/* if readable file instance put first in list*/
+ 	if (file->f_mode & FMODE_READ)
+ 		list_add(&cfile->flist, &cinode->openFileList);
+ 	else
+ 		list_add_tail(&cfile->flist, &cinode->openFileList);
+-	spin_unlock(&cifs_file_list_lock);
++	spin_unlock(&tcon->open_file_lock);
+ 
+ 	if (fid->purge_cache)
+ 		cifs_zap_mapping(inode);
+@@ -343,16 +345,16 @@ cifs_new_fileinfo(struct cifs_fid *fid,
+ struct cifsFileInfo *
+ cifsFileInfo_get(struct cifsFileInfo *cifs_file)
+ {
+-	spin_lock(&cifs_file_list_lock);
++	spin_lock(&cifs_file->file_info_lock);
+ 	cifsFileInfo_get_locked(cifs_file);
+-	spin_unlock(&cifs_file_list_lock);
++	spin_unlock(&cifs_file->file_info_lock);
+ 	return cifs_file;
+ }
+ 
+ /*
+  * Release a reference on the file private data. This may involve closing
+  * the filehandle out on the server. Must be called without holding
+- * cifs_file_list_lock.
++ * tcon->open_file_lock and cifs_file->file_info_lock.
+  */
+ void cifsFileInfo_put(struct cifsFileInfo *cifs_file)
+ {
+@@ -367,11 +369,15 @@ void cifsFileInfo_put(struct cifsFileInf
+ 	struct cifs_pending_open open;
+ 	bool oplock_break_cancelled;
+ 
+-	spin_lock(&cifs_file_list_lock);
++	spin_lock(&tcon->open_file_lock);
++
++	spin_lock(&cifs_file->file_info_lock);
+ 	if (--cifs_file->count > 0) {
+-		spin_unlock(&cifs_file_list_lock);
++		spin_unlock(&cifs_file->file_info_lock);
++		spin_unlock(&tcon->open_file_lock);
+ 		return;
+ 	}
++	spin_unlock(&cifs_file->file_info_lock);
+ 
+ 	if (server->ops->get_lease_key)
+ 		server->ops->get_lease_key(inode, &fid);
+@@ -395,7 +401,8 @@ void cifsFileInfo_put(struct cifsFileInf
+ 			set_bit(CIFS_INO_INVALID_MAPPING, &cifsi->flags);
+ 		cifs_set_oplock_level(cifsi, 0);
+ 	}
+-	spin_unlock(&cifs_file_list_lock);
++
++	spin_unlock(&tcon->open_file_lock);
+ 
+ 	oplock_break_cancelled = cancel_work_sync(&cifs_file->oplock_break);
+ 
+@@ -772,10 +779,10 @@ int cifs_closedir(struct inode *inode, s
+ 	server = tcon->ses->server;
+ 
+ 	cifs_dbg(FYI, "Freeing private data in close dir\n");
+-	spin_lock(&cifs_file_list_lock);
++	spin_lock(&cfile->file_info_lock);
+ 	if (server->ops->dir_needs_close(cfile)) {
+ 		cfile->invalidHandle = true;
+-		spin_unlock(&cifs_file_list_lock);
++		spin_unlock(&cfile->file_info_lock);
+ 		if (server->ops->close_dir)
+ 			rc = server->ops->close_dir(xid, tcon, &cfile->fid);
+ 		else
+@@ -784,7 +791,7 @@ int cifs_closedir(struct inode *inode, s
+ 		/* not much we can do if it fails anyway, ignore rc */
+ 		rc = 0;
+ 	} else
+-		spin_unlock(&cifs_file_list_lock);
++		spin_unlock(&cfile->file_info_lock);
+ 
+ 	buf = cfile->srch_inf.ntwrk_buf_start;
+ 	if (buf) {
+@@ -1720,12 +1727,13 @@ struct cifsFileInfo *find_readable_file(
+ {
+ 	struct cifsFileInfo *open_file = NULL;
+ 	struct cifs_sb_info *cifs_sb = CIFS_SB(cifs_inode->vfs_inode.i_sb);
++	struct cifs_tcon *tcon = cifs_sb_master_tcon(cifs_sb);
+ 
+ 	/* only filter by fsuid on multiuser mounts */
+ 	if (!(cifs_sb->mnt_cifs_flags & CIFS_MOUNT_MULTIUSER))
+ 		fsuid_only = false;
+ 
+-	spin_lock(&cifs_file_list_lock);
++	spin_lock(&tcon->open_file_lock);
+ 	/* we could simply get the first_list_entry since write-only entries
+ 	   are always at the end of the list but since the first entry might
+ 	   have a close pending, we go through the whole list */
+@@ -1736,8 +1744,8 @@ struct cifsFileInfo *find_readable_file(
+ 			if (!open_file->invalidHandle) {
+ 				/* found a good file */
+ 				/* lock it so it will not be closed on us */
+-				cifsFileInfo_get_locked(open_file);
+-				spin_unlock(&cifs_file_list_lock);
++				cifsFileInfo_get(open_file);
++				spin_unlock(&tcon->open_file_lock);
+ 				return open_file;
+ 			} /* else might as well continue, and look for
+ 			     another, or simply have the caller reopen it
+@@ -1745,7 +1753,7 @@ struct cifsFileInfo *find_readable_file(
+ 		} else /* write only file */
+ 			break; /* write only files are last so must be done */
+ 	}
+-	spin_unlock(&cifs_file_list_lock);
++	spin_unlock(&tcon->open_file_lock);
+ 	return NULL;
+ }
+ 
+@@ -1754,6 +1762,7 @@ struct cifsFileInfo *find_writable_file(
+ {
+ 	struct cifsFileInfo *open_file, *inv_file = NULL;
+ 	struct cifs_sb_info *cifs_sb;
++	struct cifs_tcon *tcon;
+ 	bool any_available = false;
+ 	int rc;
+ 	unsigned int refind = 0;
+@@ -1769,15 +1778,16 @@ struct cifsFileInfo *find_writable_file(
+ 	}
+ 
+ 	cifs_sb = CIFS_SB(cifs_inode->vfs_inode.i_sb);
++	tcon = cifs_sb_master_tcon(cifs_sb);
+ 
+ 	/* only filter by fsuid on multiuser mounts */
+ 	if (!(cifs_sb->mnt_cifs_flags & CIFS_MOUNT_MULTIUSER))
+ 		fsuid_only = false;
+ 
+-	spin_lock(&cifs_file_list_lock);
++	spin_lock(&tcon->open_file_lock);
+ refind_writable:
+ 	if (refind > MAX_REOPEN_ATT) {
+-		spin_unlock(&cifs_file_list_lock);
++		spin_unlock(&tcon->open_file_lock);
+ 		return NULL;
+ 	}
+ 	list_for_each_entry(open_file, &cifs_inode->openFileList, flist) {
+@@ -1788,8 +1798,8 @@ refind_writable:
+ 		if (OPEN_FMODE(open_file->f_flags) & FMODE_WRITE) {
+ 			if (!open_file->invalidHandle) {
+ 				/* found a good writable file */
+-				cifsFileInfo_get_locked(open_file);
+-				spin_unlock(&cifs_file_list_lock);
++				cifsFileInfo_get(open_file);
++				spin_unlock(&tcon->open_file_lock);
+ 				return open_file;
+ 			} else {
+ 				if (!inv_file)
+@@ -1805,24 +1815,24 @@ refind_writable:
+ 
+ 	if (inv_file) {
+ 		any_available = false;
+-		cifsFileInfo_get_locked(inv_file);
++		cifsFileInfo_get(inv_file);
+ 	}
+ 
+-	spin_unlock(&cifs_file_list_lock);
++	spin_unlock(&tcon->open_file_lock);
+ 
+ 	if (inv_file) {
+ 		rc = cifs_reopen_file(inv_file, false);
+ 		if (!rc)
+ 			return inv_file;
+ 		else {
+-			spin_lock(&cifs_file_list_lock);
++			spin_lock(&tcon->open_file_lock);
+ 			list_move_tail(&inv_file->flist,
+ 					&cifs_inode->openFileList);
+-			spin_unlock(&cifs_file_list_lock);
++			spin_unlock(&tcon->open_file_lock);
+ 			cifsFileInfo_put(inv_file);
+-			spin_lock(&cifs_file_list_lock);
+ 			++refind;
+ 			inv_file = NULL;
++			spin_lock(&tcon->open_file_lock);
+ 			goto refind_writable;
+ 		}
+ 	}
+@@ -3632,15 +3642,17 @@ static int cifs_readpage(struct file *fi
+ static int is_inode_writable(struct cifsInodeInfo *cifs_inode)
+ {
+ 	struct cifsFileInfo *open_file;
++	struct cifs_tcon *tcon =
++		cifs_sb_master_tcon(CIFS_SB(cifs_inode->vfs_inode.i_sb));
+ 
+-	spin_lock(&cifs_file_list_lock);
++	spin_lock(&tcon->open_file_lock);
+ 	list_for_each_entry(open_file, &cifs_inode->openFileList, flist) {
+ 		if (OPEN_FMODE(open_file->f_flags) & FMODE_WRITE) {
+-			spin_unlock(&cifs_file_list_lock);
++			spin_unlock(&tcon->open_file_lock);
+ 			return 1;
+ 		}
+ 	}
+-	spin_unlock(&cifs_file_list_lock);
++	spin_unlock(&tcon->open_file_lock);
+ 	return 0;
+ }
+ 
+--- a/fs/cifs/misc.c
++++ b/fs/cifs/misc.c
+@@ -120,6 +120,7 @@ tconInfoAlloc(void)
+ 		++ret_buf->tc_count;
+ 		INIT_LIST_HEAD(&ret_buf->openFileList);
+ 		INIT_LIST_HEAD(&ret_buf->tcon_list);
++		spin_lock_init(&ret_buf->open_file_lock);
+ #ifdef CONFIG_CIFS_STATS
+ 		spin_lock_init(&ret_buf->stat_lock);
+ #endif
+@@ -465,7 +466,7 @@ is_valid_oplock_break(char *buffer, stru
+ 				continue;
+ 
+ 			cifs_stats_inc(&tcon->stats.cifs_stats.num_oplock_brks);
+-			spin_lock(&cifs_file_list_lock);
++			spin_lock(&tcon->open_file_lock);
+ 			list_for_each(tmp2, &tcon->openFileList) {
+ 				netfile = list_entry(tmp2, struct cifsFileInfo,
+ 						     tlist);
+@@ -495,11 +496,11 @@ is_valid_oplock_break(char *buffer, stru
+ 					   &netfile->oplock_break);
+ 				netfile->oplock_break_cancelled = false;
+ 
+-				spin_unlock(&cifs_file_list_lock);
++				spin_unlock(&tcon->open_file_lock);
+ 				spin_unlock(&cifs_tcp_ses_lock);
+ 				return true;
+ 			}
+-			spin_unlock(&cifs_file_list_lock);
++			spin_unlock(&tcon->open_file_lock);
+ 			spin_unlock(&cifs_tcp_ses_lock);
+ 			cifs_dbg(FYI, "No matching file for oplock break\n");
+ 			return true;
+@@ -613,9 +614,9 @@ backup_cred(struct cifs_sb_info *cifs_sb
+ void
+ cifs_del_pending_open(struct cifs_pending_open *open)
+ {
+-	spin_lock(&cifs_file_list_lock);
++	spin_lock(&tlink_tcon(open->tlink)->open_file_lock);
+ 	list_del(&open->olist);
+-	spin_unlock(&cifs_file_list_lock);
++	spin_unlock(&tlink_tcon(open->tlink)->open_file_lock);
+ }
+ 
+ void
+@@ -635,7 +636,7 @@ void
+ cifs_add_pending_open(struct cifs_fid *fid, struct tcon_link *tlink,
+ 		      struct cifs_pending_open *open)
+ {
+-	spin_lock(&cifs_file_list_lock);
++	spin_lock(&tlink_tcon(tlink)->open_file_lock);
+ 	cifs_add_pending_open_locked(fid, tlink, open);
+-	spin_unlock(&cifs_file_list_lock);
++	spin_unlock(&tlink_tcon(open->tlink)->open_file_lock);
+ }
+--- a/fs/cifs/readdir.c
++++ b/fs/cifs/readdir.c
+@@ -594,14 +594,14 @@ find_cifs_entry(const unsigned int xid,
+ 	     is_dir_changed(file)) || (index_to_find < first_entry_in_buffer)) {
+ 		/* close and restart search */
+ 		cifs_dbg(FYI, "search backing up - close and restart search\n");
+-		spin_lock(&cifs_file_list_lock);
++		spin_lock(&cfile->file_info_lock);
+ 		if (server->ops->dir_needs_close(cfile)) {
+ 			cfile->invalidHandle = true;
+-			spin_unlock(&cifs_file_list_lock);
++			spin_unlock(&cfile->file_info_lock);
+ 			if (server->ops->close_dir)
+ 				server->ops->close_dir(xid, tcon, &cfile->fid);
+ 		} else
+-			spin_unlock(&cifs_file_list_lock);
++			spin_unlock(&cfile->file_info_lock);
+ 		if (cfile->srch_inf.ntwrk_buf_start) {
+ 			cifs_dbg(FYI, "freeing SMB ff cache buf on search rewind\n");
+ 			if (cfile->srch_inf.smallBuf)
+--- a/fs/cifs/smb2misc.c
++++ b/fs/cifs/smb2misc.c
+@@ -525,19 +525,19 @@ smb2_is_valid_lease_break(char *buffer)
+ 		list_for_each(tmp1, &server->smb_ses_list) {
+ 			ses = list_entry(tmp1, struct cifs_ses, smb_ses_list);
+ 
+-			spin_lock(&cifs_file_list_lock);
+ 			list_for_each(tmp2, &ses->tcon_list) {
+ 				tcon = list_entry(tmp2, struct cifs_tcon,
+ 						  tcon_list);
++				spin_lock(&tcon->open_file_lock);
+ 				cifs_stats_inc(
+ 				    &tcon->stats.cifs_stats.num_oplock_brks);
+ 				if (smb2_tcon_has_lease(tcon, rsp, lw)) {
+-					spin_unlock(&cifs_file_list_lock);
++					spin_unlock(&tcon->open_file_lock);
+ 					spin_unlock(&cifs_tcp_ses_lock);
+ 					return true;
+ 				}
++				spin_unlock(&tcon->open_file_lock);
+ 			}
+-			spin_unlock(&cifs_file_list_lock);
+ 		}
+ 	}
+ 	spin_unlock(&cifs_tcp_ses_lock);
+@@ -579,7 +579,7 @@ smb2_is_valid_oplock_break(char *buffer,
+ 			tcon = list_entry(tmp1, struct cifs_tcon, tcon_list);
+ 
+ 			cifs_stats_inc(&tcon->stats.cifs_stats.num_oplock_brks);
+-			spin_lock(&cifs_file_list_lock);
++			spin_lock(&tcon->open_file_lock);
+ 			list_for_each(tmp2, &tcon->openFileList) {
+ 				cfile = list_entry(tmp2, struct cifsFileInfo,
+ 						     tlist);
+@@ -591,7 +591,7 @@ smb2_is_valid_oplock_break(char *buffer,
+ 
+ 				cifs_dbg(FYI, "file id match, oplock break\n");
+ 				cinode = CIFS_I(d_inode(cfile->dentry));
+-
++				spin_lock(&cfile->file_info_lock);
+ 				if (!CIFS_CACHE_WRITE(cinode) &&
+ 				    rsp->OplockLevel == SMB2_OPLOCK_LEVEL_NONE)
+ 					cfile->oplock_break_cancelled = true;
+@@ -613,14 +613,14 @@ smb2_is_valid_oplock_break(char *buffer,
+ 					clear_bit(
+ 					   CIFS_INODE_DOWNGRADE_OPLOCK_TO_L2,
+ 					   &cinode->flags);
+-
++				spin_unlock(&cfile->file_info_lock);
+ 				queue_work(cifsiod_wq, &cfile->oplock_break);
+ 
+-				spin_unlock(&cifs_file_list_lock);
++				spin_unlock(&tcon->open_file_lock);
+ 				spin_unlock(&cifs_tcp_ses_lock);
+ 				return true;
+ 			}
+-			spin_unlock(&cifs_file_list_lock);
++			spin_unlock(&tcon->open_file_lock);
+ 			spin_unlock(&cifs_tcp_ses_lock);
+ 			cifs_dbg(FYI, "No matching file for oplock break\n");
+ 			return true;

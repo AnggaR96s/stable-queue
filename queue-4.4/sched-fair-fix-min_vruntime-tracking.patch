@@ -1,0 +1,104 @@
+From b60205c7c558330e4e2b5df498355ec959457358 Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Tue, 20 Sep 2016 21:58:12 +0200
+Subject: sched/fair: Fix min_vruntime tracking
+
+From: Peter Zijlstra <peterz@infradead.org>
+
+commit b60205c7c558330e4e2b5df498355ec959457358 upstream.
+
+While going through enqueue/dequeue to review the movement of
+set_curr_task() I noticed that the (2nd) update_min_vruntime() call in
+dequeue_entity() is suspect.
+
+It turns out, its actually wrong because it will consider
+cfs_rq->curr, which could be the entry we just normalized. This mixes
+different vruntime forms and leads to fail.
+
+The purpose of the second update_min_vruntime() is to move
+min_vruntime forward if the entity we just removed is the one that was
+holding it back; _except_ for the DEQUEUE_SAVE case, because then we
+know its a temporary removal and it will come back.
+
+However, since we do put_prev_task() _after_ dequeue(), cfs_rq->curr
+will still be set (and per the above, can be tranformed into a
+different unit), so update_min_vruntime() should also consider
+curr->on_rq. This also fixes another corner case where the enqueue
+(which also does update_curr()->update_min_vruntime()) happens on the
+rq->lock break in schedule(), between dequeue and put_prev_task.
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Mike Galbraith <efault@gmx.de>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: linux-kernel@vger.kernel.org
+Fixes: 1e876231785d ("sched: Fix ->min_vruntime calculation in dequeue_entity()")
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ kernel/sched/fair.c |   29 ++++++++++++++++++++++-------
+ 1 file changed, 22 insertions(+), 7 deletions(-)
+
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -456,17 +456,23 @@ static inline int entity_before(struct s
+ 
+ static void update_min_vruntime(struct cfs_rq *cfs_rq)
+ {
++	struct sched_entity *curr = cfs_rq->curr;
++
+ 	u64 vruntime = cfs_rq->min_vruntime;
+ 
+-	if (cfs_rq->curr)
+-		vruntime = cfs_rq->curr->vruntime;
++	if (curr) {
++		if (curr->on_rq)
++			vruntime = curr->vruntime;
++		else
++			curr = NULL;
++	}
+ 
+ 	if (cfs_rq->rb_leftmost) {
+ 		struct sched_entity *se = rb_entry(cfs_rq->rb_leftmost,
+ 						   struct sched_entity,
+ 						   run_node);
+ 
+-		if (!cfs_rq->curr)
++		if (!curr)
+ 			vruntime = se->vruntime;
+ 		else
+ 			vruntime = min_vruntime(vruntime, se->vruntime);
+@@ -3139,9 +3145,10 @@ dequeue_entity(struct cfs_rq *cfs_rq, st
+ 	account_entity_dequeue(cfs_rq, se);
+ 
+ 	/*
+-	 * Normalize the entity after updating the min_vruntime because the
+-	 * update can refer to the ->curr item and we need to reflect this
+-	 * movement in our normalized position.
++	 * Normalize after update_curr(); which will also have moved
++	 * min_vruntime if @se is the one holding it back. But before doing
++	 * update_min_vruntime() again, which will discount @se's position and
++	 * can move min_vruntime forward still more.
+ 	 */
+ 	if (!(flags & DEQUEUE_SLEEP))
+ 		se->vruntime -= cfs_rq->min_vruntime;
+@@ -3149,8 +3156,16 @@ dequeue_entity(struct cfs_rq *cfs_rq, st
+ 	/* return excess runtime on last dequeue */
+ 	return_cfs_rq_runtime(cfs_rq);
+ 
+-	update_min_vruntime(cfs_rq);
+ 	update_cfs_shares(cfs_rq);
++
++	/*
++	 * Now advance min_vruntime if @se was the entity holding it back,
++	 * except when: DEQUEUE_SAVE && !DEQUEUE_MOVE, in this case we'll be
++	 * put back on, and if we advance min_vruntime, we'll be placed back
++	 * further than we started -- ie. we'll be penalized.
++	 */
++	if ((flags & (DEQUEUE_SAVE | DEQUEUE_MOVE)) == DEQUEUE_SAVE)
++		update_min_vruntime(cfs_rq);
+ }
+ 
+ /*
