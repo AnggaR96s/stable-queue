@@ -1,0 +1,140 @@
+From 4eeaa4f3f1d6c47b69f70e222297a4df4743363e Mon Sep 17 00:00:00 2001
+From: Steffen Maier <maier@linux.vnet.ibm.com>
+Date: Wed, 10 Aug 2016 18:30:46 +0200
+Subject: zfcp: close window with unblocked rport during rport gone
+
+From: Steffen Maier <maier@linux.vnet.ibm.com>
+
+commit 4eeaa4f3f1d6c47b69f70e222297a4df4743363e upstream.
+
+On a successful end of reopen port forced,
+zfcp_erp_strategy_followup_success() re-uses the port erp_action
+and the subsequent zfcp_erp_action_cleanup() now
+sees ZFCP_ERP_SUCCEEDED with
+erp_action->action==ZFCP_ERP_ACTION_REOPEN_PORT
+instead of ZFCP_ERP_ACTION_REOPEN_PORT_FORCED
+but must not perform zfcp_scsi_schedule_rport_register().
+
+We can detect this because the fresh port reopen erp_action
+is in its very first step ZFCP_ERP_STEP_UNINITIALIZED.
+
+Otherwise this opens a time window with unblocked rport
+(until the followup port reopen recovery would block it again).
+If a scsi_cmnd timeout occurs during this time window
+fc_timed_out() cannot work as desired and such command
+would indeed time out and trigger scsi_eh. This prevents
+a clean and timely path failover.
+This should not happen if the path issue can be recovered
+on FC transport layer such as path issues involving RSCNs.
+
+Also, unnecessary and repeated DID_IMM_RETRY for pending and
+undesired new requests occur because internally zfcp still
+has its zfcp_port blocked.
+
+As follow-on errors with scsi_eh, it can cause,
+in the worst case, permanently lost paths due to one of:
+sd <scsidev>: [<scsidisk>] Medium access timeout failure. Offlining disk!
+sd <scsidev>: Device offlined - not ready after error recovery
+
+For fix validation and to aid future debugging with other recoveries
+we now also trace (un)blocking of rports.
+
+Signed-off-by: Steffen Maier <maier@linux.vnet.ibm.com>
+Fixes: 5767620c383a ("[SCSI] zfcp: Do not unblock rport from REOPEN_PORT_FORCED")
+Fixes: a2fa0aede07c ("[SCSI] zfcp: Block FC transport rports early on errors")
+Fixes: 5f852be9e11d ("[SCSI] zfcp: Fix deadlock between zfcp ERP and SCSI")
+Fixes: 338151e06608 ("[SCSI] zfcp: make use of fc_remote_port_delete when target port is unavailable")
+Fixes: 3859f6a248cb ("[PATCH] zfcp: add rports to enable scsi_add_device to work again")
+Reviewed-by: Benjamin Block <bblock@linux.vnet.ibm.com>
+Reviewed-by: Hannes Reinecke <hare@suse.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/s390/scsi/zfcp_dbf.h  |    7 ++++++-
+ drivers/s390/scsi/zfcp_erp.c  |   12 +++++++++---
+ drivers/s390/scsi/zfcp_scsi.c |    8 +++++++-
+ 3 files changed, 22 insertions(+), 5 deletions(-)
+
+--- a/drivers/s390/scsi/zfcp_dbf.h
++++ b/drivers/s390/scsi/zfcp_dbf.h
+@@ -2,7 +2,7 @@
+  * zfcp device driver
+  * debug feature declarations
+  *
+- * Copyright IBM Corp. 2008, 2010
++ * Copyright IBM Corp. 2008, 2015
+  */
+ 
+ #ifndef ZFCP_DBF_H
+@@ -17,6 +17,11 @@
+ 
+ #define ZFCP_DBF_INVALID_LUN	0xFFFFFFFFFFFFFFFFull
+ 
++enum zfcp_dbf_pseudo_erp_act_type {
++	ZFCP_PSEUDO_ERP_ACTION_RPORT_ADD = 0xff,
++	ZFCP_PSEUDO_ERP_ACTION_RPORT_DEL = 0xfe,
++};
++
+ /**
+  * struct zfcp_dbf_rec_trigger - trace record for triggered recovery action
+  * @ready: number of ready recovery actions
+--- a/drivers/s390/scsi/zfcp_erp.c
++++ b/drivers/s390/scsi/zfcp_erp.c
+@@ -3,7 +3,7 @@
+  *
+  * Error Recovery Procedures (ERP).
+  *
+- * Copyright IBM Corp. 2002, 2010
++ * Copyright IBM Corp. 2002, 2015
+  */
+ 
+ #define KMSG_COMPONENT "zfcp"
+@@ -1217,8 +1217,14 @@ static void zfcp_erp_action_cleanup(stru
+ 		break;
+ 
+ 	case ZFCP_ERP_ACTION_REOPEN_PORT:
+-		if (result == ZFCP_ERP_SUCCEEDED)
+-			zfcp_scsi_schedule_rport_register(port);
++		/* This switch case might also happen after a forced reopen
++		 * was successfully done and thus overwritten with a new
++		 * non-forced reopen at `ersfs_2'. In this case, we must not
++		 * do the clean-up of the non-forced version.
++		 */
++		if (act->step != ZFCP_ERP_STEP_UNINITIALIZED)
++			if (result == ZFCP_ERP_SUCCEEDED)
++				zfcp_scsi_schedule_rport_register(port);
+ 		/* fall through */
+ 	case ZFCP_ERP_ACTION_REOPEN_PORT_FORCED:
+ 		put_device(&port->dev);
+--- a/drivers/s390/scsi/zfcp_scsi.c
++++ b/drivers/s390/scsi/zfcp_scsi.c
+@@ -3,7 +3,7 @@
+  *
+  * Interface to Linux SCSI midlayer.
+  *
+- * Copyright IBM Corp. 2002, 2013
++ * Copyright IBM Corp. 2002, 2015
+  */
+ 
+ #define KMSG_COMPONENT "zfcp"
+@@ -556,6 +556,9 @@ static void zfcp_scsi_rport_register(str
+ 	ids.port_id = port->d_id;
+ 	ids.roles = FC_RPORT_ROLE_FCP_TARGET;
+ 
++	zfcp_dbf_rec_trig("scpaddy", port->adapter, port, NULL,
++			  ZFCP_PSEUDO_ERP_ACTION_RPORT_ADD,
++			  ZFCP_PSEUDO_ERP_ACTION_RPORT_ADD);
+ 	rport = fc_remote_port_add(port->adapter->scsi_host, 0, &ids);
+ 	if (!rport) {
+ 		dev_err(&port->adapter->ccw_device->dev,
+@@ -577,6 +580,9 @@ static void zfcp_scsi_rport_block(struct
+ 	struct fc_rport *rport = port->rport;
+ 
+ 	if (rport) {
++		zfcp_dbf_rec_trig("scpdely", port->adapter, port, NULL,
++				  ZFCP_PSEUDO_ERP_ACTION_RPORT_DEL,
++				  ZFCP_PSEUDO_ERP_ACTION_RPORT_DEL);
+ 		fc_remote_port_delete(rport);
+ 		port->rport = NULL;
+ 	}
