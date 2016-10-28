@@ -1,0 +1,143 @@
+From a09a4c8dd1ec7f830e1fb9e59eb72bddc965d168 Mon Sep 17 00:00:00 2001
+From: Jesse Gross <jesse@kernel.org>
+Date: Sat, 19 Mar 2016 09:32:02 -0700
+Subject: tunnels: Remove encapsulation offloads on decap.
+
+From: Jesse Gross <jesse@kernel.org>
+
+commit a09a4c8dd1ec7f830e1fb9e59eb72bddc965d168 upstream.
+
+If a packet is either locally encapsulated or processed through GRO
+it is marked with the offloads that it requires. However, when it is
+decapsulated these tunnel offload indications are not removed. This
+means that if we receive an encapsulated TCP packet, aggregate it with
+GRO, decapsulate, and retransmit the resulting frame on a NIC that does
+not support encapsulation, we won't be able to take advantage of hardware
+offloads even though it is just a simple TCP packet at this point.
+
+This fixes the problem by stripping off encapsulation offload indications
+when packets are decapsulated.
+
+The performance impacts of this bug are significant. In a test where a
+Geneve encapsulated TCP stream is sent to a hypervisor, GRO'ed, decapsulated,
+and bridged to a VM performance is improved by 60% (5Gbps->8Gbps) as a
+result of avoiding unnecessary segmentation at the VM tap interface.
+
+Reported-by: Ramu Ramamurthy <sramamur@linux.vnet.ibm.com>
+Fixes: 68c33163 ("v4 GRE: Add TCP segmentation offload for GRE")
+Signed-off-by: Jesse Gross <jesse@kernel.org>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+(backported from commit a09a4c8dd1ec7f830e1fb9e59eb72bddc965d168)
+[adapt iptunnel_pull_header arguments, avoid 7f290c9]
+Signed-off-by: Stefan Bader <stefan.bader@canonical.com>
+Signed-off-by: Juerg Haefliger <juerg.haefliger@hpe.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/net/ip_tunnels.h  |   16 ++++++++++++++++
+ net/ipv4/fou.c            |   13 +++++++++++--
+ net/ipv4/ip_tunnel_core.c |    3 ++-
+ net/ipv6/sit.c            |    5 +++--
+ 4 files changed, 32 insertions(+), 5 deletions(-)
+
+--- a/include/net/ip_tunnels.h
++++ b/include/net/ip_tunnels.h
+@@ -283,6 +283,22 @@ struct metadata_dst *iptunnel_metadata_r
+ struct sk_buff *iptunnel_handle_offloads(struct sk_buff *skb, bool gre_csum,
+ 					 int gso_type_mask);
+ 
++static inline int iptunnel_pull_offloads(struct sk_buff *skb)
++{
++	if (skb_is_gso(skb)) {
++		int err;
++
++		err = skb_unclone(skb, GFP_ATOMIC);
++		if (unlikely(err))
++			return err;
++		skb_shinfo(skb)->gso_type &= ~(NETIF_F_GSO_ENCAP_ALL >>
++					       NETIF_F_GSO_SHIFT);
++	}
++
++	skb->encapsulation = 0;
++	return 0;
++}
++
+ static inline void iptunnel_xmit_stats(int err,
+ 				       struct net_device_stats *err_stats,
+ 				       struct pcpu_sw_netstats __percpu *stats)
+--- a/net/ipv4/fou.c
++++ b/net/ipv4/fou.c
+@@ -48,7 +48,7 @@ static inline struct fou *fou_from_sock(
+ 	return sk->sk_user_data;
+ }
+ 
+-static void fou_recv_pull(struct sk_buff *skb, size_t len)
++static int fou_recv_pull(struct sk_buff *skb, size_t len)
+ {
+ 	struct iphdr *iph = ip_hdr(skb);
+ 
+@@ -59,6 +59,7 @@ static void fou_recv_pull(struct sk_buff
+ 	__skb_pull(skb, len);
+ 	skb_postpull_rcsum(skb, udp_hdr(skb), len);
+ 	skb_reset_transport_header(skb);
++	return iptunnel_pull_offloads(skb);
+ }
+ 
+ static int fou_udp_recv(struct sock *sk, struct sk_buff *skb)
+@@ -68,9 +69,14 @@ static int fou_udp_recv(struct sock *sk,
+ 	if (!fou)
+ 		return 1;
+ 
+-	fou_recv_pull(skb, sizeof(struct udphdr));
++	if (fou_recv_pull(skb, sizeof(struct udphdr)))
++		goto drop;
+ 
+ 	return -fou->protocol;
++
++drop:
++	kfree_skb(skb);
++	return 0;
+ }
+ 
+ static struct guehdr *gue_remcsum(struct sk_buff *skb, struct guehdr *guehdr,
+@@ -170,6 +176,9 @@ static int gue_udp_recv(struct sock *sk,
+ 	__skb_pull(skb, sizeof(struct udphdr) + hdrlen);
+ 	skb_reset_transport_header(skb);
+ 
++	if (iptunnel_pull_offloads(skb))
++		goto drop;
++
+ 	return -guehdr->proto_ctype;
+ 
+ drop:
+--- a/net/ipv4/ip_tunnel_core.c
++++ b/net/ipv4/ip_tunnel_core.c
+@@ -116,7 +116,8 @@ int iptunnel_pull_header(struct sk_buff
+ 	skb->vlan_tci = 0;
+ 	skb_set_queue_mapping(skb, 0);
+ 	skb->pkt_type = PACKET_HOST;
+-	return 0;
++
++	return iptunnel_pull_offloads(skb);
+ }
+ EXPORT_SYMBOL_GPL(iptunnel_pull_header);
+ 
+--- a/net/ipv6/sit.c
++++ b/net/ipv6/sit.c
+@@ -681,14 +681,15 @@ static int ipip6_rcv(struct sk_buff *skb
+ 		skb->mac_header = skb->network_header;
+ 		skb_reset_network_header(skb);
+ 		IPCB(skb)->flags = 0;
+-		skb->protocol = htons(ETH_P_IPV6);
++		skb->dev = tunnel->dev;
+ 
+ 		if (packet_is_spoofed(skb, iph, tunnel)) {
+ 			tunnel->dev->stats.rx_errors++;
+ 			goto out;
+ 		}
+ 
+-		__skb_tunnel_rx(skb, tunnel->dev, tunnel->net);
++		if (iptunnel_pull_header(skb, 0, htons(ETH_P_IPV6)))
++			goto out;
+ 
+ 		err = IP_ECN_decapsulate(iph, skb);
+ 		if (unlikely(err)) {
