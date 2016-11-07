@@ -1,0 +1,103 @@
+From 89a2848381b5fcd9c4d9c0cd97680e3b28730e31 Mon Sep 17 00:00:00 2001
+From: Johannes Weiner <hannes@cmpxchg.org>
+Date: Thu, 27 Oct 2016 17:46:56 -0700
+Subject: mm: memcontrol: do not recurse in direct reclaim
+
+From: Johannes Weiner <hannes@cmpxchg.org>
+
+commit 89a2848381b5fcd9c4d9c0cd97680e3b28730e31 upstream.
+
+On 4.0, we saw a stack corruption from a page fault entering direct
+memory cgroup reclaim, calling into btrfs_releasepage(), which then
+tried to allocate an extent and recursed back into a kmem charge ad
+nauseam:
+
+  [...]
+  btrfs_releasepage+0x2c/0x30
+  try_to_release_page+0x32/0x50
+  shrink_page_list+0x6da/0x7a0
+  shrink_inactive_list+0x1e5/0x510
+  shrink_lruvec+0x605/0x7f0
+  shrink_zone+0xee/0x320
+  do_try_to_free_pages+0x174/0x440
+  try_to_free_mem_cgroup_pages+0xa7/0x130
+  try_charge+0x17b/0x830
+  memcg_charge_kmem+0x40/0x80
+  new_slab+0x2d9/0x5a0
+  __slab_alloc+0x2fd/0x44f
+  kmem_cache_alloc+0x193/0x1e0
+  alloc_extent_state+0x21/0xc0
+  __clear_extent_bit+0x2b5/0x400
+  try_release_extent_mapping+0x1a3/0x220
+  __btrfs_releasepage+0x31/0x70
+  btrfs_releasepage+0x2c/0x30
+  try_to_release_page+0x32/0x50
+  shrink_page_list+0x6da/0x7a0
+  shrink_inactive_list+0x1e5/0x510
+  shrink_lruvec+0x605/0x7f0
+  shrink_zone+0xee/0x320
+  do_try_to_free_pages+0x174/0x440
+  try_to_free_mem_cgroup_pages+0xa7/0x130
+  try_charge+0x17b/0x830
+  mem_cgroup_try_charge+0x65/0x1c0
+  handle_mm_fault+0x117f/0x1510
+  __do_page_fault+0x177/0x420
+  do_page_fault+0xc/0x10
+  page_fault+0x22/0x30
+
+On later kernels, kmem charging is opt-in rather than opt-out, and that
+particular kmem allocation in btrfs_releasepage() is no longer being
+charged and won't recurse and overrun the stack anymore.
+
+But it's not impossible for an accounted allocation to happen from the
+memcg direct reclaim context, and we needed to reproduce this crash many
+times before we even got a useful stack trace out of it.
+
+Like other direct reclaimers, mark tasks in memcg reclaim PF_MEMALLOC to
+avoid recursing into any other form of direct reclaim.  Then let
+recursive charges from PF_MEMALLOC contexts bypass the cgroup limit.
+
+Link: http://lkml.kernel.org/r/20161025141050.GA13019@cmpxchg.org
+Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Cc: Vladimir Davydov <vdavydov.dev@gmail.com>
+Cc: Tejun Heo <tj@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ mm/memcontrol.c |    9 +++++++++
+ mm/vmscan.c     |    2 ++
+ 2 files changed, 11 insertions(+)
+
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -2055,6 +2055,15 @@ retry:
+ 		     current->flags & PF_EXITING))
+ 		goto force;
+ 
++	/*
++	 * Prevent unbounded recursion when reclaim operations need to
++	 * allocate memory. This might exceed the limits temporarily,
++	 * but we prefer facilitating memory reclaim and getting back
++	 * under the limit over triggering OOM kills in these cases.
++	 */
++	if (unlikely(current->flags & PF_MEMALLOC))
++		goto force;
++
+ 	if (unlikely(task_in_memcg_oom(current)))
+ 		goto nomem;
+ 
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -2910,7 +2910,9 @@ unsigned long try_to_free_mem_cgroup_pag
+ 					    sc.may_writepage,
+ 					    sc.gfp_mask);
+ 
++	current->flags |= PF_MEMALLOC;
+ 	nr_reclaimed = do_try_to_free_pages(zonelist, &sc);
++	current->flags &= ~PF_MEMALLOC;
+ 
+ 	trace_mm_vmscan_memcg_reclaim_end(nr_reclaimed);
+ 
