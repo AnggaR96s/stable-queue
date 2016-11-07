@@ -1,0 +1,115 @@
+From 6bad6bccf2d717f652d37e63cf261eaa23466009 Mon Sep 17 00:00:00 2001
+From: Thomas Gleixner <tglx@linutronix.de>
+Date: Sat, 22 Oct 2016 11:07:37 +0000
+Subject: timers: Prevent base clock corruption when forwarding
+
+From: Thomas Gleixner <tglx@linutronix.de>
+
+commit 6bad6bccf2d717f652d37e63cf261eaa23466009 upstream.
+
+When a timer is enqueued we try to forward the timer base clock. This
+mechanism has two issues:
+
+1) Forwarding a remote base unlocked
+
+The forwarding function is called from get_target_base() with the current
+timer base lock held. But if the new target base is a different base than
+the current base (can happen with NOHZ, sigh!) then the forwarding is done
+on an unlocked base. This can lead to corruption of base->clk.
+
+Solution is simple: Invoke the forwarding after the target base is locked.
+
+2) Possible corruption due to jiffies advancing
+
+This is similar to the issue in get_net_timer_interrupt() which was fixed
+in the previous patch. jiffies can advance between check and assignement
+and therefore advancing base->clk beyond the next expiry value.
+
+So we need to read jiffies into a local variable once and do the checks and
+assignment with the local copy.
+
+Fixes: a683f390b93f("timers: Forward the wheel clock whenever possible")
+Reported-by: Ashton Holmes <scoopta@gmail.com>
+Reported-by: Michael Thayer <michael.thayer@oracle.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Cc: Michal Necasek <michal.necasek@oracle.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: knut.osmundsen@oracle.com
+Cc: stern@rowland.harvard.edu
+Cc: rt@linutronix.de
+Link: http://lkml.kernel.org/r/20161022110552.253640125@linutronix.de
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ kernel/time/timer.c |   23 ++++++++++-------------
+ 1 file changed, 10 insertions(+), 13 deletions(-)
+
+--- a/kernel/time/timer.c
++++ b/kernel/time/timer.c
+@@ -878,7 +878,7 @@ static inline struct timer_base *get_tim
+ 
+ #ifdef CONFIG_NO_HZ_COMMON
+ static inline struct timer_base *
+-__get_target_base(struct timer_base *base, unsigned tflags)
++get_target_base(struct timer_base *base, unsigned tflags)
+ {
+ #ifdef CONFIG_SMP
+ 	if ((tflags & TIMER_PINNED) || !base->migration_enabled)
+@@ -891,25 +891,27 @@ __get_target_base(struct timer_base *bas
+ 
+ static inline void forward_timer_base(struct timer_base *base)
+ {
++	unsigned long jnow = READ_ONCE(jiffies);
++
+ 	/*
+ 	 * We only forward the base when it's idle and we have a delta between
+ 	 * base clock and jiffies.
+ 	 */
+-	if (!base->is_idle || (long) (jiffies - base->clk) < 2)
++	if (!base->is_idle || (long) (jnow - base->clk) < 2)
+ 		return;
+ 
+ 	/*
+ 	 * If the next expiry value is > jiffies, then we fast forward to
+ 	 * jiffies otherwise we forward to the next expiry value.
+ 	 */
+-	if (time_after(base->next_expiry, jiffies))
+-		base->clk = jiffies;
++	if (time_after(base->next_expiry, jnow))
++		base->clk = jnow;
+ 	else
+ 		base->clk = base->next_expiry;
+ }
+ #else
+ static inline struct timer_base *
+-__get_target_base(struct timer_base *base, unsigned tflags)
++get_target_base(struct timer_base *base, unsigned tflags)
+ {
+ 	return get_timer_this_cpu_base(tflags);
+ }
+@@ -917,14 +919,6 @@ __get_target_base(struct timer_base *bas
+ static inline void forward_timer_base(struct timer_base *base) { }
+ #endif
+ 
+-static inline struct timer_base *
+-get_target_base(struct timer_base *base, unsigned tflags)
+-{
+-	struct timer_base *target = __get_target_base(base, tflags);
+-
+-	forward_timer_base(target);
+-	return target;
+-}
+ 
+ /*
+  * We are using hashed locking: Holding per_cpu(timer_bases[x]).lock means
+@@ -1025,6 +1019,9 @@ __mod_timer(struct timer_list *timer, un
+ 		}
+ 	}
+ 
++	/* Try to forward a stale timer base clock */
++	forward_timer_base(base);
++
+ 	timer->expires = expires;
+ 	/*
+ 	 * If 'idx' was calculated above and the base time did not advance

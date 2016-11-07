@@ -1,0 +1,110 @@
+From 041ad7bc758db259bb960ef795197dd14aab19a6 Mon Sep 17 00:00:00 2001
+From: Thomas Gleixner <tglx@linutronix.de>
+Date: Sat, 22 Oct 2016 11:07:35 +0000
+Subject: timers: Prevent base clock rewind when forwarding clock
+
+From: Thomas Gleixner <tglx@linutronix.de>
+
+commit 041ad7bc758db259bb960ef795197dd14aab19a6 upstream.
+
+Ashton and Michael reported, that kernel versions 4.8 and later suffer from
+USB timeouts which are caused by the timer wheel rework.
+
+This is caused by a bug in the base clock forwarding mechanism, which leads
+to timers expiring early. The scenario which leads to this is:
+
+run_timers()
+  while (jiffies >= base->clk) {
+    collect_expired_timers();
+    base->clk++;
+    expire_timers();
+  }
+
+So base->clk = jiffies + 1. Now the cpu goes idle:
+
+idle()
+  get_next_timer_interrupt()
+    nextevt = __next_time_interrupt();
+    if (time_after(nextevt, base->clk))
+       	base->clk = jiffies;
+
+jiffies has not advanced since run_timers(), so this assignment effectively
+decrements base->clk by one.
+
+base->clk is the index into the timer wheel arrays. So let's assume the
+following state after the base->clk increment in run_timers():
+
+ jiffies = 0
+ base->clk = 1
+
+A timer gets enqueued with an expiry delta of 63 ticks (which is the case
+with the USB timeout and HZ=250) so the resulting bucket index is:
+
+  base->clk + delta = 1 + 63 = 64
+
+The timer goes into the first wheel level. The array size is 64 so it ends
+up in bucket 0, which is correct as it takes 63 ticks to advance base->clk
+to index into bucket 0 again.
+
+If the cpu goes idle before jiffies advance, then the bug in the forwarding
+mechanism sets base->clk back to 0, so the next invocation of run_timers()
+at the next tick will index into bucket 0 and therefore expire the timer 62
+ticks too early.
+
+Instead of blindly setting base->clk to jiffies we must make the forwarding
+conditional on jiffies > base->clk, but we cannot use jiffies for this as
+we might run into the following issue:
+
+  if (time_after(jiffies, base->clk) {
+    if (time_after(nextevt, base->clk))
+       base->clk = jiffies;
+
+jiffies can increment between the check and the assigment far enough to
+advance beyond nextevt. So we need to use a stable value for checking.
+
+get_next_timer_interrupt() has the basej argument which is the jiffies
+value snapshot taken in the calling code. So we can just that.
+
+Thanks to Ashton for bisecting and providing trace data!
+
+Fixes: a683f390b93f ("timers: Forward the wheel clock whenever possible")
+Reported-by: Ashton Holmes <scoopta@gmail.com>
+Reported-by: Michael Thayer <michael.thayer@oracle.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Cc: Michal Necasek <michal.necasek@oracle.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: knut.osmundsen@oracle.com
+Cc: stern@rowland.harvard.edu
+Cc: rt@linutronix.de
+Link: http://lkml.kernel.org/r/20161022110552.175308322@linutronix.de
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ kernel/time/timer.c |   14 +++++++++-----
+ 1 file changed, 9 insertions(+), 5 deletions(-)
+
+--- a/kernel/time/timer.c
++++ b/kernel/time/timer.c
+@@ -1510,12 +1510,16 @@ u64 get_next_timer_interrupt(unsigned lo
+ 	is_max_delta = (nextevt == base->clk + NEXT_TIMER_MAX_DELTA);
+ 	base->next_expiry = nextevt;
+ 	/*
+-	 * We have a fresh next event. Check whether we can forward the base:
++	 * We have a fresh next event. Check whether we can forward the
++	 * base. We can only do that when @basej is past base->clk
++	 * otherwise we might rewind base->clk.
+ 	 */
+-	if (time_after(nextevt, jiffies))
+-		base->clk = jiffies;
+-	else if (time_after(nextevt, base->clk))
+-		base->clk = nextevt;
++	if (time_after(basej, base->clk)) {
++		if (time_after(nextevt, basej))
++			base->clk = basej;
++		else if (time_after(nextevt, base->clk))
++			base->clk = nextevt;
++	}
+ 
+ 	if (time_before_eq(nextevt, basej)) {
+ 		expires = basem;

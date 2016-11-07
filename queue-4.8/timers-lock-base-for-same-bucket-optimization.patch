@@ -1,0 +1,99 @@
+From 4da9152a4308dcbf611cde399c695c359fc9145f Mon Sep 17 00:00:00 2001
+From: Thomas Gleixner <tglx@linutronix.de>
+Date: Mon, 24 Oct 2016 11:55:10 +0200
+Subject: timers: Lock base for same bucket optimization
+
+From: Thomas Gleixner <tglx@linutronix.de>
+
+commit 4da9152a4308dcbf611cde399c695c359fc9145f upstream.
+
+Linus stumbled over the unlocked modification of the timer expiry value in
+mod_timer() which is an optimization for timers which stay in the same
+bucket - due to the bucket granularity - despite their expiry time getting
+updated.
+
+The optimization itself still makes sense even if we take the lock, because
+in case that the bucket stays the same, we avoid the pointless
+queue/enqueue dance.
+
+Make the check and the modification of timer->expires protected by the base
+lock and shuffle the remaining code around so we can keep the lock held
+when we actually have to requeue the timer to a different bucket.
+
+Fixes: f00c0afdfa62 ("timers: Implement optimization for same expiry time in mod_timer()")
+Reported-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/alpine.DEB.2.20.1610241711220.4983@nanos
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ kernel/time/timer.c |   28 +++++++++++++++++-----------
+ 1 file changed, 17 insertions(+), 11 deletions(-)
+
+--- a/kernel/time/timer.c
++++ b/kernel/time/timer.c
+@@ -965,6 +965,8 @@ __mod_timer(struct timer_list *timer, un
+ 	unsigned long clk = 0, flags;
+ 	int ret = 0;
+ 
++	BUG_ON(!timer->function);
++
+ 	/*
+ 	 * This is a common optimization triggered by the networking code - if
+ 	 * the timer is re-modified to have the same timeout or ends up in the
+@@ -973,13 +975,16 @@ __mod_timer(struct timer_list *timer, un
+ 	if (timer_pending(timer)) {
+ 		if (timer->expires == expires)
+ 			return 1;
++
+ 		/*
+-		 * Take the current timer_jiffies of base, but without holding
+-		 * the lock!
++		 * We lock timer base and calculate the bucket index right
++		 * here. If the timer ends up in the same bucket, then we
++		 * just update the expiry time and avoid the whole
++		 * dequeue/enqueue dance.
+ 		 */
+-		base = get_timer_base(timer->flags);
+-		clk = base->clk;
++		base = lock_timer_base(timer, &flags);
+ 
++		clk = base->clk;
+ 		idx = calc_wheel_index(expires, clk);
+ 
+ 		/*
+@@ -989,14 +994,14 @@ __mod_timer(struct timer_list *timer, un
+ 		 */
+ 		if (idx == timer_get_idx(timer)) {
+ 			timer->expires = expires;
+-			return 1;
++			ret = 1;
++			goto out_unlock;
+ 		}
++	} else {
++		base = lock_timer_base(timer, &flags);
+ 	}
+ 
+ 	timer_stats_timer_set_start_info(timer);
+-	BUG_ON(!timer->function);
+-
+-	base = lock_timer_base(timer, &flags);
+ 
+ 	ret = detach_if_pending(timer, base, false);
+ 	if (!ret && pending_only)
+@@ -1032,9 +1037,10 @@ __mod_timer(struct timer_list *timer, un
+ 	timer->expires = expires;
+ 	/*
+ 	 * If 'idx' was calculated above and the base time did not advance
+-	 * between calculating 'idx' and taking the lock, only enqueue_timer()
+-	 * and trigger_dyntick_cpu() is required. Otherwise we need to
+-	 * (re)calculate the wheel index via internal_add_timer().
++	 * between calculating 'idx' and possibly switching the base, only
++	 * enqueue_timer() and trigger_dyntick_cpu() is required. Otherwise
++	 * we need to (re)calculate the wheel index via
++	 * internal_add_timer().
+ 	 */
+ 	if (idx != UINT_MAX && clk == base->clk) {
+ 		enqueue_timer(base, timer, idx);
