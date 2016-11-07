@@ -1,0 +1,109 @@
+From a7a7aeefbca2982586ba2c9fd7739b96416a6d1d Mon Sep 17 00:00:00 2001
+From: Gerald Schaefer <gerald.schaefer@de.ibm.com>
+Date: Wed, 19 Oct 2016 12:29:41 +0200
+Subject: GenWQE: Fix bad page access during abort of resource allocation
+
+From: Gerald Schaefer <gerald.schaefer@de.ibm.com>
+
+commit a7a7aeefbca2982586ba2c9fd7739b96416a6d1d upstream.
+
+When interrupting an application which was allocating DMAable
+memory, it was possible, that the DMA memory was deallocated
+twice, leading to the error symptoms below.
+
+Thanks to Gerald, who analyzed the problem and provided this
+patch.
+
+I agree with his analysis of the problem: ddcb_cmd_fixups() ->
+genwqe_alloc_sync_sgl() (fails in f/lpage, but sgl->sgl != NULL
+and f/lpage maybe also != NULL) -> ddcb_cmd_cleanup() ->
+genwqe_free_sync_sgl() (double free, because sgl->sgl != NULL and
+f/lpage maybe also != NULL)
+
+In this scenario we would have exactly the kind of double free that
+would explain the WARNING / Bad page state, and as expected it is
+caused by broken error handling (cleanup).
+
+Using the Ubuntu git source, tag Ubuntu-4.4.0-33.52, he was able to reproduce
+the "Bad page state" issue, and with the patch on top he could not reproduce
+it any more.
+
+------------[ cut here ]------------
+WARNING: at /build/linux-o03cxz/linux-4.4.0/arch/s390/include/asm/pci_dma.h:141
+Modules linked in: qeth_l2 ghash_s390 prng aes_s390 des_s390 des_generic sha512_s390 sha256_s390 sha1_s390 sha_common genwqe_card qeth crc_itu_t qdio ccwgroup vmur dm_multipath dasd_eckd_mod dasd_mod
+CPU: 2 PID: 3293 Comm: genwqe_gunzip Not tainted 4.4.0-33-generic #52-Ubuntu
+task: 0000000032c7e270 ti: 00000000324e4000 task.ti: 00000000324e4000
+Krnl PSW : 0404c00180000000 0000000000156346 (dma_update_cpu_trans+0x9e/0xa8)
+           R:0 T:1 IO:0 EX:0 Key:0 M:1 W:0 P:0 AS:3 CC:0 PM:0 EA:3
+Krnl GPRS: 00000000324e7bcd 0000000000c3c34a 0000000027628298 000000003215b400
+           0000000000000400 0000000000001fff 0000000000000400 0000000116853000
+           07000000324e7b1e 0000000000000001 0000000000000001 0000000000000001
+           0000000000001000 0000000116854000 0000000000156402 00000000324e7a38
+Krnl Code: 000000000015633a: 95001000           cli     0(%r1),0
+           000000000015633e: a774ffc3           brc     7,1562c4
+          #0000000000156342: a7f40001           brc     15,156344
+          >0000000000156346: 92011000           mvi     0(%r1),1
+           000000000015634a: a7f4ffbd           brc     15,1562c4
+           000000000015634e: 0707               bcr     0,%r7
+           0000000000156350: c00400000000       brcl    0,156350
+           0000000000156356: eb7ff0500024       stmg    %r7,%r15,80(%r15)
+Call Trace:
+([<00000000001563e0>] dma_update_trans+0x90/0x228)
+ [<00000000001565dc>] s390_dma_unmap_pages+0x64/0x160
+ [<00000000001567c2>] s390_dma_free+0x62/0x98
+ [<000003ff801310ce>] __genwqe_free_consistent+0x56/0x70 [genwqe_card]
+ [<000003ff801316d0>] genwqe_free_sync_sgl+0xf8/0x160 [genwqe_card]
+ [<000003ff8012bd6e>] ddcb_cmd_cleanup+0x86/0xa8 [genwqe_card]
+ [<000003ff8012c1c0>] do_execute_ddcb+0x110/0x348 [genwqe_card]
+ [<000003ff8012c914>] genwqe_ioctl+0x51c/0xc20 [genwqe_card]
+ [<000000000032513a>] do_vfs_ioctl+0x3b2/0x518
+ [<0000000000325344>] SyS_ioctl+0xa4/0xb8
+ [<00000000007b86c6>] system_call+0xd6/0x264
+ [<000003ff9e8e520a>] 0x3ff9e8e520a
+Last Breaking-Event-Address:
+ [<0000000000156342>] dma_update_cpu_trans+0x9a/0xa8
+---[ end trace 35996336235145c8 ]---
+BUG: Bad page state in process jbd2/dasdb1-8  pfn:3215b
+page:000003d100c856c0 count:-1 mapcount:0 mapping:          (null) index:0x0
+flags: 0x3fffc0000000000()
+page dumped because: nonzero _count
+
+Signed-off-by: Gerald Schaefer <gerald.schaefer@de.ibm.com>
+Signed-off-by: Frank Haverkamp <haver@linux.vnet.ibm.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/misc/genwqe/card_utils.c |   12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+--- a/drivers/misc/genwqe/card_utils.c
++++ b/drivers/misc/genwqe/card_utils.c
+@@ -352,17 +352,27 @@ int genwqe_alloc_sync_sgl(struct genwqe_
+ 		if (copy_from_user(sgl->lpage, user_addr + user_size -
+ 				   sgl->lpage_size, sgl->lpage_size)) {
+ 			rc = -EFAULT;
+-			goto err_out1;
++			goto err_out2;
+ 		}
+ 	}
+ 	return 0;
+ 
++ err_out2:
++	__genwqe_free_consistent(cd, PAGE_SIZE, sgl->lpage,
++				 sgl->lpage_dma_addr);
++	sgl->lpage = NULL;
++	sgl->lpage_dma_addr = 0;
+  err_out1:
+ 	__genwqe_free_consistent(cd, PAGE_SIZE, sgl->fpage,
+ 				 sgl->fpage_dma_addr);
++	sgl->fpage = NULL;
++	sgl->fpage_dma_addr = 0;
+  err_out:
+ 	__genwqe_free_consistent(cd, sgl->sgl_size, sgl->sgl,
+ 				 sgl->sgl_dma_addr);
++	sgl->sgl = NULL;
++	sgl->sgl_dma_addr = 0;
++	sgl->sgl_size = 0;
+ 	return -ENOMEM;
+ }
+ 
