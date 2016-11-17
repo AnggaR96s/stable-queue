@@ -1,0 +1,138 @@
+From 62bdf94a2049822ef8c6d4b0e83cd9c3a1663ab4 Mon Sep 17 00:00:00 2001
+From: Chuck Lever <chuck.lever@oracle.com>
+Date: Mon, 7 Nov 2016 16:16:24 -0500
+Subject: xprtrdma: Fix DMAR failure in frwr_op_map() after reconnect
+
+From: Chuck Lever <chuck.lever@oracle.com>
+
+commit 62bdf94a2049822ef8c6d4b0e83cd9c3a1663ab4 upstream.
+
+When a LOCALINV WR is flushed, the frmr is marked STALE, then
+frwr_op_unmap_sync DMA-unmaps the frmr's SGL. These STALE frmrs
+are then recovered when frwr_op_map hunts for an INVALID frmr to
+use.
+
+All other cases that need frmr recovery leave that SGL DMA-mapped.
+The FRMR recovery path unconditionally DMA-unmaps the frmr's SGL.
+
+To avoid DMA unmapping the SGL twice for flushed LOCAL_INV WRs,
+alter the recovery logic (rather than the hot frwr_op_unmap_sync
+path) to distinguish among these cases. This solution also takes
+care of the case where multiple LOCAL_INV WRs are issued for the
+same rpcrdma_req, some complete successfully, but some are flushed.
+
+Reported-by: Vasco Steinmetz <linux@kyberraum.net>
+Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+Tested-by: Vasco Steinmetz <linux@kyberraum.net>
+Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ net/sunrpc/xprtrdma/frwr_ops.c  |   37 ++++++++++++++++++++++---------------
+ net/sunrpc/xprtrdma/xprt_rdma.h |    3 ++-
+ 2 files changed, 24 insertions(+), 16 deletions(-)
+
+--- a/net/sunrpc/xprtrdma/frwr_ops.c
++++ b/net/sunrpc/xprtrdma/frwr_ops.c
+@@ -44,18 +44,20 @@
+  * being done.
+  *
+  * When the underlying transport disconnects, MRs are left in one of
+- * three states:
++ * four states:
+  *
+  * INVALID:	The MR was not in use before the QP entered ERROR state.
+- *		(Or, the LOCAL_INV WR has not completed or flushed yet).
+- *
+- * STALE:	The MR was being registered or unregistered when the QP
+- *		entered ERROR state, and the pending WR was flushed.
+  *
+  * VALID:	The MR was registered before the QP entered ERROR state.
+  *
+- * When frwr_op_map encounters STALE and VALID MRs, they are recovered
+- * with ib_dereg_mr and then are re-initialized. Beause MR recovery
++ * FLUSHED_FR:	The MR was being registered when the QP entered ERROR
++ *		state, and the pending WR was flushed.
++ *
++ * FLUSHED_LI:	The MR was being invalidated when the QP entered ERROR
++ *		state, and the pending WR was flushed.
++ *
++ * When frwr_op_map encounters FLUSHED and VALID MRs, they are recovered
++ * with ib_dereg_mr and then are re-initialized. Because MR recovery
+  * allocates fresh resources, it is deferred to a workqueue, and the
+  * recovered MRs are placed back on the rb_mws list when recovery is
+  * complete. frwr_op_map allocates another MR for the current RPC while
+@@ -175,12 +177,15 @@ __frwr_reset_mr(struct rpcrdma_ia *ia, s
+ static void
+ frwr_op_recover_mr(struct rpcrdma_mw *mw)
+ {
++	enum rpcrdma_frmr_state state = mw->frmr.fr_state;
+ 	struct rpcrdma_xprt *r_xprt = mw->mw_xprt;
+ 	struct rpcrdma_ia *ia = &r_xprt->rx_ia;
+ 	int rc;
+ 
+ 	rc = __frwr_reset_mr(ia, mw);
+-	ib_dma_unmap_sg(ia->ri_device, mw->mw_sg, mw->mw_nents, mw->mw_dir);
++	if (state != FRMR_FLUSHED_LI)
++		ib_dma_unmap_sg(ia->ri_device,
++				mw->mw_sg, mw->mw_nents, mw->mw_dir);
+ 	if (rc)
+ 		goto out_release;
+ 
+@@ -261,10 +266,8 @@ frwr_op_maxpages(struct rpcrdma_xprt *r_
+ }
+ 
+ static void
+-__frwr_sendcompletion_flush(struct ib_wc *wc, struct rpcrdma_frmr *frmr,
+-			    const char *wr)
++__frwr_sendcompletion_flush(struct ib_wc *wc, const char *wr)
+ {
+-	frmr->fr_state = FRMR_IS_STALE;
+ 	if (wc->status != IB_WC_WR_FLUSH_ERR)
+ 		pr_err("rpcrdma: %s: %s (%u/0x%x)\n",
+ 		       wr, ib_wc_status_msg(wc->status),
+@@ -287,7 +290,8 @@ frwr_wc_fastreg(struct ib_cq *cq, struct
+ 	if (wc->status != IB_WC_SUCCESS) {
+ 		cqe = wc->wr_cqe;
+ 		frmr = container_of(cqe, struct rpcrdma_frmr, fr_cqe);
+-		__frwr_sendcompletion_flush(wc, frmr, "fastreg");
++		frmr->fr_state = FRMR_FLUSHED_FR;
++		__frwr_sendcompletion_flush(wc, "fastreg");
+ 	}
+ }
+ 
+@@ -307,7 +311,8 @@ frwr_wc_localinv(struct ib_cq *cq, struc
+ 	if (wc->status != IB_WC_SUCCESS) {
+ 		cqe = wc->wr_cqe;
+ 		frmr = container_of(cqe, struct rpcrdma_frmr, fr_cqe);
+-		__frwr_sendcompletion_flush(wc, frmr, "localinv");
++		frmr->fr_state = FRMR_FLUSHED_LI;
++		__frwr_sendcompletion_flush(wc, "localinv");
+ 	}
+ }
+ 
+@@ -327,8 +332,10 @@ frwr_wc_localinv_wake(struct ib_cq *cq,
+ 	/* WARNING: Only wr_cqe and status are reliable at this point */
+ 	cqe = wc->wr_cqe;
+ 	frmr = container_of(cqe, struct rpcrdma_frmr, fr_cqe);
+-	if (wc->status != IB_WC_SUCCESS)
+-		__frwr_sendcompletion_flush(wc, frmr, "localinv");
++	if (wc->status != IB_WC_SUCCESS) {
++		frmr->fr_state = FRMR_FLUSHED_LI;
++		__frwr_sendcompletion_flush(wc, "localinv");
++	}
+ 	complete(&frmr->fr_linv_done);
+ }
+ 
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@ -207,7 +207,8 @@ struct rpcrdma_rep {
+ enum rpcrdma_frmr_state {
+ 	FRMR_IS_INVALID,	/* ready to be used */
+ 	FRMR_IS_VALID,		/* in use */
+-	FRMR_IS_STALE,		/* failed completion */
++	FRMR_FLUSHED_FR,	/* flushed FASTREG WR */
++	FRMR_FLUSHED_LI,	/* flushed LOCALINV WR */
+ };
+ 
+ struct rpcrdma_frmr {
