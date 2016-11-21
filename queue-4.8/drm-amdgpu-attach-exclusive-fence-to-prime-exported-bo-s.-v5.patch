@@ -1,0 +1,136 @@
+From 8e94a46c1770884166b31adc99eba7da65a446a7 Mon Sep 17 00:00:00 2001
+From: Mario Kleiner <mario.kleiner.de@gmail.com>
+Date: Wed, 9 Nov 2016 02:25:15 +0100
+Subject: drm/amdgpu: Attach exclusive fence to prime exported bo's. (v5)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+From: Mario Kleiner <mario.kleiner.de@gmail.com>
+
+commit 8e94a46c1770884166b31adc99eba7da65a446a7 upstream.
+
+External clients which import our bo's wait only
+for exclusive dmabuf-fences, not on shared ones,
+ditto for bo's which we import from external
+providers and write to.
+
+Therefore attach exclusive fences on prime shared buffers
+if our exported buffer gets imported by an external
+client, or if we import a buffer from an external
+exporter.
+
+See discussion in thread:
+https://lists.freedesktop.org/archives/dri-devel/2016-October/122370.html
+
+Prime export tested on Intel iGPU + AMD Tonga dGPU as
+DRI3/Present Prime render offload, and with the Tonga
+standalone as primary gpu.
+
+v2: Add a wait for all shared fences before prime export,
+    as suggested by Christian Koenig.
+
+v3: - Mark buffer prime_exported in amdgpu_gem_prime_pin,
+    so we only use the exclusive fence when exporting a
+    bo to external clients like a separate iGPU, but not
+    when exporting/importing from/to ourselves as part of
+    regular DRI3 fd passing.
+
+    - Propagate failure of reservation_object_wait_rcu back
+    to caller.
+
+v4: - Switch to a prime_shared_count counter instead of a
+      flag, which gets in/decremented on prime_pin/unpin, so
+      we can switch back to shared fences if all clients
+      detach from our exported bo.
+
+    - Also switch to exclusive fence for prime imported bo's.
+
+v5: - Drop lret, instead use int ret -> long ret, as proposed
+      by Christian.
+
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=95472
+Tested-by: Mike Lothian <mike@fireburn.co.uk> (v1)
+Signed-off-by: Mario Kleiner <mario.kleiner.de@gmail.com>
+Reviewed-by: Christian König <christian.koenig@amd.com>.
+Cc: Christian König <christian.koenig@amd.com>
+Cc: Michel Dänzer <michel.daenzer@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h         |    1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_bo_list.c |    2 +-
+ drivers/gpu/drm/amd/amdgpu/amdgpu_prime.c   |   20 +++++++++++++++++++-
+ 3 files changed, 21 insertions(+), 2 deletions(-)
+
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -492,6 +492,7 @@ struct amdgpu_bo {
+ 	u64				metadata_flags;
+ 	void				*metadata;
+ 	u32				metadata_size;
++	unsigned			prime_shared_count;
+ 	/* list of all virtual address to which this bo
+ 	 * is associated to
+ 	 */
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_bo_list.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_bo_list.c
+@@ -132,7 +132,7 @@ static int amdgpu_bo_list_set(struct amd
+ 		entry->priority = min(info[i].bo_priority,
+ 				      AMDGPU_BO_LIST_MAX_PRIORITY);
+ 		entry->tv.bo = &entry->robj->tbo;
+-		entry->tv.shared = true;
++		entry->tv.shared = !entry->robj->prime_shared_count;
+ 
+ 		if (entry->robj->prefered_domains == AMDGPU_GEM_DOMAIN_GDS)
+ 			gds_obj = entry->robj;
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_prime.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_prime.c
+@@ -74,20 +74,36 @@ amdgpu_gem_prime_import_sg_table(struct
+ 	if (ret)
+ 		return ERR_PTR(ret);
+ 
++	bo->prime_shared_count = 1;
+ 	return &bo->gem_base;
+ }
+ 
+ int amdgpu_gem_prime_pin(struct drm_gem_object *obj)
+ {
+ 	struct amdgpu_bo *bo = gem_to_amdgpu_bo(obj);
+-	int ret = 0;
++	long ret = 0;
+ 
+ 	ret = amdgpu_bo_reserve(bo, false);
+ 	if (unlikely(ret != 0))
+ 		return ret;
+ 
++	/*
++	 * Wait for all shared fences to complete before we switch to future
++	 * use of exclusive fence on this prime shared bo.
++	 */
++	ret = reservation_object_wait_timeout_rcu(bo->tbo.resv, true, false,
++						  MAX_SCHEDULE_TIMEOUT);
++	if (unlikely(ret < 0)) {
++		DRM_DEBUG_PRIME("Fence wait failed: %li\n", ret);
++		amdgpu_bo_unreserve(bo);
++		return ret;
++	}
++
+ 	/* pin buffer into GTT */
+ 	ret = amdgpu_bo_pin(bo, AMDGPU_GEM_DOMAIN_GTT, NULL);
++	if (likely(ret == 0))
++		bo->prime_shared_count++;
++
+ 	amdgpu_bo_unreserve(bo);
+ 	return ret;
+ }
+@@ -102,6 +118,8 @@ void amdgpu_gem_prime_unpin(struct drm_g
+ 		return;
+ 
+ 	amdgpu_bo_unpin(bo);
++	if (bo->prime_shared_count)
++		bo->prime_shared_count--;
+ 	amdgpu_bo_unreserve(bo);
+ }
+ 
