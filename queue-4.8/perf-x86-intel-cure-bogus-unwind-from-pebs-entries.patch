@@ -1,0 +1,127 @@
+From b8000586c90b4804902058a38d3a59ce5708e695 Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Thu, 17 Nov 2016 18:17:31 +0100
+Subject: perf/x86/intel: Cure bogus unwind from PEBS entries
+
+From: Peter Zijlstra <peterz@infradead.org>
+
+commit b8000586c90b4804902058a38d3a59ce5708e695 upstream.
+
+Vince Weaver reported that perf_fuzzer + KASAN detects that PEBS event
+unwinds sometimes do 'weird' things. In particular, we seemed to be
+ending up unwinding from random places on the NMI stack.
+
+While it was somewhat expected that the event record BP,SP would not
+match the interrupt BP,SP in that the interrupt is strictly later than
+the record event, it was overlooked that it could be on an already
+overwritten stack.
+
+Therefore, don't copy the recorded BP,SP over the interrupted BP,SP
+when we need stack unwinds.
+
+Note that its still possible the unwind doesn't full match the actual
+event, as its entirely possible to have done an (I)RET between record
+and interrupt, but on average it should still point in the general
+direction of where the event came from. Also, it's the best we can do,
+considering.
+
+The particular scenario that triggered the bogus NMI stack unwind was
+a PEBS event with very short period, upon enabling the event at the
+tail of the PMI handler (FREEZE_ON_PMI is not used), it instantly
+triggers a record (while still on the NMI stack) which in turn
+triggers the next PMI. This then causes back-to-back NMIs and we'll
+try and unwind the stack-frame from the last NMI, which obviously is
+now overwritten by our own.
+
+Analyzed-by: Josh Poimboeuf <jpoimboe@redhat.com>
+Reported-by: Vince Weaver <vincent.weaver@maine.edu>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Cc: Arnaldo Carvalho de Melo <acme@kernel.org>
+Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+Cc: Jiri Olsa <jolsa@redhat.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Stephane Eranian <eranian@gmail.com>
+Cc: Stephane Eranian <eranian@google.com>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: davej@codemonkey.org.uk <davej@codemonkey.org.uk>
+Cc: dvyukov@google.com <dvyukov@google.com>
+Fixes: ca037701a025 ("perf, x86: Add PEBS infrastructure")
+Link: http://lkml.kernel.org/r/20161117171731.GV3157@twins.programming.kicks-ass.net
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ arch/x86/events/intel/ds.c   |   35 +++++++++++++++++++++++------------
+ arch/x86/events/perf_event.h |    2 +-
+ 2 files changed, 24 insertions(+), 13 deletions(-)
+
+--- a/arch/x86/events/intel/ds.c
++++ b/arch/x86/events/intel/ds.c
+@@ -1070,20 +1070,20 @@ static void setup_pebs_sample_data(struc
+ 	}
+ 
+ 	/*
+-	 * We use the interrupt regs as a base because the PEBS record
+-	 * does not contain a full regs set, specifically it seems to
+-	 * lack segment descriptors, which get used by things like
+-	 * user_mode().
++	 * We use the interrupt regs as a base because the PEBS record does not
++	 * contain a full regs set, specifically it seems to lack segment
++	 * descriptors, which get used by things like user_mode().
+ 	 *
+-	 * In the simple case fix up only the IP and BP,SP regs, for
+-	 * PERF_SAMPLE_IP and PERF_SAMPLE_CALLCHAIN to function properly.
+-	 * A possible PERF_SAMPLE_REGS will have to transfer all regs.
++	 * In the simple case fix up only the IP for PERF_SAMPLE_IP.
++	 *
++	 * We must however always use BP,SP from iregs for the unwinder to stay
++	 * sane; the record BP,SP can point into thin air when the record is
++	 * from a previous PMI context or an (I)RET happend between the record
++	 * and PMI.
+ 	 */
+ 	*regs = *iregs;
+ 	regs->flags = pebs->flags;
+ 	set_linear_ip(regs, pebs->ip);
+-	regs->bp = pebs->bp;
+-	regs->sp = pebs->sp;
+ 
+ 	if (sample_type & PERF_SAMPLE_REGS_INTR) {
+ 		regs->ax = pebs->ax;
+@@ -1092,10 +1092,21 @@ static void setup_pebs_sample_data(struc
+ 		regs->dx = pebs->dx;
+ 		regs->si = pebs->si;
+ 		regs->di = pebs->di;
+-		regs->bp = pebs->bp;
+-		regs->sp = pebs->sp;
+ 
+-		regs->flags = pebs->flags;
++		/*
++		 * Per the above; only set BP,SP if we don't need callchains.
++		 *
++		 * XXX: does this make sense?
++		 */
++		if (!(sample_type & PERF_SAMPLE_CALLCHAIN)) {
++			regs->bp = pebs->bp;
++			regs->sp = pebs->sp;
++		}
++
++		/*
++		 * Preserve PERF_EFLAGS_VM from set_linear_ip().
++		 */
++		regs->flags = pebs->flags | (regs->flags & PERF_EFLAGS_VM);
+ #ifndef CONFIG_X86_32
+ 		regs->r8 = pebs->r8;
+ 		regs->r9 = pebs->r9;
+--- a/arch/x86/events/perf_event.h
++++ b/arch/x86/events/perf_event.h
+@@ -113,7 +113,7 @@ struct debug_store {
+  * Per register state.
+  */
+ struct er_account {
+-	raw_spinlock_t		lock;	/* per-core: protect structure */
++	raw_spinlock_t      lock;	/* per-core: protect structure */
+ 	u64                 config;	/* extra MSR config */
+ 	u64                 reg;	/* extra MSR number */
+ 	atomic_t            ref;	/* reference count */
