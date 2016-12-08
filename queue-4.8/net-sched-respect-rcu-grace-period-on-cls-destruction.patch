@@ -1,0 +1,257 @@
+From foo@baz Thu Dec  8 07:19:12 CET 2016
+From: Daniel Borkmann <daniel@iogearbox.net>
+Date: Sun, 27 Nov 2016 01:18:01 +0100
+Subject: net, sched: respect rcu grace period on cls destruction
+
+From: Daniel Borkmann <daniel@iogearbox.net>
+
+
+[ Upstream commit d936377414fadbafb4d17148d222fe45ca5442d4 ]
+
+Roi reported a crash in flower where tp->root was NULL in ->classify()
+callbacks. Reason is that in ->destroy() tp->root is set to NULL via
+RCU_INIT_POINTER(). It's problematic for some of the classifiers, because
+this doesn't respect RCU grace period for them, and as a result, still
+outstanding readers from tc_classify() will try to blindly dereference
+a NULL tp->root.
+
+The tp->root object is strictly private to the classifier implementation
+and holds internal data the core such as tc_ctl_tfilter() doesn't know
+about. Within some classifiers, such as cls_bpf, cls_basic, etc, tp->root
+is only checked for NULL in ->get() callback, but nowhere else. This is
+misleading and seemed to be copied from old classifier code that was not
+cleaned up properly. For example, d3fa76ee6b4a ("[NET_SCHED]: cls_basic:
+fix NULL pointer dereference") moved tp->root initialization into ->init()
+routine, where before it was part of ->change(), so ->get() had to deal
+with tp->root being NULL back then, so that was indeed a valid case, after
+d3fa76ee6b4a, not really anymore. We used to set tp->root to NULL long
+ago in ->destroy(), see 47a1a1d4be29 ("pkt_sched: remove unnecessary xchg()
+in packet classifiers"); but the NULLifying was reintroduced with the
+RCUification, but it's not correct for every classifier implementation.
+
+In the cases that are fixed here with one exception of cls_cgroup, tp->root
+object is allocated and initialized inside ->init() callback, which is always
+performed at a point in time after we allocate a new tp, which means tp and
+thus tp->root was not globally visible in the tp chain yet (see tc_ctl_tfilter()).
+Also, on destruction tp->root is strictly kfree_rcu()'ed in ->destroy()
+handler, same for the tp which is kfree_rcu()'ed right when we return
+from ->destroy() in tcf_destroy(). This means, the head object's lifetime
+for such classifiers is always tied to the tp lifetime. The RCU callback
+invocation for the two kfree_rcu() could be out of order, but that's fine
+since both are independent.
+
+Dropping the RCU_INIT_POINTER(tp->root, NULL) for these classifiers here
+means that 1) we don't need a useless NULL check in fast-path and, 2) that
+outstanding readers of that tp in tc_classify() can still execute under
+respect with RCU grace period as it is actually expected.
+
+Things that haven't been touched here: cls_fw and cls_route. They each
+handle tp->root being NULL in ->classify() path for historic reasons, so
+their ->destroy() implementation can stay as is. If someone actually
+cares, they could get cleaned up at some point to avoid the test in fast
+path. cls_u32 doesn't set tp->root to NULL. For cls_rsvp, I just added a
+!head should anyone actually be using/testing it, so it at least aligns with
+cls_fw and cls_route. For cls_flower we additionally need to defer rhashtable
+destruction (to a sleepable context) after RCU grace period as concurrent
+readers might still access it. (Note that in this case we need to hold module
+reference to keep work callback address intact, since we only wait on module
+unload for all call_rcu()s to finish.)
+
+This fixes one race to bring RCU grace period guarantees back. Next step
+as worked on by Cong however is to fix 1e052be69d04 ("net_sched: destroy
+proto tp when all filters are gone") to get the order of unlinking the tp
+in tc_ctl_tfilter() for the RTM_DELTFILTER case right by moving
+RCU_INIT_POINTER() before tcf_destroy() and let the notification for
+removal be done through the prior ->delete() callback. Both are independant
+issues. Once we have that right, we can then clean tp->root up for a number
+of classifiers by not making them RCU pointers, which requires a new callback
+(->uninit) that is triggered from tp's RCU callback, where we just kfree()
+tp->root from there.
+
+Fixes: 1f947bf151e9 ("net: sched: rcu'ify cls_bpf")
+Fixes: 9888faefe132 ("net: sched: cls_basic use RCU")
+Fixes: 70da9f0bf999 ("net: sched: cls_flow use RCU")
+Fixes: 77b9900ef53a ("tc: introduce Flower classifier")
+Fixes: bf3994d2ed31 ("net/sched: introduce Match-all classifier")
+Fixes: 952313bd6258 ("net: sched: cls_cgroup use RCU")
+Reported-by: Roi Dayan <roid@mellanox.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Cc: Cong Wang <xiyou.wangcong@gmail.com>
+Cc: John Fastabend <john.fastabend@gmail.com>
+Cc: Roi Dayan <roid@mellanox.com>
+Cc: Jiri Pirko <jiri@mellanox.com>
+Acked-by: John Fastabend <john.r.fastabend@intel.com>
+Acked-by: Cong Wang <xiyou.wangcong@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/sched/cls_basic.c    |    4 ----
+ net/sched/cls_bpf.c      |    4 ----
+ net/sched/cls_cgroup.c   |    7 +++----
+ net/sched/cls_flow.c     |    1 -
+ net/sched/cls_flower.c   |   31 ++++++++++++++++++++++++++-----
+ net/sched/cls_matchall.c |    1 -
+ net/sched/cls_rsvp.h     |    3 ++-
+ net/sched/cls_tcindex.c  |    1 -
+ 8 files changed, 31 insertions(+), 21 deletions(-)
+
+--- a/net/sched/cls_basic.c
++++ b/net/sched/cls_basic.c
+@@ -62,9 +62,6 @@ static unsigned long basic_get(struct tc
+ 	struct basic_head *head = rtnl_dereference(tp->root);
+ 	struct basic_filter *f;
+ 
+-	if (head == NULL)
+-		return 0UL;
+-
+ 	list_for_each_entry(f, &head->flist, link) {
+ 		if (f->handle == handle) {
+ 			l = (unsigned long) f;
+@@ -109,7 +106,6 @@ static bool basic_destroy(struct tcf_pro
+ 		tcf_unbind_filter(tp, &f->res);
+ 		call_rcu(&f->rcu, basic_delete_filter);
+ 	}
+-	RCU_INIT_POINTER(tp->root, NULL);
+ 	kfree_rcu(head, rcu);
+ 	return true;
+ }
+--- a/net/sched/cls_bpf.c
++++ b/net/sched/cls_bpf.c
+@@ -200,7 +200,6 @@ static bool cls_bpf_destroy(struct tcf_p
+ 		call_rcu(&prog->rcu, __cls_bpf_delete_prog);
+ 	}
+ 
+-	RCU_INIT_POINTER(tp->root, NULL);
+ 	kfree_rcu(head, rcu);
+ 	return true;
+ }
+@@ -211,9 +210,6 @@ static unsigned long cls_bpf_get(struct
+ 	struct cls_bpf_prog *prog;
+ 	unsigned long ret = 0UL;
+ 
+-	if (head == NULL)
+-		return 0UL;
+-
+ 	list_for_each_entry(prog, &head->plist, link) {
+ 		if (prog->handle == handle) {
+ 			ret = (unsigned long) prog;
+--- a/net/sched/cls_cgroup.c
++++ b/net/sched/cls_cgroup.c
+@@ -130,11 +130,10 @@ static bool cls_cgroup_destroy(struct tc
+ 
+ 	if (!force)
+ 		return false;
+-
+-	if (head) {
+-		RCU_INIT_POINTER(tp->root, NULL);
++	/* Head can still be NULL due to cls_cgroup_init(). */
++	if (head)
+ 		call_rcu(&head->rcu, cls_cgroup_destroy_rcu);
+-	}
++
+ 	return true;
+ }
+ 
+--- a/net/sched/cls_flow.c
++++ b/net/sched/cls_flow.c
+@@ -583,7 +583,6 @@ static bool flow_destroy(struct tcf_prot
+ 		list_del_rcu(&f->list);
+ 		call_rcu(&f->rcu, flow_destroy_filter);
+ 	}
+-	RCU_INIT_POINTER(tp->root, NULL);
+ 	kfree_rcu(head, rcu);
+ 	return true;
+ }
+--- a/net/sched/cls_flower.c
++++ b/net/sched/cls_flower.c
+@@ -13,6 +13,7 @@
+ #include <linux/init.h>
+ #include <linux/module.h>
+ #include <linux/rhashtable.h>
++#include <linux/workqueue.h>
+ 
+ #include <linux/if_ether.h>
+ #include <linux/in6.h>
+@@ -55,7 +56,10 @@ struct cls_fl_head {
+ 	bool mask_assigned;
+ 	struct list_head filters;
+ 	struct rhashtable_params ht_params;
+-	struct rcu_head rcu;
++	union {
++		struct work_struct work;
++		struct rcu_head	rcu;
++	};
+ };
+ 
+ struct cls_fl_filter {
+@@ -239,6 +243,24 @@ static void fl_hw_update_stats(struct tc
+ 	dev->netdev_ops->ndo_setup_tc(dev, tp->q->handle, tp->protocol, &tc);
+ }
+ 
++static void fl_destroy_sleepable(struct work_struct *work)
++{
++	struct cls_fl_head *head = container_of(work, struct cls_fl_head,
++						work);
++	if (head->mask_assigned)
++		rhashtable_destroy(&head->ht);
++	kfree(head);
++	module_put(THIS_MODULE);
++}
++
++static void fl_destroy_rcu(struct rcu_head *rcu)
++{
++	struct cls_fl_head *head = container_of(rcu, struct cls_fl_head, rcu);
++
++	INIT_WORK(&head->work, fl_destroy_sleepable);
++	schedule_work(&head->work);
++}
++
+ static bool fl_destroy(struct tcf_proto *tp, bool force)
+ {
+ 	struct cls_fl_head *head = rtnl_dereference(tp->root);
+@@ -252,10 +274,9 @@ static bool fl_destroy(struct tcf_proto
+ 		list_del_rcu(&f->list);
+ 		call_rcu(&f->rcu, fl_destroy_filter);
+ 	}
+-	RCU_INIT_POINTER(tp->root, NULL);
+-	if (head->mask_assigned)
+-		rhashtable_destroy(&head->ht);
+-	kfree_rcu(head, rcu);
++
++	__module_get(THIS_MODULE);
++	call_rcu(&head->rcu, fl_destroy_rcu);
+ 	return true;
+ }
+ 
+--- a/net/sched/cls_matchall.c
++++ b/net/sched/cls_matchall.c
+@@ -114,7 +114,6 @@ static bool mall_destroy(struct tcf_prot
+ 
+ 		call_rcu(&f->rcu, mall_destroy_filter);
+ 	}
+-	RCU_INIT_POINTER(tp->root, NULL);
+ 	kfree_rcu(head, rcu);
+ 	return true;
+ }
+--- a/net/sched/cls_rsvp.h
++++ b/net/sched/cls_rsvp.h
+@@ -152,7 +152,8 @@ static int rsvp_classify(struct sk_buff
+ 		return -1;
+ 	nhptr = ip_hdr(skb);
+ #endif
+-
++	if (unlikely(!head))
++		return -1;
+ restart:
+ 
+ #if RSVP_DST_LEN == 4
+--- a/net/sched/cls_tcindex.c
++++ b/net/sched/cls_tcindex.c
+@@ -503,7 +503,6 @@ static bool tcindex_destroy(struct tcf_p
+ 	walker.fn = tcindex_destroy_element;
+ 	tcindex_walk(tp, &walker);
+ 
+-	RCU_INIT_POINTER(tp->root, NULL);
+ 	call_rcu(&p->rcu, __tcindex_destroy);
+ 	return true;
+ }
