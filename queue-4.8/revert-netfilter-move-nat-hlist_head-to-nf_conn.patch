@@ -1,0 +1,170 @@
+From 394d96406cae0936778587a09d8be0d998132166 Mon Sep 17 00:00:00 2001
+From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date: Wed, 4 Jan 2017 18:29:16 +0100
+Subject: [PATCH 2/2] Revert "netfilter: move nat hlist_head to nf_conn"
+
+This reverts commit 7c9664351980aaa6a4b8837a314360b3a4ad382a as it is
+not working properly.  Please move to 4.9 to get the full fix.
+
+Reported-by: Pablo Neira Ayuso <pablo@netfilter.org>
+Cc: Florian Westphal <fw@strlen.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/net/netfilter/nf_conntrack.h        |    3 --
+ include/net/netfilter/nf_conntrack_extend.h |    3 ++
+ include/net/netfilter/nf_nat.h              |    2 +
+ net/netfilter/nf_conntrack_extend.c         |   15 +++++++++++-
+ net/netfilter/nf_nat_core.c                 |   33 ++++++++++++++++++++++------
+ 5 files changed, 44 insertions(+), 12 deletions(-)
+
+--- a/include/net/netfilter/nf_conntrack.h
++++ b/include/net/netfilter/nf_conntrack.h
+@@ -117,9 +117,6 @@ struct nf_conn {
+ 	/* Extensions */
+ 	struct nf_ct_ext *ext;
+ 
+-#if IS_ENABLED(CONFIG_NF_NAT)
+-	struct hlist_node	nat_bysource;
+-#endif
+ 	/* Storage reserved for other modules, must be the last member */
+ 	union nf_conntrack_proto proto;
+ };
+--- a/include/net/netfilter/nf_conntrack_extend.h
++++ b/include/net/netfilter/nf_conntrack_extend.h
+@@ -99,6 +99,9 @@ void *__nf_ct_ext_add_length(struct nf_c
+ struct nf_ct_ext_type {
+ 	/* Destroys relationships (can be NULL). */
+ 	void (*destroy)(struct nf_conn *ct);
++	/* Called when realloacted (can be NULL).
++	   Contents has already been moved. */
++	void (*move)(void *new, void *old);
+ 
+ 	enum nf_ct_ext_id id;
+ 
+--- a/include/net/netfilter/nf_nat.h
++++ b/include/net/netfilter/nf_nat.h
+@@ -29,6 +29,8 @@ struct nf_conn;
+ 
+ /* The structure embedded in the conntrack structure. */
+ struct nf_conn_nat {
++	struct hlist_node bysource;
++	struct nf_conn *ct;
+ 	union nf_conntrack_nat_help help;
+ #if IS_ENABLED(CONFIG_NF_NAT_MASQUERADE_IPV4) || \
+     IS_ENABLED(CONFIG_NF_NAT_MASQUERADE_IPV6)
+--- a/net/netfilter/nf_conntrack_extend.c
++++ b/net/netfilter/nf_conntrack_extend.c
+@@ -73,7 +73,7 @@ void *__nf_ct_ext_add_length(struct nf_c
+ 			     size_t var_alloc_len, gfp_t gfp)
+ {
+ 	struct nf_ct_ext *old, *new;
+-	int newlen, newoff;
++	int i, newlen, newoff;
+ 	struct nf_ct_ext_type *t;
+ 
+ 	/* Conntrack must not be confirmed to avoid races on reallocation. */
+@@ -99,8 +99,19 @@ void *__nf_ct_ext_add_length(struct nf_c
+ 		return NULL;
+ 
+ 	if (new != old) {
++		for (i = 0; i < NF_CT_EXT_NUM; i++) {
++			if (!__nf_ct_ext_exist(old, i))
++				continue;
++
++			rcu_read_lock();
++			t = rcu_dereference(nf_ct_ext_types[i]);
++			if (t && t->move)
++				t->move((void *)new + new->offset[i],
++					(void *)old + old->offset[i]);
++			rcu_read_unlock();
++		}
+ 		kfree_rcu(old, rcu);
+-		rcu_assign_pointer(ct->ext, new);
++		ct->ext = new;
+ 	}
+ 
+ 	new->offset[id] = newoff;
+--- a/net/netfilter/nf_nat_core.c
++++ b/net/netfilter/nf_nat_core.c
+@@ -198,9 +198,11 @@ find_appropriate_src(struct net *net,
+ 		     const struct nf_nat_range *range)
+ {
+ 	unsigned int h = hash_by_src(net, tuple);
++	const struct nf_conn_nat *nat;
+ 	const struct nf_conn *ct;
+ 
+-	hlist_for_each_entry_rcu(ct, &nf_nat_bysource[h], nat_bysource) {
++	hlist_for_each_entry_rcu(nat, &nf_nat_bysource[h], bysource) {
++		ct = nat->ct;
+ 		if (same_src(ct, tuple) &&
+ 		    net_eq(net, nf_ct_net(ct)) &&
+ 		    nf_ct_zone_equal(ct, zone, IP_CT_DIR_ORIGINAL)) {
+@@ -434,7 +436,8 @@ nf_nat_setup_info(struct nf_conn *ct,
+ 		spin_lock_bh(&nf_nat_lock);
+ 		/* nf_conntrack_alter_reply might re-allocate extension aera */
+ 		nat = nfct_nat(ct);
+-		hlist_add_head_rcu(&ct->nat_bysource,
++		nat->ct = ct;
++		hlist_add_head_rcu(&nat->bysource,
+ 				   &nf_nat_bysource[srchash]);
+ 		spin_unlock_bh(&nf_nat_lock);
+ 	}
+@@ -541,7 +544,7 @@ static int nf_nat_proto_clean(struct nf_
+ 	if (nf_nat_proto_remove(ct, data))
+ 		return 1;
+ 
+-	if (!nat)
++	if (!nat || !nat->ct)
+ 		return 0;
+ 
+ 	/* This netns is being destroyed, and conntrack has nat null binding.
+@@ -554,8 +557,9 @@ static int nf_nat_proto_clean(struct nf_
+ 		return 1;
+ 
+ 	spin_lock_bh(&nf_nat_lock);
+-	hlist_del_rcu(&ct->nat_bysource);
++	hlist_del_rcu(&nat->bysource);
+ 	ct->status &= ~IPS_NAT_DONE_MASK;
++	nat->ct = NULL;
+ 	spin_unlock_bh(&nf_nat_lock);
+ 
+ 	add_timer(&ct->timeout);
+@@ -685,13 +689,27 @@ static void nf_nat_cleanup_conntrack(str
+ {
+ 	struct nf_conn_nat *nat = nf_ct_ext_find(ct, NF_CT_EXT_NAT);
+ 
+-	if (!nat)
++	if (nat == NULL || nat->ct == NULL)
+ 		return;
+ 
+-	NF_CT_ASSERT(ct->status & IPS_SRC_NAT_DONE);
++	NF_CT_ASSERT(nat->ct->status & IPS_SRC_NAT_DONE);
++
++	spin_lock_bh(&nf_nat_lock);
++	hlist_del_rcu(&nat->bysource);
++	spin_unlock_bh(&nf_nat_lock);
++}
++
++static void nf_nat_move_storage(void *new, void *old)
++{
++	struct nf_conn_nat *new_nat = new;
++	struct nf_conn_nat *old_nat = old;
++	struct nf_conn *ct = old_nat->ct;
++
++	if (!ct || !(ct->status & IPS_SRC_NAT_DONE))
++		return;
+ 
+ 	spin_lock_bh(&nf_nat_lock);
+-	hlist_del_rcu(&ct->nat_bysource);
++	hlist_replace_rcu(&old_nat->bysource, &new_nat->bysource);
+ 	spin_unlock_bh(&nf_nat_lock);
+ }
+ 
+@@ -699,6 +717,7 @@ static struct nf_ct_ext_type nat_extend
+ 	.len		= sizeof(struct nf_conn_nat),
+ 	.align		= __alignof__(struct nf_conn_nat),
+ 	.destroy	= nf_nat_cleanup_conntrack,
++	.move		= nf_nat_move_storage,
+ 	.id		= NF_CT_EXT_NAT,
+ 	.flags		= NF_CT_EXT_F_PREALLOC,
+ };
