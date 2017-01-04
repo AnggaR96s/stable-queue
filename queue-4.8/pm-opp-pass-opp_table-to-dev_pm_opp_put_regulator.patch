@@ -1,0 +1,198 @@
+From 91291d9ad92faa65a56a9a19d658d8049b78d3d4 Mon Sep 17 00:00:00 2001
+From: Stephen Boyd <sboyd@codeaurora.org>
+Date: Wed, 30 Nov 2016 16:21:25 +0530
+Subject: PM / OPP: Pass opp_table to dev_pm_opp_put_regulator()
+
+From: Stephen Boyd <sboyd@codeaurora.org>
+
+commit 91291d9ad92faa65a56a9a19d658d8049b78d3d4 upstream.
+
+Joonyoung Shim reported an interesting problem on his ARM octa-core
+Odoroid-XU3 platform. During system suspend, dev_pm_opp_put_regulator()
+was failing for a struct device for which dev_pm_opp_set_regulator() is
+called earlier.
+
+This happened because an earlier call to
+dev_pm_opp_of_cpumask_remove_table() function (from cpufreq-dt.c file)
+removed all the entries from opp_table->dev_list apart from the last CPU
+device in the cpumask of CPUs sharing the OPP.
+
+But both dev_pm_opp_set_regulator() and dev_pm_opp_put_regulator()
+routines get CPU device for the first CPU in the cpumask. And so the OPP
+core failed to find the OPP table for the struct device.
+
+This patch attempts to fix this problem by returning a pointer to the
+opp_table from dev_pm_opp_set_regulator() and using that as the
+parameter to dev_pm_opp_put_regulator(). This ensures that the
+dev_pm_opp_put_regulator() doesn't fail to find the opp table.
+
+Note that similar design problem also exists with other
+dev_pm_opp_put_*() APIs, but those aren't used currently by anyone and
+so we don't need to update them for now.
+
+Reported-by: Joonyoung Shim <jy0922.shim@samsung.com>
+Signed-off-by: Stephen Boyd <sboyd@codeaurora.org>
+Signed-off-by: Viresh Kumar <viresh.kumar@linaro.org>
+[ Viresh: Wrote commit log and tested on exynos 5250 ]
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/base/power/opp/core.c |   22 ++++++----------------
+ drivers/cpufreq/cpufreq-dt.c  |   12 ++++++++----
+ include/linux/pm_opp.h        |   11 ++++++-----
+ 3 files changed, 20 insertions(+), 25 deletions(-)
+
+--- a/drivers/base/power/opp/core.c
++++ b/drivers/base/power/opp/core.c
+@@ -1320,7 +1320,7 @@ EXPORT_SYMBOL_GPL(dev_pm_opp_put_prop_na
+  * that this function is *NOT* called under RCU protection or in contexts where
+  * mutex cannot be locked.
+  */
+-int dev_pm_opp_set_regulator(struct device *dev, const char *name)
++struct opp_table *dev_pm_opp_set_regulator(struct device *dev, const char *name)
+ {
+ 	struct opp_table *opp_table;
+ 	struct regulator *reg;
+@@ -1358,20 +1358,20 @@ int dev_pm_opp_set_regulator(struct devi
+ 	opp_table->regulator = reg;
+ 
+ 	mutex_unlock(&opp_table_lock);
+-	return 0;
++	return opp_table;
+ 
+ err:
+ 	_remove_opp_table(opp_table);
+ unlock:
+ 	mutex_unlock(&opp_table_lock);
+ 
+-	return ret;
++	return ERR_PTR(ret);
+ }
+ EXPORT_SYMBOL_GPL(dev_pm_opp_set_regulator);
+ 
+ /**
+  * dev_pm_opp_put_regulator() - Releases resources blocked for regulator
+- * @dev: Device for which regulator was set.
++ * @opp_table: OPP table returned from dev_pm_opp_set_regulator().
+  *
+  * Locking: The internal opp_table and opp structures are RCU protected.
+  * Hence this function internally uses RCU updater strategy with mutex locks
+@@ -1379,22 +1379,12 @@ EXPORT_SYMBOL_GPL(dev_pm_opp_set_regulat
+  * that this function is *NOT* called under RCU protection or in contexts where
+  * mutex cannot be locked.
+  */
+-void dev_pm_opp_put_regulator(struct device *dev)
++void dev_pm_opp_put_regulator(struct opp_table *opp_table)
+ {
+-	struct opp_table *opp_table;
+-
+ 	mutex_lock(&opp_table_lock);
+ 
+-	/* Check for existing table for 'dev' first */
+-	opp_table = _find_opp_table(dev);
+-	if (IS_ERR(opp_table)) {
+-		dev_err(dev, "Failed to find opp_table: %ld\n",
+-			PTR_ERR(opp_table));
+-		goto unlock;
+-	}
+-
+ 	if (IS_ERR(opp_table->regulator)) {
+-		dev_err(dev, "%s: Doesn't have regulator set\n", __func__);
++		pr_err("%s: Doesn't have regulator set\n", __func__);
+ 		goto unlock;
+ 	}
+ 
+--- a/drivers/cpufreq/cpufreq-dt.c
++++ b/drivers/cpufreq/cpufreq-dt.c
+@@ -26,6 +26,7 @@
+ #include <linux/thermal.h>
+ 
+ struct private_data {
++	struct opp_table *opp_table;
+ 	struct device *cpu_dev;
+ 	struct thermal_cooling_device *cdev;
+ 	const char *reg_name;
+@@ -141,6 +142,7 @@ static int resources_available(void)
+ static int cpufreq_init(struct cpufreq_policy *policy)
+ {
+ 	struct cpufreq_frequency_table *freq_table;
++	struct opp_table *opp_table = NULL;
+ 	struct private_data *priv;
+ 	struct device *cpu_dev;
+ 	struct clk *cpu_clk;
+@@ -184,8 +186,9 @@ static int cpufreq_init(struct cpufreq_p
+ 	 */
+ 	name = find_supply_name(cpu_dev);
+ 	if (name) {
+-		ret = dev_pm_opp_set_regulator(cpu_dev, name);
+-		if (ret) {
++		opp_table = dev_pm_opp_set_regulator(cpu_dev, name);
++		if (IS_ERR(opp_table)) {
++			ret = PTR_ERR(opp_table);
+ 			dev_err(cpu_dev, "Failed to set regulator for cpu%d: %d\n",
+ 				policy->cpu, ret);
+ 			goto out_put_clk;
+@@ -235,6 +238,7 @@ static int cpufreq_init(struct cpufreq_p
+ 	}
+ 
+ 	priv->reg_name = name;
++	priv->opp_table = opp_table;
+ 
+ 	ret = dev_pm_opp_init_cpufreq_table(cpu_dev, &freq_table);
+ 	if (ret) {
+@@ -283,7 +287,7 @@ out_free_priv:
+ out_free_opp:
+ 	dev_pm_opp_of_cpumask_remove_table(policy->cpus);
+ 	if (name)
+-		dev_pm_opp_put_regulator(cpu_dev);
++		dev_pm_opp_put_regulator(opp_table);
+ out_put_clk:
+ 	clk_put(cpu_clk);
+ 
+@@ -298,7 +302,7 @@ static int cpufreq_exit(struct cpufreq_p
+ 	dev_pm_opp_free_cpufreq_table(priv->cpu_dev, &policy->freq_table);
+ 	dev_pm_opp_of_cpumask_remove_table(policy->related_cpus);
+ 	if (priv->reg_name)
+-		dev_pm_opp_put_regulator(priv->cpu_dev);
++		dev_pm_opp_put_regulator(priv->opp_table);
+ 
+ 	clk_put(policy->clk);
+ 	kfree(priv);
+--- a/include/linux/pm_opp.h
++++ b/include/linux/pm_opp.h
+@@ -19,6 +19,7 @@
+ 
+ struct dev_pm_opp;
+ struct device;
++struct opp_table;
+ 
+ enum dev_pm_opp_event {
+ 	OPP_EVENT_ADD, OPP_EVENT_REMOVE, OPP_EVENT_ENABLE, OPP_EVENT_DISABLE,
+@@ -62,8 +63,8 @@ int dev_pm_opp_set_supported_hw(struct d
+ void dev_pm_opp_put_supported_hw(struct device *dev);
+ int dev_pm_opp_set_prop_name(struct device *dev, const char *name);
+ void dev_pm_opp_put_prop_name(struct device *dev);
+-int dev_pm_opp_set_regulator(struct device *dev, const char *name);
+-void dev_pm_opp_put_regulator(struct device *dev);
++struct opp_table *dev_pm_opp_set_regulator(struct device *dev, const char *name);
++void dev_pm_opp_put_regulator(struct opp_table *opp_table);
+ int dev_pm_opp_set_rate(struct device *dev, unsigned long target_freq);
+ int dev_pm_opp_set_sharing_cpus(struct device *cpu_dev, const struct cpumask *cpumask);
+ int dev_pm_opp_get_sharing_cpus(struct device *cpu_dev, struct cpumask *cpumask);
+@@ -170,12 +171,12 @@ static inline int dev_pm_opp_set_prop_na
+ 
+ static inline void dev_pm_opp_put_prop_name(struct device *dev) {}
+ 
+-static inline int dev_pm_opp_set_regulator(struct device *dev, const char *name)
++static inline struct opp_table *dev_pm_opp_set_regulator(struct device *dev, const char *name)
+ {
+-	return -ENOTSUPP;
++	return ERR_PTR(-ENOTSUPP);
+ }
+ 
+-static inline void dev_pm_opp_put_regulator(struct device *dev) {}
++static inline void dev_pm_opp_put_regulator(struct opp_table *opp_table) {}
+ 
+ static inline int dev_pm_opp_set_rate(struct device *dev, unsigned long target_freq)
+ {
