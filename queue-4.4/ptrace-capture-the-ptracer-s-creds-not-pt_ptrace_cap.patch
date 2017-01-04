@@ -1,0 +1,147 @@
+From 64b875f7ac8a5d60a4e191479299e931ee949b67 Mon Sep 17 00:00:00 2001
+From: "Eric W. Biederman" <ebiederm@xmission.com>
+Date: Mon, 14 Nov 2016 18:48:07 -0600
+Subject: ptrace: Capture the ptracer's creds not PT_PTRACE_CAP
+
+From: Eric W. Biederman <ebiederm@xmission.com>
+
+commit 64b875f7ac8a5d60a4e191479299e931ee949b67 upstream.
+
+When the flag PT_PTRACE_CAP was added the PTRACE_TRACEME path was
+overlooked.  This can result in incorrect behavior when an application
+like strace traces an exec of a setuid executable.
+
+Further PT_PTRACE_CAP does not have enough information for making good
+security decisions as it does not report which user namespace the
+capability is in.  This has already allowed one mistake through
+insufficient granulariy.
+
+I found this issue when I was testing another corner case of exec and
+discovered that I could not get strace to set PT_PTRACE_CAP even when
+running strace as root with a full set of caps.
+
+This change fixes the above issue with strace allowing stracing as
+root a setuid executable without disabling setuid.  More fundamentaly
+this change allows what is allowable at all times, by using the correct
+information in it's decision.
+
+Fixes: 4214e42f96d4 ("v2.4.9.11 -> v2.4.9.12")
+Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/exec.c                  |    2 +-
+ include/linux/capability.h |    1 +
+ include/linux/ptrace.h     |    1 -
+ include/linux/sched.h      |    1 +
+ kernel/capability.c        |   20 ++++++++++++++++++++
+ kernel/ptrace.c            |   12 +++++++-----
+ 6 files changed, 30 insertions(+), 7 deletions(-)
+
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@ -1273,7 +1273,7 @@ static void check_unsafe_exec(struct lin
+ 	unsigned n_fs;
+ 
+ 	if (p->ptrace) {
+-		if (p->ptrace & PT_PTRACE_CAP)
++		if (ptracer_capable(p, current_user_ns()))
+ 			bprm->unsafe |= LSM_UNSAFE_PTRACE_CAP;
+ 		else
+ 			bprm->unsafe |= LSM_UNSAFE_PTRACE;
+--- a/include/linux/capability.h
++++ b/include/linux/capability.h
+@@ -250,6 +250,7 @@ static inline bool ns_capable_noaudit(st
+ extern bool privileged_wrt_inode_uidgid(struct user_namespace *ns, const struct inode *inode);
+ extern bool capable_wrt_inode_uidgid(const struct inode *inode, int cap);
+ extern bool file_ns_capable(const struct file *file, struct user_namespace *ns, int cap);
++extern bool ptracer_capable(struct task_struct *tsk, struct user_namespace *ns);
+ 
+ /* audit system wants to get cap info from files as well */
+ extern int get_vfs_caps_from_disk(const struct dentry *dentry, struct cpu_vfs_cap_data *cpu_caps);
+--- a/include/linux/ptrace.h
++++ b/include/linux/ptrace.h
+@@ -19,7 +19,6 @@
+ #define PT_SEIZED	0x00010000	/* SEIZE used, enable new behavior */
+ #define PT_PTRACED	0x00000001
+ #define PT_DTRACE	0x00000002	/* delayed trace (used on m68k, i386) */
+-#define PT_PTRACE_CAP	0x00000004	/* ptracer can follow suid-exec */
+ 
+ #define PT_OPT_FLAG_SHIFT	3
+ /* PT_TRACE_* event enable flags */
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1540,6 +1540,7 @@ struct task_struct {
+ 	struct list_head cpu_timers[3];
+ 
+ /* process credentials */
++	const struct cred __rcu *ptracer_cred; /* Tracer's credentials at attach */
+ 	const struct cred __rcu *real_cred; /* objective and real subjective task
+ 					 * credentials (COW) */
+ 	const struct cred __rcu *cred;	/* effective (overridable) subjective task
+--- a/kernel/capability.c
++++ b/kernel/capability.c
+@@ -485,3 +485,23 @@ bool capable_wrt_inode_uidgid(const stru
+ 	return ns_capable(ns, cap) && privileged_wrt_inode_uidgid(ns, inode);
+ }
+ EXPORT_SYMBOL(capable_wrt_inode_uidgid);
++
++/**
++ * ptracer_capable - Determine if the ptracer holds CAP_SYS_PTRACE in the namespace
++ * @tsk: The task that may be ptraced
++ * @ns: The user namespace to search for CAP_SYS_PTRACE in
++ *
++ * Return true if the task that is ptracing the current task had CAP_SYS_PTRACE
++ * in the specified user namespace.
++ */
++bool ptracer_capable(struct task_struct *tsk, struct user_namespace *ns)
++{
++	int ret = 0;  /* An absent tracer adds no restrictions */
++	const struct cred *cred;
++	rcu_read_lock();
++	cred = rcu_dereference(tsk->ptracer_cred);
++	if (cred)
++		ret = security_capable_noaudit(cred, ns, CAP_SYS_PTRACE);
++	rcu_read_unlock();
++	return (ret == 0);
++}
+--- a/kernel/ptrace.c
++++ b/kernel/ptrace.c
+@@ -39,6 +39,9 @@ void __ptrace_link(struct task_struct *c
+ 	BUG_ON(!list_empty(&child->ptrace_entry));
+ 	list_add(&child->ptrace_entry, &new_parent->ptraced);
+ 	child->parent = new_parent;
++	rcu_read_lock();
++	child->ptracer_cred = get_cred(__task_cred(new_parent));
++	rcu_read_unlock();
+ }
+ 
+ /**
+@@ -71,11 +74,15 @@ void __ptrace_link(struct task_struct *c
+  */
+ void __ptrace_unlink(struct task_struct *child)
+ {
++	const struct cred *old_cred;
+ 	BUG_ON(!child->ptrace);
+ 
+ 	child->ptrace = 0;
+ 	child->parent = child->real_parent;
+ 	list_del_init(&child->ptrace_entry);
++	old_cred = child->ptracer_cred;
++	child->ptracer_cred = NULL;
++	put_cred(old_cred);
+ 
+ 	spin_lock(&child->sighand->siglock);
+ 
+@@ -325,11 +332,6 @@ static int ptrace_attach(struct task_str
+ 
+ 	task_lock(task);
+ 	retval = __ptrace_may_access(task, PTRACE_MODE_ATTACH_REALCREDS);
+-	if (!retval) {
+-		struct mm_struct *mm = task->mm;
+-		if (mm && ns_capable(mm->user_ns, CAP_SYS_PTRACE))
+-			flags |= PT_PTRACE_CAP;
+-	}
+ 	task_unlock(task);
+ 	if (retval)
+ 		goto unlock_creds;
