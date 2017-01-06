@@ -1,0 +1,234 @@
+From dac37e15b7d511e026a9313c8c46794c144103cd Mon Sep 17 00:00:00 2001
+From: Benjamin Block <bblock@linux.vnet.ibm.com>
+Date: Fri, 9 Dec 2016 17:16:31 +0100
+Subject: scsi: zfcp: fix use-after-"free" in FC ingress path after TMF
+
+From: Benjamin Block <bblock@linux.vnet.ibm.com>
+
+commit dac37e15b7d511e026a9313c8c46794c144103cd upstream.
+
+When SCSI EH invokes zFCP's callbacks for eh_device_reset_handler() and
+eh_target_reset_handler(), it expects us to relent the ownership over
+the given scsi_cmnd and all other scsi_cmnds within the same scope - LUN
+or target - when returning with SUCCESS from the callback ('release'
+them).  SCSI EH can then reuse those commands.
+
+We did not follow this rule to release commands upon SUCCESS; and if
+later a reply arrived for one of those supposed to be released commands,
+we would still make use of the scsi_cmnd in our ingress tasklet. This
+will at least result in undefined behavior or a kernel panic because of
+a wrong kernel pointer dereference.
+
+To fix this, we NULLify all pointers to scsi_cmnds (struct zfcp_fsf_req
+*)->data in the matching scope if a TMF was successful. This is done
+under the locks (struct zfcp_adapter *)->abort_lock and (struct
+zfcp_reqlist *)->lock to prevent the requests from being removed from
+the request-hashtable, and the ingress tasklet from making use of the
+scsi_cmnd-pointer in zfcp_fsf_fcp_cmnd_handler().
+
+For cases where a reply arrives during SCSI EH, but before we get a
+chance to NULLify the pointer - but before we return from the callback
+-, we assume that the code is protected from races via the CAS operation
+in blk_complete_request() that is called in scsi_done().
+
+The following stacktrace shows an example for a crash resulting from the
+previous behavior:
+
+Unable to handle kernel pointer dereference at virtual kernel address fffffee17a672000
+Oops: 0038 [#1] SMP
+CPU: 2 PID: 0 Comm: swapper/2 Not tainted
+task: 00000003f7ff5be0 ti: 00000003f3d38000 task.ti: 00000003f3d38000
+Krnl PSW : 0404d00180000000 00000000001156b0 (smp_vcpu_scheduled+0x18/0x40)
+           R:0 T:1 IO:0 EX:0 Key:0 M:1 W:0 P:0 AS:3 CC:1 PM:0 EA:3
+Krnl GPRS: 000000200000007e 0000000000000000 fffffee17a671fd8 0000000300000015
+           ffffffff80000000 00000000005dfde8 07000003f7f80e00 000000004fa4e800
+           000000036ce8d8f8 000000036ce8d9c0 00000003ece8fe00 ffffffff969c9e93
+           00000003fffffffd 000000036ce8da10 00000000003bf134 00000003f3b07918
+Krnl Code: 00000000001156a2: a7190000        lghi    %r1,0
+           00000000001156a6: a7380015        lhi    %r3,21
+          #00000000001156aa: e32050000008    ag    %r2,0(%r5)
+          >00000000001156b0: 482022b0        lh    %r2,688(%r2)
+           00000000001156b4: ae123000        sigp    %r1,%r2,0(%r3)
+           00000000001156b8: b2220020        ipm    %r2
+           00000000001156bc: 8820001c        srl    %r2,28
+           00000000001156c0: c02700000001    xilf    %r2,1
+Call Trace:
+([<0000000000000000>] 0x0)
+ [<000003ff807bdb8e>] zfcp_fsf_fcp_cmnd_handler+0x3de/0x490 [zfcp]
+ [<000003ff807be30a>] zfcp_fsf_req_complete+0x252/0x800 [zfcp]
+ [<000003ff807c0a48>] zfcp_fsf_reqid_check+0xe8/0x190 [zfcp]
+ [<000003ff807c194e>] zfcp_qdio_int_resp+0x66/0x188 [zfcp]
+ [<000003ff80440c64>] qdio_kick_handler+0xdc/0x310 [qdio]
+ [<000003ff804463d0>] __tiqdio_inbound_processing+0xf8/0xcd8 [qdio]
+ [<0000000000141fd4>] tasklet_action+0x9c/0x170
+ [<0000000000141550>] __do_softirq+0xe8/0x258
+ [<000000000010ce0a>] do_softirq+0xba/0xc0
+ [<000000000014187c>] irq_exit+0xc4/0xe8
+ [<000000000046b526>] do_IRQ+0x146/0x1d8
+ [<00000000005d6a3c>] io_return+0x0/0x8
+ [<00000000005d6422>] vtime_stop_cpu+0x4a/0xa0
+([<0000000000000000>] 0x0)
+ [<0000000000103d8a>] arch_cpu_idle+0xa2/0xb0
+ [<0000000000197f94>] cpu_startup_entry+0x13c/0x1f8
+ [<0000000000114782>] smp_start_secondary+0xda/0xe8
+ [<00000000005d6efe>] restart_int_handler+0x56/0x6c
+ [<0000000000000000>] 0x0
+Last Breaking-Event-Address:
+ [<00000000003bf12e>] arch_spin_lock_wait+0x56/0xb0
+
+Suggested-by: Steffen Maier <maier@linux.vnet.ibm.com>
+Signed-off-by: Benjamin Block <bblock@linux.vnet.ibm.com>
+Fixes: ea127f9754 ("[PATCH] s390 (7/7): zfcp host adapter.") (tglx/history.git)
+Signed-off-by: Steffen Maier <maier@linux.vnet.ibm.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/s390/scsi/zfcp_dbf.h     |   11 +++++++
+ drivers/s390/scsi/zfcp_reqlist.h |   30 +++++++++++++++++++-
+ drivers/s390/scsi/zfcp_scsi.c    |   57 +++++++++++++++++++++++++++++++++++++--
+ 3 files changed, 95 insertions(+), 3 deletions(-)
+
+--- a/drivers/s390/scsi/zfcp_dbf.h
++++ b/drivers/s390/scsi/zfcp_dbf.h
+@@ -388,4 +388,15 @@ void zfcp_dbf_scsi_devreset(char *tag, s
+ 	_zfcp_dbf_scsi(tmp_tag, 1, scmnd, NULL);
+ }
+ 
++/**
++ * zfcp_dbf_scsi_nullcmnd() - trace NULLify of SCSI command in dev/tgt-reset.
++ * @scmnd: SCSI command that was NULLified.
++ * @fsf_req: request that owned @scmnd.
++ */
++static inline void zfcp_dbf_scsi_nullcmnd(struct scsi_cmnd *scmnd,
++					  struct zfcp_fsf_req *fsf_req)
++{
++	_zfcp_dbf_scsi("scfc__1", 3, scmnd, fsf_req);
++}
++
+ #endif /* ZFCP_DBF_H */
+--- a/drivers/s390/scsi/zfcp_reqlist.h
++++ b/drivers/s390/scsi/zfcp_reqlist.h
+@@ -4,7 +4,7 @@
+  * Data structure and helper functions for tracking pending FSF
+  * requests.
+  *
+- * Copyright IBM Corp. 2009
++ * Copyright IBM Corp. 2009, 2016
+  */
+ 
+ #ifndef ZFCP_REQLIST_H
+@@ -180,4 +180,32 @@ static inline void zfcp_reqlist_move(str
+ 	spin_unlock_irqrestore(&rl->lock, flags);
+ }
+ 
++/**
++ * zfcp_reqlist_apply_for_all() - apply a function to every request.
++ * @rl: the requestlist that contains the target requests.
++ * @f: the function to apply to each request; the first parameter of the
++ *     function will be the target-request; the second parameter is the same
++ *     pointer as given with the argument @data.
++ * @data: freely chosen argument; passed through to @f as second parameter.
++ *
++ * Uses :c:macro:`list_for_each_entry` to iterate over the lists in the hash-
++ * table (not a 'safe' variant, so don't modify the list).
++ *
++ * Holds @rl->lock over the entire request-iteration.
++ */
++static inline void
++zfcp_reqlist_apply_for_all(struct zfcp_reqlist *rl,
++			   void (*f)(struct zfcp_fsf_req *, void *), void *data)
++{
++	struct zfcp_fsf_req *req;
++	unsigned long flags;
++	unsigned int i;
++
++	spin_lock_irqsave(&rl->lock, flags);
++	for (i = 0; i < ZFCP_REQ_LIST_BUCKETS; i++)
++		list_for_each_entry(req, &rl->buckets[i], list)
++			f(req, data);
++	spin_unlock_irqrestore(&rl->lock, flags);
++}
++
+ #endif /* ZFCP_REQLIST_H */
+--- a/drivers/s390/scsi/zfcp_scsi.c
++++ b/drivers/s390/scsi/zfcp_scsi.c
+@@ -3,7 +3,7 @@
+  *
+  * Interface to Linux SCSI midlayer.
+  *
+- * Copyright IBM Corp. 2002, 2015
++ * Copyright IBM Corp. 2002, 2016
+  */
+ 
+ #define KMSG_COMPONENT "zfcp"
+@@ -209,6 +209,57 @@ static int zfcp_scsi_eh_abort_handler(st
+ 	return retval;
+ }
+ 
++struct zfcp_scsi_req_filter {
++	u8 tmf_scope;
++	u32 lun_handle;
++	u32 port_handle;
++};
++
++static void zfcp_scsi_forget_cmnd(struct zfcp_fsf_req *old_req, void *data)
++{
++	struct zfcp_scsi_req_filter *filter =
++		(struct zfcp_scsi_req_filter *)data;
++
++	/* already aborted - prevent side-effects - or not a SCSI command */
++	if (old_req->data == NULL || old_req->fsf_command != FSF_QTCB_FCP_CMND)
++		return;
++
++	/* (tmf_scope == FCP_TMF_TGT_RESET || tmf_scope == FCP_TMF_LUN_RESET) */
++	if (old_req->qtcb->header.port_handle != filter->port_handle)
++		return;
++
++	if (filter->tmf_scope == FCP_TMF_LUN_RESET &&
++	    old_req->qtcb->header.lun_handle != filter->lun_handle)
++		return;
++
++	zfcp_dbf_scsi_nullcmnd((struct scsi_cmnd *)old_req->data, old_req);
++	old_req->data = NULL;
++}
++
++static void zfcp_scsi_forget_cmnds(struct zfcp_scsi_dev *zsdev, u8 tm_flags)
++{
++	struct zfcp_adapter *adapter = zsdev->port->adapter;
++	struct zfcp_scsi_req_filter filter = {
++		.tmf_scope = FCP_TMF_TGT_RESET,
++		.port_handle = zsdev->port->handle,
++	};
++	unsigned long flags;
++
++	if (tm_flags == FCP_TMF_LUN_RESET) {
++		filter.tmf_scope = FCP_TMF_LUN_RESET;
++		filter.lun_handle = zsdev->lun_handle;
++	}
++
++	/*
++	 * abort_lock secures against other processings - in the abort-function
++	 * and normal cmnd-handler - of (struct zfcp_fsf_req *)->data
++	 */
++	write_lock_irqsave(&adapter->abort_lock, flags);
++	zfcp_reqlist_apply_for_all(adapter->req_list, zfcp_scsi_forget_cmnd,
++				   &filter);
++	write_unlock_irqrestore(&adapter->abort_lock, flags);
++}
++
+ static int zfcp_task_mgmt_function(struct scsi_cmnd *scpnt, u8 tm_flags)
+ {
+ 	struct zfcp_scsi_dev *zfcp_sdev = sdev_to_zfcp(scpnt->device);
+@@ -241,8 +292,10 @@ static int zfcp_task_mgmt_function(struc
+ 	if (fsf_req->status & ZFCP_STATUS_FSFREQ_TMFUNCFAILED) {
+ 		zfcp_dbf_scsi_devreset("fail", scpnt, tm_flags);
+ 		retval = FAILED;
+-	} else
++	} else {
+ 		zfcp_dbf_scsi_devreset("okay", scpnt, tm_flags);
++		zfcp_scsi_forget_cmnds(zfcp_sdev, tm_flags);
++	}
+ 
+ 	zfcp_fsf_req_free(fsf_req);
+ 	return retval;
