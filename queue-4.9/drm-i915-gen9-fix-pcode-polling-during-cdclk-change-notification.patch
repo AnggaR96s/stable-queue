@@ -1,0 +1,222 @@
+From 2c7d0602c815277f7cb7c932b091288710d8aba7 Mon Sep 17 00:00:00 2001
+From: Imre Deak <imre.deak@intel.com>
+Date: Mon, 5 Dec 2016 18:27:37 +0200
+Subject: drm/i915/gen9: Fix PCODE polling during CDCLK change notification
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+From: Imre Deak <imre.deak@intel.com>
+
+commit 2c7d0602c815277f7cb7c932b091288710d8aba7 upstream.
+
+commit 848496e5902833600f7992f4faa82dc1546051ba
+Author: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Date:   Wed Jul 13 16:32:03 2016 +0300
+
+    drm/i915: Wait up to 3ms for the pcu to ack the cdclk change request on SKL
+
+increased the timeout to match the spec, but we still see a timeout on
+at least one SKL. A CDCLK change request following the failed one will
+succeed nevertheless.
+
+I could reproduce this problem easily by running kms_pipe_crc_basic in a
+loop. In all failure cases _wait_for() was pre-empted for >3ms and so in
+the worst case - when the pre-emption happened right after calculating
+timeout__ in _wait_for() - we called skl_cdclk_wait_for_pcu_ready() only
+once which failed and so _wait_for() timed out. As opposed to this the
+spec says to keep retrying the request for at most a 3ms period.
+
+To fix this send the first request explicitly to guarantee that there is
+3ms between the first and last request. Though this matches the spec, I
+noticed that in rare cases this can still time out if we sent only a few
+requests (in the worst case 2) _and_ PCODE is busy for some reason even
+after a previous request and a 3ms delay. To work around this retry the
+polling with pre-emption disabled to maximize the number of requests.
+Also increase the timeout to 10ms to account for interrupts that could
+reduce the number of requests. With this change I couldn't trigger
+the problem.
+
+v2:
+- Use 1ms poll period instead of 10us. (Chris)
+v3:
+- Poll with pre-emption disabled to increase the number of request
+  attempts. (Ville, Chris)
+- Factor out a helper to poll, it's also needed by the next patch.
+v4:
+- Pass reply_mask, reply to skl_pcode_request(), instead of assuming the
+  reply is generic. (Ville)
+v5:
+- List the request specific timeout values as code comment. (Ville)
+v6:
+- Try the poll first with preemption enabled.
+- Add code comment about first request being queued by PCODE. (Art)
+- Add timeout_base_ms argument. (Ville)
+v7:
+- Clarify code comment about first queued request. (Chris)
+
+Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Art Runyan <arthur.j.runyan@intel.com>
+Cc: <stable@vger.kernel.org> # v4.2- : 3b2c171 : drm/i915: Wait up to 3ms
+Cc: <stable@vger.kernel.org> # v4.2-
+Fixes: 5d96d8afcfbb ("drm/i915/skl: Deinit/init the display at suspend/resume")
+Reference: https://bugs.freedesktop.org/show_bug.cgi?id=97929
+Testcase: igt/kms_pipe_crc_basic/suspend-read-crc-pipe-B
+Signed-off-by: Imre Deak <imre.deak@intel.com>
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Link: http://patchwork.freedesktop.org/patch/msgid/1480955258-26311-1-git-send-email-imre.deak@intel.com
+(cherry picked from commit a0b8a1fe34430c3a82258e8cb45f5968bdf31afd)
+Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/gpu/drm/i915/i915_drv.h      |    2 
+ drivers/gpu/drm/i915/intel_display.c |   31 ++++----------
+ drivers/gpu/drm/i915/intel_pm.c      |   75 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 87 insertions(+), 21 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -3684,6 +3684,8 @@ extern void intel_display_print_error_st
+ 
+ int sandybridge_pcode_read(struct drm_i915_private *dev_priv, u32 mbox, u32 *val);
+ int sandybridge_pcode_write(struct drm_i915_private *dev_priv, u32 mbox, u32 val);
++int skl_pcode_request(struct drm_i915_private *dev_priv, u32 mbox, u32 request,
++		      u32 reply_mask, u32 reply, int timeout_base_ms);
+ 
+ /* intel_sideband.c */
+ u32 vlv_punit_read(struct drm_i915_private *dev_priv, u32 addr);
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -6262,36 +6262,25 @@ skl_dpll0_disable(struct drm_i915_privat
+ 	dev_priv->cdclk_pll.vco = 0;
+ }
+ 
+-static bool skl_cdclk_pcu_ready(struct drm_i915_private *dev_priv)
+-{
+-	int ret;
+-	u32 val;
+-
+-	/* inform PCU we want to change CDCLK */
+-	val = SKL_CDCLK_PREPARE_FOR_CHANGE;
+-	mutex_lock(&dev_priv->rps.hw_lock);
+-	ret = sandybridge_pcode_read(dev_priv, SKL_PCODE_CDCLK_CONTROL, &val);
+-	mutex_unlock(&dev_priv->rps.hw_lock);
+-
+-	return ret == 0 && (val & SKL_CDCLK_READY_FOR_CHANGE);
+-}
+-
+-static bool skl_cdclk_wait_for_pcu_ready(struct drm_i915_private *dev_priv)
+-{
+-	return _wait_for(skl_cdclk_pcu_ready(dev_priv), 3000, 10) == 0;
+-}
+-
+ static void skl_set_cdclk(struct drm_i915_private *dev_priv, int cdclk, int vco)
+ {
+ 	struct drm_device *dev = &dev_priv->drm;
+ 	u32 freq_select, pcu_ack;
++	int ret;
+ 
+ 	WARN_ON((cdclk == 24000) != (vco == 0));
+ 
+ 	DRM_DEBUG_DRIVER("Changing CDCLK to %d kHz (VCO %d kHz)\n", cdclk, vco);
+ 
+-	if (!skl_cdclk_wait_for_pcu_ready(dev_priv)) {
+-		DRM_ERROR("failed to inform PCU about cdclk change\n");
++	mutex_lock(&dev_priv->rps.hw_lock);
++	ret = skl_pcode_request(dev_priv, SKL_PCODE_CDCLK_CONTROL,
++				SKL_CDCLK_PREPARE_FOR_CHANGE,
++				SKL_CDCLK_READY_FOR_CHANGE,
++				SKL_CDCLK_READY_FOR_CHANGE, 3);
++	mutex_unlock(&dev_priv->rps.hw_lock);
++	if (ret) {
++		DRM_ERROR("Failed to inform PCU about cdclk change (%d)\n",
++			  ret);
+ 		return;
+ 	}
+ 
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -7955,6 +7955,81 @@ int sandybridge_pcode_write(struct drm_i
+ 	return 0;
+ }
+ 
++static bool skl_pcode_try_request(struct drm_i915_private *dev_priv, u32 mbox,
++				  u32 request, u32 reply_mask, u32 reply,
++				  u32 *status)
++{
++	u32 val = request;
++
++	*status = sandybridge_pcode_read(dev_priv, mbox, &val);
++
++	return *status || ((val & reply_mask) == reply);
++}
++
++/**
++ * skl_pcode_request - send PCODE request until acknowledgment
++ * @dev_priv: device private
++ * @mbox: PCODE mailbox ID the request is targeted for
++ * @request: request ID
++ * @reply_mask: mask used to check for request acknowledgment
++ * @reply: value used to check for request acknowledgment
++ * @timeout_base_ms: timeout for polling with preemption enabled
++ *
++ * Keep resending the @request to @mbox until PCODE acknowledges it, PCODE
++ * reports an error or an overall timeout of @timeout_base_ms+10 ms expires.
++ * The request is acknowledged once the PCODE reply dword equals @reply after
++ * applying @reply_mask. Polling is first attempted with preemption enabled
++ * for @timeout_base_ms and if this times out for another 10 ms with
++ * preemption disabled.
++ *
++ * Returns 0 on success, %-ETIMEDOUT in case of a timeout, <0 in case of some
++ * other error as reported by PCODE.
++ */
++int skl_pcode_request(struct drm_i915_private *dev_priv, u32 mbox, u32 request,
++		      u32 reply_mask, u32 reply, int timeout_base_ms)
++{
++	u32 status;
++	int ret;
++
++	WARN_ON(!mutex_is_locked(&dev_priv->rps.hw_lock));
++
++#define COND skl_pcode_try_request(dev_priv, mbox, request, reply_mask, reply, \
++				   &status)
++
++	/*
++	 * Prime the PCODE by doing a request first. Normally it guarantees
++	 * that a subsequent request, at most @timeout_base_ms later, succeeds.
++	 * _wait_for() doesn't guarantee when its passed condition is evaluated
++	 * first, so send the first request explicitly.
++	 */
++	if (COND) {
++		ret = 0;
++		goto out;
++	}
++	ret = _wait_for(COND, timeout_base_ms * 1000, 10);
++	if (!ret)
++		goto out;
++
++	/*
++	 * The above can time out if the number of requests was low (2 in the
++	 * worst case) _and_ PCODE was busy for some reason even after a
++	 * (queued) request and @timeout_base_ms delay. As a workaround retry
++	 * the poll with preemption disabled to maximize the number of
++	 * requests. Increase the timeout from @timeout_base_ms to 50ms to
++	 * account for interrupts that could reduce the number of these
++	 * requests.
++	 */
++	DRM_DEBUG_KMS("PCODE timeout, retrying with preemption disabled\n");
++	WARN_ON_ONCE(timeout_base_ms > 3);
++	preempt_disable();
++	ret = wait_for_atomic(COND, 50);
++	preempt_enable();
++
++out:
++	return ret ? ret : status;
++#undef COND
++}
++
+ static int byt_gpu_freq(struct drm_i915_private *dev_priv, int val)
+ {
+ 	/*
