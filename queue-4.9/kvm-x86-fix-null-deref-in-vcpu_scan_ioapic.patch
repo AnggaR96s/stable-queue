@@ -1,0 +1,126 @@
+From 546d87e5c903a7f3ee7b9f998949a94729fbc65b Mon Sep 17 00:00:00 2001
+From: Wanpeng Li <wanpeng.li@hotmail.com>
+Date: Tue, 3 Jan 2017 18:56:19 -0800
+Subject: KVM: x86: fix NULL deref in vcpu_scan_ioapic
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+From: Wanpeng Li <wanpeng.li@hotmail.com>
+
+commit 546d87e5c903a7f3ee7b9f998949a94729fbc65b upstream.
+
+Reported by syzkaller:
+
+    BUG: unable to handle kernel NULL pointer dereference at 00000000000001b0
+    IP: _raw_spin_lock+0xc/0x30
+    PGD 3e28eb067
+    PUD 3f0ac6067
+    PMD 0
+    Oops: 0002 [#1] SMP
+    CPU: 0 PID: 2431 Comm: test Tainted: G           OE   4.10.0-rc1+ #3
+    Call Trace:
+     ? kvm_ioapic_scan_entry+0x3e/0x110 [kvm]
+     kvm_arch_vcpu_ioctl_run+0x10a8/0x15f0 [kvm]
+     ? pick_next_task_fair+0xe1/0x4e0
+     ? kvm_arch_vcpu_load+0xea/0x260 [kvm]
+     kvm_vcpu_ioctl+0x33a/0x600 [kvm]
+     ? hrtimer_try_to_cancel+0x29/0x130
+     ? do_nanosleep+0x97/0xf0
+     do_vfs_ioctl+0xa1/0x5d0
+     ? __hrtimer_init+0x90/0x90
+     ? do_nanosleep+0x5b/0xf0
+     SyS_ioctl+0x79/0x90
+     do_syscall_64+0x6e/0x180
+     entry_SYSCALL64_slow_path+0x25/0x25
+    RIP: _raw_spin_lock+0xc/0x30 RSP: ffffa43688973cc0
+
+The syzkaller folks reported a NULL pointer dereference due to
+ENABLE_CAP succeeding even without an irqchip.  The Hyper-V
+synthetic interrupt controller is activated, resulting in a
+wrong request to rescan the ioapic and a NULL pointer dereference.
+
+    #include <sys/ioctl.h>
+    #include <sys/mman.h>
+    #include <sys/types.h>
+    #include <linux/kvm.h>
+    #include <pthread.h>
+    #include <stddef.h>
+    #include <stdint.h>
+    #include <stdlib.h>
+    #include <string.h>
+    #include <unistd.h>
+
+    #ifndef KVM_CAP_HYPERV_SYNIC
+    #define KVM_CAP_HYPERV_SYNIC 123
+    #endif
+
+    void* thr(void* arg)
+    {
+	struct kvm_enable_cap cap;
+	cap.flags = 0;
+	cap.cap = KVM_CAP_HYPERV_SYNIC;
+	ioctl((long)arg, KVM_ENABLE_CAP, &cap);
+	return 0;
+    }
+
+    int main()
+    {
+	void *host_mem = mmap(0, 0x1000, PROT_READ|PROT_WRITE,
+			MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+	int kvmfd = open("/dev/kvm", 0);
+	int vmfd = ioctl(kvmfd, KVM_CREATE_VM, 0);
+	struct kvm_userspace_memory_region memreg;
+	memreg.slot = 0;
+	memreg.flags = 0;
+	memreg.guest_phys_addr = 0;
+	memreg.memory_size = 0x1000;
+	memreg.userspace_addr = (unsigned long)host_mem;
+	host_mem[0] = 0xf4;
+	ioctl(vmfd, KVM_SET_USER_MEMORY_REGION, &memreg);
+	int cpufd = ioctl(vmfd, KVM_CREATE_VCPU, 0);
+	struct kvm_sregs sregs;
+	ioctl(cpufd, KVM_GET_SREGS, &sregs);
+	sregs.cr0 = 0;
+	sregs.cr4 = 0;
+	sregs.efer = 0;
+	sregs.cs.selector = 0;
+	sregs.cs.base = 0;
+	ioctl(cpufd, KVM_SET_SREGS, &sregs);
+	struct kvm_regs regs = { .rflags = 2 };
+	ioctl(cpufd, KVM_SET_REGS, &regs);
+	ioctl(vmfd, KVM_CREATE_IRQCHIP, 0);
+	pthread_t th;
+	pthread_create(&th, 0, thr, (void*)(long)cpufd);
+	usleep(rand() % 10000);
+	ioctl(cpufd, KVM_RUN, 0);
+	pthread_join(th, 0);
+	return 0;
+    }
+
+This patch fixes it by failing ENABLE_CAP if without an irqchip.
+
+Reported-by: Dmitry Vyukov <dvyukov@google.com>
+Fixes: 5c919412fe61 (kvm/x86: Hyper-V synthetic interrupt controller)
+Cc: Paolo Bonzini <pbonzini@redhat.com>
+Cc: Radim Krčmář <rkrcmar@redhat.com>
+Cc: Dmitry Vyukov <dvyukov@google.com>
+Signed-off-by: Wanpeng Li <wanpeng.li@hotmail.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ arch/x86/kvm/x86.c |    2 ++
+ 1 file changed, 2 insertions(+)
+
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -3308,6 +3308,8 @@ static int kvm_vcpu_ioctl_enable_cap(str
+ 
+ 	switch (cap->cap) {
+ 	case KVM_CAP_HYPERV_SYNIC:
++		if (!irqchip_in_kernel(vcpu->kvm))
++			return -EINVAL;
+ 		return kvm_hv_activate_synic(vcpu);
+ 	default:
+ 		return -EINVAL;
