@@ -1,0 +1,356 @@
+From fc791b6335152c5278dc4a4991bcb2d329f806f9 Mon Sep 17 00:00:00 2001
+From: Paolo Abeni <pabeni@redhat.com>
+Date: Thu, 13 Oct 2016 18:26:56 +0200
+Subject: IB/ipoib: move back IB LL address into the hard header
+
+From: Paolo Abeni <pabeni@redhat.com>
+
+commit fc791b6335152c5278dc4a4991bcb2d329f806f9 upstream.
+
+After the commit 9207f9d45b0a ("net: preserve IP control block
+during GSO segmentation"), the GSO CB and the IPoIB CB conflict.
+That destroy the IPoIB address information cached there,
+causing a severe performance regression, as better described here:
+
+http://marc.info/?l=linux-kernel&m=146787279825501&w=2
+
+This change moves the data cached by the IPoIB driver from the
+skb control lock into the IPoIB hard header, as done before
+the commit 936d7de3d736 ("IPoIB: Stop lying about hard_header_len
+and use skb->cb to stash LL addresses").
+In order to avoid GRO issue, on packet reception, the IPoIB driver
+stash into the skb a dummy pseudo header, so that the received
+packets have actually a hard header matching the declared length.
+To avoid changing the connected mode maximum mtu, the allocated
+head buffer size is increased by the pseudo header length.
+
+After this commit, IPoIB performances are back to pre-regression
+value.
+
+v2 -> v3: rebased
+v1 -> v2: avoid changing the max mtu, increasing the head buf size
+
+Fixes: 9207f9d45b0a ("net: preserve IP control block during GSO segmentation")
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Cc: Vasiliy Tolstov <v.tolstov@selfip.ru>
+Cc: Nikolay Borisov <n.borisov.lkml@gmail.com>
+Cc: Doug Ledford <dledford@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/infiniband/ulp/ipoib/ipoib.h           |   20 ++++++---
+ drivers/infiniband/ulp/ipoib/ipoib_cm.c        |   15 +++---
+ drivers/infiniband/ulp/ipoib/ipoib_ib.c        |   12 ++---
+ drivers/infiniband/ulp/ipoib/ipoib_main.c      |   54 +++++++++++++++----------
+ drivers/infiniband/ulp/ipoib/ipoib_multicast.c |    6 +-
+ 5 files changed, 64 insertions(+), 43 deletions(-)
+
+--- a/drivers/infiniband/ulp/ipoib/ipoib.h
++++ b/drivers/infiniband/ulp/ipoib/ipoib.h
+@@ -63,6 +63,8 @@ enum ipoib_flush_level {
+ 
+ enum {
+ 	IPOIB_ENCAP_LEN		  = 4,
++	IPOIB_PSEUDO_LEN	  = 20,
++	IPOIB_HARD_LEN		  = IPOIB_ENCAP_LEN + IPOIB_PSEUDO_LEN,
+ 
+ 	IPOIB_UD_HEAD_SIZE	  = IB_GRH_BYTES + IPOIB_ENCAP_LEN,
+ 	IPOIB_UD_RX_SG		  = 2, /* max buffer needed for 4K mtu */
+@@ -131,15 +133,21 @@ struct ipoib_header {
+ 	u16	reserved;
+ };
+ 
+-struct ipoib_cb {
+-	struct qdisc_skb_cb	qdisc_cb;
+-	u8			hwaddr[INFINIBAND_ALEN];
++struct ipoib_pseudo_header {
++	u8	hwaddr[INFINIBAND_ALEN];
+ };
+ 
+-static inline struct ipoib_cb *ipoib_skb_cb(const struct sk_buff *skb)
++static inline void skb_add_pseudo_hdr(struct sk_buff *skb)
+ {
+-	BUILD_BUG_ON(sizeof(skb->cb) < sizeof(struct ipoib_cb));
+-	return (struct ipoib_cb *)skb->cb;
++	char *data = skb_push(skb, IPOIB_PSEUDO_LEN);
++
++	/*
++	 * only the ipoib header is present now, make room for a dummy
++	 * pseudo header and set skb field accordingly
++	 */
++	memset(data, 0, IPOIB_PSEUDO_LEN);
++	skb_reset_mac_header(skb);
++	skb_pull(skb, IPOIB_HARD_LEN);
+ }
+ 
+ /* Used for all multicast joins (broadcast, IPv4 mcast and IPv6 mcast) */
+--- a/drivers/infiniband/ulp/ipoib/ipoib_cm.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_cm.c
+@@ -63,6 +63,8 @@ MODULE_PARM_DESC(cm_data_debug_level,
+ #define IPOIB_CM_RX_DELAY       (3 * 256 * HZ)
+ #define IPOIB_CM_RX_UPDATE_MASK (0x3)
+ 
++#define IPOIB_CM_RX_RESERVE     (ALIGN(IPOIB_HARD_LEN, 16) - IPOIB_ENCAP_LEN)
++
+ static struct ib_qp_attr ipoib_cm_err_attr = {
+ 	.qp_state = IB_QPS_ERR
+ };
+@@ -147,15 +149,15 @@ static struct sk_buff *ipoib_cm_alloc_rx
+ 	struct sk_buff *skb;
+ 	int i;
+ 
+-	skb = dev_alloc_skb(IPOIB_CM_HEAD_SIZE + 12);
++	skb = dev_alloc_skb(ALIGN(IPOIB_CM_HEAD_SIZE + IPOIB_PSEUDO_LEN, 16));
+ 	if (unlikely(!skb))
+ 		return NULL;
+ 
+ 	/*
+-	 * IPoIB adds a 4 byte header. So we need 12 more bytes to align the
++	 * IPoIB adds a IPOIB_ENCAP_LEN byte header, this will align the
+ 	 * IP header to a multiple of 16.
+ 	 */
+-	skb_reserve(skb, 12);
++	skb_reserve(skb, IPOIB_CM_RX_RESERVE);
+ 
+ 	mapping[0] = ib_dma_map_single(priv->ca, skb->data, IPOIB_CM_HEAD_SIZE,
+ 				       DMA_FROM_DEVICE);
+@@ -624,9 +626,9 @@ void ipoib_cm_handle_rx_wc(struct net_de
+ 	if (wc->byte_len < IPOIB_CM_COPYBREAK) {
+ 		int dlen = wc->byte_len;
+ 
+-		small_skb = dev_alloc_skb(dlen + 12);
++		small_skb = dev_alloc_skb(dlen + IPOIB_CM_RX_RESERVE);
+ 		if (small_skb) {
+-			skb_reserve(small_skb, 12);
++			skb_reserve(small_skb, IPOIB_CM_RX_RESERVE);
+ 			ib_dma_sync_single_for_cpu(priv->ca, rx_ring[wr_id].mapping[0],
+ 						   dlen, DMA_FROM_DEVICE);
+ 			skb_copy_from_linear_data(skb, small_skb->data, dlen);
+@@ -663,8 +665,7 @@ void ipoib_cm_handle_rx_wc(struct net_de
+ 
+ copied:
+ 	skb->protocol = ((struct ipoib_header *) skb->data)->proto;
+-	skb_reset_mac_header(skb);
+-	skb_pull(skb, IPOIB_ENCAP_LEN);
++	skb_add_pseudo_hdr(skb);
+ 
+ 	++dev->stats.rx_packets;
+ 	dev->stats.rx_bytes += skb->len;
+--- a/drivers/infiniband/ulp/ipoib/ipoib_ib.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_ib.c
+@@ -130,16 +130,15 @@ static struct sk_buff *ipoib_alloc_rx_sk
+ 
+ 	buf_size = IPOIB_UD_BUF_SIZE(priv->max_ib_mtu);
+ 
+-	skb = dev_alloc_skb(buf_size + IPOIB_ENCAP_LEN);
++	skb = dev_alloc_skb(buf_size + IPOIB_HARD_LEN);
+ 	if (unlikely(!skb))
+ 		return NULL;
+ 
+ 	/*
+-	 * IB will leave a 40 byte gap for a GRH and IPoIB adds a 4 byte
+-	 * header.  So we need 4 more bytes to get to 48 and align the
+-	 * IP header to a multiple of 16.
++	 * the IP header will be at IPOIP_HARD_LEN + IB_GRH_BYTES, that is
++	 * 64 bytes aligned
+ 	 */
+-	skb_reserve(skb, 4);
++	skb_reserve(skb, sizeof(struct ipoib_pseudo_header));
+ 
+ 	mapping = priv->rx_ring[id].mapping;
+ 	mapping[0] = ib_dma_map_single(priv->ca, skb->data, buf_size,
+@@ -242,8 +241,7 @@ static void ipoib_ib_handle_rx_wc(struct
+ 	skb_pull(skb, IB_GRH_BYTES);
+ 
+ 	skb->protocol = ((struct ipoib_header *) skb->data)->proto;
+-	skb_reset_mac_header(skb);
+-	skb_pull(skb, IPOIB_ENCAP_LEN);
++	skb_add_pseudo_hdr(skb);
+ 
+ 	++dev->stats.rx_packets;
+ 	dev->stats.rx_bytes += skb->len;
+--- a/drivers/infiniband/ulp/ipoib/ipoib_main.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+@@ -850,9 +850,12 @@ static void neigh_add_path(struct sk_buf
+ 				ipoib_neigh_free(neigh);
+ 				goto err_drop;
+ 			}
+-			if (skb_queue_len(&neigh->queue) < IPOIB_MAX_PATH_REC_QUEUE)
++			if (skb_queue_len(&neigh->queue) <
++			    IPOIB_MAX_PATH_REC_QUEUE) {
++				/* put pseudoheader back on for next time */
++				skb_push(skb, IPOIB_PSEUDO_LEN);
+ 				__skb_queue_tail(&neigh->queue, skb);
+-			else {
++			} else {
+ 				ipoib_warn(priv, "queue length limit %d. Packet drop.\n",
+ 					   skb_queue_len(&neigh->queue));
+ 				goto err_drop;
+@@ -889,7 +892,7 @@ err_drop:
+ }
+ 
+ static void unicast_arp_send(struct sk_buff *skb, struct net_device *dev,
+-			     struct ipoib_cb *cb)
++			     struct ipoib_pseudo_header *phdr)
+ {
+ 	struct ipoib_dev_priv *priv = netdev_priv(dev);
+ 	struct ipoib_path *path;
+@@ -897,16 +900,18 @@ static void unicast_arp_send(struct sk_b
+ 
+ 	spin_lock_irqsave(&priv->lock, flags);
+ 
+-	path = __path_find(dev, cb->hwaddr + 4);
++	path = __path_find(dev, phdr->hwaddr + 4);
+ 	if (!path || !path->valid) {
+ 		int new_path = 0;
+ 
+ 		if (!path) {
+-			path = path_rec_create(dev, cb->hwaddr + 4);
++			path = path_rec_create(dev, phdr->hwaddr + 4);
+ 			new_path = 1;
+ 		}
+ 		if (path) {
+ 			if (skb_queue_len(&path->queue) < IPOIB_MAX_PATH_REC_QUEUE) {
++				/* put pseudoheader back on for next time */
++				skb_push(skb, IPOIB_PSEUDO_LEN);
+ 				__skb_queue_tail(&path->queue, skb);
+ 			} else {
+ 				++dev->stats.tx_dropped;
+@@ -934,10 +939,12 @@ static void unicast_arp_send(struct sk_b
+ 			  be16_to_cpu(path->pathrec.dlid));
+ 
+ 		spin_unlock_irqrestore(&priv->lock, flags);
+-		ipoib_send(dev, skb, path->ah, IPOIB_QPN(cb->hwaddr));
++		ipoib_send(dev, skb, path->ah, IPOIB_QPN(phdr->hwaddr));
+ 		return;
+ 	} else if ((path->query || !path_rec_start(dev, path)) &&
+ 		   skb_queue_len(&path->queue) < IPOIB_MAX_PATH_REC_QUEUE) {
++		/* put pseudoheader back on for next time */
++		skb_push(skb, IPOIB_PSEUDO_LEN);
+ 		__skb_queue_tail(&path->queue, skb);
+ 	} else {
+ 		++dev->stats.tx_dropped;
+@@ -951,13 +958,15 @@ static int ipoib_start_xmit(struct sk_bu
+ {
+ 	struct ipoib_dev_priv *priv = netdev_priv(dev);
+ 	struct ipoib_neigh *neigh;
+-	struct ipoib_cb *cb = ipoib_skb_cb(skb);
++	struct ipoib_pseudo_header *phdr;
+ 	struct ipoib_header *header;
+ 	unsigned long flags;
+ 
++	phdr = (struct ipoib_pseudo_header *) skb->data;
++	skb_pull(skb, sizeof(*phdr));
+ 	header = (struct ipoib_header *) skb->data;
+ 
+-	if (unlikely(cb->hwaddr[4] == 0xff)) {
++	if (unlikely(phdr->hwaddr[4] == 0xff)) {
+ 		/* multicast, arrange "if" according to probability */
+ 		if ((header->proto != htons(ETH_P_IP)) &&
+ 		    (header->proto != htons(ETH_P_IPV6)) &&
+@@ -970,13 +979,13 @@ static int ipoib_start_xmit(struct sk_bu
+ 			return NETDEV_TX_OK;
+ 		}
+ 		/* Add in the P_Key for multicast*/
+-		cb->hwaddr[8] = (priv->pkey >> 8) & 0xff;
+-		cb->hwaddr[9] = priv->pkey & 0xff;
++		phdr->hwaddr[8] = (priv->pkey >> 8) & 0xff;
++		phdr->hwaddr[9] = priv->pkey & 0xff;
+ 
+-		neigh = ipoib_neigh_get(dev, cb->hwaddr);
++		neigh = ipoib_neigh_get(dev, phdr->hwaddr);
+ 		if (likely(neigh))
+ 			goto send_using_neigh;
+-		ipoib_mcast_send(dev, cb->hwaddr, skb);
++		ipoib_mcast_send(dev, phdr->hwaddr, skb);
+ 		return NETDEV_TX_OK;
+ 	}
+ 
+@@ -985,16 +994,16 @@ static int ipoib_start_xmit(struct sk_bu
+ 	case htons(ETH_P_IP):
+ 	case htons(ETH_P_IPV6):
+ 	case htons(ETH_P_TIPC):
+-		neigh = ipoib_neigh_get(dev, cb->hwaddr);
++		neigh = ipoib_neigh_get(dev, phdr->hwaddr);
+ 		if (unlikely(!neigh)) {
+-			neigh_add_path(skb, cb->hwaddr, dev);
++			neigh_add_path(skb, phdr->hwaddr, dev);
+ 			return NETDEV_TX_OK;
+ 		}
+ 		break;
+ 	case htons(ETH_P_ARP):
+ 	case htons(ETH_P_RARP):
+ 		/* for unicast ARP and RARP should always perform path find */
+-		unicast_arp_send(skb, dev, cb);
++		unicast_arp_send(skb, dev, phdr);
+ 		return NETDEV_TX_OK;
+ 	default:
+ 		/* ethertype not supported by IPoIB */
+@@ -1011,11 +1020,13 @@ send_using_neigh:
+ 			goto unref;
+ 		}
+ 	} else if (neigh->ah) {
+-		ipoib_send(dev, skb, neigh->ah, IPOIB_QPN(cb->hwaddr));
++		ipoib_send(dev, skb, neigh->ah, IPOIB_QPN(phdr->hwaddr));
+ 		goto unref;
+ 	}
+ 
+ 	if (skb_queue_len(&neigh->queue) < IPOIB_MAX_PATH_REC_QUEUE) {
++		/* put pseudoheader back on for next time */
++		skb_push(skb, sizeof(*phdr));
+ 		spin_lock_irqsave(&priv->lock, flags);
+ 		__skb_queue_tail(&neigh->queue, skb);
+ 		spin_unlock_irqrestore(&priv->lock, flags);
+@@ -1047,8 +1058,8 @@ static int ipoib_hard_header(struct sk_b
+ 			     unsigned short type,
+ 			     const void *daddr, const void *saddr, unsigned len)
+ {
++	struct ipoib_pseudo_header *phdr;
+ 	struct ipoib_header *header;
+-	struct ipoib_cb *cb = ipoib_skb_cb(skb);
+ 
+ 	header = (struct ipoib_header *) skb_push(skb, sizeof *header);
+ 
+@@ -1057,12 +1068,13 @@ static int ipoib_hard_header(struct sk_b
+ 
+ 	/*
+ 	 * we don't rely on dst_entry structure,  always stuff the
+-	 * destination address into skb->cb so we can figure out where
++	 * destination address into skb hard header so we can figure out where
+ 	 * to send the packet later.
+ 	 */
+-	memcpy(cb->hwaddr, daddr, INFINIBAND_ALEN);
++	phdr = (struct ipoib_pseudo_header *) skb_push(skb, sizeof(*phdr));
++	memcpy(phdr->hwaddr, daddr, INFINIBAND_ALEN);
+ 
+-	return sizeof *header;
++	return IPOIB_HARD_LEN;
+ }
+ 
+ static void ipoib_set_mcast_list(struct net_device *dev)
+@@ -1638,7 +1650,7 @@ void ipoib_setup(struct net_device *dev)
+ 
+ 	dev->flags		|= IFF_BROADCAST | IFF_MULTICAST;
+ 
+-	dev->hard_header_len	 = IPOIB_ENCAP_LEN;
++	dev->hard_header_len	 = IPOIB_HARD_LEN;
+ 	dev->addr_len		 = INFINIBAND_ALEN;
+ 	dev->type		 = ARPHRD_INFINIBAND;
+ 	dev->tx_queue_len	 = ipoib_sendq_size * 2;
+--- a/drivers/infiniband/ulp/ipoib/ipoib_multicast.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_multicast.c
+@@ -756,9 +756,11 @@ void ipoib_mcast_send(struct net_device
+ 			__ipoib_mcast_add(dev, mcast);
+ 			list_add_tail(&mcast->list, &priv->multicast_list);
+ 		}
+-		if (skb_queue_len(&mcast->pkt_queue) < IPOIB_MAX_MCAST_QUEUE)
++		if (skb_queue_len(&mcast->pkt_queue) < IPOIB_MAX_MCAST_QUEUE) {
++			/* put pseudoheader back on for next time */
++			skb_push(skb, sizeof(struct ipoib_pseudo_header));
+ 			skb_queue_tail(&mcast->pkt_queue, skb);
+-		else {
++		} else {
+ 			++dev->stats.tx_dropped;
+ 			dev_kfree_skb_any(skb);
+ 		}
