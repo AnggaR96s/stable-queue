@@ -1,0 +1,113 @@
+From e47483bca2cc59a4593b37a270b16ee42b1d9f08 Mon Sep 17 00:00:00 2001
+From: Vlastimil Babka <vbabka@suse.cz>
+Date: Tue, 24 Jan 2017 15:18:41 -0800
+Subject: mm, page_alloc: fix premature OOM when racing with cpuset mems update
+
+From: Vlastimil Babka <vbabka@suse.cz>
+
+commit e47483bca2cc59a4593b37a270b16ee42b1d9f08 upstream.
+
+Ganapatrao Kulkarni reported that the LTP test cpuset01 in stress mode
+triggers OOM killer in few seconds, despite lots of free memory.  The
+test attempts to repeatedly fault in memory in one process in a cpuset,
+while changing allowed nodes of the cpuset between 0 and 1 in another
+process.
+
+The problem comes from insufficient protection against cpuset changes,
+which can cause get_page_from_freelist() to consider all zones as
+non-eligible due to nodemask and/or current->mems_allowed.  This was
+masked in the past by sufficient retries, but since commit 682a3385e773
+("mm, page_alloc: inline the fast path of the zonelist iterator") we fix
+the preferred_zoneref once, and don't iterate over the whole zonelist in
+further attempts, thus the only eligible zones might be placed in the
+zonelist before our starting point and we always miss them.
+
+A previous patch fixed this problem for current->mems_allowed.  However,
+cpuset changes also update the task's mempolicy nodemask.  The fix has
+two parts.  We have to repeat the preferred_zoneref search when we
+detect cpuset update by way of seqcount, and we have to check the
+seqcount before considering OOM.
+
+[akpm@linux-foundation.org: fix typo in comment]
+Link: http://lkml.kernel.org/r/20170120103843.24587-5-vbabka@suse.cz
+Fixes: c33d6c06f60f ("mm, page_alloc: avoid looking up the first zone in a zonelist twice")
+Signed-off-by: Vlastimil Babka <vbabka@suse.cz>
+Reported-by: Ganapatrao Kulkarni <gpkulkarni@gmail.com>
+Acked-by: Mel Gorman <mgorman@techsingularity.net>
+Acked-by: Hillf Danton <hillf.zj@alibaba-inc.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ mm/page_alloc.c |   35 ++++++++++++++++++++++++-----------
+ 1 file changed, 24 insertions(+), 11 deletions(-)
+
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -3534,6 +3534,17 @@ retry_cpuset:
+ 	no_progress_loops = 0;
+ 	compact_priority = DEF_COMPACT_PRIORITY;
+ 	cpuset_mems_cookie = read_mems_allowed_begin();
++	/*
++	 * We need to recalculate the starting point for the zonelist iterator
++	 * because we might have used different nodemask in the fast path, or
++	 * there was a cpuset modification and we are retrying - otherwise we
++	 * could end up iterating over non-eligible zones endlessly.
++	 */
++	ac->preferred_zoneref = first_zones_zonelist(ac->zonelist,
++					ac->high_zoneidx, ac->nodemask);
++	if (!ac->preferred_zoneref->zone)
++		goto nopage;
++
+ 
+ 	/*
+ 	 * The fast path uses conservative alloc_flags to succeed only until
+@@ -3694,6 +3705,13 @@ retry:
+ 				&compaction_retries))
+ 		goto retry;
+ 
++	/*
++	 * It's possible we raced with cpuset update so the OOM would be
++	 * premature (see below the nopage: label for full explanation).
++	 */
++	if (read_mems_allowed_retry(cpuset_mems_cookie))
++		goto retry_cpuset;
++
+ 	/* Reclaim has failed us, start killing things */
+ 	page = __alloc_pages_may_oom(gfp_mask, order, ac, &did_some_progress);
+ 	if (page)
+@@ -3707,10 +3725,11 @@ retry:
+ 
+ nopage:
+ 	/*
+-	 * When updating a task's mems_allowed, it is possible to race with
+-	 * parallel threads in such a way that an allocation can fail while
+-	 * the mask is being updated. If a page allocation is about to fail,
+-	 * check if the cpuset changed during allocation and if so, retry.
++	 * When updating a task's mems_allowed or mempolicy nodemask, it is
++	 * possible to race with parallel threads in such a way that our
++	 * allocation can fail while the mask is being updated. If we are about
++	 * to fail, check if the cpuset changed during allocation and if so,
++	 * retry.
+ 	 */
+ 	if (read_mems_allowed_retry(cpuset_mems_cookie))
+ 		goto retry_cpuset;
+@@ -3801,15 +3820,9 @@ no_zone:
+ 	/*
+ 	 * Restore the original nodemask if it was potentially replaced with
+ 	 * &cpuset_current_mems_allowed to optimize the fast-path attempt.
+-	 * Also recalculate the starting point for the zonelist iterator or
+-	 * we could end up iterating over non-eligible zones endlessly.
+ 	 */
+-	if (unlikely(ac.nodemask != nodemask)) {
++	if (unlikely(ac.nodemask != nodemask))
+ 		ac.nodemask = nodemask;
+-		ac.preferred_zoneref = first_zones_zonelist(ac.zonelist,
+-						ac.high_zoneidx, ac.nodemask);
+-		/* If we have NULL preferred zone, slowpath wll handle that */
+-	}
+ 
+ 	page = __alloc_pages_slowpath(alloc_mask, order, &ac);
+ 
