@@ -1,0 +1,251 @@
+From c12a67fec8d99bb554e8d4e99120d418f1a39c87 Mon Sep 17 00:00:00 2001
+From: Steve Wise <swise@opengridcomputing.com>
+Date: Thu, 22 Dec 2016 07:40:36 -0800
+Subject: iw_cxgb4: free EQ queue memory on last deref
+
+From: Steve Wise <swise@opengridcomputing.com>
+
+commit c12a67fec8d99bb554e8d4e99120d418f1a39c87 upstream.
+
+Commit ad61a4c7a9b7 ("iw_cxgb4: don't block in destroy_qp awaiting
+the last deref") introduced a bug where the RDMA QP EQ queue memory
+(and QIDs) are possibly freed before the underlying connection has been
+fully shutdown.  The result being a possible DMA read issued by HW after
+the queue memory has been unmapped and freed.  This results in possible
+WR corruption in the worst case, system bus errors if an IOMMU is in use,
+and SGE "bad WR" errors reported in the very least.  The fix is to defer
+unmap/free of queue memory and QID resources until the QP struct has
+been fully dereferenced.  To do this, the c4iw_ucontext must also be kept
+around until the last QP that references it is fully freed.  In addition,
+since the last QP deref can happen in an IRQ disabled context, we need
+a new workqueue thread to do the final unmap/free of the EQ queue memory.
+
+Fixes: ad61a4c7a9b7 ("iw_cxgb4: don't block in destroy_qp awaiting the last deref")
+Signed-off-by: Steve Wise <swise@opengridcomputing.com>
+Signed-off-by: Doug Ledford <dledford@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/infiniband/hw/cxgb4/device.c   |    9 ++++++++
+ drivers/infiniband/hw/cxgb4/iw_cxgb4.h |   18 ++++++++++++++++
+ drivers/infiniband/hw/cxgb4/provider.c |   20 +++++++++++++++---
+ drivers/infiniband/hw/cxgb4/qp.c       |   35 ++++++++++++++++++++++++---------
+ 4 files changed, 69 insertions(+), 13 deletions(-)
+
+--- a/drivers/infiniband/hw/cxgb4/device.c
++++ b/drivers/infiniband/hw/cxgb4/device.c
+@@ -848,9 +848,17 @@ static int c4iw_rdev_open(struct c4iw_rd
+ 		}
+ 	}
+ 
++	rdev->free_workq = create_singlethread_workqueue("iw_cxgb4_free");
++	if (!rdev->free_workq) {
++		err = -ENOMEM;
++		goto err_free_status_page;
++	}
++
+ 	rdev->status_page->db_off = 0;
+ 
+ 	return 0;
++err_free_status_page:
++	free_page((unsigned long)rdev->status_page);
+ destroy_ocqp_pool:
+ 	c4iw_ocqp_pool_destroy(rdev);
+ destroy_rqtpool:
+@@ -864,6 +872,7 @@ destroy_resource:
+ 
+ static void c4iw_rdev_close(struct c4iw_rdev *rdev)
+ {
++	destroy_workqueue(rdev->free_workq);
+ 	kfree(rdev->wr_log);
+ 	free_page((unsigned long)rdev->status_page);
+ 	c4iw_pblpool_destroy(rdev);
+--- a/drivers/infiniband/hw/cxgb4/iw_cxgb4.h
++++ b/drivers/infiniband/hw/cxgb4/iw_cxgb4.h
+@@ -45,6 +45,7 @@
+ #include <linux/kref.h>
+ #include <linux/timer.h>
+ #include <linux/io.h>
++#include <linux/workqueue.h>
+ 
+ #include <asm/byteorder.h>
+ 
+@@ -107,6 +108,7 @@ struct c4iw_dev_ucontext {
+ 	struct list_head qpids;
+ 	struct list_head cqids;
+ 	struct mutex lock;
++	struct kref kref;
+ };
+ 
+ enum c4iw_rdev_flags {
+@@ -183,6 +185,7 @@ struct c4iw_rdev {
+ 	atomic_t wr_log_idx;
+ 	struct wr_log_entry *wr_log;
+ 	int wr_log_size;
++	struct workqueue_struct *free_workq;
+ };
+ 
+ static inline int c4iw_fatal_error(struct c4iw_rdev *rdev)
+@@ -482,6 +485,8 @@ struct c4iw_qp {
+ 	int sq_sig_all;
+ 	struct completion rq_drained;
+ 	struct completion sq_drained;
++	struct work_struct free_work;
++	struct c4iw_ucontext *ucontext;
+ };
+ 
+ static inline struct c4iw_qp *to_c4iw_qp(struct ib_qp *ibqp)
+@@ -495,6 +500,7 @@ struct c4iw_ucontext {
+ 	u32 key;
+ 	spinlock_t mmap_lock;
+ 	struct list_head mmaps;
++	struct kref kref;
+ };
+ 
+ static inline struct c4iw_ucontext *to_c4iw_ucontext(struct ib_ucontext *c)
+@@ -502,6 +508,18 @@ static inline struct c4iw_ucontext *to_c
+ 	return container_of(c, struct c4iw_ucontext, ibucontext);
+ }
+ 
++void _c4iw_free_ucontext(struct kref *kref);
++
++static inline void c4iw_put_ucontext(struct c4iw_ucontext *ucontext)
++{
++	kref_put(&ucontext->kref, _c4iw_free_ucontext);
++}
++
++static inline void c4iw_get_ucontext(struct c4iw_ucontext *ucontext)
++{
++	kref_get(&ucontext->kref);
++}
++
+ struct c4iw_mm_entry {
+ 	struct list_head entry;
+ 	u64 addr;
+--- a/drivers/infiniband/hw/cxgb4/provider.c
++++ b/drivers/infiniband/hw/cxgb4/provider.c
+@@ -91,17 +91,28 @@ static int c4iw_process_mad(struct ib_de
+ 	return -ENOSYS;
+ }
+ 
+-static int c4iw_dealloc_ucontext(struct ib_ucontext *context)
++void _c4iw_free_ucontext(struct kref *kref)
+ {
+-	struct c4iw_dev *rhp = to_c4iw_dev(context->device);
+-	struct c4iw_ucontext *ucontext = to_c4iw_ucontext(context);
++	struct c4iw_ucontext *ucontext;
++	struct c4iw_dev *rhp;
+ 	struct c4iw_mm_entry *mm, *tmp;
+ 
+-	PDBG("%s context %p\n", __func__, context);
++	ucontext = container_of(kref, struct c4iw_ucontext, kref);
++	rhp = to_c4iw_dev(ucontext->ibucontext.device);
++
++	PDBG("%s ucontext %p\n", __func__, ucontext);
+ 	list_for_each_entry_safe(mm, tmp, &ucontext->mmaps, entry)
+ 		kfree(mm);
+ 	c4iw_release_dev_ucontext(&rhp->rdev, &ucontext->uctx);
+ 	kfree(ucontext);
++}
++
++static int c4iw_dealloc_ucontext(struct ib_ucontext *context)
++{
++	struct c4iw_ucontext *ucontext = to_c4iw_ucontext(context);
++
++	PDBG("%s context %p\n", __func__, context);
++	c4iw_put_ucontext(ucontext);
+ 	return 0;
+ }
+ 
+@@ -125,6 +136,7 @@ static struct ib_ucontext *c4iw_alloc_uc
+ 	c4iw_init_dev_ucontext(&rhp->rdev, &context->uctx);
+ 	INIT_LIST_HEAD(&context->mmaps);
+ 	spin_lock_init(&context->mmap_lock);
++	kref_init(&context->kref);
+ 
+ 	if (udata->outlen < sizeof(uresp) - sizeof(uresp.reserved)) {
+ 		if (!warned++)
+--- a/drivers/infiniband/hw/cxgb4/qp.c
++++ b/drivers/infiniband/hw/cxgb4/qp.c
+@@ -714,13 +714,32 @@ static int build_inv_stag(union t4_wr *w
+ 	return 0;
+ }
+ 
+-static void _free_qp(struct kref *kref)
++static void free_qp_work(struct work_struct *work)
++{
++	struct c4iw_ucontext *ucontext;
++	struct c4iw_qp *qhp;
++	struct c4iw_dev *rhp;
++
++	qhp = container_of(work, struct c4iw_qp, free_work);
++	ucontext = qhp->ucontext;
++	rhp = qhp->rhp;
++
++	PDBG("%s qhp %p ucontext %p\n", __func__, qhp, ucontext);
++	destroy_qp(&rhp->rdev, &qhp->wq,
++		   ucontext ? &ucontext->uctx : &rhp->rdev.uctx);
++
++	if (ucontext)
++		c4iw_put_ucontext(ucontext);
++	kfree(qhp);
++}
++
++static void queue_qp_free(struct kref *kref)
+ {
+ 	struct c4iw_qp *qhp;
+ 
+ 	qhp = container_of(kref, struct c4iw_qp, kref);
+ 	PDBG("%s qhp %p\n", __func__, qhp);
+-	kfree(qhp);
++	queue_work(qhp->rhp->rdev.free_workq, &qhp->free_work);
+ }
+ 
+ void c4iw_qp_add_ref(struct ib_qp *qp)
+@@ -732,7 +751,7 @@ void c4iw_qp_add_ref(struct ib_qp *qp)
+ void c4iw_qp_rem_ref(struct ib_qp *qp)
+ {
+ 	PDBG("%s ib_qp %p\n", __func__, qp);
+-	kref_put(&to_c4iw_qp(qp)->kref, _free_qp);
++	kref_put(&to_c4iw_qp(qp)->kref, queue_qp_free);
+ }
+ 
+ static void add_to_fc_list(struct list_head *head, struct list_head *entry)
+@@ -1642,7 +1661,6 @@ int c4iw_destroy_qp(struct ib_qp *ib_qp)
+ 	struct c4iw_dev *rhp;
+ 	struct c4iw_qp *qhp;
+ 	struct c4iw_qp_attributes attrs;
+-	struct c4iw_ucontext *ucontext;
+ 
+ 	qhp = to_c4iw_qp(ib_qp);
+ 	rhp = qhp->rhp;
+@@ -1662,11 +1680,6 @@ int c4iw_destroy_qp(struct ib_qp *ib_qp)
+ 	spin_unlock_irq(&rhp->lock);
+ 	free_ird(rhp, qhp->attr.max_ird);
+ 
+-	ucontext = ib_qp->uobject ?
+-		   to_c4iw_ucontext(ib_qp->uobject->context) : NULL;
+-	destroy_qp(&rhp->rdev, &qhp->wq,
+-		   ucontext ? &ucontext->uctx : &rhp->rdev.uctx);
+-
+ 	c4iw_qp_rem_ref(ib_qp);
+ 
+ 	PDBG("%s ib_qp %p qpid 0x%0x\n", __func__, ib_qp, qhp->wq.sq.qid);
+@@ -1767,6 +1780,7 @@ struct ib_qp *c4iw_create_qp(struct ib_p
+ 	mutex_init(&qhp->mutex);
+ 	init_waitqueue_head(&qhp->wait);
+ 	kref_init(&qhp->kref);
++	INIT_WORK(&qhp->free_work, free_qp_work);
+ 
+ 	ret = insert_handle(rhp, &rhp->qpidr, qhp, qhp->wq.sq.qid);
+ 	if (ret)
+@@ -1853,6 +1867,9 @@ struct ib_qp *c4iw_create_qp(struct ib_p
+ 			ma_sync_key_mm->len = PAGE_SIZE;
+ 			insert_mmap(ucontext, ma_sync_key_mm);
+ 		}
++
++		c4iw_get_ucontext(ucontext);
++		qhp->ucontext = ucontext;
+ 	}
+ 	qhp->ibqp.qp_num = qhp->wq.sq.qid;
+ 	init_timer(&(qhp->timer));
