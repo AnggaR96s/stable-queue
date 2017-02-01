@@ -1,0 +1,247 @@
+From foo@baz Wed Feb  1 08:50:24 CET 2017
+From: David Ahern <dsa@cumulusnetworks.com>
+Date: Tue, 17 Jan 2017 14:57:36 -0800
+Subject: lwtunnel: fix autoload of lwt modules
+
+From: David Ahern <dsa@cumulusnetworks.com>
+
+
+[ Upstream commit 9ed59592e3e379b2e9557dc1d9e9ec8fcbb33f16]
+
+Trying to add an mpls encap route when the MPLS modules are not loaded
+hangs. For example:
+
+    CONFIG_MPLS=y
+    CONFIG_NET_MPLS_GSO=m
+    CONFIG_MPLS_ROUTING=m
+    CONFIG_MPLS_IPTUNNEL=m
+
+    $ ip route add 10.10.10.10/32 encap mpls 100 via inet 10.100.1.2
+
+The ip command hangs:
+root       880   826  0 21:25 pts/0    00:00:00 ip route add 10.10.10.10/32 encap mpls 100 via inet 10.100.1.2
+
+    $ cat /proc/880/stack
+    [<ffffffff81065a9b>] call_usermodehelper_exec+0xd6/0x134
+    [<ffffffff81065efc>] __request_module+0x27b/0x30a
+    [<ffffffff814542f6>] lwtunnel_build_state+0xe4/0x178
+    [<ffffffff814aa1e4>] fib_create_info+0x47f/0xdd4
+    [<ffffffff814ae451>] fib_table_insert+0x90/0x41f
+    [<ffffffff814a8010>] inet_rtm_newroute+0x4b/0x52
+    ...
+
+modprobe is trying to load rtnl-lwt-MPLS:
+
+root       881     5  0 21:25 ?        00:00:00 /sbin/modprobe -q -- rtnl-lwt-MPLS
+
+and it hangs after loading mpls_router:
+
+    $ cat /proc/881/stack
+    [<ffffffff81441537>] rtnl_lock+0x12/0x14
+    [<ffffffff8142ca2a>] register_netdevice_notifier+0x16/0x179
+    [<ffffffffa0033025>] mpls_init+0x25/0x1000 [mpls_router]
+    [<ffffffff81000471>] do_one_initcall+0x8e/0x13f
+    [<ffffffff81119961>] do_init_module+0x5a/0x1e5
+    [<ffffffff810bd070>] load_module+0x13bd/0x17d6
+    ...
+
+The problem is that lwtunnel_build_state is called with rtnl lock
+held preventing mpls_init from registering.
+
+Given the potential references held by the time lwtunnel_build_state it
+can not drop the rtnl lock to the load module. So, extract the module
+loading code from lwtunnel_build_state into a new function to validate
+the encap type. The new function is called while converting the user
+request into a fib_config which is well before any table, device or
+fib entries are examined.
+
+Fixes: 745041e2aaf1 ("lwtunnel: autoload of lwt modules")
+Signed-off-by: David Ahern <dsa@cumulusnetworks.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/net/lwtunnel.h  |   11 ++++++++
+ net/core/lwtunnel.c     |   62 +++++++++++++++++++++++++++++++++++++++++++-----
+ net/ipv4/fib_frontend.c |    8 ++++++
+ net/ipv6/route.c        |   12 ++++++++-
+ 4 files changed, 86 insertions(+), 7 deletions(-)
+
+--- a/include/net/lwtunnel.h
++++ b/include/net/lwtunnel.h
+@@ -106,6 +106,8 @@ int lwtunnel_encap_add_ops(const struct
+ 			   unsigned int num);
+ int lwtunnel_encap_del_ops(const struct lwtunnel_encap_ops *op,
+ 			   unsigned int num);
++int lwtunnel_valid_encap_type(u16 encap_type);
++int lwtunnel_valid_encap_type_attr(struct nlattr *attr, int len);
+ int lwtunnel_build_state(struct net_device *dev, u16 encap_type,
+ 			 struct nlattr *encap,
+ 			 unsigned int family, const void *cfg,
+@@ -168,6 +170,15 @@ static inline int lwtunnel_encap_del_ops
+ {
+ 	return -EOPNOTSUPP;
+ }
++
++static inline int lwtunnel_valid_encap_type(u16 encap_type)
++{
++	return -EOPNOTSUPP;
++}
++static inline int lwtunnel_valid_encap_type_attr(struct nlattr *attr, int len)
++{
++	return -EOPNOTSUPP;
++}
+ 
+ static inline int lwtunnel_build_state(struct net_device *dev, u16 encap_type,
+ 				       struct nlattr *encap,
+--- a/net/core/lwtunnel.c
++++ b/net/core/lwtunnel.c
+@@ -26,6 +26,7 @@
+ #include <net/lwtunnel.h>
+ #include <net/rtnetlink.h>
+ #include <net/ip6_fib.h>
++#include <net/nexthop.h>
+ 
+ #ifdef CONFIG_MODULES
+ 
+@@ -110,25 +111,74 @@ int lwtunnel_build_state(struct net_devi
+ 	ret = -EOPNOTSUPP;
+ 	rcu_read_lock();
+ 	ops = rcu_dereference(lwtun_encaps[encap_type]);
++	if (likely(ops && ops->build_state))
++		ret = ops->build_state(dev, encap, family, cfg, lws);
++	rcu_read_unlock();
++
++	return ret;
++}
++EXPORT_SYMBOL(lwtunnel_build_state);
++
++int lwtunnel_valid_encap_type(u16 encap_type)
++{
++	const struct lwtunnel_encap_ops *ops;
++	int ret = -EINVAL;
++
++	if (encap_type == LWTUNNEL_ENCAP_NONE ||
++	    encap_type > LWTUNNEL_ENCAP_MAX)
++		return ret;
++
++	rcu_read_lock();
++	ops = rcu_dereference(lwtun_encaps[encap_type]);
++	rcu_read_unlock();
+ #ifdef CONFIG_MODULES
+ 	if (!ops) {
+ 		const char *encap_type_str = lwtunnel_encap_str(encap_type);
+ 
+ 		if (encap_type_str) {
+-			rcu_read_unlock();
++			__rtnl_unlock();
+ 			request_module("rtnl-lwt-%s", encap_type_str);
++			rtnl_lock();
++
+ 			rcu_read_lock();
+ 			ops = rcu_dereference(lwtun_encaps[encap_type]);
++			rcu_read_unlock();
+ 		}
+ 	}
+ #endif
+-	if (likely(ops && ops->build_state))
+-		ret = ops->build_state(dev, encap, family, cfg, lws);
+-	rcu_read_unlock();
++	return ops ? 0 : -EOPNOTSUPP;
++}
++EXPORT_SYMBOL(lwtunnel_valid_encap_type);
+ 
+-	return ret;
++int lwtunnel_valid_encap_type_attr(struct nlattr *attr, int remaining)
++{
++	struct rtnexthop *rtnh = (struct rtnexthop *)attr;
++	struct nlattr *nla_entype;
++	struct nlattr *attrs;
++	struct nlattr *nla;
++	u16 encap_type;
++	int attrlen;
++
++	while (rtnh_ok(rtnh, remaining)) {
++		attrlen = rtnh_attrlen(rtnh);
++		if (attrlen > 0) {
++			attrs = rtnh_attrs(rtnh);
++			nla = nla_find(attrs, attrlen, RTA_ENCAP);
++			nla_entype = nla_find(attrs, attrlen, RTA_ENCAP_TYPE);
++
++			if (nla_entype) {
++				encap_type = nla_get_u16(nla_entype);
++
++				if (lwtunnel_valid_encap_type(encap_type) != 0)
++					return -EOPNOTSUPP;
++			}
++		}
++		rtnh = rtnh_next(rtnh, &remaining);
++	}
++
++	return 0;
+ }
+-EXPORT_SYMBOL(lwtunnel_build_state);
++EXPORT_SYMBOL(lwtunnel_valid_encap_type_attr);
+ 
+ int lwtunnel_fill_encap(struct sk_buff *skb, struct lwtunnel_state *lwtstate)
+ {
+--- a/net/ipv4/fib_frontend.c
++++ b/net/ipv4/fib_frontend.c
+@@ -46,6 +46,7 @@
+ #include <net/rtnetlink.h>
+ #include <net/xfrm.h>
+ #include <net/l3mdev.h>
++#include <net/lwtunnel.h>
+ #include <trace/events/fib.h>
+ 
+ #ifndef CONFIG_IP_MULTIPLE_TABLES
+@@ -676,6 +677,10 @@ static int rtm_to_fib_config(struct net
+ 			cfg->fc_mx_len = nla_len(attr);
+ 			break;
+ 		case RTA_MULTIPATH:
++			err = lwtunnel_valid_encap_type_attr(nla_data(attr),
++							     nla_len(attr));
++			if (err < 0)
++				goto errout;
+ 			cfg->fc_mp = nla_data(attr);
+ 			cfg->fc_mp_len = nla_len(attr);
+ 			break;
+@@ -690,6 +695,9 @@ static int rtm_to_fib_config(struct net
+ 			break;
+ 		case RTA_ENCAP_TYPE:
+ 			cfg->fc_encap_type = nla_get_u16(attr);
++			err = lwtunnel_valid_encap_type(cfg->fc_encap_type);
++			if (err < 0)
++				goto errout;
+ 			break;
+ 		}
+ 	}
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@ -2885,6 +2885,11 @@ static int rtm_to_fib6_config(struct sk_
+ 	if (tb[RTA_MULTIPATH]) {
+ 		cfg->fc_mp = nla_data(tb[RTA_MULTIPATH]);
+ 		cfg->fc_mp_len = nla_len(tb[RTA_MULTIPATH]);
++
++		err = lwtunnel_valid_encap_type_attr(cfg->fc_mp,
++						     cfg->fc_mp_len);
++		if (err < 0)
++			goto errout;
+ 	}
+ 
+ 	if (tb[RTA_PREF]) {
+@@ -2898,9 +2903,14 @@ static int rtm_to_fib6_config(struct sk_
+ 	if (tb[RTA_ENCAP])
+ 		cfg->fc_encap = tb[RTA_ENCAP];
+ 
+-	if (tb[RTA_ENCAP_TYPE])
++	if (tb[RTA_ENCAP_TYPE]) {
+ 		cfg->fc_encap_type = nla_get_u16(tb[RTA_ENCAP_TYPE]);
+ 
++		err = lwtunnel_valid_encap_type(cfg->fc_encap_type);
++		if (err < 0)
++			goto errout;
++	}
++
+ 	if (tb[RTA_EXPIRES]) {
+ 		unsigned long timeout = addrconf_timeout_fixup(nla_get_u32(tb[RTA_EXPIRES]), HZ);
+ 
