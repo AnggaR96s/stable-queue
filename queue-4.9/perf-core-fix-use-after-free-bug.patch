@@ -1,0 +1,105 @@
+From a76a82a3e38c8d3fb6499e3dfaeb0949241ab588 Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Thu, 26 Jan 2017 16:39:55 +0100
+Subject: perf/core: Fix use-after-free bug
+
+From: Peter Zijlstra <peterz@infradead.org>
+
+commit a76a82a3e38c8d3fb6499e3dfaeb0949241ab588 upstream.
+
+Dmitry reported a KASAN use-after-free on event->group_leader.
+
+It turns out there's a hole in perf_remove_from_context() due to
+event_function_call() not calling its function when the task
+associated with the event is already dead.
+
+In this case the event will have been detached from the task, but the
+grouping will have been retained, such that group operations might
+still work properly while there are live child events etc.
+
+This does however mean that we can miss a perf_group_detach() call
+when the group decomposes, this in turn can then lead to
+use-after-free.
+
+Fix it by explicitly doing the group detach if its still required.
+
+Reported-by: Dmitry Vyukov <dvyukov@google.com>
+Tested-by: Dmitry Vyukov <dvyukov@google.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Cc: Arnaldo Carvalho de Melo <acme@kernel.org>
+Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+Cc: Jiri Olsa <jolsa@redhat.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: syzkaller <syzkaller@googlegroups.com>
+Fixes: 63b6da39bb38 ("perf: Fix perf_event_exit_task() race")
+Link: http://lkml.kernel.org/r/20170126153955.GD6515@twins.programming.kicks-ass.net
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ kernel/events/core.c |   27 +++++++++++++++++++++++++--
+ 1 file changed, 25 insertions(+), 2 deletions(-)
+
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -1469,7 +1469,6 @@ ctx_group_list(struct perf_event *event,
+ static void
+ list_add_event(struct perf_event *event, struct perf_event_context *ctx)
+ {
+-
+ 	lockdep_assert_held(&ctx->lock);
+ 
+ 	WARN_ON_ONCE(event->attach_state & PERF_ATTACH_CONTEXT);
+@@ -1624,6 +1623,8 @@ static void perf_group_attach(struct per
+ {
+ 	struct perf_event *group_leader = event->group_leader, *pos;
+ 
++	lockdep_assert_held(&event->ctx->lock);
++
+ 	/*
+ 	 * We can have double attach due to group movement in perf_event_open.
+ 	 */
+@@ -1697,6 +1698,8 @@ static void perf_group_detach(struct per
+ 	struct perf_event *sibling, *tmp;
+ 	struct list_head *list = NULL;
+ 
++	lockdep_assert_held(&event->ctx->lock);
++
+ 	/*
+ 	 * We can have double detach due to exit/hot-unplug + close.
+ 	 */
+@@ -1895,9 +1898,29 @@ __perf_remove_from_context(struct perf_e
+  */
+ static void perf_remove_from_context(struct perf_event *event, unsigned long flags)
+ {
+-	lockdep_assert_held(&event->ctx->mutex);
++	struct perf_event_context *ctx = event->ctx;
++
++	lockdep_assert_held(&ctx->mutex);
+ 
+ 	event_function_call(event, __perf_remove_from_context, (void *)flags);
++
++	/*
++	 * The above event_function_call() can NO-OP when it hits
++	 * TASK_TOMBSTONE. In that case we must already have been detached
++	 * from the context (by perf_event_exit_event()) but the grouping
++	 * might still be in-tact.
++	 */
++	WARN_ON_ONCE(event->attach_state & PERF_ATTACH_CONTEXT);
++	if ((flags & DETACH_GROUP) &&
++	    (event->attach_state & PERF_ATTACH_GROUP)) {
++		/*
++		 * Since in that case we cannot possibly be scheduled, simply
++		 * detach now.
++		 */
++		raw_spin_lock_irq(&ctx->lock);
++		perf_group_detach(event);
++		raw_spin_unlock_irq(&ctx->lock);
++	}
+ }
+ 
+ /*
