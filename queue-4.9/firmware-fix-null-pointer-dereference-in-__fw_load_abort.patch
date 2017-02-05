@@ -1,0 +1,152 @@
+From 191e885a2e130e639bb0c8ee350d7047294f2ce6 Mon Sep 17 00:00:00 2001
+From: "Luis R. Rodriguez" <mcgrof@kernel.org>
+Date: Wed, 25 Jan 2017 10:31:52 -0800
+Subject: firmware: fix NULL pointer dereference in __fw_load_abort()
+
+From: Luis R. Rodriguez <mcgrof@kernel.org>
+
+commit 191e885a2e130e639bb0c8ee350d7047294f2ce6 upstream.
+
+Since commit 5d47ec02c37ea6 ("firmware: Correct handling of
+fw_state_wait() return value") fw_load_abort() could be called twice and
+lead us to a kernel crash. This happens only when the firmware fallback
+mechanism (regular or custom) is used. The fallback mechanism exposes a
+sysfs interface for userspace to upload a file and notify the kernel
+when the file is loaded and ready, or to cancel an upload by echo'ing -1
+into on the loading file:
+
+echo -n "-1" > /sys/$DEVPATH/loading
+
+This will call fw_load_abort(). Some distributions actually have a udev
+rule in place to *always* immediately cancel all firmware fallback
+mechanism requests (Debian), they have:
+
+  $ cat /lib/udev/rules.d/50-firmware.rules
+  # stub for immediately telling the kernel that userspace firmware loading
+  # failed; necessary to avoid long timeouts with CONFIG_FW_LOADER_USER_HELPER=y
+  SUBSYSTEM=="firmware", ACTION=="add", ATTR{loading}="-1
+
+Distributions with this udev rule would run into this crash only if the
+fallback mechanism is used. Since most distributions disable by default
+using the fallback mechanism (CONFIG_FW_LOADER_USER_HELPER_FALLBACK),
+this would typicaly mean only 2 drivers which *require* the fallback
+mechanism could typically incur a crash: drivers/firmware/dell_rbu.c and
+the drivers/leds/leds-lp55xx-common.c driver. Distributions enabling
+CONFIG_FW_LOADER_USER_HELPER_FALLBACK by default are obviously more
+exposed to this crash.
+
+The crash happens because after commit 5b029624948d ("firmware: do not
+use fw_lock for fw_state protection") and subsequent fix commit
+5d47ec02c37ea6 ("firmware: Correct handling of fw_state_wait() return
+value") a race can happen between this cancelation and the firmware
+fw_state_wait_timeout() being woken up after a state change with which
+fw_load_abort() as that calls swake_up(). Upon error
+fw_state_wait_timeout() will also again call fw_load_abort() and trigger
+a null reference.
+
+At first glance we could just fix this with a !buf check on
+fw_load_abort() before accessing buf->fw_st, however there is a logical
+issue in having a state machine used for the fallback mechanism and
+preventing access from it once we abort as its inside the buf
+(buf->fw_st).
+
+The firmware_class.c code is setting the buf to NULL to annotate an
+abort has occurred. Replace this mechanism by simply using the state
+check instead. All the other code in place already uses similar checks
+for aborting as well so no further changes are needed.
+
+An oops can be reproduced with the new fw_fallback.sh fallback mechanism
+cancellation test. Either cancelling the fallback mechanism or the
+custom fallback mechanism triggers a crash.
+
+mcgrof@piggy ~/linux-next/tools/testing/selftests/firmware
+(git::20170111-fw-fixes)$ sudo ./fw_fallback.sh
+
+./fw_fallback.sh: timeout works
+./fw_fallback.sh: firmware comparison works
+./fw_fallback.sh: fallback mechanism works
+
+[ this then sits here when it is trying the cancellation test ]
+
+Kernel log:
+
+test_firmware: loading 'nope-test-firmware.bin'
+misc test_firmware: Direct firmware load for nope-test-firmware.bin failed with error -2
+misc test_firmware: Falling back to user helper
+BUG: unable to handle kernel NULL pointer dereference at 0000000000000038
+IP: _request_firmware+0xa27/0xad0
+PGD 0
+
+Oops: 0000 [#1] SMP
+Modules linked in: test_firmware(E) ... etc ...
+CPU: 1 PID: 1396 Comm: fw_fallback.sh Tainted: G        W E   4.10.0-rc3-next-20170111+ #30
+Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS rel-1.10.1-0-g8891697-prebuilt.qemu-project.org 04/01/2014
+task: ffff9740b27f4340 task.stack: ffffbb15c0bc8000
+RIP: 0010:_request_firmware+0xa27/0xad0
+RSP: 0018:ffffbb15c0bcbd10 EFLAGS: 00010246
+RAX: 00000000fffffffe RBX: ffff9740afe5aa80 RCX: 0000000000000000
+RDX: ffff9740b27f4340 RSI: 0000000000000283 RDI: 0000000000000000
+RBP: ffffbb15c0bcbd90 R08: ffffbb15c0bcbcd8 R09: 0000000000000000
+R10: 0000000894a0d4b1 R11: 000000000000008c R12: ffffffffc0312480
+R13: 0000000000000005 R14: ffff9740b1c32400 R15: 00000000000003e8
+FS:  00007f8604422700(0000) GS:ffff9740bfc80000(0000) knlGS:0000000000000000
+CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+CR2: 0000000000000038 CR3: 000000012164c000 CR4: 00000000000006e0
+Call Trace:
+ request_firmware+0x37/0x50
+ trigger_request_store+0x79/0xd0 [test_firmware]
+ dev_attr_store+0x18/0x30
+ sysfs_kf_write+0x37/0x40
+ kernfs_fop_write+0x110/0x1a0
+ __vfs_write+0x37/0x160
+ ? _cond_resched+0x1a/0x50
+ vfs_write+0xb5/0x1a0
+ SyS_write+0x55/0xc0
+ ? trace_do_page_fault+0x37/0xd0
+ entry_SYSCALL_64_fastpath+0x1e/0xad
+RIP: 0033:0x7f8603f49620
+RSP: 002b:00007fff6287b788 EFLAGS: 00000246 ORIG_RAX: 0000000000000001
+RAX: ffffffffffffffda RBX: 000055c307b110a0 RCX: 00007f8603f49620
+RDX: 0000000000000016 RSI: 000055c3084d8a90 RDI: 0000000000000001
+RBP: 0000000000000016 R08: 000000000000c0ff R09: 000055c3084d6336
+R10: 000055c307b108b0 R11: 0000000000000246 R12: 000055c307b13c80
+R13: 000055c3084d6320 R14: 0000000000000000 R15: 00007fff6287b950
+Code: 9f 64 84 e8 9c 61 fe ff b8 f4 ff ff ff e9 6b f9 ff
+ff 48 c7 c7 40 6b 8d 84 89 45 a8 e8 43 84 18 00 49 8b be 00 03 00 00 8b
+45 a8 <83> 7f 38 02 74 08 e8 6e ec ff ff 8b 45 a8 49 c7 86 00 03 00 00
+RIP: _request_firmware+0xa27/0xad0 RSP: ffffbb15c0bcbd10
+CR2: 0000000000000038
+---[ end trace 6d94ac339c133e6f ]---
+
+Fixes: 5d47ec02c37e ("firmware: Correct handling of fw_state_wait() return value")
+Reported-and-Tested-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+Reported-and-Tested-by: Patrick Bruenn <p.bruenn@beckhoff.com>
+Reported-by: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Luis R. Rodriguez <mcgrof@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/base/firmware_class.c |    5 +----
+ 1 file changed, 1 insertion(+), 4 deletions(-)
+
+--- a/drivers/base/firmware_class.c
++++ b/drivers/base/firmware_class.c
+@@ -491,9 +491,6 @@ static void fw_load_abort(struct firmwar
+ 	struct firmware_buf *buf = fw_priv->buf;
+ 
+ 	__fw_load_abort(buf);
+-
+-	/* avoid user action after loading abort */
+-	fw_priv->buf = NULL;
+ }
+ 
+ #define is_fw_load_aborted(buf)	\
+@@ -647,7 +644,7 @@ static ssize_t firmware_loading_store(st
+ 
+ 	mutex_lock(&fw_lock);
+ 	fw_buf = fw_priv->buf;
+-	if (!fw_buf)
++	if (fw_state_is_aborted(&fw_buf->fw_st))
+ 		goto out;
+ 
+ 	switch (loading) {
