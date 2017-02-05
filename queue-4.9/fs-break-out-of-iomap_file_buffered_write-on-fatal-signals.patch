@@ -1,0 +1,88 @@
+From d1908f52557b3230fbd63c0429f3b4b748bf2b6d Mon Sep 17 00:00:00 2001
+From: Michal Hocko <mhocko@suse.com>
+Date: Fri, 3 Feb 2017 13:13:26 -0800
+Subject: fs: break out of iomap_file_buffered_write on fatal signals
+
+From: Michal Hocko <mhocko@suse.com>
+
+commit d1908f52557b3230fbd63c0429f3b4b748bf2b6d upstream.
+
+Tetsuo has noticed that an OOM stress test which performs large write
+requests can cause the full memory reserves depletion.  He has tracked
+this down to the following path
+
+	__alloc_pages_nodemask+0x436/0x4d0
+	alloc_pages_current+0x97/0x1b0
+	__page_cache_alloc+0x15d/0x1a0          mm/filemap.c:728
+	pagecache_get_page+0x5a/0x2b0           mm/filemap.c:1331
+	grab_cache_page_write_begin+0x23/0x40   mm/filemap.c:2773
+	iomap_write_begin+0x50/0xd0             fs/iomap.c:118
+	iomap_write_actor+0xb5/0x1a0            fs/iomap.c:190
+	? iomap_write_end+0x80/0x80             fs/iomap.c:150
+	iomap_apply+0xb3/0x130                  fs/iomap.c:79
+	iomap_file_buffered_write+0x68/0xa0     fs/iomap.c:243
+	? iomap_write_end+0x80/0x80
+	xfs_file_buffered_aio_write+0x132/0x390 [xfs]
+	? remove_wait_queue+0x59/0x60
+	xfs_file_write_iter+0x90/0x130 [xfs]
+	__vfs_write+0xe5/0x140
+	vfs_write+0xc7/0x1f0
+	? syscall_trace_enter+0x1d0/0x380
+	SyS_write+0x58/0xc0
+	do_syscall_64+0x6c/0x200
+	entry_SYSCALL64_slow_path+0x25/0x25
+
+the oom victim has access to all memory reserves to make a forward
+progress to exit easier.  But iomap_file_buffered_write and other
+callers of iomap_apply loop to complete the full request.  We need to
+check for fatal signals and back off with a short write instead.
+
+As the iomap_apply delegates all the work down to the actor we have to
+hook into those.  All callers that work with the page cache are calling
+iomap_write_begin so we will check for signals there.  dax_iomap_actor
+has to handle the situation explicitly because it copies data to the
+userspace directly.  Other callers like iomap_page_mkwrite work on a
+single page or iomap_fiemap_actor do not allocate memory based on the
+given len.
+
+Fixes: 68a9f5e7007c ("xfs: implement iomap based buffered write path")
+Link: http://lkml.kernel.org/r/20170201092706.9966-2-mhocko@kernel.org
+Signed-off-by: Michal Hocko <mhocko@suse.com>
+Reported-by: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/dax.c   |    5 +++++
+ fs/iomap.c |    3 +++
+ 2 files changed, 8 insertions(+)
+
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@ -1270,6 +1270,11 @@ iomap_dax_actor(struct inode *inode, lof
+ 		struct blk_dax_ctl dax = { 0 };
+ 		ssize_t map_len;
+ 
++		if (fatal_signal_pending(current)) {
++			ret = -EINTR;
++			break;
++		}
++
+ 		dax.sector = iomap->blkno +
+ 			(((pos & PAGE_MASK) - iomap->offset) >> 9);
+ 		dax.size = (length + offset + PAGE_SIZE - 1) & PAGE_MASK;
+--- a/fs/iomap.c
++++ b/fs/iomap.c
+@@ -113,6 +113,9 @@ iomap_write_begin(struct inode *inode, l
+ 
+ 	BUG_ON(pos + len > iomap->offset + iomap->length);
+ 
++	if (fatal_signal_pending(current))
++		return -EINTR;
++
+ 	page = grab_cache_page_write_begin(inode->i_mapping, index, flags);
+ 	if (!page)
+ 		return -ENOMEM;
