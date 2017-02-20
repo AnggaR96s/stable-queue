@@ -1,0 +1,153 @@
+From be628be09563f8f6e81929efbd7cf3f45c344416 Mon Sep 17 00:00:00 2001
+From: Kent Overstreet <kent.overstreet@gmail.com>
+Date: Wed, 26 Oct 2016 20:31:17 -0700
+Subject: bcache: Make gc wakeup sane, remove set_task_state()
+
+From: Kent Overstreet <kent.overstreet@gmail.com>
+
+commit be628be09563f8f6e81929efbd7cf3f45c344416 upstream.
+
+Signed-off-by: Kent Overstreet <kent.overstreet@gmail.com>
+Cc: Coly Li <colyli@suse.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/md/bcache/bcache.h  |    4 ++--
+ drivers/md/bcache/btree.c   |   39 ++++++++++++++++++++-------------------
+ drivers/md/bcache/btree.h   |    3 +--
+ drivers/md/bcache/request.c |    4 +---
+ drivers/md/bcache/super.c   |    2 ++
+ 5 files changed, 26 insertions(+), 26 deletions(-)
+
+--- a/drivers/md/bcache/bcache.h
++++ b/drivers/md/bcache/bcache.h
+@@ -425,7 +425,7 @@ struct cache {
+ 	 * until a gc finishes - otherwise we could pointlessly burn a ton of
+ 	 * cpu
+ 	 */
+-	unsigned		invalidate_needs_gc:1;
++	unsigned		invalidate_needs_gc;
+ 
+ 	bool			discard; /* Get rid of? */
+ 
+@@ -593,8 +593,8 @@ struct cache_set {
+ 
+ 	/* Counts how many sectors bio_insert has added to the cache */
+ 	atomic_t		sectors_to_gc;
++	wait_queue_head_t	gc_wait;
+ 
+-	wait_queue_head_t	moving_gc_wait;
+ 	struct keybuf		moving_gc_keys;
+ 	/* Number of moving GC bios in flight */
+ 	struct semaphore	moving_in_flight;
+--- a/drivers/md/bcache/btree.c
++++ b/drivers/md/bcache/btree.c
+@@ -1757,32 +1757,34 @@ static void bch_btree_gc(struct cache_se
+ 	bch_moving_gc(c);
+ }
+ 
+-static int bch_gc_thread(void *arg)
++static bool gc_should_run(struct cache_set *c)
+ {
+-	struct cache_set *c = arg;
+ 	struct cache *ca;
+ 	unsigned i;
+ 
+-	while (1) {
+-again:
+-		bch_btree_gc(c);
++	for_each_cache(ca, c, i)
++		if (ca->invalidate_needs_gc)
++			return true;
+ 
+-		set_current_state(TASK_INTERRUPTIBLE);
+-		if (kthread_should_stop())
+-			break;
++	if (atomic_read(&c->sectors_to_gc) < 0)
++		return true;
+ 
+-		mutex_lock(&c->bucket_lock);
++	return false;
++}
+ 
+-		for_each_cache(ca, c, i)
+-			if (ca->invalidate_needs_gc) {
+-				mutex_unlock(&c->bucket_lock);
+-				set_current_state(TASK_RUNNING);
+-				goto again;
+-			}
++static int bch_gc_thread(void *arg)
++{
++	struct cache_set *c = arg;
+ 
+-		mutex_unlock(&c->bucket_lock);
++	while (1) {
++		wait_event_interruptible(c->gc_wait,
++			   kthread_should_stop() || gc_should_run(c));
+ 
+-		schedule();
++		if (kthread_should_stop())
++			break;
++
++		set_gc_sectors(c);
++		bch_btree_gc(c);
+ 	}
+ 
+ 	return 0;
+@@ -1790,11 +1792,10 @@ again:
+ 
+ int bch_gc_thread_start(struct cache_set *c)
+ {
+-	c->gc_thread = kthread_create(bch_gc_thread, c, "bcache_gc");
++	c->gc_thread = kthread_run(bch_gc_thread, c, "bcache_gc");
+ 	if (IS_ERR(c->gc_thread))
+ 		return PTR_ERR(c->gc_thread);
+ 
+-	set_task_state(c->gc_thread, TASK_INTERRUPTIBLE);
+ 	return 0;
+ }
+ 
+--- a/drivers/md/bcache/btree.h
++++ b/drivers/md/bcache/btree.h
+@@ -260,8 +260,7 @@ void bch_initial_mark_key(struct cache_s
+ 
+ static inline void wake_up_gc(struct cache_set *c)
+ {
+-	if (c->gc_thread)
+-		wake_up_process(c->gc_thread);
++	wake_up(&c->gc_wait);
+ }
+ 
+ #define MAP_DONE	0
+--- a/drivers/md/bcache/request.c
++++ b/drivers/md/bcache/request.c
+@@ -196,10 +196,8 @@ static void bch_data_insert_start(struct
+ 	struct data_insert_op *op = container_of(cl, struct data_insert_op, cl);
+ 	struct bio *bio = op->bio, *n;
+ 
+-	if (atomic_sub_return(bio_sectors(bio), &op->c->sectors_to_gc) < 0) {
+-		set_gc_sectors(op->c);
++	if (atomic_sub_return(bio_sectors(bio), &op->c->sectors_to_gc) < 0)
+ 		wake_up_gc(op->c);
+-	}
+ 
+ 	if (op->bypass)
+ 		return bch_data_invalidate(cl);
+--- a/drivers/md/bcache/super.c
++++ b/drivers/md/bcache/super.c
+@@ -1491,6 +1491,7 @@ struct cache_set *bch_cache_set_alloc(st
+ 	mutex_init(&c->bucket_lock);
+ 	init_waitqueue_head(&c->btree_cache_wait);
+ 	init_waitqueue_head(&c->bucket_wait);
++	init_waitqueue_head(&c->gc_wait);
+ 	sema_init(&c->uuid_write_mutex, 1);
+ 
+ 	spin_lock_init(&c->btree_gc_time.lock);
+@@ -1550,6 +1551,7 @@ static void run_cache_set(struct cache_s
+ 
+ 	for_each_cache(ca, c, i)
+ 		c->nbuckets += ca->sb.nbuckets;
++	set_gc_sectors(c);
+ 
+ 	if (CACHE_SYNC(&c->sb)) {
+ 		LIST_HEAD(journal);
