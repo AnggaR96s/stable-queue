@@ -1,0 +1,80 @@
+From 6ba4d2722d06960102c981322035239cd66f7316 Mon Sep 17 00:00:00 2001
+From: Sahitya Tummala <stummala@codeaurora.org>
+Date: Wed, 8 Feb 2017 20:30:56 +0530
+Subject: fuse: fix use after free issue in fuse_dev_do_read()
+
+From: Sahitya Tummala <stummala@codeaurora.org>
+
+commit 6ba4d2722d06960102c981322035239cd66f7316 upstream.
+
+There is a potential race between fuse_dev_do_write()
+and request_wait_answer() contexts as shown below:
+
+TASK 1:
+__fuse_request_send():
+  |--spin_lock(&fiq->waitq.lock);
+  |--queue_request();
+  |--spin_unlock(&fiq->waitq.lock);
+  |--request_wait_answer():
+       |--if (test_bit(FR_SENT, &req->flags))
+       <gets pre-empted after it is validated true>
+                                   TASK 2:
+                                   fuse_dev_do_write():
+                                     |--clears bit FR_SENT,
+                                     |--request_end():
+                                        |--sets bit FR_FINISHED
+                                        |--spin_lock(&fiq->waitq.lock);
+                                        |--list_del_init(&req->intr_entry);
+                                        |--spin_unlock(&fiq->waitq.lock);
+                                        |--fuse_put_request();
+       |--queue_interrupt();
+       <request gets queued to interrupts list>
+            |--wake_up_locked(&fiq->waitq);
+       |--wait_event_freezable();
+       <as FR_FINISHED is set, it returns and then
+       the caller frees this request>
+
+Now, the next fuse_dev_do_read(), see interrupts list is not empty
+and then calls fuse_read_interrupt() which tries to access the request
+which is already free'd and gets the below crash:
+
+[11432.401266] Unable to handle kernel paging request at virtual address
+6b6b6b6b6b6b6b6b
+...
+[11432.418518] Kernel BUG at ffffff80083720e0
+[11432.456168] PC is at __list_del_entry+0x6c/0xc4
+[11432.463573] LR is at fuse_dev_do_read+0x1ac/0x474
+...
+[11432.679999] [<ffffff80083720e0>] __list_del_entry+0x6c/0xc4
+[11432.687794] [<ffffff80082c65e0>] fuse_dev_do_read+0x1ac/0x474
+[11432.693180] [<ffffff80082c6b14>] fuse_dev_read+0x6c/0x78
+[11432.699082] [<ffffff80081d5638>] __vfs_read+0xc0/0xe8
+[11432.704459] [<ffffff80081d5efc>] vfs_read+0x90/0x108
+[11432.709406] [<ffffff80081d67f0>] SyS_read+0x58/0x94
+
+As FR_FINISHED bit is set before deleting the intr_entry with input
+queue lock in request completion path, do the testing of this flag and
+queueing atomically with the same lock in queue_interrupt().
+
+Signed-off-by: Sahitya Tummala <stummala@codeaurora.org>
+Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+Fixes: fd22d62ed0c3 ("fuse: no fc->lock for iqueue parts")
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/fuse/dev.c |    4 ++++
+ 1 file changed, 4 insertions(+)
+
+--- a/fs/fuse/dev.c
++++ b/fs/fuse/dev.c
+@@ -418,6 +418,10 @@ static void request_end(struct fuse_conn
+ static void queue_interrupt(struct fuse_iqueue *fiq, struct fuse_req *req)
+ {
+ 	spin_lock(&fiq->waitq.lock);
++	if (test_bit(FR_FINISHED, &req->flags)) {
++		spin_unlock(&fiq->waitq.lock);
++		return;
++	}
+ 	if (list_empty(&req->intr_entry)) {
+ 		list_add_tail(&req->intr_entry, &fiq->interrupts);
+ 		wake_up_locked(&fiq->waitq);
