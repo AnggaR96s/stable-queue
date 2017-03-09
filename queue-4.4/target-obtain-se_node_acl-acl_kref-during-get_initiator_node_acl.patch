@@ -1,0 +1,200 @@
+From 21aaa23b0ebbd19334fa461370c03cbb076b3295 Mon Sep 17 00:00:00 2001
+From: Nicholas Bellinger <nab@linux-iscsi.org>
+Date: Thu, 7 Jan 2016 22:09:27 -0800
+Subject: target: Obtain se_node_acl->acl_kref during get_initiator_node_acl
+
+From: Nicholas Bellinger <nab@linux-iscsi.org>
+
+commit 21aaa23b0ebbd19334fa461370c03cbb076b3295 upstream.
+
+This patch addresses a long standing race where obtaining
+se_node_acl->acl_kref in __transport_register_session()
+happens a bit too late, and leaves open the potential
+for core_tpg_del_initiator_node_acl() to hit a NULL
+pointer dereference.
+
+Instead, take ->acl_kref in core_tpg_get_initiator_node_acl()
+while se_portal_group->acl_node_mutex is held, and move the
+final target_put_nacl() from transport_deregister_session()
+into transport_free_session() so that fabric driver login
+failure handling using the modern method to still work
+as expected.
+
+Also, update core_tpg_get_initiator_node_acl() to take
+an extra reference for dynamically generated acls for
+demo-mode, before returning to fabric caller.  Also
+update iscsi-target sendtargets special case handling
+to use target_tpg_has_node_acl() when checking if
+demo_mode_discovery == true during discovery lookup.
+
+Note the existing wait_for_completion(&acl->acl_free_comp)
+in core_tpg_del_initiator_node_acl() does not change.
+
+Cc: Sagi Grimberg <sagig@mellanox.com>
+Cc: Christoph Hellwig <hch@lst.de>
+Cc: Hannes Reinecke <hare@suse.de>
+Cc: Andy Grover <agrover@redhat.com>
+Cc: Mike Christie <michaelc@cs.wisc.edu>
+Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/target/iscsi/iscsi_target.c    |    2 -
+ drivers/target/target_core_tpg.c       |   42 ++++++++++++++++++++++++++++++++-
+ drivers/target/target_core_transport.c |   19 ++++++++++----
+ include/target/target_core_fabric.h    |    2 +
+ 4 files changed, 57 insertions(+), 8 deletions(-)
+
+--- a/drivers/target/iscsi/iscsi_target.c
++++ b/drivers/target/iscsi/iscsi_target.c
+@@ -3436,7 +3436,7 @@ iscsit_build_sendtargets_response(struct
+ 
+ 			if ((tpg->tpg_attrib.generate_node_acls == 0) &&
+ 			    (tpg->tpg_attrib.demo_mode_discovery == 0) &&
+-			    (!core_tpg_get_initiator_node_acl(&tpg->tpg_se_tpg,
++			    (!target_tpg_has_node_acl(&tpg->tpg_se_tpg,
+ 				cmd->conn->sess->sess_ops->InitiatorName))) {
+ 				continue;
+ 			}
+--- a/drivers/target/target_core_tpg.c
++++ b/drivers/target/target_core_tpg.c
+@@ -75,9 +75,21 @@ struct se_node_acl *core_tpg_get_initiat
+ 	unsigned char *initiatorname)
+ {
+ 	struct se_node_acl *acl;
+-
++	/*
++	 * Obtain se_node_acl->acl_kref using fabric driver provided
++	 * initiatorname[] during node acl endpoint lookup driven by
++	 * new se_session login.
++	 *
++	 * The reference is held until se_session shutdown -> release
++	 * occurs via fabric driver invoked transport_deregister_session()
++	 * or transport_free_session() code.
++	 */
+ 	mutex_lock(&tpg->acl_node_mutex);
+ 	acl = __core_tpg_get_initiator_node_acl(tpg, initiatorname);
++	if (acl) {
++		if (!kref_get_unless_zero(&acl->acl_kref))
++			acl = NULL;
++	}
+ 	mutex_unlock(&tpg->acl_node_mutex);
+ 
+ 	return acl;
+@@ -232,6 +244,25 @@ static void target_add_node_acl(struct s
+ 		acl->initiatorname);
+ }
+ 
++bool target_tpg_has_node_acl(struct se_portal_group *tpg,
++			     const char *initiatorname)
++{
++	struct se_node_acl *acl;
++	bool found = false;
++
++	mutex_lock(&tpg->acl_node_mutex);
++	list_for_each_entry(acl, &tpg->acl_node_list, acl_list) {
++		if (!strcmp(acl->initiatorname, initiatorname)) {
++			found = true;
++			break;
++		}
++	}
++	mutex_unlock(&tpg->acl_node_mutex);
++
++	return found;
++}
++EXPORT_SYMBOL(target_tpg_has_node_acl);
++
+ struct se_node_acl *core_tpg_check_initiator_node_acl(
+ 	struct se_portal_group *tpg,
+ 	unsigned char *initiatorname)
+@@ -248,6 +279,15 @@ struct se_node_acl *core_tpg_check_initi
+ 	acl = target_alloc_node_acl(tpg, initiatorname);
+ 	if (!acl)
+ 		return NULL;
++	/*
++	 * When allocating a dynamically generated node_acl, go ahead
++	 * and take the extra kref now before returning to the fabric
++	 * driver caller.
++	 *
++	 * Note this reference will be released at session shutdown
++	 * time within transport_free_session() code.
++	 */
++	kref_get(&acl->acl_kref);
+ 	acl->dynamic_node_acl = 1;
+ 
+ 	/*
+--- a/drivers/target/target_core_transport.c
++++ b/drivers/target/target_core_transport.c
+@@ -341,7 +341,6 @@ void __transport_register_session(
+ 					&buf[0], PR_REG_ISID_LEN);
+ 			se_sess->sess_bin_isid = get_unaligned_be64(&buf[0]);
+ 		}
+-		kref_get(&se_nacl->acl_kref);
+ 
+ 		spin_lock_irq(&se_nacl->nacl_sess_lock);
+ 		/*
+@@ -432,6 +431,7 @@ void target_put_nacl(struct se_node_acl
+ {
+ 	kref_put(&nacl->acl_kref, target_complete_nacl);
+ }
++EXPORT_SYMBOL(target_put_nacl);
+ 
+ void transport_deregister_session_configfs(struct se_session *se_sess)
+ {
+@@ -464,6 +464,15 @@ EXPORT_SYMBOL(transport_deregister_sessi
+ 
+ void transport_free_session(struct se_session *se_sess)
+ {
++	struct se_node_acl *se_nacl = se_sess->se_node_acl;
++	/*
++	 * Drop the se_node_acl->nacl_kref obtained from within
++	 * core_tpg_get_initiator_node_acl().
++	 */
++	if (se_nacl) {
++		se_sess->se_node_acl = NULL;
++		target_put_nacl(se_nacl);
++	}
+ 	if (se_sess->sess_cmd_map) {
+ 		percpu_ida_destroy(&se_sess->sess_tag_pool);
+ 		kvfree(se_sess->sess_cmd_map);
+@@ -478,7 +487,7 @@ void transport_deregister_session(struct
+ 	const struct target_core_fabric_ops *se_tfo;
+ 	struct se_node_acl *se_nacl;
+ 	unsigned long flags;
+-	bool comp_nacl = true, drop_nacl = false;
++	bool drop_nacl = false;
+ 
+ 	if (!se_tpg) {
+ 		transport_free_session(se_sess);
+@@ -511,18 +520,16 @@ void transport_deregister_session(struct
+ 	if (drop_nacl) {
+ 		core_tpg_wait_for_nacl_pr_ref(se_nacl);
+ 		core_free_device_list_for_node(se_nacl, se_tpg);
++		se_sess->se_node_acl = NULL;
+ 		kfree(se_nacl);
+-		comp_nacl = false;
+ 	}
+ 	pr_debug("TARGET_CORE[%s]: Deregistered fabric_sess\n",
+ 		se_tpg->se_tpg_tfo->get_fabric_name());
+ 	/*
+ 	 * If last kref is dropping now for an explicit NodeACL, awake sleeping
+ 	 * ->acl_free_comp caller to wakeup configfs se_node_acl->acl_group
+-	 * removal context.
++	 * removal context from within transport_free_session() code.
+ 	 */
+-	if (se_nacl && comp_nacl)
+-		target_put_nacl(se_nacl);
+ 
+ 	transport_free_session(se_sess);
+ }
+--- a/include/target/target_core_fabric.h
++++ b/include/target/target_core_fabric.h
+@@ -168,6 +168,8 @@ void	core_allocate_nexus_loss_ua(struct
+ 
+ struct se_node_acl *core_tpg_get_initiator_node_acl(struct se_portal_group *tpg,
+ 		unsigned char *);
++bool	target_tpg_has_node_acl(struct se_portal_group *tpg,
++		const char *);
+ struct se_node_acl *core_tpg_check_initiator_node_acl(struct se_portal_group *,
+ 		unsigned char *);
+ int	core_tpg_set_initiator_node_queue_depth(struct se_portal_group *,
