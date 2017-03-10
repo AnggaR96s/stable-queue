@@ -1,0 +1,94 @@
+From 783112f7401ff449d979530209b3f6c2594fdb4e Mon Sep 17 00:00:00 2001
+From: Christoph Hellwig <hch@lst.de>
+Date: Mon, 20 Feb 2017 07:21:33 +0100
+Subject: nfsd: special case truncates some more
+
+From: Christoph Hellwig <hch@lst.de>
+
+commit 783112f7401ff449d979530209b3f6c2594fdb4e upstream.
+
+Both the NFS protocols and the Linux VFS use a setattr operation with a
+bitmap of attributes to set to set various file attributes including the
+file size and the uid/gid.
+
+The Linux syscalls never mix size updates with unrelated updates like
+the uid/gid, and some file systems like XFS and GFS2 rely on the fact
+that truncates don't update random other attributes, and many other file
+systems handle the case but do not update the other attributes in the
+same transaction.  NFSD on the other hand passes the attributes it gets
+on the wire more or less directly through to the VFS, leading to updates
+the file systems don't expect.  XFS at least has an assert on the
+allowed attributes, which caught an unusual NFS client setting the size
+and group at the same time.
+
+To handle this issue properly this splits the notify_change call in
+nfsd_setattr into two separate ones.
+
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Tested-by: Chuck Lever <chuck.lever@oracle.com>
+Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/nfsd/vfs.c |   32 ++++++++++++++++++++++++++------
+ 1 file changed, 26 insertions(+), 6 deletions(-)
+
+--- a/fs/nfsd/vfs.c
++++ b/fs/nfsd/vfs.c
+@@ -406,13 +406,19 @@ nfsd_setattr(struct svc_rqst *rqstp, str
+ 
+ 	/*
+ 	 * The size case is special, it changes the file in addition to the
+-	 * attributes.
++	 * attributes, and file systems don't expect it to be mixed with
++	 * "random" attribute changes.  We thus split out the size change
++	 * into a separate call to ->setattr, and do the rest as a separate
++	 * setattr call.
+ 	 */
+ 	if (size_change) {
+ 		err = nfsd_get_write_access(rqstp, fhp, iap);
+ 		if (err)
+ 			return err;
++	}
+ 
++	fh_lock(fhp);
++	if (size_change) {
+ 		/*
+ 		 * RFC5661, Section 18.30.4:
+ 		 *   Changing the size of a file with SETATTR indirectly
+@@ -420,16 +426,30 @@ nfsd_setattr(struct svc_rqst *rqstp, str
+ 		 *
+ 		 * (and similar for the older RFCs)
+ 		 */
+-		if (iap->ia_size != i_size_read(inode))
+-			iap->ia_valid |= ATTR_MTIME;
++		struct iattr size_attr = {
++			.ia_valid	= ATTR_SIZE | ATTR_CTIME | ATTR_MTIME,
++			.ia_size	= iap->ia_size,
++		};
++
++		host_err = notify_change(dentry, &size_attr, NULL);
++		if (host_err)
++			goto out_unlock;
++		iap->ia_valid &= ~ATTR_SIZE;
++
++		/*
++		 * Avoid the additional setattr call below if the only other
++		 * attribute that the client sends is the mtime, as we update
++		 * it as part of the size change above.
++		 */
++		if ((iap->ia_valid & ~ATTR_MTIME) == 0)
++			goto out_unlock;
+ 	}
+ 
+ 	iap->ia_valid |= ATTR_CTIME;
+-
+-	fh_lock(fhp);
+ 	host_err = notify_change(dentry, iap, NULL);
+-	fh_unlock(fhp);
+ 
++out_unlock:
++	fh_unlock(fhp);
+ 	if (size_change)
+ 		put_write_access(inode);
+ out:
