@@ -1,0 +1,129 @@
+From 2b0841766a898aba84630fb723989a77a9d3b4e6 Mon Sep 17 00:00:00 2001
+From: Erez Shitrit <erezsh@mellanox.com>
+Date: Wed, 1 Feb 2017 19:10:05 +0200
+Subject: IB/IPoIB: Add destination address when re-queue packet
+
+From: Erez Shitrit <erezsh@mellanox.com>
+
+commit 2b0841766a898aba84630fb723989a77a9d3b4e6 upstream.
+
+When sending packet to destination that was not resolved yet
+via path query, the driver keeps the skb and tries to re-send it
+again when the path is resolved.
+
+But when re-sending via dev_queue_xmit the kernel doesn't call
+to dev_hard_header, so IPoIB needs to keep 20 bytes in the skb
+and to put the destination address inside them.
+
+In that way the dev_start_xmit will have the correct destination,
+and the driver won't take the destination from the skb->data, while
+nothing exists there, which causes to packet be be dropped.
+
+The test flow is:
+1. Run the SM on remote node,
+2. Restart the driver.
+4. Ping some destination,
+3. Observe that first ICMP request will be dropped.
+
+Fixes: fc791b633515 ("IB/ipoib: move back IB LL address into the hard header")
+Signed-off-by: Erez Shitrit <erezsh@mellanox.com>
+Signed-off-by: Noa Osherovich <noaos@mellanox.com>
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Tested-by: Yuval Shaia <yuval.shaia@oracle.com>
+Signed-off-by: Doug Ledford <dledford@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/infiniband/ulp/ipoib/ipoib_main.c |   30 +++++++++++++++++-------------
+ 1 file changed, 17 insertions(+), 13 deletions(-)
+
+--- a/drivers/infiniband/ulp/ipoib/ipoib_main.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+@@ -701,6 +701,14 @@ int ipoib_check_sm_sendonly_fullmember_s
+ 	return ret;
+ }
+ 
++static void push_pseudo_header(struct sk_buff *skb, const char *daddr)
++{
++	struct ipoib_pseudo_header *phdr;
++
++	phdr = (struct ipoib_pseudo_header *)skb_push(skb, sizeof(*phdr));
++	memcpy(phdr->hwaddr, daddr, INFINIBAND_ALEN);
++}
++
+ void ipoib_flush_paths(struct net_device *dev)
+ {
+ 	struct ipoib_dev_priv *priv = netdev_priv(dev);
+@@ -925,8 +933,7 @@ static void neigh_add_path(struct sk_buf
+ 			}
+ 			if (skb_queue_len(&neigh->queue) <
+ 			    IPOIB_MAX_PATH_REC_QUEUE) {
+-				/* put pseudoheader back on for next time */
+-				skb_push(skb, IPOIB_PSEUDO_LEN);
++				push_pseudo_header(skb, neigh->daddr);
+ 				__skb_queue_tail(&neigh->queue, skb);
+ 			} else {
+ 				ipoib_warn(priv, "queue length limit %d. Packet drop.\n",
+@@ -944,10 +951,12 @@ static void neigh_add_path(struct sk_buf
+ 
+ 		if (!path->query && path_rec_start(dev, path))
+ 			goto err_path;
+-		if (skb_queue_len(&neigh->queue) < IPOIB_MAX_PATH_REC_QUEUE)
++		if (skb_queue_len(&neigh->queue) < IPOIB_MAX_PATH_REC_QUEUE) {
++			push_pseudo_header(skb, neigh->daddr);
+ 			__skb_queue_tail(&neigh->queue, skb);
+-		else
++		} else {
+ 			goto err_drop;
++		}
+ 	}
+ 
+ 	spin_unlock_irqrestore(&priv->lock, flags);
+@@ -983,8 +992,7 @@ static void unicast_arp_send(struct sk_b
+ 		}
+ 		if (path) {
+ 			if (skb_queue_len(&path->queue) < IPOIB_MAX_PATH_REC_QUEUE) {
+-				/* put pseudoheader back on for next time */
+-				skb_push(skb, IPOIB_PSEUDO_LEN);
++				push_pseudo_header(skb, phdr->hwaddr);
+ 				__skb_queue_tail(&path->queue, skb);
+ 			} else {
+ 				++dev->stats.tx_dropped;
+@@ -1016,8 +1024,7 @@ static void unicast_arp_send(struct sk_b
+ 		return;
+ 	} else if ((path->query || !path_rec_start(dev, path)) &&
+ 		   skb_queue_len(&path->queue) < IPOIB_MAX_PATH_REC_QUEUE) {
+-		/* put pseudoheader back on for next time */
+-		skb_push(skb, IPOIB_PSEUDO_LEN);
++		push_pseudo_header(skb, phdr->hwaddr);
+ 		__skb_queue_tail(&path->queue, skb);
+ 	} else {
+ 		++dev->stats.tx_dropped;
+@@ -1098,8 +1105,7 @@ send_using_neigh:
+ 	}
+ 
+ 	if (skb_queue_len(&neigh->queue) < IPOIB_MAX_PATH_REC_QUEUE) {
+-		/* put pseudoheader back on for next time */
+-		skb_push(skb, sizeof(*phdr));
++		push_pseudo_header(skb, phdr->hwaddr);
+ 		spin_lock_irqsave(&priv->lock, flags);
+ 		__skb_queue_tail(&neigh->queue, skb);
+ 		spin_unlock_irqrestore(&priv->lock, flags);
+@@ -1131,7 +1137,6 @@ static int ipoib_hard_header(struct sk_b
+ 			     unsigned short type,
+ 			     const void *daddr, const void *saddr, unsigned len)
+ {
+-	struct ipoib_pseudo_header *phdr;
+ 	struct ipoib_header *header;
+ 
+ 	header = (struct ipoib_header *) skb_push(skb, sizeof *header);
+@@ -1144,8 +1149,7 @@ static int ipoib_hard_header(struct sk_b
+ 	 * destination address into skb hard header so we can figure out where
+ 	 * to send the packet later.
+ 	 */
+-	phdr = (struct ipoib_pseudo_header *) skb_push(skb, sizeof(*phdr));
+-	memcpy(phdr->hwaddr, daddr, INFINIBAND_ALEN);
++	push_pseudo_header(skb, daddr);
+ 
+ 	return IPOIB_HARD_LEN;
+ }

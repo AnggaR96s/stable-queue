@@ -1,0 +1,148 @@
+From 171ed0fcd8966d82c45376f1434678e7b9d4d9b1 Mon Sep 17 00:00:00 2001
+From: Andrew Donnellan <andrew.donnellan@au1.ibm.com>
+Date: Mon, 6 Feb 2017 12:07:17 +1100
+Subject: cxl: fix nested locking hang during EEH hotplug
+
+From: Andrew Donnellan <andrew.donnellan@au1.ibm.com>
+
+commit 171ed0fcd8966d82c45376f1434678e7b9d4d9b1 upstream.
+
+Commit 14a3ae34bfd0 ("cxl: Prevent read/write to AFU config space while AFU
+not configured") introduced a rwsem to fix an invalid memory access that
+occurred when someone attempts to access the config space of an AFU on a
+vPHB whilst the AFU is deconfigured, such as during EEH recovery.
+
+It turns out that it's possible to run into a nested locking issue when EEH
+recovery fails and a full device hotplug is required.
+cxl_pci_error_detected() deconfigures the AFU, taking a writer lock on
+configured_rwsem. When EEH recovery fails, the EEH code calls
+pci_hp_remove_devices() to remove the device, which in turn calls
+cxl_remove() -> cxl_pci_remove_afu() -> pci_deconfigure_afu(), which tries
+to grab the writer lock that's already held.
+
+Standard rwsem semantics don't express what we really want to do here and
+don't allow for nested locking. Fix this by replacing the rwsem with an
+atomic_t which we can control more finely. Allow the AFU to be locked
+multiple times so long as there are no readers.
+
+Fixes: 14a3ae34bfd0 ("cxl: Prevent read/write to AFU config space while AFU not configured")
+Signed-off-by: Andrew Donnellan <andrew.donnellan@au1.ibm.com>
+Acked-by: Frederic Barrat <fbarrat@linux.vnet.ibm.com>
+Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/misc/cxl/cxl.h  |    5 +++--
+ drivers/misc/cxl/main.c |    3 +--
+ drivers/misc/cxl/pci.c  |   11 +++++++++--
+ drivers/misc/cxl/vphb.c |   18 ++++++++++++++----
+ 4 files changed, 27 insertions(+), 10 deletions(-)
+
+--- a/drivers/misc/cxl/cxl.h
++++ b/drivers/misc/cxl/cxl.h
+@@ -418,8 +418,9 @@ struct cxl_afu {
+ 	struct dentry *debugfs;
+ 	struct mutex contexts_lock;
+ 	spinlock_t afu_cntl_lock;
+-	/* Used to block access to AFU config space while deconfigured */
+-	struct rw_semaphore configured_rwsem;
++
++	/* -1: AFU deconfigured/locked, >= 0: number of readers */
++	atomic_t configured_state;
+ 
+ 	/* AFU error buffer fields and bin attribute for sysfs */
+ 	u64 eb_len, eb_offset;
+--- a/drivers/misc/cxl/main.c
++++ b/drivers/misc/cxl/main.c
+@@ -268,8 +268,7 @@ struct cxl_afu *cxl_alloc_afu(struct cxl
+ 	idr_init(&afu->contexts_idr);
+ 	mutex_init(&afu->contexts_lock);
+ 	spin_lock_init(&afu->afu_cntl_lock);
+-	init_rwsem(&afu->configured_rwsem);
+-	down_write(&afu->configured_rwsem);
++	atomic_set(&afu->configured_state, -1);
+ 	afu->prefault_mode = CXL_PREFAULT_NONE;
+ 	afu->irqs_max = afu->adapter->user_irqs;
+ 
+--- a/drivers/misc/cxl/pci.c
++++ b/drivers/misc/cxl/pci.c
+@@ -1129,7 +1129,7 @@ static int pci_configure_afu(struct cxl_
+ 	if ((rc = cxl_native_register_psl_irq(afu)))
+ 		goto err2;
+ 
+-	up_write(&afu->configured_rwsem);
++	atomic_set(&afu->configured_state, 0);
+ 	return 0;
+ 
+ err2:
+@@ -1142,7 +1142,14 @@ err1:
+ 
+ static void pci_deconfigure_afu(struct cxl_afu *afu)
+ {
+-	down_write(&afu->configured_rwsem);
++	/*
++	 * It's okay to deconfigure when AFU is already locked, otherwise wait
++	 * until there are no readers
++	 */
++	if (atomic_read(&afu->configured_state) != -1) {
++		while (atomic_cmpxchg(&afu->configured_state, 0, -1) != -1)
++			schedule();
++	}
+ 	cxl_native_release_psl_irq(afu);
+ 	if (afu->adapter->native->sl_ops->release_serr_irq)
+ 		afu->adapter->native->sl_ops->release_serr_irq(afu);
+--- a/drivers/misc/cxl/vphb.c
++++ b/drivers/misc/cxl/vphb.c
+@@ -83,6 +83,16 @@ static inline struct cxl_afu *pci_bus_to
+ 	return phb ? phb->private_data : NULL;
+ }
+ 
++static void cxl_afu_configured_put(struct cxl_afu *afu)
++{
++	atomic_dec_if_positive(&afu->configured_state);
++}
++
++static bool cxl_afu_configured_get(struct cxl_afu *afu)
++{
++	return atomic_inc_unless_negative(&afu->configured_state);
++}
++
+ static inline int cxl_pcie_config_info(struct pci_bus *bus, unsigned int devfn,
+ 				       struct cxl_afu *afu, int *_record)
+ {
+@@ -107,7 +117,7 @@ static int cxl_pcie_read_config(struct p
+ 
+ 	afu = pci_bus_to_afu(bus);
+ 	/* Grab a reader lock on afu. */
+-	if (afu == NULL || !down_read_trylock(&afu->configured_rwsem))
++	if (afu == NULL || !cxl_afu_configured_get(afu))
+ 		return PCIBIOS_DEVICE_NOT_FOUND;
+ 
+ 	rc = cxl_pcie_config_info(bus, devfn, afu, &record);
+@@ -132,7 +142,7 @@ static int cxl_pcie_read_config(struct p
+ 	}
+ 
+ out:
+-	up_read(&afu->configured_rwsem);
++	cxl_afu_configured_put(afu);
+ 	return rc ? PCIBIOS_DEVICE_NOT_FOUND : PCIBIOS_SUCCESSFUL;
+ }
+ 
+@@ -144,7 +154,7 @@ static int cxl_pcie_write_config(struct
+ 
+ 	afu = pci_bus_to_afu(bus);
+ 	/* Grab a reader lock on afu. */
+-	if (afu == NULL || !down_read_trylock(&afu->configured_rwsem))
++	if (afu == NULL || !cxl_afu_configured_get(afu))
+ 		return PCIBIOS_DEVICE_NOT_FOUND;
+ 
+ 	rc = cxl_pcie_config_info(bus, devfn, afu, &record);
+@@ -166,7 +176,7 @@ static int cxl_pcie_write_config(struct
+ 	}
+ 
+ out:
+-	up_read(&afu->configured_rwsem);
++	cxl_afu_configured_put(afu);
+ 	return rc ? PCIBIOS_SET_FAILED : PCIBIOS_SUCCESSFUL;
+ }
+ 

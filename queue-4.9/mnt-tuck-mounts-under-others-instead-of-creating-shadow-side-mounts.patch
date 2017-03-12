@@ -1,0 +1,422 @@
+From 1064f874abc0d05eeed8993815f584d847b72486 Mon Sep 17 00:00:00 2001
+From: "Eric W. Biederman" <ebiederm@xmission.com>
+Date: Fri, 20 Jan 2017 18:28:35 +1300
+Subject: mnt: Tuck mounts under others instead of creating shadow/side mounts.
+
+From: Eric W. Biederman <ebiederm@xmission.com>
+
+commit 1064f874abc0d05eeed8993815f584d847b72486 upstream.
+
+Ever since mount propagation was introduced in cases where a mount in
+propagated to parent mount mountpoint pair that is already in use the
+code has placed the new mount behind the old mount in the mount hash
+table.
+
+This implementation detail is problematic as it allows creating
+arbitrary length mount hash chains.
+
+Furthermore it invalidates the constraint maintained elsewhere in the
+mount code that a parent mount and a mountpoint pair will have exactly
+one mount upon them.  Making it hard to deal with and to talk about
+this special case in the mount code.
+
+Modify mount propagation to notice when there is already a mount at
+the parent mount and mountpoint where a new mount is propagating to
+and place that preexisting mount on top of the new mount.
+
+Modify unmount propagation to notice when a mount that is being
+unmounted has another mount on top of it (and no other children), and
+to replace the unmounted mount with the mount on top of it.
+
+Move the MNT_UMUONT test from __lookup_mnt_last into
+__propagate_umount as that is the only call of __lookup_mnt_last where
+MNT_UMOUNT may be set on any mount visible in the mount hash table.
+
+These modifications allow:
+ - __lookup_mnt_last to be removed.
+ - attach_shadows to be renamed __attach_mnt and its shadow
+   handling to be removed.
+ - commit_tree to be simplified
+ - copy_tree to be simplified
+
+The result is an easier to understand tree of mounts that does not
+allow creation of arbitrary length hash chains in the mount hash table.
+
+The result is also a very slight userspace visible difference in semantics.
+The following two cases now behave identically, where before order
+mattered:
+
+case 1: (explicit user action)
+	B is a slave of A
+	mount something on A/a , it will propagate to B/a
+	and than mount something on B/a
+
+case 2: (tucked mount)
+	B is a slave of A
+	mount something on B/a
+	and than mount something on A/a
+
+Histroically umount A/a would fail in case 1 and succeed in case 2.
+Now umount A/a succeeds in both configurations.
+
+This very small change in semantics appears if anything to be a bug
+fix to me and my survey of userspace leads me to believe that no programs
+will notice or care of this subtle semantic change.
+
+v2: Updated to mnt_change_mountpoint to not call dput or mntput
+and instead to decrement the counts directly.  It is guaranteed
+that there will be other references when mnt_change_mountpoint is
+called so this is safe.
+
+v3: Moved put_mountpoint under mount_lock in attach_recursive_mnt
+    As the locking in fs/namespace.c changed between v2 and v3.
+
+v4: Reworked the logic in propagate_mount_busy and __propagate_umount
+    that detects when a mount completely covers another mount.
+
+v5: Removed unnecessary tests whose result is alwasy true in
+    find_topper and attach_recursive_mnt.
+
+v6: Document the user space visible semantic difference.
+
+Fixes: b90fa9ae8f51 ("[PATCH] shared mount handling: bind and rbind")
+Tested-by: Andrei Vagin <avagin@virtuozzo.com>
+Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/mount.h     |    1 
+ fs/namespace.c |  110 +++++++++++++++++++++++++++++++--------------------------
+ fs/pnode.c     |   61 +++++++++++++++++++++++++------
+ fs/pnode.h     |    2 +
+ 4 files changed, 111 insertions(+), 63 deletions(-)
+
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -89,7 +89,6 @@ static inline int is_mounted(struct vfsm
+ }
+ 
+ extern struct mount *__lookup_mnt(struct vfsmount *, struct dentry *);
+-extern struct mount *__lookup_mnt_last(struct vfsmount *, struct dentry *);
+ 
+ extern int __legitimize_mnt(struct vfsmount *, unsigned);
+ extern bool legitimize_mnt(struct vfsmount *, unsigned);
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -641,28 +641,6 @@ struct mount *__lookup_mnt(struct vfsmou
+ }
+ 
+ /*
+- * find the last mount at @dentry on vfsmount @mnt.
+- * mount_lock must be held.
+- */
+-struct mount *__lookup_mnt_last(struct vfsmount *mnt, struct dentry *dentry)
+-{
+-	struct mount *p, *res = NULL;
+-	p = __lookup_mnt(mnt, dentry);
+-	if (!p)
+-		goto out;
+-	if (!(p->mnt.mnt_flags & MNT_UMOUNT))
+-		res = p;
+-	hlist_for_each_entry_continue(p, mnt_hash) {
+-		if (&p->mnt_parent->mnt != mnt || p->mnt_mountpoint != dentry)
+-			break;
+-		if (!(p->mnt.mnt_flags & MNT_UMOUNT))
+-			res = p;
+-	}
+-out:
+-	return res;
+-}
+-
+-/*
+  * lookup_mnt - Return the first child mount mounted at path
+  *
+  * "First" means first mounted chronologically.  If you create the
+@@ -882,6 +860,13 @@ void mnt_set_mountpoint(struct mount *mn
+ 	hlist_add_head(&child_mnt->mnt_mp_list, &mp->m_list);
+ }
+ 
++static void __attach_mnt(struct mount *mnt, struct mount *parent)
++{
++	hlist_add_head_rcu(&mnt->mnt_hash,
++			   m_hash(&parent->mnt, mnt->mnt_mountpoint));
++	list_add_tail(&mnt->mnt_child, &parent->mnt_mounts);
++}
++
+ /*
+  * vfsmount lock must be held for write
+  */
+@@ -890,28 +875,45 @@ static void attach_mnt(struct mount *mnt
+ 			struct mountpoint *mp)
+ {
+ 	mnt_set_mountpoint(parent, mp, mnt);
+-	hlist_add_head_rcu(&mnt->mnt_hash, m_hash(&parent->mnt, mp->m_dentry));
+-	list_add_tail(&mnt->mnt_child, &parent->mnt_mounts);
++	__attach_mnt(mnt, parent);
+ }
+ 
+-static void attach_shadowed(struct mount *mnt,
+-			struct mount *parent,
+-			struct mount *shadows)
++void mnt_change_mountpoint(struct mount *parent, struct mountpoint *mp, struct mount *mnt)
+ {
+-	if (shadows) {
+-		hlist_add_behind_rcu(&mnt->mnt_hash, &shadows->mnt_hash);
+-		list_add(&mnt->mnt_child, &shadows->mnt_child);
+-	} else {
+-		hlist_add_head_rcu(&mnt->mnt_hash,
+-				m_hash(&parent->mnt, mnt->mnt_mountpoint));
+-		list_add_tail(&mnt->mnt_child, &parent->mnt_mounts);
+-	}
++	struct mountpoint *old_mp = mnt->mnt_mp;
++	struct dentry *old_mountpoint = mnt->mnt_mountpoint;
++	struct mount *old_parent = mnt->mnt_parent;
++
++	list_del_init(&mnt->mnt_child);
++	hlist_del_init(&mnt->mnt_mp_list);
++	hlist_del_init_rcu(&mnt->mnt_hash);
++
++	attach_mnt(mnt, parent, mp);
++
++	put_mountpoint(old_mp);
++
++	/*
++	 * Safely avoid even the suggestion this code might sleep or
++	 * lock the mount hash by taking advantage of the knowledge that
++	 * mnt_change_mountpoint will not release the final reference
++	 * to a mountpoint.
++	 *
++	 * During mounting, the mount passed in as the parent mount will
++	 * continue to use the old mountpoint and during unmounting, the
++	 * old mountpoint will continue to exist until namespace_unlock,
++	 * which happens well after mnt_change_mountpoint.
++	 */
++	spin_lock(&old_mountpoint->d_lock);
++	old_mountpoint->d_lockref.count--;
++	spin_unlock(&old_mountpoint->d_lock);
++
++	mnt_add_count(old_parent, -1);
+ }
+ 
+ /*
+  * vfsmount lock must be held for write
+  */
+-static void commit_tree(struct mount *mnt, struct mount *shadows)
++static void commit_tree(struct mount *mnt)
+ {
+ 	struct mount *parent = mnt->mnt_parent;
+ 	struct mount *m;
+@@ -929,7 +931,7 @@ static void commit_tree(struct mount *mn
+ 	n->mounts += n->pending_mounts;
+ 	n->pending_mounts = 0;
+ 
+-	attach_shadowed(mnt, parent, shadows);
++	__attach_mnt(mnt, parent);
+ 	touch_mnt_namespace(n);
+ }
+ 
+@@ -1737,7 +1739,6 @@ struct mount *copy_tree(struct mount *mn
+ 			continue;
+ 
+ 		for (s = r; s; s = next_mnt(s, r)) {
+-			struct mount *t = NULL;
+ 			if (!(flag & CL_COPY_UNBINDABLE) &&
+ 			    IS_MNT_UNBINDABLE(s)) {
+ 				s = skip_mnt_tree(s);
+@@ -1759,14 +1760,7 @@ struct mount *copy_tree(struct mount *mn
+ 				goto out;
+ 			lock_mount_hash();
+ 			list_add_tail(&q->mnt_list, &res->mnt_list);
+-			mnt_set_mountpoint(parent, p->mnt_mp, q);
+-			if (!list_empty(&parent->mnt_mounts)) {
+-				t = list_last_entry(&parent->mnt_mounts,
+-					struct mount, mnt_child);
+-				if (t->mnt_mp != p->mnt_mp)
+-					t = NULL;
+-			}
+-			attach_shadowed(q, parent, t);
++			attach_mnt(q, parent, p->mnt_mp);
+ 			unlock_mount_hash();
+ 		}
+ 	}
+@@ -1967,10 +1961,18 @@ static int attach_recursive_mnt(struct m
+ {
+ 	HLIST_HEAD(tree_list);
+ 	struct mnt_namespace *ns = dest_mnt->mnt_ns;
++	struct mountpoint *smp;
+ 	struct mount *child, *p;
+ 	struct hlist_node *n;
+ 	int err;
+ 
++	/* Preallocate a mountpoint in case the new mounts need
++	 * to be tucked under other mounts.
++	 */
++	smp = get_mountpoint(source_mnt->mnt.mnt_root);
++	if (IS_ERR(smp))
++		return PTR_ERR(smp);
++
+ 	/* Is there space to add these mounts to the mount namespace? */
+ 	if (!parent_path) {
+ 		err = count_mounts(ns, source_mnt);
+@@ -1997,16 +1999,19 @@ static int attach_recursive_mnt(struct m
+ 		touch_mnt_namespace(source_mnt->mnt_ns);
+ 	} else {
+ 		mnt_set_mountpoint(dest_mnt, dest_mp, source_mnt);
+-		commit_tree(source_mnt, NULL);
++		commit_tree(source_mnt);
+ 	}
+ 
+ 	hlist_for_each_entry_safe(child, n, &tree_list, mnt_hash) {
+ 		struct mount *q;
+ 		hlist_del_init(&child->mnt_hash);
+-		q = __lookup_mnt_last(&child->mnt_parent->mnt,
+-				      child->mnt_mountpoint);
+-		commit_tree(child, q);
++		q = __lookup_mnt(&child->mnt_parent->mnt,
++				 child->mnt_mountpoint);
++		if (q)
++			mnt_change_mountpoint(child, smp, q);
++		commit_tree(child);
+ 	}
++	put_mountpoint(smp);
+ 	unlock_mount_hash();
+ 
+ 	return 0;
+@@ -2021,6 +2026,11 @@ static int attach_recursive_mnt(struct m
+ 	cleanup_group_ids(source_mnt, NULL);
+  out:
+ 	ns->pending_mounts = 0;
++
++	read_seqlock_excl(&mount_lock);
++	put_mountpoint(smp);
++	read_sequnlock_excl(&mount_lock);
++
+ 	return err;
+ }
+ 
+--- a/fs/pnode.c
++++ b/fs/pnode.c
+@@ -324,6 +324,21 @@ out:
+ 	return ret;
+ }
+ 
++static struct mount *find_topper(struct mount *mnt)
++{
++	/* If there is exactly one mount covering mnt completely return it. */
++	struct mount *child;
++
++	if (!list_is_singular(&mnt->mnt_mounts))
++		return NULL;
++
++	child = list_first_entry(&mnt->mnt_mounts, struct mount, mnt_child);
++	if (child->mnt_mountpoint != mnt->mnt.mnt_root)
++		return NULL;
++
++	return child;
++}
++
+ /*
+  * return true if the refcount is greater than count
+  */
+@@ -344,9 +359,8 @@ static inline int do_refcount_check(stru
+  */
+ int propagate_mount_busy(struct mount *mnt, int refcnt)
+ {
+-	struct mount *m, *child;
++	struct mount *m, *child, *topper;
+ 	struct mount *parent = mnt->mnt_parent;
+-	int ret = 0;
+ 
+ 	if (mnt == parent)
+ 		return do_refcount_check(mnt, refcnt);
+@@ -361,12 +375,24 @@ int propagate_mount_busy(struct mount *m
+ 
+ 	for (m = propagation_next(parent, parent); m;
+ 	     		m = propagation_next(m, parent)) {
+-		child = __lookup_mnt_last(&m->mnt, mnt->mnt_mountpoint);
+-		if (child && list_empty(&child->mnt_mounts) &&
+-		    (ret = do_refcount_check(child, 1)))
+-			break;
++		int count = 1;
++		child = __lookup_mnt(&m->mnt, mnt->mnt_mountpoint);
++		if (!child)
++			continue;
++
++		/* Is there exactly one mount on the child that covers
++		 * it completely whose reference should be ignored?
++		 */
++		topper = find_topper(child);
++		if (topper)
++			count += 1;
++		else if (!list_empty(&child->mnt_mounts))
++			continue;
++
++		if (do_refcount_check(child, count))
++			return 1;
+ 	}
+-	return ret;
++	return 0;
+ }
+ 
+ /*
+@@ -383,7 +409,7 @@ void propagate_mount_unlock(struct mount
+ 
+ 	for (m = propagation_next(parent, parent); m;
+ 			m = propagation_next(m, parent)) {
+-		child = __lookup_mnt_last(&m->mnt, mnt->mnt_mountpoint);
++		child = __lookup_mnt(&m->mnt, mnt->mnt_mountpoint);
+ 		if (child)
+ 			child->mnt.mnt_flags &= ~MNT_LOCKED;
+ 	}
+@@ -401,9 +427,11 @@ static void mark_umount_candidates(struc
+ 
+ 	for (m = propagation_next(parent, parent); m;
+ 			m = propagation_next(m, parent)) {
+-		struct mount *child = __lookup_mnt_last(&m->mnt,
++		struct mount *child = __lookup_mnt(&m->mnt,
+ 						mnt->mnt_mountpoint);
+-		if (child && (!IS_MNT_LOCKED(child) || IS_MNT_MARKED(m))) {
++		if (!child || (child->mnt.mnt_flags & MNT_UMOUNT))
++			continue;
++		if (!IS_MNT_LOCKED(child) || IS_MNT_MARKED(m)) {
+ 			SET_MNT_MARK(child);
+ 		}
+ 	}
+@@ -422,8 +450,8 @@ static void __propagate_umount(struct mo
+ 
+ 	for (m = propagation_next(parent, parent); m;
+ 			m = propagation_next(m, parent)) {
+-
+-		struct mount *child = __lookup_mnt_last(&m->mnt,
++		struct mount *topper;
++		struct mount *child = __lookup_mnt(&m->mnt,
+ 						mnt->mnt_mountpoint);
+ 		/*
+ 		 * umount the child only if the child has no children
+@@ -432,6 +460,15 @@ static void __propagate_umount(struct mo
+ 		if (!child || !IS_MNT_MARKED(child))
+ 			continue;
+ 		CLEAR_MNT_MARK(child);
++
++		/* If there is exactly one mount covering all of child
++		 * replace child with that mount.
++		 */
++		topper = find_topper(child);
++		if (topper)
++			mnt_change_mountpoint(child->mnt_parent, child->mnt_mp,
++					      topper);
++
+ 		if (list_empty(&child->mnt_mounts)) {
+ 			list_del_init(&child->mnt_child);
+ 			child->mnt.mnt_flags |= MNT_UMOUNT;
+--- a/fs/pnode.h
++++ b/fs/pnode.h
+@@ -49,6 +49,8 @@ int get_dominating_id(struct mount *mnt,
+ unsigned int mnt_get_count(struct mount *mnt);
+ void mnt_set_mountpoint(struct mount *, struct mountpoint *,
+ 			struct mount *);
++void mnt_change_mountpoint(struct mount *parent, struct mountpoint *mp,
++			   struct mount *mnt);
+ struct mount *copy_tree(struct mount *, struct dentry *, int);
+ bool is_path_reachable(struct mount *, struct dentry *,
+ 			 const struct path *root);
