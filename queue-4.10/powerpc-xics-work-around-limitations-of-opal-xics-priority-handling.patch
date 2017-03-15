@@ -1,0 +1,126 @@
+From a69e2fb70350a66f91175cd2625f1e8215c5b6e9 Mon Sep 17 00:00:00 2001
+From: Balbir Singh <bsingharora@gmail.com>
+Date: Fri, 3 Mar 2017 11:58:44 +1100
+Subject: powerpc/xics: Work around limitations of OPAL XICS priority handling
+
+From: Balbir Singh <bsingharora@gmail.com>
+
+commit a69e2fb70350a66f91175cd2625f1e8215c5b6e9 upstream.
+
+The CPPR (Current Processor Priority Register) of a XICS interrupt
+presentation controller contains a value N, such that only interrupts
+with a priority "more favoured" than N will be received by the CPU,
+where "more favoured" means "less than". So if the CPPR has the value 5
+then only interrupts with a priority of 0-4 inclusive will be received.
+
+In theory the CPPR can support a value of 0 to 255 inclusive.
+In practice Linux only uses values of 0, 4, 5 and 0xff. Setting the CPPR
+to 0 rejects all interrupts, setting it to 0xff allows all interrupts.
+The values 4 and 5 are used to differentiate IPIs from external
+interrupts. Setting the CPPR to 5 allows IPIs to be received but not
+external interrupts.
+
+The CPPR emulation in the OPAL XICS implementation only directly
+supports priorities 0 and 0xff. All other priorities are considered
+equivalent, and mapped to a single priority value internally. This means
+when using icp-opal we can not allow IPIs but not externals.
+
+This breaks Linux's use of priority values when a CPU is hot unplugged.
+After migrating IRQs away from the CPU that is being offlined, we set
+the priority to 5, meaning we still want the offline CPU to receive
+IPIs. But the effect of the OPAL XICS emulation's use of a single
+priority value is that all interrupts are rejected by the CPU. With the
+CPU offline, and not receiving IPIs, we may not be able to wake it up to
+bring it back online.
+
+The first part of the fix is in icp_opal_set_cpu_priority(). CPPR values
+of 0 to 4 inclusive will correctly cause all interrupts to be rejected,
+so we pass those CPPR values through to OPAL. However if we are called
+with a CPPR of 5 or greater, the caller is expecting to be able to allow
+IPIs but not external interrupts. We know this doesn't work, so instead
+of rejecting all interrupts we choose the opposite which is to allow all
+interrupts. This is still not correct behaviour, but we know for the
+only existing caller (xics_migrate_irqs_away()), that it is the better
+option.
+
+The other part of the fix is in xics_migrate_irqs_away(). Instead of
+setting priority (CPPR) to 0, and then back to 5 before migrating IRQs,
+we migrate the IRQs before setting the priority back to 5. This should
+have no effect on an ICP backend with a working set_priority(), and on
+icp-opal it means we will keep all interrupts blocked until after we've
+finished doing the IRQ migration. Additionally we wait for 5ms after
+doing the migration to make sure there are no IRQs in flight.
+
+Fixes: d74361881f0d ("powerpc/xics: Add ICP OPAL backend")
+Suggested-by: Michael Ellerman <mpe@ellerman.id.au>
+Reported-by: Vaidyanathan Srinivasan <svaidy@linux.vnet.ibm.com>
+Tested-by: Vaidyanathan Srinivasan <svaidy@linux.vnet.ibm.com>
+Signed-off-by: Balbir Singh <bsingharora@gmail.com>
+[mpe: Rewrote comments and change log, change delay to 5ms]
+Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ arch/powerpc/sysdev/xics/icp-opal.c    |   10 ++++++++++
+ arch/powerpc/sysdev/xics/xics-common.c |   17 ++++++++++++++---
+ 2 files changed, 24 insertions(+), 3 deletions(-)
+
+--- a/arch/powerpc/sysdev/xics/icp-opal.c
++++ b/arch/powerpc/sysdev/xics/icp-opal.c
+@@ -91,6 +91,16 @@ static unsigned int icp_opal_get_irq(voi
+ 
+ static void icp_opal_set_cpu_priority(unsigned char cppr)
+ {
++	/*
++	 * Here be dragons. The caller has asked to allow only IPI's and not
++	 * external interrupts. But OPAL XIVE doesn't support that. So instead
++	 * of allowing no interrupts allow all. That's still not right, but
++	 * currently the only caller who does this is xics_migrate_irqs_away()
++	 * and it works in that case.
++	 */
++	if (cppr >= DEFAULT_PRIORITY)
++		cppr = LOWEST_PRIORITY;
++
+ 	xics_set_base_cppr(cppr);
+ 	opal_int_set_cppr(cppr);
+ 	iosync();
+--- a/arch/powerpc/sysdev/xics/xics-common.c
++++ b/arch/powerpc/sysdev/xics/xics-common.c
+@@ -20,6 +20,7 @@
+ #include <linux/of.h>
+ #include <linux/slab.h>
+ #include <linux/spinlock.h>
++#include <linux/delay.h>
+ 
+ #include <asm/prom.h>
+ #include <asm/io.h>
+@@ -198,9 +199,6 @@ void xics_migrate_irqs_away(void)
+ 	/* Remove ourselves from the global interrupt queue */
+ 	xics_set_cpu_giq(xics_default_distrib_server, 0);
+ 
+-	/* Allow IPIs again... */
+-	icp_ops->set_priority(DEFAULT_PRIORITY);
+-
+ 	for_each_irq_desc(virq, desc) {
+ 		struct irq_chip *chip;
+ 		long server;
+@@ -255,6 +253,19 @@ void xics_migrate_irqs_away(void)
+ unlock:
+ 		raw_spin_unlock_irqrestore(&desc->lock, flags);
+ 	}
++
++	/* Allow "sufficient" time to drop any inflight IRQ's */
++	mdelay(5);
++
++	/*
++	 * Allow IPIs again. This is done at the very end, after migrating all
++	 * interrupts, the expectation is that we'll only get woken up by an IPI
++	 * interrupt beyond this point, but leave externals masked just to be
++	 * safe. If we're using icp-opal this may actually allow all
++	 * interrupts anyway, but that should be OK.
++	 */
++	icp_ops->set_priority(DEFAULT_PRIORITY);
++
+ }
+ #endif /* CONFIG_HOTPLUG_CPU */
+ 
