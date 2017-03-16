@@ -1,0 +1,122 @@
+From d67a5f4b5947aba4bfe9a80a2b86079c215ca755 Mon Sep 17 00:00:00 2001
+From: Mikulas Patocka <mpatocka@redhat.com>
+Date: Wed, 15 Feb 2017 11:26:10 -0500
+Subject: dm: flush queued bios when process blocks to avoid deadlock
+
+From: Mikulas Patocka <mpatocka@redhat.com>
+
+commit d67a5f4b5947aba4bfe9a80a2b86079c215ca755 upstream.
+
+Commit df2cb6daa4 ("block: Avoid deadlocks with bio allocation by
+stacking drivers") created a workqueue for every bio set and code
+in bio_alloc_bioset() that tries to resolve some low-memory deadlocks
+by redirecting bios queued on current->bio_list to the workqueue if the
+system is low on memory.  However other deadlocks (see below **) may
+happen, without any low memory condition, because generic_make_request
+is queuing bios to current->bio_list (rather than submitting them).
+
+** the related dm-snapshot deadlock is detailed here:
+https://www.redhat.com/archives/dm-devel/2016-July/msg00065.html
+
+Fix this deadlock by redirecting any bios on current->bio_list to the
+bio_set's rescue workqueue on every schedule() call.  Consequently,
+when the process blocks on a mutex, the bios queued on
+current->bio_list are dispatched to independent workqueus and they can
+complete without waiting for the mutex to be available.
+
+The structure blk_plug contains an entry cb_list and this list can contain
+arbitrary callback functions that are called when the process blocks.
+To implement this fix DM (ab)uses the onstack plug's cb_list interface
+to get its flush_current_bio_list() called at schedule() time.
+
+This fixes the snapshot deadlock - if the map method blocks,
+flush_current_bio_list() will be called and it redirects bios waiting
+on current->bio_list to appropriate workqueues.
+
+Fixes: https://bugzilla.redhat.com/show_bug.cgi?id=1267650
+Depends-on: df2cb6daa4 ("block: Avoid deadlocks with bio allocation by stacking drivers")
+Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/md/dm.c |   55 +++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 55 insertions(+)
+
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@ -1467,11 +1467,62 @@ void dm_accept_partial_bio(struct bio *b
+ }
+ EXPORT_SYMBOL_GPL(dm_accept_partial_bio);
+ 
++/*
++ * Flush current->bio_list when the target map method blocks.
++ * This fixes deadlocks in snapshot and possibly in other targets.
++ */
++struct dm_offload {
++	struct blk_plug plug;
++	struct blk_plug_cb cb;
++};
++
++static void flush_current_bio_list(struct blk_plug_cb *cb, bool from_schedule)
++{
++	struct dm_offload *o = container_of(cb, struct dm_offload, cb);
++	struct bio_list list;
++	struct bio *bio;
++
++	INIT_LIST_HEAD(&o->cb.list);
++
++	if (unlikely(!current->bio_list))
++		return;
++
++	list = *current->bio_list;
++	bio_list_init(current->bio_list);
++
++	while ((bio = bio_list_pop(&list))) {
++		struct bio_set *bs = bio->bi_pool;
++		if (unlikely(!bs) || bs == fs_bio_set) {
++			bio_list_add(current->bio_list, bio);
++			continue;
++		}
++
++		spin_lock(&bs->rescue_lock);
++		bio_list_add(&bs->rescue_list, bio);
++		queue_work(bs->rescue_workqueue, &bs->rescue_work);
++		spin_unlock(&bs->rescue_lock);
++	}
++}
++
++static void dm_offload_start(struct dm_offload *o)
++{
++	blk_start_plug(&o->plug);
++	o->cb.callback = flush_current_bio_list;
++	list_add(&o->cb.list, &current->plug->cb_list);
++}
++
++static void dm_offload_end(struct dm_offload *o)
++{
++	list_del(&o->cb.list);
++	blk_finish_plug(&o->plug);
++}
++
+ static void __map_bio(struct dm_target_io *tio)
+ {
+ 	int r;
+ 	sector_t sector;
+ 	struct mapped_device *md;
++	struct dm_offload o;
+ 	struct bio *clone = &tio->clone;
+ 	struct dm_target *ti = tio->ti;
+ 
+@@ -1484,7 +1535,11 @@ static void __map_bio(struct dm_target_i
+ 	 */
+ 	atomic_inc(&tio->io->io_count);
+ 	sector = clone->bi_iter.bi_sector;
++
++	dm_offload_start(&o);
+ 	r = ti->type->map(ti, clone);
++	dm_offload_end(&o);
++
+ 	if (r == DM_MAPIO_REMAPPED) {
+ 		/* the bio has been remapped so dispatch it */
+ 
