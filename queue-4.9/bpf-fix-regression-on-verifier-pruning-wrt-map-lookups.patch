@@ -1,0 +1,107 @@
+From foo@baz Sat Mar 18 22:03:25 CST 2017
+From: Daniel Borkmann <daniel@iogearbox.net>
+Date: Thu, 15 Dec 2016 01:30:06 +0100
+Subject: bpf: fix regression on verifier pruning wrt map lookups
+
+From: Daniel Borkmann <daniel@iogearbox.net>
+
+
+[ Upstream commit a08dd0da5307ba01295c8383923e51e7997c3576 ]
+
+Commit 57a09bf0a416 ("bpf: Detect identical PTR_TO_MAP_VALUE_OR_NULL
+registers") introduced a regression where existing programs stopped
+loading due to reaching the verifier's maximum complexity limit,
+whereas prior to this commit they were loading just fine; the affected
+program has roughly 2k instructions.
+
+What was found is that state pruning couldn't be performed effectively
+anymore due to mismatches of the verifier's register state, in particular
+in the id tracking. It doesn't mean that 57a09bf0a416 is incorrect per
+se, but rather that verifier needs to perform a lot more work for the
+same program with regards to involved map lookups.
+
+Since commit 57a09bf0a416 is only about tracking registers with type
+PTR_TO_MAP_VALUE_OR_NULL, the id is only needed to follow registers
+until they are promoted through pattern matching with a NULL check to
+either PTR_TO_MAP_VALUE or UNKNOWN_VALUE type. After that point, the
+id becomes irrelevant for the transitioned types.
+
+For UNKNOWN_VALUE, id is already reset to 0 via mark_reg_unknown_value(),
+but not so for PTR_TO_MAP_VALUE where id is becoming stale. It's even
+transferred further into other types that don't make use of it. Among
+others, one example is where UNKNOWN_VALUE is set on function call
+return with RET_INTEGER return type.
+
+states_equal() will then fall through the memcmp() on register state;
+note that the second memcmp() uses offsetofend(), so the id is part of
+that since d2a4dd37f6b4 ("bpf: fix state equivalence"). But the bisect
+pointed already to 57a09bf0a416, where we really reach beyond complexity
+limit. What I found was that states_equal() often failed in this
+case due to id mismatches in spilled regs with registers in type
+PTR_TO_MAP_VALUE. Unlike non-spilled regs, spilled regs just perform
+a memcmp() on their reg state and don't have any other optimizations
+in place, therefore also id was relevant in this case for making a
+pruning decision.
+
+We can safely reset id to 0 as well when converting to PTR_TO_MAP_VALUE.
+For the affected program, it resulted in a ~17 fold reduction of
+complexity and let the program load fine again. Selftest suite also
+runs fine. The only other place where env->id_gen is used currently is
+through direct packet access, but for these cases id is long living, thus
+a different scenario.
+
+Also, the current logic in mark_map_regs() is not fully correct when
+marking NULL branch with UNKNOWN_VALUE. We need to cache the destination
+reg's id in any case. Otherwise, once we marked that reg as UNKNOWN_VALUE,
+it's id is reset and any subsequent registers that hold the original id
+and are of type PTR_TO_MAP_VALUE_OR_NULL won't be marked UNKNOWN_VALUE
+anymore, since mark_map_reg() reuses the uncached regs[regno].id that
+was just overridden. Note, we don't need to cache it outside of
+mark_map_regs(), since it's called once on this_branch and the other
+time on other_branch, which are both two independent verifier states.
+A test case for this is added here, too.
+
+Fixes: 57a09bf0a416 ("bpf: Detect identical PTR_TO_MAP_VALUE_OR_NULL registers")
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Thomas Graf <tgraf@suug.ch>
+Acked-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ kernel/bpf/verifier.c |   11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -1940,6 +1940,11 @@ static void mark_map_reg(struct bpf_reg_
+ 
+ 	if (reg->type == PTR_TO_MAP_VALUE_OR_NULL && reg->id == id) {
+ 		reg->type = type;
++		/* We don't need id from this point onwards anymore, thus we
++		 * should better reset it, so that state pruning has chances
++		 * to take effect.
++		 */
++		reg->id = 0;
+ 		if (type == UNKNOWN_VALUE)
+ 			mark_reg_unknown_value(regs, regno);
+ 	}
+@@ -1952,16 +1957,16 @@ static void mark_map_regs(struct bpf_ver
+ 			  enum bpf_reg_type type)
+ {
+ 	struct bpf_reg_state *regs = state->regs;
++	u32 id = regs[regno].id;
+ 	int i;
+ 
+ 	for (i = 0; i < MAX_BPF_REG; i++)
+-		mark_map_reg(regs, i, regs[regno].id, type);
++		mark_map_reg(regs, i, id, type);
+ 
+ 	for (i = 0; i < MAX_BPF_STACK; i += BPF_REG_SIZE) {
+ 		if (state->stack_slot_type[i] != STACK_SPILL)
+ 			continue;
+-		mark_map_reg(state->spilled_regs, i / BPF_REG_SIZE,
+-			     regs[regno].id, type);
++		mark_map_reg(state->spilled_regs, i / BPF_REG_SIZE, id, type);
+ 	}
+ }
+ 
