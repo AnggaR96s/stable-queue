@@ -1,0 +1,150 @@
+From foo@baz Mon Mar 20 11:41:01 CET 2017
+From: alexander.levin@verizon.com
+Date: Fri, 17 Mar 2017 00:48:29 +0000
+Subject: [PATCH v2 for-4.9 27/40] vfio/spapr: Postpone default window creation
+To: "gregkh@linuxfoundation.org" <gregkh@linuxfoundation.org>
+Cc: "stable@vger.kernel.org" <stable@vger.kernel.org>
+Message-ID: <20170317004812.26960-27-alexander.levin@verizon.com>
+
+From: Alexey Kardashevskiy <aik@ozlabs.ru>
+
+[ Upstream commit d9c728949ddc9de5734bf3b12ea906ca8a77f2a0 ]
+
+We are going to allow the userspace to configure container in
+one memory context and pass container fd to another so
+we are postponing memory allocations accounted against
+the locked memory limit. One of previous patches took care of
+it_userspace.
+
+At the moment we create the default DMA window when the first group is
+attached to a container; this is done for the userspace which is not
+DDW-aware but familiar with the SPAPR TCE IOMMU v2 in the part of memory
+pre-registration - such client expects the default DMA window to exist.
+
+This postpones the default DMA window allocation till one of
+the folliwing happens:
+1. first map/unmap request arrives;
+2. new window is requested;
+This adds noop for the case when the userspace requested removal
+of the default window which has not been created yet.
+
+Signed-off-by: Alexey Kardashevskiy <aik@ozlabs.ru>
+Reviewed-by: David Gibson <david@gibson.dropbear.id.au>
+Acked-by: Alex Williamson <alex.williamson@redhat.com>
+Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/vfio/vfio_iommu_spapr_tce.c |   40 ++++++++++++++++++++++--------------
+ 1 file changed, 25 insertions(+), 15 deletions(-)
+
+--- a/drivers/vfio/vfio_iommu_spapr_tce.c
++++ b/drivers/vfio/vfio_iommu_spapr_tce.c
+@@ -106,6 +106,7 @@ struct tce_container {
+ 	struct mutex lock;
+ 	bool enabled;
+ 	bool v2;
++	bool def_window_pending;
+ 	unsigned long locked_pages;
+ 	struct mm_struct *mm;
+ 	struct iommu_table *tables[IOMMU_TABLE_GROUP_MAX_TABLES];
+@@ -791,6 +792,9 @@ static long tce_iommu_create_default_win
+ 	struct tce_iommu_group *tcegrp;
+ 	struct iommu_table_group *table_group;
+ 
++	if (!container->def_window_pending)
++		return 0;
++
+ 	if (!tce_groups_attached(container))
+ 		return -ENODEV;
+ 
+@@ -804,6 +808,9 @@ static long tce_iommu_create_default_win
+ 			table_group->tce32_size, 1, &start_addr);
+ 	WARN_ON_ONCE(!ret && start_addr);
+ 
++	if (!ret)
++		container->def_window_pending = false;
++
+ 	return ret;
+ }
+ 
+@@ -907,6 +914,10 @@ static long tce_iommu_ioctl(void *iommu_
+ 				VFIO_DMA_MAP_FLAG_WRITE))
+ 			return -EINVAL;
+ 
++		ret = tce_iommu_create_default_window(container);
++		if (ret)
++			return ret;
++
+ 		num = tce_iommu_find_table(container, param.iova, &tbl);
+ 		if (num < 0)
+ 			return -ENXIO;
+@@ -970,6 +981,10 @@ static long tce_iommu_ioctl(void *iommu_
+ 		if (param.flags)
+ 			return -EINVAL;
+ 
++		ret = tce_iommu_create_default_window(container);
++		if (ret)
++			return ret;
++
+ 		num = tce_iommu_find_table(container, param.iova, &tbl);
+ 		if (num < 0)
+ 			return -ENXIO;
+@@ -1107,6 +1122,10 @@ static long tce_iommu_ioctl(void *iommu_
+ 
+ 		mutex_lock(&container->lock);
+ 
++		ret = tce_iommu_create_default_window(container);
++		if (ret)
++			return ret;
++
+ 		ret = tce_iommu_create_window(container, create.page_shift,
+ 				create.window_size, create.levels,
+ 				&create.start_addr);
+@@ -1143,6 +1162,11 @@ static long tce_iommu_ioctl(void *iommu_
+ 		if (remove.flags)
+ 			return -EINVAL;
+ 
++		if (container->def_window_pending && !remove.start_addr) {
++			container->def_window_pending = false;
++			return 0;
++		}
++
+ 		mutex_lock(&container->lock);
+ 
+ 		ret = tce_iommu_remove_window(container, remove.start_addr);
+@@ -1240,7 +1264,6 @@ static int tce_iommu_attach_group(void *
+ 	struct tce_container *container = iommu_data;
+ 	struct iommu_table_group *table_group;
+ 	struct tce_iommu_group *tcegrp = NULL;
+-	bool create_default_window = false;
+ 
+ 	mutex_lock(&container->lock);
+ 
+@@ -1288,25 +1311,12 @@ static int tce_iommu_attach_group(void *
+ 	} else {
+ 		ret = tce_iommu_take_ownership_ddw(container, table_group);
+ 		if (!tce_groups_attached(container) && !container->tables[0])
+-			create_default_window = true;
++			container->def_window_pending = true;
+ 	}
+ 
+ 	if (!ret) {
+ 		tcegrp->grp = iommu_group;
+ 		list_add(&tcegrp->next, &container->group_list);
+-		/*
+-		 * If it the first group attached, check if there is
+-		 * a default DMA window and create one if none as
+-		 * the userspace expects it to exist.
+-		 */
+-		if (create_default_window) {
+-			ret = tce_iommu_create_default_window(container);
+-			if (ret) {
+-				list_del(&tcegrp->next);
+-				tce_iommu_release_ownership_ddw(container,
+-						table_group);
+-			}
+-		}
+ 	}
+ 
+ unlock_exit:

@@ -1,0 +1,179 @@
+From foo@baz Mon Mar 20 11:41:01 CET 2017
+From: alexander.levin@verizon.com
+Date: Fri, 17 Mar 2017 00:48:31 +0000
+Subject: [PATCH v2 for-4.9 34/40] slub: move synchronize_sched out of slab_mutex on shrink
+To: "gregkh@linuxfoundation.org" <gregkh@linuxfoundation.org>
+Cc: "stable@vger.kernel.org" <stable@vger.kernel.org>
+Message-ID: <20170317004812.26960-34-alexander.levin@verizon.com>
+
+From: Vladimir Davydov <vdavydov.dev@gmail.com>
+
+[ Upstream commit 89e364db71fb5e7fc8d93228152abfa67daf35fa ]
+
+synchronize_sched() is a heavy operation and calling it per each cache
+owned by a memory cgroup being destroyed may take quite some time.  What
+is worse, it's currently called under the slab_mutex, stalling all works
+doing cache creation/destruction.
+
+Actually, there isn't much point in calling synchronize_sched() for each
+cache - it's enough to call it just once - after setting cpu_partial for
+all caches and before shrinking them.  This way, we can also move it out
+of the slab_mutex, which we have to hold for iterating over the slab
+cache list.
+
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=172991
+Link: http://lkml.kernel.org/r/0a10d71ecae3db00fb4421bcd3f82bcc911f4be4.1475329751.git.vdavydov.dev@gmail.com
+Signed-off-by: Vladimir Davydov <vdavydov.dev@gmail.com>
+Reported-by: Doug Smythies <dsmythies@telus.net>
+Acked-by: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+Cc: Christoph Lameter <cl@linux.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Pekka Enberg <penberg@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ mm/slab.c        |    4 ++--
+ mm/slab.h        |    2 +-
+ mm/slab_common.c |   27 +++++++++++++++++++++++++--
+ mm/slob.c        |    2 +-
+ mm/slub.c        |   19 ++-----------------
+ 5 files changed, 31 insertions(+), 23 deletions(-)
+
+--- a/mm/slab.c
++++ b/mm/slab.c
+@@ -2332,7 +2332,7 @@ out:
+ 	return nr_freed;
+ }
+ 
+-int __kmem_cache_shrink(struct kmem_cache *cachep, bool deactivate)
++int __kmem_cache_shrink(struct kmem_cache *cachep)
+ {
+ 	int ret = 0;
+ 	int node;
+@@ -2352,7 +2352,7 @@ int __kmem_cache_shrink(struct kmem_cach
+ 
+ int __kmem_cache_shutdown(struct kmem_cache *cachep)
+ {
+-	return __kmem_cache_shrink(cachep, false);
++	return __kmem_cache_shrink(cachep);
+ }
+ 
+ void __kmem_cache_release(struct kmem_cache *cachep)
+--- a/mm/slab.h
++++ b/mm/slab.h
+@@ -146,7 +146,7 @@ static inline unsigned long kmem_cache_f
+ 
+ int __kmem_cache_shutdown(struct kmem_cache *);
+ void __kmem_cache_release(struct kmem_cache *);
+-int __kmem_cache_shrink(struct kmem_cache *, bool);
++int __kmem_cache_shrink(struct kmem_cache *);
+ void slab_kmem_cache_release(struct kmem_cache *);
+ 
+ struct seq_file;
+--- a/mm/slab_common.c
++++ b/mm/slab_common.c
+@@ -573,6 +573,29 @@ void memcg_deactivate_kmem_caches(struct
+ 	get_online_cpus();
+ 	get_online_mems();
+ 
++#ifdef CONFIG_SLUB
++	/*
++	 * In case of SLUB, we need to disable empty slab caching to
++	 * avoid pinning the offline memory cgroup by freeable kmem
++	 * pages charged to it. SLAB doesn't need this, as it
++	 * periodically purges unused slabs.
++	 */
++	mutex_lock(&slab_mutex);
++	list_for_each_entry(s, &slab_caches, list) {
++		c = is_root_cache(s) ? cache_from_memcg_idx(s, idx) : NULL;
++		if (c) {
++			c->cpu_partial = 0;
++			c->min_partial = 0;
++		}
++	}
++	mutex_unlock(&slab_mutex);
++	/*
++	 * kmem_cache->cpu_partial is checked locklessly (see
++	 * put_cpu_partial()). Make sure the change is visible.
++	 */
++	synchronize_sched();
++#endif
++
+ 	mutex_lock(&slab_mutex);
+ 	list_for_each_entry(s, &slab_caches, list) {
+ 		if (!is_root_cache(s))
+@@ -584,7 +607,7 @@ void memcg_deactivate_kmem_caches(struct
+ 		if (!c)
+ 			continue;
+ 
+-		__kmem_cache_shrink(c, true);
++		__kmem_cache_shrink(c);
+ 		arr->entries[idx] = NULL;
+ 	}
+ 	mutex_unlock(&slab_mutex);
+@@ -755,7 +778,7 @@ int kmem_cache_shrink(struct kmem_cache
+ 	get_online_cpus();
+ 	get_online_mems();
+ 	kasan_cache_shrink(cachep);
+-	ret = __kmem_cache_shrink(cachep, false);
++	ret = __kmem_cache_shrink(cachep);
+ 	put_online_mems();
+ 	put_online_cpus();
+ 	return ret;
+--- a/mm/slob.c
++++ b/mm/slob.c
+@@ -634,7 +634,7 @@ void __kmem_cache_release(struct kmem_ca
+ {
+ }
+ 
+-int __kmem_cache_shrink(struct kmem_cache *d, bool deactivate)
++int __kmem_cache_shrink(struct kmem_cache *d)
+ {
+ 	return 0;
+ }
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -3887,7 +3887,7 @@ EXPORT_SYMBOL(kfree);
+  * being allocated from last increasing the chance that the last objects
+  * are freed in them.
+  */
+-int __kmem_cache_shrink(struct kmem_cache *s, bool deactivate)
++int __kmem_cache_shrink(struct kmem_cache *s)
+ {
+ 	int node;
+ 	int i;
+@@ -3899,21 +3899,6 @@ int __kmem_cache_shrink(struct kmem_cach
+ 	unsigned long flags;
+ 	int ret = 0;
+ 
+-	if (deactivate) {
+-		/*
+-		 * Disable empty slabs caching. Used to avoid pinning offline
+-		 * memory cgroups by kmem pages that can be freed.
+-		 */
+-		s->cpu_partial = 0;
+-		s->min_partial = 0;
+-
+-		/*
+-		 * s->cpu_partial is checked locklessly (see put_cpu_partial),
+-		 * so we have to make sure the change is visible.
+-		 */
+-		synchronize_sched();
+-	}
+-
+ 	flush_all(s);
+ 	for_each_kmem_cache_node(s, node, n) {
+ 		INIT_LIST_HEAD(&discard);
+@@ -3970,7 +3955,7 @@ static int slab_mem_going_offline_callba
+ 
+ 	mutex_lock(&slab_mutex);
+ 	list_for_each_entry(s, &slab_caches, list)
+-		__kmem_cache_shrink(s, false);
++		__kmem_cache_shrink(s);
+ 	mutex_unlock(&slab_mutex);
+ 
+ 	return 0;

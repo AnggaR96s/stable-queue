@@ -1,0 +1,124 @@
+From foo@baz Mon Mar 20 11:41:01 CET 2017
+From: alexander.levin@verizon.com
+Date: Fri, 17 Mar 2017 00:48:22 +0000
+Subject: [PATCH v2 for-4.9 10/40] x86/hyperv: Handle unknown NMIs on one CPU when unknown_nmi_panic
+To: "gregkh@linuxfoundation.org" <gregkh@linuxfoundation.org>
+Cc: "stable@vger.kernel.org" <stable@vger.kernel.org>
+Message-ID: <20170317004812.26960-10-alexander.levin@verizon.com>
+
+From: Vitaly Kuznetsov <vkuznets@redhat.com>
+
+[ Upstream commit 59107e2f48831daedc46973ce4988605ab066de3 ]
+
+There is a feature in Hyper-V ('Debug-VM --InjectNonMaskableInterrupt')
+which injects NMI to the guest. We may want to crash the guest and do kdump
+on this NMI by enabling unknown_nmi_panic. To make kdump succeed we need to
+allow the kdump kernel to re-establish VMBus connection so it will see
+VMBus devices (storage, network,..).
+
+To properly unload VMBus making it possible to start over during kdump we
+need to do the following:
+
+ - Send an 'unload' message to the hypervisor. This can be done on any CPU
+   so we do this the crashing CPU.
+
+ - Receive the 'unload finished' reply message. WS2012R2 delivers this
+   message to the CPU which was used to establish VMBus connection during
+   module load and this CPU may differ from the CPU sending 'unload'.
+
+Receiving a VMBus message means the following:
+
+ - There is a per-CPU slot in memory for one message. This slot can in
+   theory be accessed by any CPU.
+
+ - We get an interrupt on the CPU when a message was placed into the slot.
+
+ - When we read the message we need to clear the slot and signal the fact
+   to the hypervisor. In case there are more messages to this CPU pending
+   the hypervisor will deliver the next message. The signaling is done by
+   writing to an MSR so this can only be done on the appropriate CPU.
+
+To avoid doing cross-CPU work on crash we have vmbus_wait_for_unload()
+function which checks message slots for all CPUs in a loop waiting for the
+'unload finished' messages. However, there is an issue which arises when
+these conditions are met:
+
+ - We're crashing on a CPU which is different from the one which was used
+   to initially contact the hypervisor.
+
+ - The CPU which was used for the initial contact is blocked with interrupts
+   disabled and there is a message pending in the message slot.
+
+In this case we won't be able to read the 'unload finished' message on the
+crashing CPU. This is reproducible when we receive unknown NMIs on all CPUs
+simultaneously: the first CPU entering panic() will proceed to crash and
+all other CPUs will stop themselves with interrupts disabled.
+
+The suggested solution is to handle unknown NMIs for Hyper-V guests on the
+first CPU which gets them only. This will allow us to rely on VMBus
+interrupt handler being able to receive the 'unload finish' message in
+case it is delivered to a different CPU.
+
+The issue is not reproducible on WS2016 as Debug-VM delivers NMI to the
+boot CPU only, WS2012R2 and earlier Hyper-V versions are affected.
+
+Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+Acked-by: K. Y. Srinivasan <kys@microsoft.com>
+Cc: devel@linuxdriverproject.org
+Cc: Haiyang Zhang <haiyangz@microsoft.com>
+Link: http://lkml.kernel.org/r/20161202100720.28121-1-vkuznets@redhat.com
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/x86/kernel/cpu/mshyperv.c |   24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+--- a/arch/x86/kernel/cpu/mshyperv.c
++++ b/arch/x86/kernel/cpu/mshyperv.c
+@@ -31,6 +31,7 @@
+ #include <asm/apic.h>
+ #include <asm/timer.h>
+ #include <asm/reboot.h>
++#include <asm/nmi.h>
+ 
+ struct ms_hyperv_info ms_hyperv;
+ EXPORT_SYMBOL_GPL(ms_hyperv);
+@@ -158,6 +159,26 @@ static unsigned char hv_get_nmi_reason(v
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_X86_LOCAL_APIC
++/*
++ * Prior to WS2016 Debug-VM sends NMIs to all CPUs which makes
++ * it dificult to process CHANNELMSG_UNLOAD in case of crash. Handle
++ * unknown NMI on the first CPU which gets it.
++ */
++static int hv_nmi_unknown(unsigned int val, struct pt_regs *regs)
++{
++	static atomic_t nmi_cpu = ATOMIC_INIT(-1);
++
++	if (!unknown_nmi_panic)
++		return NMI_DONE;
++
++	if (atomic_cmpxchg(&nmi_cpu, -1, raw_smp_processor_id()) != -1)
++		return NMI_HANDLED;
++
++	return NMI_DONE;
++}
++#endif
++
+ static void __init ms_hyperv_init_platform(void)
+ {
+ 	/*
+@@ -183,6 +204,9 @@ static void __init ms_hyperv_init_platfo
+ 		pr_info("HyperV: LAPIC Timer Frequency: %#x\n",
+ 			lapic_timer_frequency);
+ 	}
++
++	register_nmi_handler(NMI_UNKNOWN, hv_nmi_unknown, NMI_FLAG_FIRST,
++			     "hv_nmi_unknown");
+ #endif
+ 
+ 	if (ms_hyperv.features & HV_X64_MSR_TIME_REF_COUNT_AVAILABLE)

@@ -1,0 +1,129 @@
+From foo@baz Mon Mar 20 11:41:01 CET 2017
+From: alexander.levin@verizon.com
+Date: Fri, 17 Mar 2017 00:48:22 +0000
+Subject: [PATCH v2 for-4.9 09/40] scsi: ibmvscsis: Synchronize cmds at remove time
+To: "gregkh@linuxfoundation.org" <gregkh@linuxfoundation.org>
+Cc: "stable@vger.kernel.org" <stable@vger.kernel.org>
+Message-ID: <20170317004812.26960-9-alexander.levin@verizon.com>
+
+From: Michael Cyr <mikecyr@us.ibm.com>
+
+[ Upstream commit 8bf11557d44d00562360d370de8aa70ba89aa0d5 ]
+
+This patch adds code to disconnect from the client, which will make sure
+any outstanding commands have been completed, before continuing on with
+the remove operation.
+
+Signed-off-by: Michael Cyr <mikecyr@us.ibm.com>
+Signed-off-by: Bryant G. Ly <bryantly@linux.vnet.ibm.com>
+Tested-by: Steven Royer <seroyer@linux.vnet.ibm.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/scsi/ibmvscsi_tgt/ibmvscsi_tgt.c |   39 +++++++++++++++++++++++++++----
+ drivers/scsi/ibmvscsi_tgt/ibmvscsi_tgt.h |    3 ++
+ 2 files changed, 37 insertions(+), 5 deletions(-)
+
+--- a/drivers/scsi/ibmvscsi_tgt/ibmvscsi_tgt.c
++++ b/drivers/scsi/ibmvscsi_tgt/ibmvscsi_tgt.c
+@@ -470,6 +470,18 @@ static void ibmvscsis_disconnect(struct
+ 
+ 	case WAIT_ENABLED:
+ 		switch (new_state) {
++		case UNCONFIGURING:
++			vscsi->state = new_state;
++			vscsi->flags |= RESPONSE_Q_DOWN;
++			vscsi->flags &= ~(SCHEDULE_DISCONNECT |
++					  DISCONNECT_SCHEDULED);
++			dma_rmb();
++			if (vscsi->flags & CFG_SLEEPING) {
++				vscsi->flags &= ~CFG_SLEEPING;
++				complete(&vscsi->unconfig);
++			}
++			break;
++
+ 		/* should never happen */
+ 		case ERR_DISCONNECT:
+ 		case ERR_DISCONNECT_RECONNECT:
+@@ -482,6 +494,13 @@ static void ibmvscsis_disconnect(struct
+ 
+ 	case WAIT_IDLE:
+ 		switch (new_state) {
++		case UNCONFIGURING:
++			vscsi->flags |= RESPONSE_Q_DOWN;
++			vscsi->state = new_state;
++			vscsi->flags &= ~(SCHEDULE_DISCONNECT |
++					  DISCONNECT_SCHEDULED);
++			ibmvscsis_free_command_q(vscsi);
++			break;
+ 		case ERR_DISCONNECT:
+ 		case ERR_DISCONNECT_RECONNECT:
+ 			vscsi->state = new_state;
+@@ -1187,6 +1206,15 @@ static void ibmvscsis_adapter_idle(struc
+ 		free_qs = true;
+ 
+ 	switch (vscsi->state) {
++	case UNCONFIGURING:
++		ibmvscsis_free_command_q(vscsi);
++		dma_rmb();
++		isync();
++		if (vscsi->flags & CFG_SLEEPING) {
++			vscsi->flags &= ~CFG_SLEEPING;
++			complete(&vscsi->unconfig);
++		}
++		break;
+ 	case ERR_DISCONNECT_RECONNECT:
+ 		ibmvscsis_reset_queue(vscsi);
+ 		pr_debug("adapter_idle, disc_rec: flags 0x%x\n", vscsi->flags);
+@@ -3342,6 +3370,7 @@ static int ibmvscsis_probe(struct vio_de
+ 		     (unsigned long)vscsi);
+ 
+ 	init_completion(&vscsi->wait_idle);
++	init_completion(&vscsi->unconfig);
+ 
+ 	snprintf(wq_name, 24, "ibmvscsis%s", dev_name(&vdev->dev));
+ 	vscsi->work_q = create_workqueue(wq_name);
+@@ -3397,10 +3426,11 @@ static int ibmvscsis_remove(struct vio_d
+ 
+ 	pr_debug("remove (%s)\n", dev_name(&vscsi->dma_dev->dev));
+ 
+-	/*
+-	 * TBD: Need to handle if there are commands on the waiting_rsp q
+-	 *      Actually, can there still be cmds outstanding to tcm?
+-	 */
++	spin_lock_bh(&vscsi->intr_lock);
++	ibmvscsis_post_disconnect(vscsi, UNCONFIGURING, 0);
++	vscsi->flags |= CFG_SLEEPING;
++	spin_unlock_bh(&vscsi->intr_lock);
++	wait_for_completion(&vscsi->unconfig);
+ 
+ 	vio_disable_interrupts(vdev);
+ 	free_irq(vdev->irq, vscsi);
+@@ -3409,7 +3439,6 @@ static int ibmvscsis_remove(struct vio_d
+ 			 DMA_BIDIRECTIONAL);
+ 	kfree(vscsi->map_buf);
+ 	tasklet_kill(&vscsi->work_task);
+-	ibmvscsis_unregister_command_q(vscsi);
+ 	ibmvscsis_destroy_command_q(vscsi);
+ 	ibmvscsis_freetimer(vscsi);
+ 	ibmvscsis_free_cmds(vscsi);
+--- a/drivers/scsi/ibmvscsi_tgt/ibmvscsi_tgt.h
++++ b/drivers/scsi/ibmvscsi_tgt/ibmvscsi_tgt.h
+@@ -257,6 +257,8 @@ struct scsi_info {
+ #define SCHEDULE_DISCONNECT           0x00400
+ 	/* disconnect handler is scheduled */
+ #define DISCONNECT_SCHEDULED          0x00800
++	/* remove function is sleeping */
++#define CFG_SLEEPING                  0x01000
+ 	u32 flags;
+ 	/* adapter lock */
+ 	spinlock_t intr_lock;
+@@ -285,6 +287,7 @@ struct scsi_info {
+ 
+ 	struct workqueue_struct *work_q;
+ 	struct completion wait_idle;
++	struct completion unconfig;
+ 	struct device dev;
+ 	struct vio_dev *dma_dev;
+ 	struct srp_target target;
