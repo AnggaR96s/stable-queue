@@ -1,0 +1,266 @@
+From 28b62b1458685d8f68f67d9b2d511bf8fa32b746 Mon Sep 17 00:00:00 2001
+From: Krzysztof Kozlowski <krzk@kernel.org>
+Date: Wed, 8 Mar 2017 23:14:20 +0200
+Subject: crypto: s5p-sss - Fix spinlock recursion on LRW(AES)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+From: Krzysztof Kozlowski <krzk@kernel.org>
+
+commit 28b62b1458685d8f68f67d9b2d511bf8fa32b746 upstream.
+
+Running TCRYPT with LRW compiled causes spinlock recursion:
+
+    testing speed of async lrw(aes) (lrw(ecb-aes-s5p)) encryption
+    tcrypt: test 0 (256 bit key, 16 byte blocks): 19007 operations in 1 seconds (304112 bytes)
+    tcrypt: test 1 (256 bit key, 64 byte blocks): 15753 operations in 1 seconds (1008192 bytes)
+    tcrypt: test 2 (256 bit key, 256 byte blocks): 14293 operations in 1 seconds (3659008 bytes)
+    tcrypt: test 3 (256 bit key, 1024 byte blocks): 11906 operations in 1 seconds (12191744 bytes)
+    tcrypt: test 4 (256 bit key, 8192 byte blocks):
+    BUG: spinlock recursion on CPU#1, irq/84-10830000/89
+     lock: 0xeea99a68, .magic: dead4ead, .owner: irq/84-10830000/89, .owner_cpu: 1
+    CPU: 1 PID: 89 Comm: irq/84-10830000 Not tainted 4.11.0-rc1-00001-g897ca6d0800d #559
+    Hardware name: SAMSUNG EXYNOS (Flattened Device Tree)
+    [<c010e1ec>] (unwind_backtrace) from [<c010ae1c>] (show_stack+0x10/0x14)
+    [<c010ae1c>] (show_stack) from [<c03449c0>] (dump_stack+0x78/0x8c)
+    [<c03449c0>] (dump_stack) from [<c015de68>] (do_raw_spin_lock+0x11c/0x120)
+    [<c015de68>] (do_raw_spin_lock) from [<c0720110>] (_raw_spin_lock_irqsave+0x20/0x28)
+    [<c0720110>] (_raw_spin_lock_irqsave) from [<c0572ca0>] (s5p_aes_crypt+0x2c/0xb4)
+    [<c0572ca0>] (s5p_aes_crypt) from [<bf1d8aa4>] (do_encrypt+0x78/0xb0 [lrw])
+    [<bf1d8aa4>] (do_encrypt [lrw]) from [<bf1d8b00>] (encrypt_done+0x24/0x54 [lrw])
+    [<bf1d8b00>] (encrypt_done [lrw]) from [<c05732a0>] (s5p_aes_complete+0x60/0xcc)
+    [<c05732a0>] (s5p_aes_complete) from [<c0573440>] (s5p_aes_interrupt+0x134/0x1a0)
+    [<c0573440>] (s5p_aes_interrupt) from [<c01667c4>] (irq_thread_fn+0x1c/0x54)
+    [<c01667c4>] (irq_thread_fn) from [<c0166a98>] (irq_thread+0x12c/0x1e0)
+    [<c0166a98>] (irq_thread) from [<c0136a28>] (kthread+0x108/0x138)
+    [<c0136a28>] (kthread) from [<c0107778>] (ret_from_fork+0x14/0x3c)
+
+Interrupt handling routine was calling req->base.complete() under
+spinlock.  In most cases this wasn't fatal but when combined with some
+of the cipher modes (like LRW) this caused recursion - starting the new
+encryption (s5p_aes_crypt()) while still holding the spinlock from
+previous round (s5p_aes_complete()).
+
+Beside that, the s5p_aes_interrupt() error handling path could execute
+two completions in case of error for RX and TX blocks.
+
+Rewrite the interrupt handling routine and the completion by:
+
+1. Splitting the operations on scatterlist copies from
+   s5p_aes_complete() into separate s5p_sg_done(). This still should be
+   done under lock.
+   The s5p_aes_complete() now only calls req->base.complete() and it has
+   to be called outside of lock.
+
+2. Moving the s5p_aes_complete() out of spinlock critical sections.
+   In interrupt service routine s5p_aes_interrupts(), it appeared in few
+   places, including error paths inside other functions called from ISR.
+   This code was not so obvious to read so simplify it by putting the
+   s5p_aes_complete() only within ISR level.
+
+Reported-by: Nathan Royce <nroycea+kernel@gmail.com>
+Signed-off-by: Krzysztof Kozlowski <krzk@kernel.org>
+Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/crypto/s5p-sss.c |  127 ++++++++++++++++++++++++++++++-----------------
+ 1 file changed, 82 insertions(+), 45 deletions(-)
+
+--- a/drivers/crypto/s5p-sss.c
++++ b/drivers/crypto/s5p-sss.c
+@@ -270,7 +270,7 @@ static void s5p_sg_copy_buf(void *buf, s
+ 	scatterwalk_done(&walk, out, 0);
+ }
+ 
+-static void s5p_aes_complete(struct s5p_aes_dev *dev, int err)
++static void s5p_sg_done(struct s5p_aes_dev *dev)
+ {
+ 	if (dev->sg_dst_cpy) {
+ 		dev_dbg(dev->dev,
+@@ -281,8 +281,11 @@ static void s5p_aes_complete(struct s5p_
+ 	}
+ 	s5p_free_sg_cpy(dev, &dev->sg_src_cpy);
+ 	s5p_free_sg_cpy(dev, &dev->sg_dst_cpy);
++}
+ 
+-	/* holding a lock outside */
++/* Calls the completion. Cannot be called with dev->lock hold. */
++static void s5p_aes_complete(struct s5p_aes_dev *dev, int err)
++{
+ 	dev->req->base.complete(&dev->req->base, err);
+ 	dev->busy = false;
+ }
+@@ -368,51 +371,44 @@ exit:
+ }
+ 
+ /*
+- * Returns true if new transmitting (output) data is ready and its
+- * address+length have to be written to device (by calling
+- * s5p_set_dma_outdata()). False otherwise.
++ * Returns -ERRNO on error (mapping of new data failed).
++ * On success returns:
++ *  - 0 if there is no more data,
++ *  - 1 if new transmitting (output) data is ready and its address+length
++ *     have to be written to device (by calling s5p_set_dma_outdata()).
+  */
+-static bool s5p_aes_tx(struct s5p_aes_dev *dev)
++static int s5p_aes_tx(struct s5p_aes_dev *dev)
+ {
+-	int err = 0;
+-	bool ret = false;
++	int ret = 0;
+ 
+ 	s5p_unset_outdata(dev);
+ 
+ 	if (!sg_is_last(dev->sg_dst)) {
+-		err = s5p_set_outdata(dev, sg_next(dev->sg_dst));
+-		if (err)
+-			s5p_aes_complete(dev, err);
+-		else
+-			ret = true;
+-	} else {
+-		s5p_aes_complete(dev, err);
+-
+-		dev->busy = true;
+-		tasklet_schedule(&dev->tasklet);
++		ret = s5p_set_outdata(dev, sg_next(dev->sg_dst));
++		if (!ret)
++			ret = 1;
+ 	}
+ 
+ 	return ret;
+ }
+ 
+ /*
+- * Returns true if new receiving (input) data is ready and its
+- * address+length have to be written to device (by calling
+- * s5p_set_dma_indata()). False otherwise.
++ * Returns -ERRNO on error (mapping of new data failed).
++ * On success returns:
++ *  - 0 if there is no more data,
++ *  - 1 if new receiving (input) data is ready and its address+length
++ *     have to be written to device (by calling s5p_set_dma_indata()).
+  */
+-static bool s5p_aes_rx(struct s5p_aes_dev *dev)
++static int s5p_aes_rx(struct s5p_aes_dev *dev/*, bool *set_dma*/)
+ {
+-	int err;
+-	bool ret = false;
++	int ret = 0;
+ 
+ 	s5p_unset_indata(dev);
+ 
+ 	if (!sg_is_last(dev->sg_src)) {
+-		err = s5p_set_indata(dev, sg_next(dev->sg_src));
+-		if (err)
+-			s5p_aes_complete(dev, err);
+-		else
+-			ret = true;
++		ret = s5p_set_indata(dev, sg_next(dev->sg_src));
++		if (!ret)
++			ret = 1;
+ 	}
+ 
+ 	return ret;
+@@ -422,33 +418,73 @@ static irqreturn_t s5p_aes_interrupt(int
+ {
+ 	struct platform_device *pdev = dev_id;
+ 	struct s5p_aes_dev *dev = platform_get_drvdata(pdev);
+-	bool set_dma_tx = false;
+-	bool set_dma_rx = false;
++	int err_dma_tx = 0;
++	int err_dma_rx = 0;
++	bool tx_end = false;
+ 	unsigned long flags;
+ 	uint32_t status;
++	int err;
+ 
+ 	spin_lock_irqsave(&dev->lock, flags);
+ 
++	/*
++	 * Handle rx or tx interrupt. If there is still data (scatterlist did not
++	 * reach end), then map next scatterlist entry.
++	 * In case of such mapping error, s5p_aes_complete() should be called.
++	 *
++	 * If there is no more data in tx scatter list, call s5p_aes_complete()
++	 * and schedule new tasklet.
++	 */
+ 	status = SSS_READ(dev, FCINTSTAT);
+ 	if (status & SSS_FCINTSTAT_BRDMAINT)
+-		set_dma_rx = s5p_aes_rx(dev);
+-	if (status & SSS_FCINTSTAT_BTDMAINT)
+-		set_dma_tx = s5p_aes_tx(dev);
++		err_dma_rx = s5p_aes_rx(dev);
++
++	if (status & SSS_FCINTSTAT_BTDMAINT) {
++		if (sg_is_last(dev->sg_dst))
++			tx_end = true;
++		err_dma_tx = s5p_aes_tx(dev);
++	}
+ 
+ 	SSS_WRITE(dev, FCINTPEND, status);
+ 
+-	/*
+-	 * Writing length of DMA block (either receiving or transmitting)
+-	 * will start the operation immediately, so this should be done
+-	 * at the end (even after clearing pending interrupts to not miss the
+-	 * interrupt).
+-	 */
+-	if (set_dma_tx)
+-		s5p_set_dma_outdata(dev, dev->sg_dst);
+-	if (set_dma_rx)
+-		s5p_set_dma_indata(dev, dev->sg_src);
++	if (err_dma_rx < 0) {
++		err = err_dma_rx;
++		goto error;
++	}
++	if (err_dma_tx < 0) {
++		err = err_dma_tx;
++		goto error;
++	}
++
++	if (tx_end) {
++		s5p_sg_done(dev);
++
++		spin_unlock_irqrestore(&dev->lock, flags);
++
++		s5p_aes_complete(dev, 0);
++		dev->busy = true;
++		tasklet_schedule(&dev->tasklet);
++	} else {
++		/*
++		 * Writing length of DMA block (either receiving or
++		 * transmitting) will start the operation immediately, so this
++		 * should be done at the end (even after clearing pending
++		 * interrupts to not miss the interrupt).
++		 */
++		if (err_dma_tx == 1)
++			s5p_set_dma_outdata(dev, dev->sg_dst);
++		if (err_dma_rx == 1)
++			s5p_set_dma_indata(dev, dev->sg_src);
++
++		spin_unlock_irqrestore(&dev->lock, flags);
++	}
++
++	return IRQ_HANDLED;
+ 
++error:
++	s5p_sg_done(dev);
+ 	spin_unlock_irqrestore(&dev->lock, flags);
++	s5p_aes_complete(dev, err);
+ 
+ 	return IRQ_HANDLED;
+ }
+@@ -597,8 +633,9 @@ outdata_error:
+ 	s5p_unset_indata(dev);
+ 
+ indata_error:
+-	s5p_aes_complete(dev, err);
++	s5p_sg_done(dev);
+ 	spin_unlock_irqrestore(&dev->lock, flags);
++	s5p_aes_complete(dev, err);
+ }
+ 
+ static void s5p_tasklet_cb(unsigned long data)
