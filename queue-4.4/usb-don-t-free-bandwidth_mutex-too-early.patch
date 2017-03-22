@@ -1,0 +1,124 @@
+From ab2a4bf83902c170d29ba130a8abb5f9d90559e1 Mon Sep 17 00:00:00 2001
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Mon, 27 Jun 2016 10:23:10 -0400
+Subject: USB: don't free bandwidth_mutex too early
+
+From: Alan Stern <stern@rowland.harvard.edu>
+
+commit ab2a4bf83902c170d29ba130a8abb5f9d90559e1 upstream.
+
+The USB core contains a bug that can show up when a USB-3 host
+controller is removed.  If the primary (USB-2) hcd structure is
+released before the shared (USB-3) hcd, the core will try to do a
+double-free of the common bandwidth_mutex.
+
+The problem was described in graphical form by Chung-Geol Kim, who
+first reported it:
+
+=================================================
+     At *remove USB(3.0) Storage
+     sequence <1> --> <5> ((Problem Case))
+=================================================
+                                  VOLD
+------------------------------------|------------
+                                 (uevent)
+                            ________|_________
+                           |<1>               |
+                           |dwc3_otg_sm_work  |
+                           |usb_put_hcd       |
+                           |peer_hcd(kref=2)|
+                           |__________________|
+                            ________|_________
+                           |<2>               |
+                           |New USB BUS #2    |
+                           |                  |
+                           |peer_hcd(kref=1)  |
+                           |                  |
+                         --(Link)-bandXX_mutex|
+                         | |__________________|
+                         |
+    ___________________  |
+   |<3>                | |
+   |dwc3_otg_sm_work   | |
+   |usb_put_hcd        | |
+   |primary_hcd(kref=1)| |
+   |___________________| |
+    _________|_________  |
+   |<4>                | |
+   |New USB BUS #1     | |
+   |hcd_release        | |
+   |primary_hcd(kref=0)| |
+   |                   | |
+   |bandXX_mutex(free) |<-
+   |___________________|
+                               (( VOLD ))
+                            ______|___________
+                           |<5>               |
+                           |      SCSI        |
+                           |usb_put_hcd       |
+                           |peer_hcd(kref=0)  |
+                           |*hcd_release      |
+                           |bandXX_mutex(free*)|<- double free
+                           |__________________|
+
+=================================================
+
+This happens because hcd_release() frees the bandwidth_mutex whenever
+it sees a primary hcd being released (which is not a very good idea
+in any case), but in the course of releasing the primary hcd, it
+changes the pointers in the shared hcd in such a way that the shared
+hcd will appear to be primary when it gets released.
+
+This patch fixes the problem by changing hcd_release() so that it
+deallocates the bandwidth_mutex only when the _last_ hcd structure
+referencing it is released.  The patch also removes an unnecessary
+test, so that when an hcd is released, both the shared_hcd and
+primary_hcd pointers in the hcd's peer will be cleared.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Reported-by: Chung-Geol Kim <chunggeol.kim@samsung.com>
+Tested-by: Chung-Geol Kim <chunggeol.kim@samsung.com>
+Cc: Sumit Semwal <sumit.semwal@linaro.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+
+---
+ drivers/usb/core/hcd.c |   17 +++++++----------
+ 1 file changed, 7 insertions(+), 10 deletions(-)
+
+--- a/drivers/usb/core/hcd.c
++++ b/drivers/usb/core/hcd.c
+@@ -2573,26 +2573,23 @@ EXPORT_SYMBOL_GPL(usb_create_hcd);
+  * Don't deallocate the bandwidth_mutex until the last shared usb_hcd is
+  * deallocated.
+  *
+- * Make sure to only deallocate the bandwidth_mutex when the primary HCD is
+- * freed.  When hcd_release() is called for either hcd in a peer set
+- * invalidate the peer's ->shared_hcd and ->primary_hcd pointers to
+- * block new peering attempts
++ * Make sure to deallocate the bandwidth_mutex only when the last HCD is
++ * freed.  When hcd_release() is called for either hcd in a peer set,
++ * invalidate the peer's ->shared_hcd and ->primary_hcd pointers.
+  */
+ static void hcd_release(struct kref *kref)
+ {
+ 	struct usb_hcd *hcd = container_of (kref, struct usb_hcd, kref);
+ 
+ 	mutex_lock(&usb_port_peer_mutex);
+-	if (usb_hcd_is_primary_hcd(hcd)) {
+-		kfree(hcd->address0_mutex);
+-		kfree(hcd->bandwidth_mutex);
+-	}
+ 	if (hcd->shared_hcd) {
+ 		struct usb_hcd *peer = hcd->shared_hcd;
+ 
+ 		peer->shared_hcd = NULL;
+-		if (peer->primary_hcd == hcd)
+-			peer->primary_hcd = NULL;
++		peer->primary_hcd = NULL;
++	} else {
++		kfree(hcd->address0_mutex);
++		kfree(hcd->bandwidth_mutex);
+ 	}
+ 	mutex_unlock(&usb_port_peer_mutex);
+ 	kfree(hcd);
