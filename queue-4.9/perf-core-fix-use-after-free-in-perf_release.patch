@@ -1,0 +1,99 @@
+From e552a8389aa409e257b7dcba74f67f128f979ccc Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Thu, 16 Mar 2017 13:47:48 +0100
+Subject: perf/core: Fix use-after-free in perf_release()
+
+From: Peter Zijlstra <peterz@infradead.org>
+
+commit e552a8389aa409e257b7dcba74f67f128f979ccc upstream.
+
+Dmitry reported syzcaller tripped a use-after-free in perf_release().
+
+After much puzzlement Oleg spotted the below scenario:
+
+  Task1                           Task2
+
+  fork()
+    perf_event_init_task()
+    /* ... */
+    goto bad_fork_$foo;
+    /* ... */
+    perf_event_free_task()
+      mutex_lock(ctx->lock)
+      perf_free_event(B)
+
+                                  perf_event_release_kernel(A)
+                                    mutex_lock(A->child_mutex)
+                                    list_for_each_entry(child, ...) {
+                                      /* child == B */
+                                      ctx = B->ctx;
+                                      get_ctx(ctx);
+                                      mutex_unlock(A->child_mutex);
+
+        mutex_lock(A->child_mutex)
+        list_del_init(B->child_list)
+        mutex_unlock(A->child_mutex)
+
+        /* ... */
+
+      mutex_unlock(ctx->lock);
+      put_ctx() /* >0 */
+    free_task();
+                                      mutex_lock(ctx->lock);
+                                      mutex_lock(A->child_mutex);
+                                      /* ... */
+                                      mutex_unlock(A->child_mutex);
+                                      mutex_unlock(ctx->lock)
+                                      put_ctx() /* 0 */
+                                        ctx->task && !TOMBSTONE
+                                          put_task_struct() /* UAF */
+
+This patch closes the hole by making perf_event_free_task() destroy the
+task <-> ctx relation such that perf_event_release_kernel() will no longer
+observe the now dead task.
+
+Spotted-by: Oleg Nesterov <oleg@redhat.com>
+Reported-by: Dmitry Vyukov <dvyukov@google.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Cc: Arnaldo Carvalho de Melo <acme@kernel.org>
+Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+Cc: Jiri Olsa <jolsa@redhat.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Stephane Eranian <eranian@google.com>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Vince Weaver <vincent.weaver@maine.edu>
+Cc: fweisbec@gmail.com
+Cc: oleg@redhat.com
+Fixes: c6e5b73242d2 ("perf: Synchronously clean up child events")
+Link: http://lkml.kernel.org/r/20170314155949.GE32474@worktop
+Link: http://lkml.kernel.org/r/20170316125823.140295131@infradead.org
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ kernel/events/core.c |   11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -10333,6 +10333,17 @@ void perf_event_free_task(struct task_st
+ 			continue;
+ 
+ 		mutex_lock(&ctx->mutex);
++		raw_spin_lock_irq(&ctx->lock);
++		/*
++		 * Destroy the task <-> ctx relation and mark the context dead.
++		 *
++		 * This is important because even though the task hasn't been
++		 * exposed yet the context has been (through child_list).
++		 */
++		RCU_INIT_POINTER(task->perf_event_ctxp[ctxn], NULL);
++		WRITE_ONCE(ctx->task, TASK_TOMBSTONE);
++		put_task_struct(task); /* cannot be last */
++		raw_spin_unlock_irq(&ctx->lock);
+ again:
+ 		list_for_each_entry_safe(event, tmp, &ctx->pinned_groups,
+ 				group_entry)
