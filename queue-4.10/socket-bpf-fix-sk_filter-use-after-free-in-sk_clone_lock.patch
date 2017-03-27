@@ -1,0 +1,65 @@
+From foo@baz Mon Mar 27 18:18:08 CEST 2017
+From: Daniel Borkmann <daniel@iogearbox.net>
+Date: Wed, 22 Mar 2017 13:08:08 +0100
+Subject: socket, bpf: fix sk_filter use after free in sk_clone_lock
+
+From: Daniel Borkmann <daniel@iogearbox.net>
+
+
+[ Upstream commit a97e50cc4cb67e1e7bff56f6b41cda62ca832336 ]
+
+In sk_clone_lock(), we create a new socket and inherit most of the
+parent's members via sock_copy() which memcpy()'s various sections.
+Now, in case the parent socket had a BPF socket filter attached,
+then newsk->sk_filter points to the same instance as the original
+sk->sk_filter.
+
+sk_filter_charge() is then called on the newsk->sk_filter to take a
+reference and should that fail due to hitting max optmem, we bail
+out and release the newsk instance.
+
+The issue is that commit 278571baca2a ("net: filter: simplify socket
+charging") wrongly combined the dismantle path with the failure path
+of xfrm_sk_clone_policy(). This means, even when charging failed, we
+call sk_free_unlock_clone() on the newsk, which then still points to
+the same sk_filter as the original sk.
+
+Thus, sk_free_unlock_clone() calls into __sk_destruct() eventually
+where it tests for present sk_filter and calls sk_filter_uncharge()
+on it, which potentially lets sk_omem_alloc wrap around and releases
+the eBPF prog and sk_filter structure from the (still intact) parent.
+
+Fix it by making sure that when sk_filter_charge() failed, we reset
+newsk->sk_filter back to NULL before passing to sk_free_unlock_clone(),
+so that we don't mess with the parents sk_filter.
+
+Only if xfrm_sk_clone_policy() fails, we did reach the point where
+either the parent's filter was NULL and as a result newsk's as well
+or where we previously had a successful sk_filter_charge(), thus for
+that case, we do need sk_filter_uncharge() to release the prior taken
+reference on sk_filter.
+
+Fixes: 278571baca2a ("net: filter: simplify socket charging")
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/core/sock.c |    6 ++++++
+ 1 file changed, 6 insertions(+)
+
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@ -1545,6 +1545,12 @@ struct sock *sk_clone_lock(const struct
+ 			is_charged = sk_filter_charge(newsk, filter);
+ 
+ 		if (unlikely(!is_charged || xfrm_sk_clone_policy(newsk, sk))) {
++			/* We need to make sure that we don't uncharge the new
++			 * socket if we couldn't charge it in the first place
++			 * as otherwise we uncharge the parent's filter.
++			 */
++			if (!is_charged)
++				RCU_INIT_POINTER(newsk->sk_filter, NULL);
+ 			/* It is still raw copy of parent, so invalidate
+ 			 * destructor and make plain sk_free() */
+ 			newsk->sk_destruct = NULL;
