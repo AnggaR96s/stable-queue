@@ -1,0 +1,128 @@
+From a05d4fd9176003e0c1f9c3d083f4dac19fd346ab Mon Sep 17 00:00:00 2001
+From: Tejun Heo <tj@kernel.org>
+Date: Tue, 14 Mar 2017 19:25:56 -0400
+Subject: cgroup, net_cls: iterate the fds of only the tasks which are being migrated
+
+From: Tejun Heo <tj@kernel.org>
+
+commit a05d4fd9176003e0c1f9c3d083f4dac19fd346ab upstream.
+
+The net_cls controller controls the classid field of each socket which
+is associated with the cgroup.  Because the classid is per-socket
+attribute, when a task migrates to another cgroup or the configured
+classid of the cgroup changes, the controller needs to walk all
+sockets and update the classid value, which was implemented by
+3b13758f51de ("cgroups: Allow dynamically changing net_classid").
+
+While the approach is not scalable, migrating tasks which have a lot
+of fds attached to them is rare and the cost is born by the ones
+initiating the operations.  However, for simplicity, both the
+migration and classid config change paths call update_classid() which
+scans all fds of all tasks in the target css.  This is an overkill for
+the migration path which only needs to cover a much smaller subset of
+tasks which are actually getting migrated in.
+
+On cgroup v1, this can lead to unexpected scalability issues when one
+tries to migrate a task or process into a net_cls cgroup which already
+contains a lot of fds.  Even if the migration traget doesn't have many
+to get scanned, update_classid() ends up scanning all fds in the
+target cgroup which can be extremely numerous.
+
+Unfortunately, on cgroup v2 which doesn't use net_cls, the problem is
+even worse.  Before bfc2cf6f61fc ("cgroup: call subsys->*attach() only
+for subsystems which are actually affected by migration"), cgroup core
+would call the ->css_attach callback even for controllers which don't
+see actual migration to a different css.
+
+As net_cls is always disabled but still mounted on cgroup v2, whenever
+a process is migrated on the cgroup v2 hierarchy, net_cls sees
+identity migration from root to root and cgroup core used to call
+->css_attach callback for those.  The net_cls ->css_attach ends up
+calling update_classid() on the root net_cls css to which all
+processes on the system belong to as the controller isn't used.  This
+makes any cgroup v2 migration O(total_number_of_fds_on_the_system)
+which is horrible and easily leads to noticeable stalls triggering RCU
+stall warnings and so on.
+
+The worst symptom is already fixed in upstream by bfc2cf6f61fc
+("cgroup: call subsys->*attach() only for subsystems which are
+actually affected by migration"); however, backporting that commit is
+too invasive and we want to avoid other cases too.
+
+This patch updates net_cls's cgrp_attach() to iterate fds of only the
+processes which are actually getting migrated.  This removes the
+surprising migration cost which is dependent on the total number of
+fds in the target cgroup.  As this leaves write_classid() the only
+user of update_classid(), open-code the helper into write_classid().
+
+Reported-by: David Goode <dgoode@fb.com>
+Fixes: 3b13758f51de ("cgroups: Allow dynamically changing net_classid")
+Cc: Nina Schiff <ninasc@fb.com>
+Cc: David S. Miller <davem@davemloft.net>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ net/core/netclassid_cgroup.c |   32 ++++++++++++++++----------------
+ 1 file changed, 16 insertions(+), 16 deletions(-)
+
+--- a/net/core/netclassid_cgroup.c
++++ b/net/core/netclassid_cgroup.c
+@@ -69,27 +69,17 @@ static int update_classid_sock(const voi
+ 	return 0;
+ }
+ 
+-static void update_classid(struct cgroup_subsys_state *css, void *v)
++static void cgrp_attach(struct cgroup_taskset *tset)
+ {
+-	struct css_task_iter it;
++	struct cgroup_subsys_state *css;
+ 	struct task_struct *p;
+ 
+-	css_task_iter_start(css, &it);
+-	while ((p = css_task_iter_next(&it))) {
++	cgroup_taskset_for_each(p, css, tset) {
+ 		task_lock(p);
+-		iterate_fd(p->files, 0, update_classid_sock, v);
++		iterate_fd(p->files, 0, update_classid_sock,
++			   (void *)(unsigned long)css_cls_state(css)->classid);
+ 		task_unlock(p);
+ 	}
+-	css_task_iter_end(&it);
+-}
+-
+-static void cgrp_attach(struct cgroup_taskset *tset)
+-{
+-	struct cgroup_subsys_state *css;
+-
+-	cgroup_taskset_first(tset, &css);
+-	update_classid(css,
+-		       (void *)(unsigned long)css_cls_state(css)->classid);
+ }
+ 
+ static u64 read_classid(struct cgroup_subsys_state *css, struct cftype *cft)
+@@ -101,12 +91,22 @@ static int write_classid(struct cgroup_s
+ 			 u64 value)
+ {
+ 	struct cgroup_cls_state *cs = css_cls_state(css);
++	struct css_task_iter it;
++	struct task_struct *p;
+ 
+ 	cgroup_sk_alloc_disable();
+ 
+ 	cs->classid = (u32)value;
+ 
+-	update_classid(css, (void *)(unsigned long)cs->classid);
++	css_task_iter_start(css, &it);
++	while ((p = css_task_iter_next(&it))) {
++		task_lock(p);
++		iterate_fd(p->files, 0, update_classid_sock,
++			   (void *)(unsigned long)cs->classid);
++		task_unlock(p);
++	}
++	css_task_iter_end(&it);
++
+ 	return 0;
+ }
+ 
