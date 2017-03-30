@@ -1,0 +1,122 @@
+From c4a9b538ab2a109c5f9798bea1f8f4bf93aadfb9 Mon Sep 17 00:00:00 2001
+From: Joe Carnuccio <joe.carnuccio@cavium.com>
+Date: Wed, 15 Mar 2017 09:48:43 -0700
+Subject: qla2xxx: Allow vref count to timeout on vport delete.
+
+From: Joe Carnuccio <joe.carnuccio@cavium.com>
+
+commit c4a9b538ab2a109c5f9798bea1f8f4bf93aadfb9 upstream.
+
+Signed-off-by: Joe Carnuccio <joe.carnuccio@cavium.com>
+Signed-off-by: Himanshu Madhani <himanshu.madhani@cavium.com>
+Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/scsi/qla2xxx/qla_attr.c |    4 +---
+ drivers/scsi/qla2xxx/qla_def.h  |    6 +++++-
+ drivers/scsi/qla2xxx/qla_init.c |    1 +
+ drivers/scsi/qla2xxx/qla_mid.c  |   14 ++++++++------
+ drivers/scsi/qla2xxx/qla_os.c   |    1 +
+ 5 files changed, 16 insertions(+), 10 deletions(-)
+
+--- a/drivers/scsi/qla2xxx/qla_attr.c
++++ b/drivers/scsi/qla2xxx/qla_attr.c
+@@ -2154,8 +2154,6 @@ qla24xx_vport_delete(struct fc_vport *fc
+ 		    "Timer for the VP[%d] has stopped\n", vha->vp_idx);
+ 	}
+ 
+-	BUG_ON(atomic_read(&vha->vref_count));
+-
+ 	qla2x00_free_fcports(vha);
+ 
+ 	mutex_lock(&ha->vport_lock);
+@@ -2163,7 +2161,7 @@ qla24xx_vport_delete(struct fc_vport *fc
+ 	clear_bit(vha->vp_idx, ha->vp_idx_map);
+ 	mutex_unlock(&ha->vport_lock);
+ 
+-	if (vha->qpair->vp_idx == vha->vp_idx) {
++	if (vha->qpair && vha->qpair->vp_idx == vha->vp_idx) {
+ 		if (qla2xxx_delete_qpair(vha, vha->qpair) != QLA_SUCCESS)
+ 			ql_log(ql_log_warn, vha, 0x7087,
+ 			    "Queue Pair delete failed.\n");
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@ -3788,6 +3788,7 @@ typedef struct scsi_qla_host {
+ 	struct qla8044_reset_template reset_tmplt;
+ 	struct qla_tgt_counters tgt_counters;
+ 	uint16_t	bbcr;
++	wait_queue_head_t vref_waitq;
+ } scsi_qla_host_t;
+ 
+ struct qla27xx_image_status {
+@@ -3843,14 +3844,17 @@ struct qla2_sgx {
+ 	mb();						\
+ 	if (__vha->flags.delete_progress) {		\
+ 		atomic_dec(&__vha->vref_count);		\
++		wake_up(&__vha->vref_waitq);		\
+ 		__bail = 1;				\
+ 	} else {					\
+ 		__bail = 0;				\
+ 	}						\
+ } while (0)
+ 
+-#define QLA_VHA_MARK_NOT_BUSY(__vha)			\
++#define QLA_VHA_MARK_NOT_BUSY(__vha) do {		\
+ 	atomic_dec(&__vha->vref_count);			\
++	wake_up(&__vha->vref_waitq);			\
++} while (0)						\
+ 
+ #define QLA_QPAIR_MARK_BUSY(__qpair, __bail) do {	\
+ 	atomic_inc(&__qpair->ref_count);		\
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@ -4352,6 +4352,7 @@ qla2x00_update_fcports(scsi_qla_host_t *
+ 			}
+ 		}
+ 		atomic_dec(&vha->vref_count);
++		wake_up(&vha->vref_waitq);
+ 	}
+ 	spin_unlock_irqrestore(&ha->vport_slock, flags);
+ }
+--- a/drivers/scsi/qla2xxx/qla_mid.c
++++ b/drivers/scsi/qla2xxx/qla_mid.c
+@@ -74,13 +74,14 @@ qla24xx_deallocate_vp_id(scsi_qla_host_t
+ 	 * ensures no active vp_list traversal while the vport is removed
+ 	 * from the queue)
+ 	 */
+-	spin_lock_irqsave(&ha->vport_slock, flags);
+-	while (atomic_read(&vha->vref_count)) {
+-		spin_unlock_irqrestore(&ha->vport_slock, flags);
+-
+-		msleep(500);
++	wait_event_timeout(vha->vref_waitq, atomic_read(&vha->vref_count),
++	    10*HZ);
+ 
+-		spin_lock_irqsave(&ha->vport_slock, flags);
++	spin_lock_irqsave(&ha->vport_slock, flags);
++	if (atomic_read(&vha->vref_count)) {
++		ql_dbg(ql_dbg_vport, vha, 0xfffa,
++		    "vha->vref_count=%u timeout\n", vha->vref_count.counter);
++		vha->vref_count = (atomic_t)ATOMIC_INIT(0);
+ 	}
+ 	list_del(&vha->list);
+ 	qlt_update_vp_map(vha, RESET_VP_IDX);
+@@ -269,6 +270,7 @@ qla2x00_alert_all_vps(struct rsp_que *rs
+ 
+ 			spin_lock_irqsave(&ha->vport_slock, flags);
+ 			atomic_dec(&vha->vref_count);
++			wake_up(&vha->vref_waitq);
+ 		}
+ 		i++;
+ 	}
+--- a/drivers/scsi/qla2xxx/qla_os.c
++++ b/drivers/scsi/qla2xxx/qla_os.c
+@@ -4215,6 +4215,7 @@ struct scsi_qla_host *qla2x00_create_hos
+ 
+ 	spin_lock_init(&vha->work_lock);
+ 	spin_lock_init(&vha->cmd_list_lock);
++	init_waitqueue_head(&vha->vref_waitq);
+ 
+ 	sprintf(vha->host_str, "%s_%ld", QLA2XXX_DRIVER_NAME, vha->host_no);
+ 	ql_dbg(ql_dbg_init, vha, 0x0041,
