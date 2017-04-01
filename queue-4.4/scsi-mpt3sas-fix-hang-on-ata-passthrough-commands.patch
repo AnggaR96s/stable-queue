@@ -1,0 +1,150 @@
+From 16236802bfecb1082144a48b7d6fa60997824662 Mon Sep 17 00:00:00 2001
+From: James Bottomley <James.Bottomley@HansenPartnership.com>
+Date: Sun, 1 Jan 2017 09:39:24 -0800
+Subject: scsi: mpt3sas: fix hang on ata passthrough commands
+
+From: James Bottomley <James.Bottomley@HansenPartnership.com>
+
+commit ffb58456589443ca572221fabbdef3db8483a779 upstream.
+
+mpt3sas has a firmware failure where it can only handle one pass through
+ATA command at a time.  If another comes in, contrary to the SAT
+standard, it will hang until the first one completes (causing long
+commands like secure erase to timeout).  The original fix was to block
+the device when an ATA command came in, but this caused a regression
+with
+
+commit 669f044170d8933c3d66d231b69ea97cb8447338
+Author: Bart Van Assche <bart.vanassche@sandisk.com>
+Date:   Tue Nov 22 16:17:13 2016 -0800
+
+    scsi: srp_transport: Move queuecommand() wait code to SCSI core
+
+So fix the original fix of the secure erase timeout by properly
+returning SAM_STAT_BUSY like the SAT recommends.  The original patch
+also had a concurrency problem since scsih_qcmd is lockless at that
+point (this is fixed by using atomic bitops to set and test the flag).
+
+[mkp: addressed feedback wrt. test_bit and fixed whitespace]
+
+Fixes: 18f6084a989ba1b (mpt3sas: Fix secure erase premature termination)
+Signed-off-by: James Bottomley <James.Bottomley@HansenPartnership.com>
+Acked-by: Sreekanth Reddy <Sreekanth.Reddy@broadcom.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reported-by: Ingo Molnar <mingo@kernel.org>
+Tested-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Cc: Joe Korty <joe.korty@ccur.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/scsi/mpt3sas/mpt3sas_base.h  |   12 ++++++++++
+ drivers/scsi/mpt3sas/mpt3sas_scsih.c |   40 ++++++++++++++++++++++-------------
+ 2 files changed, 38 insertions(+), 14 deletions(-)
+
+--- a/drivers/scsi/mpt3sas/mpt3sas_base.h
++++ b/drivers/scsi/mpt3sas/mpt3sas_base.h
+@@ -390,6 +390,7 @@ struct MPT3SAS_TARGET {
+  * @eedp_enable: eedp support enable bit
+  * @eedp_type: 0(type_1), 1(type_2), 2(type_3)
+  * @eedp_block_length: block size
++ * @ata_command_pending: SATL passthrough outstanding for device
+  */
+ struct MPT3SAS_DEVICE {
+ 	struct MPT3SAS_TARGET *sas_target;
+@@ -398,6 +399,17 @@ struct MPT3SAS_DEVICE {
+ 	u8	configured_lun;
+ 	u8	block;
+ 	u8	tlr_snoop_check;
++	/*
++	 * Bug workaround for SATL handling: the mpt2/3sas firmware
++	 * doesn't return BUSY or TASK_SET_FULL for subsequent
++	 * commands while a SATL pass through is in operation as the
++	 * spec requires, it simply does nothing with them until the
++	 * pass through completes, causing them possibly to timeout if
++	 * the passthrough is a long executing command (like format or
++	 * secure erase).  This variable allows us to do the right
++	 * thing while a SATL command is pending.
++	 */
++	unsigned long ata_command_pending;
+ };
+ 
+ #define MPT3_CMD_NOT_USED	0x8000	/* free */
+--- a/drivers/scsi/mpt3sas/mpt3sas_scsih.c
++++ b/drivers/scsi/mpt3sas/mpt3sas_scsih.c
+@@ -3707,9 +3707,18 @@ _scsih_temp_threshold_events(struct MPT3
+ 	}
+ }
+ 
+-static inline bool ata_12_16_cmd(struct scsi_cmnd *scmd)
++static int _scsih_set_satl_pending(struct scsi_cmnd *scmd, bool pending)
+ {
+-	return (scmd->cmnd[0] == ATA_12 || scmd->cmnd[0] == ATA_16);
++	struct MPT3SAS_DEVICE *priv = scmd->device->hostdata;
++
++	if (scmd->cmnd[0] != ATA_12 && scmd->cmnd[0] != ATA_16)
++		return 0;
++
++	if (pending)
++		return test_and_set_bit(0, &priv->ata_command_pending);
++
++	clear_bit(0, &priv->ata_command_pending);
++	return 0;
+ }
+ 
+ /**
+@@ -3733,9 +3742,7 @@ _scsih_flush_running_cmds(struct MPT3SAS
+ 		if (!scmd)
+ 			continue;
+ 		count++;
+-		if (ata_12_16_cmd(scmd))
+-			scsi_internal_device_unblock(scmd->device,
+-							SDEV_RUNNING);
++		_scsih_set_satl_pending(scmd, false);
+ 		mpt3sas_base_free_smid(ioc, smid);
+ 		scsi_dma_unmap(scmd);
+ 		if (ioc->pci_error_recovery)
+@@ -3866,13 +3873,6 @@ scsih_qcmd(struct Scsi_Host *shost, stru
+ 	if (ioc->logging_level & MPT_DEBUG_SCSI)
+ 		scsi_print_command(scmd);
+ 
+-	/*
+-	 * Lock the device for any subsequent command until command is
+-	 * done.
+-	 */
+-	if (ata_12_16_cmd(scmd))
+-		scsi_internal_device_block(scmd->device);
+-
+ 	sas_device_priv_data = scmd->device->hostdata;
+ 	if (!sas_device_priv_data || !sas_device_priv_data->sas_target) {
+ 		scmd->result = DID_NO_CONNECT << 16;
+@@ -3886,6 +3886,19 @@ scsih_qcmd(struct Scsi_Host *shost, stru
+ 		return 0;
+ 	}
+ 
++	/*
++	 * Bug work around for firmware SATL handling.  The loop
++	 * is based on atomic operations and ensures consistency
++	 * since we're lockless at this point
++	 */
++	do {
++		if (test_bit(0, &sas_device_priv_data->ata_command_pending)) {
++			scmd->result = SAM_STAT_BUSY;
++			scmd->scsi_done(scmd);
++			return 0;
++		}
++	} while (_scsih_set_satl_pending(scmd, true));
++
+ 	sas_target_priv_data = sas_device_priv_data->sas_target;
+ 
+ 	/* invalid device handle */
+@@ -4445,8 +4458,7 @@ _scsih_io_done(struct MPT3SAS_ADAPTER *i
+ 	if (scmd == NULL)
+ 		return 1;
+ 
+-	if (ata_12_16_cmd(scmd))
+-		scsi_internal_device_unblock(scmd->device, SDEV_RUNNING);
++	_scsih_set_satl_pending(scmd, false);
+ 
+ 	mpi_request = mpt3sas_base_get_msg_frame(ioc, smid);
+ 
