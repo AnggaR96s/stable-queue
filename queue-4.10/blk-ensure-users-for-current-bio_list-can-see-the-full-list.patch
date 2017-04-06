@@ -1,0 +1,197 @@
+From f5fe1b51905df7cfe4fdfd85c5fb7bc5b71a094f Mon Sep 17 00:00:00 2001
+From: NeilBrown <neilb@suse.com>
+Date: Fri, 10 Mar 2017 17:00:47 +1100
+Subject: blk: Ensure users for current->bio_list can see the full list.
+
+From: NeilBrown <neilb@suse.com>
+
+commit f5fe1b51905df7cfe4fdfd85c5fb7bc5b71a094f upstream.
+
+Commit 79bd99596b73 ("blk: improve order of bio handling in generic_make_request()")
+changed current->bio_list so that it did not contain *all* of the
+queued bios, but only those submitted by the currently running
+make_request_fn.
+
+There are two places which walk the list and requeue selected bios,
+and others that check if the list is empty.  These are no longer
+correct.
+
+So redefine current->bio_list to point to an array of two lists, which
+contain all queued bios, and adjust various code to test or walk both
+lists.
+
+Signed-off-by: NeilBrown <neilb@suse.com>
+Fixes: 79bd99596b73 ("blk: improve order of bio handling in generic_make_request()")
+Signed-off-by: Jens Axboe <axboe@fb.com>
+Cc: Jack Wang <jinpu.wang@profitbricks.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ block/bio.c         |   12 +++++++++---
+ block/blk-core.c    |   30 ++++++++++++++++++------------
+ drivers/md/dm.c     |   29 ++++++++++++++++-------------
+ drivers/md/raid10.c |    3 ++-
+ 4 files changed, 45 insertions(+), 29 deletions(-)
+
+--- a/block/bio.c
++++ b/block/bio.c
+@@ -376,10 +376,14 @@ static void punt_bios_to_rescuer(struct
+ 	bio_list_init(&punt);
+ 	bio_list_init(&nopunt);
+ 
+-	while ((bio = bio_list_pop(current->bio_list)))
++	while ((bio = bio_list_pop(&current->bio_list[0])))
+ 		bio_list_add(bio->bi_pool == bs ? &punt : &nopunt, bio);
++	current->bio_list[0] = nopunt;
+ 
+-	*current->bio_list = nopunt;
++	bio_list_init(&nopunt);
++	while ((bio = bio_list_pop(&current->bio_list[1])))
++		bio_list_add(bio->bi_pool == bs ? &punt : &nopunt, bio);
++	current->bio_list[1] = nopunt;
+ 
+ 	spin_lock(&bs->rescue_lock);
+ 	bio_list_merge(&bs->rescue_list, &punt);
+@@ -466,7 +470,9 @@ struct bio *bio_alloc_bioset(gfp_t gfp_m
+ 		 * we retry with the original gfp_flags.
+ 		 */
+ 
+-		if (current->bio_list && !bio_list_empty(current->bio_list))
++		if (current->bio_list &&
++		    (!bio_list_empty(&current->bio_list[0]) ||
++		     !bio_list_empty(&current->bio_list[1])))
+ 			gfp_mask &= ~__GFP_DIRECT_RECLAIM;
+ 
+ 		p = mempool_alloc(bs->bio_pool, gfp_mask);
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -1977,7 +1977,14 @@ end_io:
+  */
+ blk_qc_t generic_make_request(struct bio *bio)
+ {
+-	struct bio_list bio_list_on_stack;
++	/*
++	 * bio_list_on_stack[0] contains bios submitted by the current
++	 * make_request_fn.
++	 * bio_list_on_stack[1] contains bios that were submitted before
++	 * the current make_request_fn, but that haven't been processed
++	 * yet.
++	 */
++	struct bio_list bio_list_on_stack[2];
+ 	blk_qc_t ret = BLK_QC_T_NONE;
+ 
+ 	if (!generic_make_request_checks(bio))
+@@ -1994,7 +2001,7 @@ blk_qc_t generic_make_request(struct bio
+ 	 * should be added at the tail
+ 	 */
+ 	if (current->bio_list) {
+-		bio_list_add(current->bio_list, bio);
++		bio_list_add(&current->bio_list[0], bio);
+ 		goto out;
+ 	}
+ 
+@@ -2013,18 +2020,17 @@ blk_qc_t generic_make_request(struct bio
+ 	 * bio_list, and call into ->make_request() again.
+ 	 */
+ 	BUG_ON(bio->bi_next);
+-	bio_list_init(&bio_list_on_stack);
+-	current->bio_list = &bio_list_on_stack;
++	bio_list_init(&bio_list_on_stack[0]);
++	current->bio_list = bio_list_on_stack;
+ 	do {
+ 		struct request_queue *q = bdev_get_queue(bio->bi_bdev);
+ 
+ 		if (likely(blk_queue_enter(q, false) == 0)) {
+-			struct bio_list hold;
+ 			struct bio_list lower, same;
+ 
+ 			/* Create a fresh bio_list for all subordinate requests */
+-			hold = bio_list_on_stack;
+-			bio_list_init(&bio_list_on_stack);
++			bio_list_on_stack[1] = bio_list_on_stack[0];
++			bio_list_init(&bio_list_on_stack[0]);
+ 			ret = q->make_request_fn(q, bio);
+ 
+ 			blk_queue_exit(q);
+@@ -2034,19 +2040,19 @@ blk_qc_t generic_make_request(struct bio
+ 			 */
+ 			bio_list_init(&lower);
+ 			bio_list_init(&same);
+-			while ((bio = bio_list_pop(&bio_list_on_stack)) != NULL)
++			while ((bio = bio_list_pop(&bio_list_on_stack[0])) != NULL)
+ 				if (q == bdev_get_queue(bio->bi_bdev))
+ 					bio_list_add(&same, bio);
+ 				else
+ 					bio_list_add(&lower, bio);
+ 			/* now assemble so we handle the lowest level first */
+-			bio_list_merge(&bio_list_on_stack, &lower);
+-			bio_list_merge(&bio_list_on_stack, &same);
+-			bio_list_merge(&bio_list_on_stack, &hold);
++			bio_list_merge(&bio_list_on_stack[0], &lower);
++			bio_list_merge(&bio_list_on_stack[0], &same);
++			bio_list_merge(&bio_list_on_stack[0], &bio_list_on_stack[1]);
+ 		} else {
+ 			bio_io_error(bio);
+ 		}
+-		bio = bio_list_pop(current->bio_list);
++		bio = bio_list_pop(&bio_list_on_stack[0]);
+ 	} while (bio);
+ 	current->bio_list = NULL; /* deactivate */
+ 
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@ -986,26 +986,29 @@ static void flush_current_bio_list(struc
+ 	struct dm_offload *o = container_of(cb, struct dm_offload, cb);
+ 	struct bio_list list;
+ 	struct bio *bio;
++	int i;
+ 
+ 	INIT_LIST_HEAD(&o->cb.list);
+ 
+ 	if (unlikely(!current->bio_list))
+ 		return;
+ 
+-	list = *current->bio_list;
+-	bio_list_init(current->bio_list);
+-
+-	while ((bio = bio_list_pop(&list))) {
+-		struct bio_set *bs = bio->bi_pool;
+-		if (unlikely(!bs) || bs == fs_bio_set) {
+-			bio_list_add(current->bio_list, bio);
+-			continue;
++	for (i = 0; i < 2; i++) {
++		list = current->bio_list[i];
++		bio_list_init(&current->bio_list[i]);
++
++		while ((bio = bio_list_pop(&list))) {
++			struct bio_set *bs = bio->bi_pool;
++			if (unlikely(!bs) || bs == fs_bio_set) {
++				bio_list_add(&current->bio_list[i], bio);
++				continue;
++			}
++
++			spin_lock(&bs->rescue_lock);
++			bio_list_add(&bs->rescue_list, bio);
++			queue_work(bs->rescue_workqueue, &bs->rescue_work);
++			spin_unlock(&bs->rescue_lock);
+ 		}
+-
+-		spin_lock(&bs->rescue_lock);
+-		bio_list_add(&bs->rescue_list, bio);
+-		queue_work(bs->rescue_workqueue, &bs->rescue_work);
+-		spin_unlock(&bs->rescue_lock);
+ 	}
+ }
+ 
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@ -974,7 +974,8 @@ static void wait_barrier(struct r10conf
+ 				    !conf->barrier ||
+ 				    (atomic_read(&conf->nr_pending) &&
+ 				     current->bio_list &&
+-				     !bio_list_empty(current->bio_list)),
++				     (!bio_list_empty(&current->bio_list[0]) ||
++				      !bio_list_empty(&current->bio_list[1]))),
+ 				    conf->resync_lock);
+ 		conf->nr_waiting--;
+ 		if (!conf->nr_waiting)
