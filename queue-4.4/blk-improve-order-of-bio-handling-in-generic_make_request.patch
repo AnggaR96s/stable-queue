@@ -1,0 +1,118 @@
+From 79bd99596b7305ab08109a8bf44a6a4511dbf1cd Mon Sep 17 00:00:00 2001
+From: NeilBrown <neilb@suse.com>
+Date: Wed, 8 Mar 2017 07:38:05 +1100
+Subject: blk: improve order of bio handling in generic_make_request()
+
+From: NeilBrown <neilb@suse.com>
+
+commit 79bd99596b7305ab08109a8bf44a6a4511dbf1cd upstream.
+
+To avoid recursion on the kernel stack when stacked block devices
+are in use, generic_make_request() will, when called recursively,
+queue new requests for later handling.  They will be handled when the
+make_request_fn for the current bio completes.
+
+If any bios are submitted by a make_request_fn, these will ultimately
+be handled seqeuntially.  If the handling of one of those generates
+further requests, they will be added to the end of the queue.
+
+This strict first-in-first-out behaviour can lead to deadlocks in
+various ways, normally because a request might need to wait for a
+previous request to the same device to complete.  This can happen when
+they share a mempool, and can happen due to interdependencies
+particular to the device.  Both md and dm have examples where this happens.
+
+These deadlocks can be erradicated by more selective ordering of bios.
+Specifically by handling them in depth-first order.  That is: when the
+handling of one bio generates one or more further bios, they are
+handled immediately after the parent, before any siblings of the
+parent.  That way, when generic_make_request() calls make_request_fn
+for some particular device, we can be certain that all previously
+submited requests for that device have been completely handled and are
+not waiting for anything in the queue of requests maintained in
+generic_make_request().
+
+An easy way to achieve this would be to use a last-in-first-out stack
+instead of a queue.  However this will change the order of consecutive
+bios submitted by a make_request_fn, which could have unexpected consequences.
+Instead we take a slightly more complex approach.
+A fresh queue is created for each call to a make_request_fn.  After it completes,
+any bios for a different device are placed on the front of the main queue, followed
+by any bios for the same device, followed by all bios that were already on
+the queue before the make_request_fn was called.
+This provides the depth-first approach without reordering bios on the same level.
+
+This, by itself, it not enough to remove all deadlocks.  It just makes
+it possible for drivers to take the extra step required themselves.
+
+To avoid deadlocks, drivers must never risk waiting for a request
+after submitting one to generic_make_request.  This includes never
+allocing from a mempool twice in the one call to a make_request_fn.
+
+A common pattern in drivers is to call bio_split() in a loop, handling
+the first part and then looping around to possibly split the next part.
+Instead, a driver that finds it needs to split a bio should queue
+(with generic_make_request) the second part, handle the first part,
+and then return.  The new code in generic_make_request will ensure the
+requests to underlying bios are processed first, then the second bio
+that was split off.  If it splits again, the same process happens.  In
+each case one bio will be completely handled before the next one is attempted.
+
+With this is place, it should be possible to disable the
+punt_bios_to_recover() recovery thread for many block devices, and
+eventually it may be possible to remove it completely.
+
+Ref: http://www.spinics.net/lists/raid/msg54680.html
+Tested-by: Jinpu Wang <jinpu.wang@profitbricks.com>
+Inspired-by: Lars Ellenberg <lars.ellenberg@linbit.com>
+Signed-off-by: NeilBrown <neilb@suse.com>
+Signed-off-by: Jens Axboe <axboe@fb.com>
+[jwang: backport to 4.4]
+Signed-off-by: Jack Wang <jinpu.wang@profitbricks.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ block/blk-core.c |   25 ++++++++++++++++++++-----
+ 1 file changed, 20 insertions(+), 5 deletions(-)
+
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -2063,18 +2063,33 @@ blk_qc_t generic_make_request(struct bio
+ 		struct request_queue *q = bdev_get_queue(bio->bi_bdev);
+ 
+ 		if (likely(blk_queue_enter(q, __GFP_DIRECT_RECLAIM) == 0)) {
++			struct bio_list lower, same, hold;
++
++			/* Create a fresh bio_list for all subordinate requests */
++			hold = bio_list_on_stack;
++			bio_list_init(&bio_list_on_stack);
+ 
+ 			ret = q->make_request_fn(q, bio);
+ 
+ 			blk_queue_exit(q);
+-
+-			bio = bio_list_pop(current->bio_list);
++			/* sort new bios into those for a lower level
++			 * and those for the same level
++			 */
++			bio_list_init(&lower);
++			bio_list_init(&same);
++			while ((bio = bio_list_pop(&bio_list_on_stack)) != NULL)
++				if (q == bdev_get_queue(bio->bi_bdev))
++					bio_list_add(&same, bio);
++				else
++					bio_list_add(&lower, bio);
++			/* now assemble so we handle the lowest level first */
++			bio_list_merge(&bio_list_on_stack, &lower);
++			bio_list_merge(&bio_list_on_stack, &same);
++			bio_list_merge(&bio_list_on_stack, &hold);
+ 		} else {
+-			struct bio *bio_next = bio_list_pop(current->bio_list);
+-
+ 			bio_io_error(bio);
+-			bio = bio_next;
+ 		}
++		bio = bio_list_pop(current->bio_list);
+ 	} while (bio);
+ 	current->bio_list = NULL; /* deactivate */
+ 
