@@ -1,0 +1,172 @@
+From fe25deb7737ce6c0879ccf79c99fa1221d428bf2 Mon Sep 17 00:00:00 2001
+From: Thomas Hellstrom <thellstrom@vmware.com>
+Date: Mon, 27 Mar 2017 11:21:25 +0200
+Subject: drm/ttm, drm/vmwgfx: Relax permission checking when opening surfaces
+
+From: Thomas Hellstrom <thellstrom@vmware.com>
+
+commit fe25deb7737ce6c0879ccf79c99fa1221d428bf2 upstream.
+
+Previously, when a surface was opened using a legacy (non prime) handle,
+it was verified to have been created by a client in the same master realm.
+Relax this so that opening is also allowed recursively if the client
+already has the surface open.
+
+This works around a regression in svga mesa where opening of a shared
+surface is used recursively to obtain surface information.
+
+Signed-off-by: Thomas Hellstrom <thellstrom@vmware.com>
+Reviewed-by: Sinclair Yeh <syeh@vmware.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/gpu/drm/ttm/ttm_object.c         |   10 +++++++---
+ drivers/gpu/drm/vmwgfx/vmwgfx_fence.c    |    6 ++----
+ drivers/gpu/drm/vmwgfx/vmwgfx_resource.c |    4 ++--
+ drivers/gpu/drm/vmwgfx/vmwgfx_surface.c  |   22 +++++++++-------------
+ include/drm/ttm/ttm_object.h             |    5 ++++-
+ 5 files changed, 24 insertions(+), 23 deletions(-)
+
+--- a/drivers/gpu/drm/ttm/ttm_object.c
++++ b/drivers/gpu/drm/ttm/ttm_object.c
+@@ -179,7 +179,7 @@ int ttm_base_object_init(struct ttm_obje
+ 	if (unlikely(ret != 0))
+ 		goto out_err0;
+ 
+-	ret = ttm_ref_object_add(tfile, base, TTM_REF_USAGE, NULL);
++	ret = ttm_ref_object_add(tfile, base, TTM_REF_USAGE, NULL, false);
+ 	if (unlikely(ret != 0))
+ 		goto out_err1;
+ 
+@@ -318,7 +318,8 @@ EXPORT_SYMBOL(ttm_ref_object_exists);
+ 
+ int ttm_ref_object_add(struct ttm_object_file *tfile,
+ 		       struct ttm_base_object *base,
+-		       enum ttm_ref_type ref_type, bool *existed)
++		       enum ttm_ref_type ref_type, bool *existed,
++		       bool require_existed)
+ {
+ 	struct drm_open_hash *ht = &tfile->ref_hash[ref_type];
+ 	struct ttm_ref_object *ref;
+@@ -345,6 +346,9 @@ int ttm_ref_object_add(struct ttm_object
+ 		}
+ 
+ 		rcu_read_unlock();
++		if (require_existed)
++			return -EPERM;
++
+ 		ret = ttm_mem_global_alloc(mem_glob, sizeof(*ref),
+ 					   false, false);
+ 		if (unlikely(ret != 0))
+@@ -635,7 +639,7 @@ int ttm_prime_fd_to_handle(struct ttm_ob
+ 	prime = (struct ttm_prime_object *) dma_buf->priv;
+ 	base = &prime->base;
+ 	*handle = base->hash.key;
+-	ret = ttm_ref_object_add(tfile, base, TTM_REF_USAGE, NULL);
++	ret = ttm_ref_object_add(tfile, base, TTM_REF_USAGE, NULL, false);
+ 
+ 	dma_buf_put(dma_buf);
+ 
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_fence.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_fence.c
+@@ -1144,10 +1144,8 @@ int vmw_fence_event_ioctl(struct drm_dev
+ 		(void) vmw_fence_obj_reference(fence);
+ 
+ 		if (user_fence_rep != NULL) {
+-			bool existed;
+-
+-			ret = ttm_ref_object_add(tfile, base,
+-						 TTM_REF_USAGE, &existed);
++			ret = ttm_ref_object_add(vmw_fp->tfile, base,
++						 TTM_REF_USAGE, NULL, false);
+ 			if (unlikely(ret != 0)) {
+ 				DRM_ERROR("Failed to reference a fence "
+ 					  "object.\n");
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_resource.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_resource.c
+@@ -591,7 +591,7 @@ static int vmw_user_dmabuf_synccpu_grab(
+ 		return ret;
+ 
+ 	ret = ttm_ref_object_add(tfile, &user_bo->prime.base,
+-				 TTM_REF_SYNCCPU_WRITE, &existed);
++				 TTM_REF_SYNCCPU_WRITE, &existed, false);
+ 	if (ret != 0 || existed)
+ 		ttm_bo_synccpu_write_release(&user_bo->dma.base);
+ 
+@@ -775,7 +775,7 @@ int vmw_user_dmabuf_reference(struct ttm
+ 
+ 	*handle = user_bo->prime.base.hash.key;
+ 	return ttm_ref_object_add(tfile, &user_bo->prime.base,
+-				  TTM_REF_USAGE, NULL);
++				  TTM_REF_USAGE, NULL, false);
+ }
+ 
+ /*
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_surface.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_surface.c
+@@ -904,17 +904,16 @@ vmw_surface_handle_reference(struct vmw_
+ 	uint32_t handle;
+ 	struct ttm_base_object *base;
+ 	int ret;
++	bool require_exist = false;
+ 
+ 	if (handle_type == DRM_VMW_HANDLE_PRIME) {
+ 		ret = ttm_prime_fd_to_handle(tfile, u_handle, &handle);
+ 		if (unlikely(ret != 0))
+ 			return ret;
+ 	} else {
+-		if (unlikely(drm_is_render_client(file_priv))) {
+-			DRM_ERROR("Render client refused legacy "
+-				  "surface reference.\n");
+-			return -EACCES;
+-		}
++		if (unlikely(drm_is_render_client(file_priv)))
++			require_exist = true;
++
+ 		if (ACCESS_ONCE(vmw_fpriv(file_priv)->locked_master)) {
+ 			DRM_ERROR("Locked master refused legacy "
+ 				  "surface reference.\n");
+@@ -942,17 +941,14 @@ vmw_surface_handle_reference(struct vmw_
+ 
+ 		/*
+ 		 * Make sure the surface creator has the same
+-		 * authenticating master.
++		 * authenticating master, or is already registered with us.
+ 		 */
+ 		if (drm_is_primary_client(file_priv) &&
+-		    user_srf->master != file_priv->master) {
+-			DRM_ERROR("Trying to reference surface outside of"
+-				  " master domain.\n");
+-			ret = -EACCES;
+-			goto out_bad_resource;
+-		}
++		    user_srf->master != file_priv->master)
++			require_exist = true;
+ 
+-		ret = ttm_ref_object_add(tfile, base, TTM_REF_USAGE, NULL);
++		ret = ttm_ref_object_add(tfile, base, TTM_REF_USAGE, NULL,
++					 require_exist);
+ 		if (unlikely(ret != 0)) {
+ 			DRM_ERROR("Could not add a reference to a surface.\n");
+ 			goto out_bad_resource;
+--- a/include/drm/ttm/ttm_object.h
++++ b/include/drm/ttm/ttm_object.h
+@@ -229,6 +229,8 @@ extern void ttm_base_object_unref(struct
+  * @ref_type: The type of reference.
+  * @existed: Upon completion, indicates that an identical reference object
+  * already existed, and the refcount was upped on that object instead.
++ * @require_existed: Fail with -EPERM if an identical ref object didn't
++ * already exist.
+  *
+  * Checks that the base object is shareable and adds a ref object to it.
+  *
+@@ -243,7 +245,8 @@ extern void ttm_base_object_unref(struct
+  */
+ extern int ttm_ref_object_add(struct ttm_object_file *tfile,
+ 			      struct ttm_base_object *base,
+-			      enum ttm_ref_type ref_type, bool *existed);
++			      enum ttm_ref_type ref_type, bool *existed,
++			      bool require_existed);
+ 
+ extern bool ttm_ref_object_exists(struct ttm_object_file *tfile,
+ 				  struct ttm_base_object *base);
