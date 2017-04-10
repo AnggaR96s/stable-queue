@@ -1,0 +1,150 @@
+From foo@baz Mon Apr 10 17:43:56 CEST 2017
+From: alexander.levin@verizon.com
+Date: Tue, 4 Apr 2017 19:32:17 +0000
+Subject: ACPI / sysfs: Provide quirk mechanism to prevent GPE flooding
+To: "gregkh@linuxfoundation.org" <gregkh@linuxfoundation.org>
+Cc: "stable@vger.kernel.org" <stable@vger.kernel.org>
+Message-ID: <20170404193158.19041-41-alexander.levin@verizon.com>
+
+From: Lv Zheng <lv.zheng@intel.com>
+
+[ Upstream commit 9c4aa1eecb48cfac18ed5e3aca9d9ae58fbafc11 ]
+
+Sometimes, the users may require a quirk to be provided from ACPI subsystem
+core to prevent a GPE from flooding.
+Normally, if a GPE cannot be dispatched, ACPICA core automatically prevents
+the GPE from firing. But there are cases the GPE is dispatched by _Lxx/_Exx
+provided via AML table, and OSPM is lacking of the knowledge to get
+_Lxx/_Exx correctly executed to handle the GPE, thus the GPE flooding may
+still occur.
+
+The existing quirk mechanism can be enabled/disabled using the following
+commands to prevent such kind of GPE flooding during runtime:
+ # echo mask > /sys/firmware/acpi/interrupts/gpe00
+ # echo unmask > /sys/firmware/acpi/interrupts/gpe00
+To avoid GPE flooding during boot, we need a boot stage mechanism.
+
+This patch provides such a boot stage quirk mechanism to stop this kind of
+GPE flooding. This patch doesn't fix any feature gap but since the new
+feature gaps could be found in the future endlessly, and can disappear if
+the feature gaps are filled, providing a boot parameter rather than a DMI
+table should suffice.
+
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=53071
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=117481
+Link: https://bugs.launchpad.net/ubuntu/+source/linux/+bug/887793
+Signed-off-by: Lv Zheng <lv.zheng@intel.com>
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ Documentation/kernel-parameters.txt |   10 ++++++
+ drivers/acpi/internal.h             |    1 
+ drivers/acpi/scan.c                 |    1 
+ drivers/acpi/sysfs.c                |   56 ++++++++++++++++++++++++++++++++++++
+ 4 files changed, 68 insertions(+)
+
+--- a/Documentation/kernel-parameters.txt
++++ b/Documentation/kernel-parameters.txt
+@@ -305,6 +305,16 @@ bytes respectively. Such letter suffixes
+ 			use by PCI
+ 			Format: <irq>,<irq>...
+ 
++	acpi_mask_gpe=  [HW,ACPI]
++			Due to the existence of _Lxx/_Exx, some GPEs triggered
++			by unsupported hardware/firmware features can result in
++                        GPE floodings that cannot be automatically disabled by
++                        the GPE dispatcher.
++			This facility can be used to prevent such uncontrolled
++			GPE floodings.
++			Format: <int>
++			Support masking of GPEs numbered from 0x00 to 0x7f.
++
+ 	acpi_no_auto_serialize	[HW,ACPI]
+ 			Disable auto-serialization of AML methods
+ 			AML control methods that contain the opcodes to create
+--- a/drivers/acpi/internal.h
++++ b/drivers/acpi/internal.h
+@@ -37,6 +37,7 @@ void acpi_amba_init(void);
+ static inline void acpi_amba_init(void) {}
+ #endif
+ int acpi_sysfs_init(void);
++void acpi_gpe_apply_masked_gpes(void);
+ void acpi_container_init(void);
+ void acpi_memory_hotplug_init(void);
+ #ifdef	CONFIG_ACPI_HOTPLUG_IOAPIC
+--- a/drivers/acpi/scan.c
++++ b/drivers/acpi/scan.c
+@@ -2044,6 +2044,7 @@ int __init acpi_scan_init(void)
+ 		}
+ 	}
+ 
++	acpi_gpe_apply_masked_gpes();
+ 	acpi_update_all_gpes();
+ 	acpi_ec_ecdt_start();
+ 
+--- a/drivers/acpi/sysfs.c
++++ b/drivers/acpi/sysfs.c
+@@ -708,6 +708,62 @@ end:
+ 	return result ? result : size;
+ }
+ 
++/*
++ * A Quirk Mechanism for GPE Flooding Prevention:
++ *
++ * Quirks may be needed to prevent GPE flooding on a specific GPE. The
++ * flooding typically cannot be detected and automatically prevented by
++ * ACPI_GPE_DISPATCH_NONE check because there is a _Lxx/_Exx prepared in
++ * the AML tables. This normally indicates a feature gap in Linux, thus
++ * instead of providing endless quirk tables, we provide a boot parameter
++ * for those who want this quirk. For example, if the users want to prevent
++ * the GPE flooding for GPE 00, they need to specify the following boot
++ * parameter:
++ *   acpi_mask_gpe=0x00
++ * The masking status can be modified by the following runtime controlling
++ * interface:
++ *   echo unmask > /sys/firmware/acpi/interrupts/gpe00
++ */
++
++/*
++ * Currently, the GPE flooding prevention only supports to mask the GPEs
++ * numbered from 00 to 7f.
++ */
++#define ACPI_MASKABLE_GPE_MAX	0x80
++
++static u64 __initdata acpi_masked_gpes;
++
++static int __init acpi_gpe_set_masked_gpes(char *val)
++{
++	u8 gpe;
++
++	if (kstrtou8(val, 0, &gpe) || gpe > ACPI_MASKABLE_GPE_MAX)
++		return -EINVAL;
++	acpi_masked_gpes |= ((u64)1<<gpe);
++
++	return 1;
++}
++__setup("acpi_mask_gpe=", acpi_gpe_set_masked_gpes);
++
++void __init acpi_gpe_apply_masked_gpes(void)
++{
++	acpi_handle handle;
++	acpi_status status;
++	u8 gpe;
++
++	for (gpe = 0;
++	     gpe < min_t(u8, ACPI_MASKABLE_GPE_MAX, acpi_current_gpe_count);
++	     gpe++) {
++		if (acpi_masked_gpes & ((u64)1<<gpe)) {
++			status = acpi_get_gpe_device(gpe, &handle);
++			if (ACPI_SUCCESS(status)) {
++				pr_info("Masking GPE 0x%x.\n", gpe);
++				(void)acpi_mask_gpe(handle, gpe, TRUE);
++			}
++		}
++	}
++}
++
+ void acpi_irq_stats_init(void)
+ {
+ 	acpi_status status;

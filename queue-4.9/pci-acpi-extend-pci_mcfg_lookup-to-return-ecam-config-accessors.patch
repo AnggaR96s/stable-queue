@@ -1,0 +1,144 @@
+From foo@baz Mon Apr 10 17:43:56 CEST 2017
+From: alexander.levin@verizon.com
+Date: Tue, 4 Apr 2017 19:32:09 +0000
+Subject: PCI/ACPI: Extend pci_mcfg_lookup() to return ECAM config accessors
+To: "gregkh@linuxfoundation.org" <gregkh@linuxfoundation.org>
+Cc: "stable@vger.kernel.org" <stable@vger.kernel.org>
+Message-ID: <20170404193158.19041-22-alexander.levin@verizon.com>
+
+From: Tomasz Nowicki <tn@semihalf.com>
+
+[ Upstream commit 13983eb89d5afaa65acd4479fad151cbd4de5509 ]
+
+pci_mcfg_lookup() is the external interface to the generic MCFG code.
+Previously it merely looked up the ECAM base address for a given domain and
+bus range.  We want a way to add MCFG quirks, some of which may require
+special config accessors and adjustments to the ECAM address range.
+
+Extend pci_mcfg_lookup() so it can return a pointer to a pci_ecam_ops
+structure and a struct resource for the ECAM address space.  For now, it
+always returns &pci_generic_ecam_ops (the standard accessor) and the
+resource described by the MCFG.
+
+No functional changes intended.
+
+[bhelgaas: changelog]
+Signed-off-by: Tomasz Nowicki <tn@semihalf.com>
+Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/arm64/kernel/pci.c  |   17 +++++------------
+ drivers/acpi/pci_mcfg.c  |   28 +++++++++++++++++++++++++---
+ include/linux/pci-acpi.h |    4 +++-
+ 3 files changed, 33 insertions(+), 16 deletions(-)
+
+--- a/arch/arm64/kernel/pci.c
++++ b/arch/arm64/kernel/pci.c
+@@ -124,25 +124,18 @@ pci_acpi_setup_ecam_mapping(struct acpi_
+ 	struct device *dev = &root->device->dev;
+ 	struct resource *bus_res = &root->secondary;
+ 	u16 seg = root->segment;
++	struct pci_ecam_ops *ecam_ops;
+ 	struct resource cfgres;
+ 	struct acpi_device *adev;
+ 	struct pci_config_window *cfg;
+-	unsigned int bsz;
++	int ret;
+ 
+-	/* Use address from _CBA if present, otherwise lookup MCFG */
+-	if (!root->mcfg_addr)
+-		root->mcfg_addr = pci_mcfg_lookup(seg, bus_res);
+-
+-	if (!root->mcfg_addr) {
++	ret = pci_mcfg_lookup(root, &cfgres, &ecam_ops);
++	if (ret) {
+ 		dev_err(dev, "%04x:%pR ECAM region not found\n", seg, bus_res);
+ 		return NULL;
+ 	}
+ 
+-	bsz = 1 << pci_generic_ecam_ops.bus_shift;
+-	cfgres.start = root->mcfg_addr + bus_res->start * bsz;
+-	cfgres.end = cfgres.start + resource_size(bus_res) * bsz - 1;
+-	cfgres.flags = IORESOURCE_MEM;
+-
+ 	adev = acpi_resource_consumer(&cfgres);
+ 	if (adev)
+ 		dev_info(dev, "ECAM area %pR reserved by %s\n", &cfgres,
+@@ -151,7 +144,7 @@ pci_acpi_setup_ecam_mapping(struct acpi_
+ 		dev_warn(dev, FW_BUG "ECAM area %pR not reserved in ACPI namespace\n",
+ 			 &cfgres);
+ 
+-	cfg = pci_ecam_create(dev, &cfgres, bus_res, &pci_generic_ecam_ops);
++	cfg = pci_ecam_create(dev, &cfgres, bus_res, ecam_ops);
+ 	if (IS_ERR(cfg)) {
+ 		dev_err(dev, "%04x:%pR error %ld mapping ECAM\n", seg, bus_res,
+ 			PTR_ERR(cfg));
+--- a/drivers/acpi/pci_mcfg.c
++++ b/drivers/acpi/pci_mcfg.c
+@@ -22,6 +22,7 @@
+ #include <linux/kernel.h>
+ #include <linux/pci.h>
+ #include <linux/pci-acpi.h>
++#include <linux/pci-ecam.h>
+ 
+ /* Structure to hold entries from the MCFG table */
+ struct mcfg_entry {
+@@ -35,9 +36,18 @@ struct mcfg_entry {
+ /* List to save MCFG entries */
+ static LIST_HEAD(pci_mcfg_list);
+ 
+-phys_addr_t pci_mcfg_lookup(u16 seg, struct resource *bus_res)
++int pci_mcfg_lookup(struct acpi_pci_root *root, struct resource *cfgres,
++		    struct pci_ecam_ops **ecam_ops)
+ {
++	struct pci_ecam_ops *ops = &pci_generic_ecam_ops;
++	struct resource *bus_res = &root->secondary;
++	u16 seg = root->segment;
+ 	struct mcfg_entry *e;
++	struct resource res;
++
++	/* Use address from _CBA if present, otherwise lookup MCFG */
++	if (root->mcfg_addr)
++		goto skip_lookup;
+ 
+ 	/*
+ 	 * We expect exact match, unless MCFG entry end bus covers more than
+@@ -45,10 +55,22 @@ phys_addr_t pci_mcfg_lookup(u16 seg, str
+ 	 */
+ 	list_for_each_entry(e, &pci_mcfg_list, list) {
+ 		if (e->segment == seg && e->bus_start == bus_res->start &&
+-		    e->bus_end >= bus_res->end)
+-			return e->addr;
++		    e->bus_end >= bus_res->end) {
++			root->mcfg_addr = e->addr;
++		}
++
+ 	}
+ 
++	if (!root->mcfg_addr)
++		return -ENXIO;
++
++skip_lookup:
++	memset(&res, 0, sizeof(res));
++	res.start = root->mcfg_addr + (bus_res->start << 20);
++	res.end = res.start + (resource_size(bus_res) << 20) - 1;
++	res.flags = IORESOURCE_MEM;
++	*cfgres = res;
++	*ecam_ops = ops;
+ 	return 0;
+ }
+ 
+--- a/include/linux/pci-acpi.h
++++ b/include/linux/pci-acpi.h
+@@ -24,7 +24,9 @@ static inline acpi_status pci_acpi_remov
+ }
+ extern phys_addr_t acpi_pci_root_get_mcfg_addr(acpi_handle handle);
+ 
+-extern phys_addr_t pci_mcfg_lookup(u16 domain, struct resource *bus_res);
++struct pci_ecam_ops;
++extern int pci_mcfg_lookup(struct acpi_pci_root *root, struct resource *cfgres,
++			   struct pci_ecam_ops **ecam_ops);
+ 
+ static inline acpi_handle acpi_find_root_bridge_handle(struct pci_dev *pdev)
+ {

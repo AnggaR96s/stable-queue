@@ -1,0 +1,173 @@
+From foo@baz Mon Apr 10 17:43:56 CEST 2017
+From: alexander.levin@verizon.com
+Date: Tue, 4 Apr 2017 19:32:29 +0000
+Subject: ASoC: Intel: cht_bsw_rt5645: add Baytrail MCLK support
+To: "gregkh@linuxfoundation.org" <gregkh@linuxfoundation.org>
+Cc: "stable@vger.kernel.org" <stable@vger.kernel.org>
+Message-ID: <20170404193158.19041-74-alexander.levin@verizon.com>
+
+From: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+
+[ Upstream commit a50477e55fff69e1028f25624ee9fc9182d59b1f ]
+
+The existing code assumes a 19.2 MHz MCLK as the default
+hardware configuration. This is valid for CherryTrail but
+not for Baytrail.
+
+Add explicit MCLK configuration to set the 19.2 clock on/off
+depending on DAPM events.
+
+This is a prerequisite step to enable devices with Baytrail
+and RT5645 such as Asus X205TA
+
+Signed-off-by: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+Signed-off-by: Mark Brown <broonie@kernel.org>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ sound/soc/intel/boards/cht_bsw_rt5645.c |   84 +++++++++++++++++++++++++++-----
+ 1 file changed, 71 insertions(+), 13 deletions(-)
+
+--- a/sound/soc/intel/boards/cht_bsw_rt5645.c
++++ b/sound/soc/intel/boards/cht_bsw_rt5645.c
+@@ -24,6 +24,9 @@
+ #include <linux/acpi.h>
+ #include <linux/platform_device.h>
+ #include <linux/slab.h>
++#include <asm/cpu_device_id.h>
++#include <asm/platform_sst_audio.h>
++#include <linux/clk.h>
+ #include <sound/pcm.h>
+ #include <sound/pcm_params.h>
+ #include <sound/soc.h>
+@@ -45,6 +48,7 @@ struct cht_mc_private {
+ 	struct snd_soc_jack jack;
+ 	struct cht_acpi_card *acpi_card;
+ 	char codec_name[16];
++	struct clk *mclk;
+ };
+ 
+ static inline struct snd_soc_dai *cht_get_codec_dai(struct snd_soc_card *card)
+@@ -65,6 +69,7 @@ static int platform_clock_control(struct
+ 	struct snd_soc_dapm_context *dapm = w->dapm;
+ 	struct snd_soc_card *card = dapm->card;
+ 	struct snd_soc_dai *codec_dai;
++	struct cht_mc_private *ctx = snd_soc_card_get_drvdata(card);
+ 	int ret;
+ 
+ 	codec_dai = cht_get_codec_dai(card);
+@@ -73,19 +78,30 @@ static int platform_clock_control(struct
+ 		return -EIO;
+ 	}
+ 
+-	if (!SND_SOC_DAPM_EVENT_OFF(event))
+-		return 0;
++	if (SND_SOC_DAPM_EVENT_ON(event)) {
++		if (ctx->mclk) {
++			ret = clk_prepare_enable(ctx->mclk);
++			if (ret < 0) {
++				dev_err(card->dev,
++					"could not configure MCLK state");
++				return ret;
++			}
++		}
++	} else {
++		/* Set codec sysclk source to its internal clock because codec PLL will
++		 * be off when idle and MCLK will also be off when codec is
++		 * runtime suspended. Codec needs clock for jack detection and button
++		 * press. MCLK is turned off with clock framework or ACPI.
++		 */
++		ret = snd_soc_dai_set_sysclk(codec_dai, RT5645_SCLK_S_RCCLK,
++					48000 * 512, SND_SOC_CLOCK_IN);
++		if (ret < 0) {
++			dev_err(card->dev, "can't set codec sysclk: %d\n", ret);
++			return ret;
++		}
+ 
+-	/* Set codec sysclk source to its internal clock because codec PLL will
+-	 * be off when idle and MCLK will also be off by ACPI when codec is
+-	 * runtime suspended. Codec needs clock for jack detection and button
+-	 * press.
+-	 */
+-	ret = snd_soc_dai_set_sysclk(codec_dai, RT5645_SCLK_S_RCCLK,
+-			0, SND_SOC_CLOCK_IN);
+-	if (ret < 0) {
+-		dev_err(card->dev, "can't set codec sysclk: %d\n", ret);
+-		return ret;
++		if (ctx->mclk)
++			clk_disable_unprepare(ctx->mclk);
+ 	}
+ 
+ 	return 0;
+@@ -97,7 +113,7 @@ static const struct snd_soc_dapm_widget
+ 	SND_SOC_DAPM_MIC("Int Mic", NULL),
+ 	SND_SOC_DAPM_SPK("Ext Spk", NULL),
+ 	SND_SOC_DAPM_SUPPLY("Platform Clock", SND_SOC_NOPM, 0, 0,
+-			platform_clock_control, SND_SOC_DAPM_POST_PMD),
++			platform_clock_control, SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMD),
+ };
+ 
+ static const struct snd_soc_dapm_route cht_rt5645_audio_map[] = {
+@@ -225,6 +241,26 @@ static int cht_codec_init(struct snd_soc
+ 
+ 	rt5645_set_jack_detect(codec, &ctx->jack, &ctx->jack, &ctx->jack);
+ 
++	if (ctx->mclk) {
++		/*
++		 * The firmware might enable the clock at
++		 * boot (this information may or may not
++		 * be reflected in the enable clock register).
++		 * To change the rate we must disable the clock
++		 * first to cover these cases. Due to common
++		 * clock framework restrictions that do not allow
++		 * to disable a clock that has not been enabled,
++		 * we need to enable the clock first.
++		 */
++		ret = clk_prepare_enable(ctx->mclk);
++		if (!ret)
++			clk_disable_unprepare(ctx->mclk);
++
++		ret = clk_set_rate(ctx->mclk, CHT_PLAT_CLK_3_HZ);
++
++		if (ret)
++			dev_err(runtime->dev, "unable to set MCLK rate\n");
++	}
+ 	return ret;
+ }
+ 
+@@ -349,6 +385,18 @@ static struct cht_acpi_card snd_soc_card
+ 
+ static char cht_rt5640_codec_name[16]; /* i2c-<HID>:00 with HID being 8 chars */
+ 
++static bool is_valleyview(void)
++{
++	static const struct x86_cpu_id cpu_ids[] = {
++		{ X86_VENDOR_INTEL, 6, 55 }, /* Valleyview, Bay Trail */
++		{}
++	};
++
++	if (!x86_match_cpu(cpu_ids))
++		return false;
++	return true;
++}
++
+ static int snd_cht_mc_probe(struct platform_device *pdev)
+ {
+ 	int ret_val = 0;
+@@ -401,6 +449,16 @@ static int snd_cht_mc_probe(struct platf
+ 		cht_dailink[dai_index].codec_name = cht_rt5640_codec_name;
+ 	}
+ 
++	if (is_valleyview()) {
++		drv->mclk = devm_clk_get(&pdev->dev, "pmc_plt_clk_3");
++		if (IS_ERR(drv->mclk)) {
++			dev_err(&pdev->dev,
++				"Failed to get MCLK from pmc_plt_clk_3: %ld\n",
++				PTR_ERR(drv->mclk));
++			return PTR_ERR(drv->mclk);
++		}
++	}
++
+ 	snd_soc_card_set_drvdata(card, drv);
+ 	ret_val = devm_snd_soc_register_card(&pdev->dev, card);
+ 	if (ret_val) {
