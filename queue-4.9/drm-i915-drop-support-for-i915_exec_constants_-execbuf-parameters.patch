@@ -1,0 +1,174 @@
+From 0f5418e564ac6452b9086295646e602a9addc4bf Mon Sep 17 00:00:00 2001
+From: Kenneth Graunke <kenneth@whitecape.org>
+Date: Mon, 13 Mar 2017 17:04:33 +0000
+Subject: drm/i915: Drop support for I915_EXEC_CONSTANTS_* execbuf parameters.
+
+From: Kenneth Graunke <kenneth@whitecape.org>
+
+commit 0f5418e564ac6452b9086295646e602a9addc4bf upstream.
+
+This patch makes the I915_PARAM_HAS_EXEC_CONSTANTS getparam return 0
+(indicating the optional feature is not supported), and makes execbuf
+always return -EINVAL if the flags are used.
+
+Apparently, no userspace ever shipped which used this optional feature:
+I checked the git history of Mesa, xf86-video-intel, libva, and Beignet,
+and there were zero commits showing a use of these flags.  Kernel commit
+72bfa19c8deb4 apparently introduced the feature prematurely.  According
+to Chris, the intention was to use this in cairo-drm, but "the use was
+broken for gen6", so I don't think it ever happened.
+
+'relative_constants_mode' has always been tracked per-device, but this
+has actually been wrong ever since hardware contexts were introduced, as
+the INSTPM register is saved (and automatically restored) as part of the
+render ring context. The software per-device value could therefore get
+out of sync with the hardware per-context value.  This meant that using
+them is actually unsafe: a client which tried to use them could damage
+the state of other clients, causing the GPU to interpret their BO
+offsets as absolute pointers, leading to bogus memory reads.
+
+These flags were also never ported to execlist mode, making them no-ops
+on Gen9+ (which requires execlists), and Gen8 in the default mode.
+
+On Gen8+, userspace can write these registers directly, achieving the
+same effect.  On Gen6-7.5, it likely makes sense to extend the command
+parser to support them.  I don't think anyone wants this on Gen4-5.
+
+Based on a patch by Dave Gordon.
+
+v3: Return -ENODEV for the getparam, as this is what we do for other
+    obsolete features.  Suggested by Chris Wilson.
+
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=92448
+Signed-off-by: Kenneth Graunke <kenneth@whitecape.org>
+Reviewed-by: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Link: http://patchwork.freedesktop.org/patch/msgid/20170215093446.21291-1-kenneth@whitecape.org
+Acked-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Link: http://patchwork.freedesktop.org/patch/msgid/20170313170433.26843-1-chris@chris-wilson.co.uk
+(cherry picked from commit ef0f411f51475f4eebf9fc1b19a85be698af19ff)
+Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/gpu/drm/i915/i915_drv.c            |    4 --
+ drivers/gpu/drm/i915/i915_drv.h            |    2 -
+ drivers/gpu/drm/i915/i915_gem.c            |    2 -
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |   52 +----------------------------
+ 4 files changed, 3 insertions(+), 57 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -240,6 +240,7 @@ static int i915_getparam(struct drm_devi
+ 	case I915_PARAM_IRQ_ACTIVE:
+ 	case I915_PARAM_ALLOW_BATCHBUFFER:
+ 	case I915_PARAM_LAST_DISPATCH:
++	case I915_PARAM_HAS_EXEC_CONSTANTS:
+ 		/* Reject all old ums/dri params. */
+ 		return -ENODEV;
+ 	case I915_PARAM_CHIPSET_ID:
+@@ -266,9 +267,6 @@ static int i915_getparam(struct drm_devi
+ 	case I915_PARAM_HAS_BSD2:
+ 		value = intel_engine_initialized(&dev_priv->engine[VCS2]);
+ 		break;
+-	case I915_PARAM_HAS_EXEC_CONSTANTS:
+-		value = INTEL_GEN(dev_priv) >= 4;
+-		break;
+ 	case I915_PARAM_HAS_LLC:
+ 		value = HAS_LLC(dev_priv);
+ 		break;
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1751,8 +1751,6 @@ struct drm_i915_private {
+ 
+ 	const struct intel_device_info info;
+ 
+-	int relative_constants_mode;
+-
+ 	void __iomem *regs;
+ 
+ 	struct intel_uncore uncore;
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -4587,8 +4587,6 @@ i915_gem_load_init(struct drm_device *de
+ 	init_waitqueue_head(&dev_priv->gpu_error.wait_queue);
+ 	init_waitqueue_head(&dev_priv->gpu_error.reset_queue);
+ 
+-	dev_priv->relative_constants_mode = I915_EXEC_CONSTANTS_REL_GENERAL;
+-
+ 	init_waitqueue_head(&dev_priv->pending_flip_queue);
+ 
+ 	dev_priv->mm.interruptible = true;
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -1454,10 +1454,7 @@ execbuf_submit(struct i915_execbuffer_pa
+ 	       struct drm_i915_gem_execbuffer2 *args,
+ 	       struct list_head *vmas)
+ {
+-	struct drm_i915_private *dev_priv = params->request->i915;
+ 	u64 exec_start, exec_len;
+-	int instp_mode;
+-	u32 instp_mask;
+ 	int ret;
+ 
+ 	ret = i915_gem_execbuffer_move_to_gpu(params->request, vmas);
+@@ -1468,56 +1465,11 @@ execbuf_submit(struct i915_execbuffer_pa
+ 	if (ret)
+ 		return ret;
+ 
+-	instp_mode = args->flags & I915_EXEC_CONSTANTS_MASK;
+-	instp_mask = I915_EXEC_CONSTANTS_MASK;
+-	switch (instp_mode) {
+-	case I915_EXEC_CONSTANTS_REL_GENERAL:
+-	case I915_EXEC_CONSTANTS_ABSOLUTE:
+-	case I915_EXEC_CONSTANTS_REL_SURFACE:
+-		if (instp_mode != 0 && params->engine->id != RCS) {
+-			DRM_DEBUG("non-0 rel constants mode on non-RCS\n");
+-			return -EINVAL;
+-		}
+-
+-		if (instp_mode != dev_priv->relative_constants_mode) {
+-			if (INTEL_INFO(dev_priv)->gen < 4) {
+-				DRM_DEBUG("no rel constants on pre-gen4\n");
+-				return -EINVAL;
+-			}
+-
+-			if (INTEL_INFO(dev_priv)->gen > 5 &&
+-			    instp_mode == I915_EXEC_CONSTANTS_REL_SURFACE) {
+-				DRM_DEBUG("rel surface constants mode invalid on gen5+\n");
+-				return -EINVAL;
+-			}
+-
+-			/* The HW changed the meaning on this bit on gen6 */
+-			if (INTEL_INFO(dev_priv)->gen >= 6)
+-				instp_mask &= ~I915_EXEC_CONSTANTS_REL_SURFACE;
+-		}
+-		break;
+-	default:
+-		DRM_DEBUG("execbuf with unknown constants: %d\n", instp_mode);
++	if (args->flags & I915_EXEC_CONSTANTS_MASK) {
++		DRM_DEBUG("I915_EXEC_CONSTANTS_* unsupported\n");
+ 		return -EINVAL;
+ 	}
+ 
+-	if (params->engine->id == RCS &&
+-	    instp_mode != dev_priv->relative_constants_mode) {
+-		struct intel_ring *ring = params->request->ring;
+-
+-		ret = intel_ring_begin(params->request, 4);
+-		if (ret)
+-			return ret;
+-
+-		intel_ring_emit(ring, MI_NOOP);
+-		intel_ring_emit(ring, MI_LOAD_REGISTER_IMM(1));
+-		intel_ring_emit_reg(ring, INSTPM);
+-		intel_ring_emit(ring, instp_mask << 16 | instp_mode);
+-		intel_ring_advance(ring);
+-
+-		dev_priv->relative_constants_mode = instp_mode;
+-	}
+-
+ 	if (args->flags & I915_EXEC_GEN7_SOL_RESET) {
+ 		ret = i915_reset_gen7_sol_offsets(params->request);
+ 		if (ret)
