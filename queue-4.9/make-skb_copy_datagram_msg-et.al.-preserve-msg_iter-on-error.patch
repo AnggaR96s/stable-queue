@@ -1,0 +1,136 @@
+From 3278682123811dd8ef07de5eb701fc4548fcebf2 Mon Sep 17 00:00:00 2001
+From: Al Viro <viro@zeniv.linux.org.uk>
+Date: Fri, 17 Feb 2017 20:16:34 -0500
+Subject: make skb_copy_datagram_msg() et.al. preserve ->msg_iter on error
+
+From: Al Viro <viro@zeniv.linux.org.uk>
+
+commit 3278682123811dd8ef07de5eb701fc4548fcebf2 upstream.
+
+Fixes the mess observed in e.g. rsync over a noisy link we'd been
+seeing since last Summer.  What happens is that we copy part of
+a datagram before noticing a checksum mismatch.  Datagram will be
+resent, all right, but we want the next try go into the same place,
+not after it...
+
+All this family of primitives (copy/checksum and copy a datagram
+into destination) is "all or nothing" sort of interface - either
+we get 0 (meaning that copy had been successful) or we get an
+error (and no way to tell how much had been copied before we ran
+into whatever error it had been).  Make all of them leave iterator
+unadvanced in case of errors - all callers must be able to cope
+with that (an error might've been caught before the iterator had
+been advanced), it costs very little to arrange, it's safer for
+callers and actually fixes at least one bug in said callers.
+
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ net/core/datagram.c |   23 ++++++++++++++---------
+ 1 file changed, 14 insertions(+), 9 deletions(-)
+
+--- a/net/core/datagram.c
++++ b/net/core/datagram.c
+@@ -378,7 +378,7 @@ int skb_copy_datagram_iter(const struct
+ 			   struct iov_iter *to, int len)
+ {
+ 	int start = skb_headlen(skb);
+-	int i, copy = start - offset;
++	int i, copy = start - offset, start_off = offset, n;
+ 	struct sk_buff *frag_iter;
+ 
+ 	trace_skb_copy_datagram_iovec(skb, len);
+@@ -387,11 +387,12 @@ int skb_copy_datagram_iter(const struct
+ 	if (copy > 0) {
+ 		if (copy > len)
+ 			copy = len;
+-		if (copy_to_iter(skb->data + offset, copy, to) != copy)
++		n = copy_to_iter(skb->data + offset, copy, to);
++		offset += n;
++		if (n != copy)
+ 			goto short_copy;
+ 		if ((len -= copy) == 0)
+ 			return 0;
+-		offset += copy;
+ 	}
+ 
+ 	/* Copy paged appendix. Hmm... why does this look so complicated? */
+@@ -405,13 +406,14 @@ int skb_copy_datagram_iter(const struct
+ 		if ((copy = end - offset) > 0) {
+ 			if (copy > len)
+ 				copy = len;
+-			if (copy_page_to_iter(skb_frag_page(frag),
++			n = copy_page_to_iter(skb_frag_page(frag),
+ 					      frag->page_offset + offset -
+-					      start, copy, to) != copy)
++					      start, copy, to);
++			offset += n;
++			if (n != copy)
+ 				goto short_copy;
+ 			if (!(len -= copy))
+ 				return 0;
+-			offset += copy;
+ 		}
+ 		start = end;
+ 	}
+@@ -443,6 +445,7 @@ int skb_copy_datagram_iter(const struct
+ 	 */
+ 
+ fault:
++	iov_iter_revert(to, offset - start_off);
+ 	return -EFAULT;
+ 
+ short_copy:
+@@ -593,7 +596,7 @@ static int skb_copy_and_csum_datagram(co
+ 				      __wsum *csump)
+ {
+ 	int start = skb_headlen(skb);
+-	int i, copy = start - offset;
++	int i, copy = start - offset, start_off = offset;
+ 	struct sk_buff *frag_iter;
+ 	int pos = 0;
+ 	int n;
+@@ -603,11 +606,11 @@ static int skb_copy_and_csum_datagram(co
+ 		if (copy > len)
+ 			copy = len;
+ 		n = csum_and_copy_to_iter(skb->data + offset, copy, csump, to);
++		offset += n;
+ 		if (n != copy)
+ 			goto fault;
+ 		if ((len -= copy) == 0)
+ 			return 0;
+-		offset += copy;
+ 		pos = copy;
+ 	}
+ 
+@@ -629,12 +632,12 @@ static int skb_copy_and_csum_datagram(co
+ 						  offset - start, copy,
+ 						  &csum2, to);
+ 			kunmap(page);
++			offset += n;
+ 			if (n != copy)
+ 				goto fault;
+ 			*csump = csum_block_add(*csump, csum2, pos);
+ 			if (!(len -= copy))
+ 				return 0;
+-			offset += copy;
+ 			pos += copy;
+ 		}
+ 		start = end;
+@@ -667,6 +670,7 @@ static int skb_copy_and_csum_datagram(co
+ 		return 0;
+ 
+ fault:
++	iov_iter_revert(to, offset - start_off);
+ 	return -EFAULT;
+ }
+ 
+@@ -751,6 +755,7 @@ int skb_copy_and_csum_datagram_msg(struc
+ 	}
+ 	return 0;
+ csum_error:
++	iov_iter_revert(&msg->msg_iter, chunk);
+ 	return -EINVAL;
+ fault:
+ 	return -EFAULT;
