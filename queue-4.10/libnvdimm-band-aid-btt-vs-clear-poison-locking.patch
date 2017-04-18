@@ -1,0 +1,76 @@
+From 4aa5615e080a9855e607accc75b07ab79b252dde Mon Sep 17 00:00:00 2001
+From: Dan Williams <dan.j.williams@intel.com>
+Date: Fri, 7 Apr 2017 12:25:52 -0700
+Subject: libnvdimm: band aid btt vs clear poison locking
+
+From: Dan Williams <dan.j.williams@intel.com>
+
+commit 4aa5615e080a9855e607accc75b07ab79b252dde upstream.
+
+The following warning results from holding a lane spinlock,
+preempt_disable(), or the btt map spinlock and then trying to take the
+reconfig_mutex to walk the poison list and potentially add new entries.
+
+ BUG: sleeping function called from invalid context at kernel/locking/mutex.c:747
+ in_atomic(): 1, irqs_disabled(): 0, pid: 17159, name: dd
+ [..]
+ Call Trace:
+  dump_stack+0x85/0xc8
+  ___might_sleep+0x184/0x250
+  __might_sleep+0x4a/0x90
+  __mutex_lock+0x58/0x9b0
+  ? nvdimm_bus_lock+0x21/0x30 [libnvdimm]
+  ? __nvdimm_bus_badblocks_clear+0x2f/0x60 [libnvdimm]
+  ? acpi_nfit_forget_poison+0x79/0x80 [nfit]
+  ? _raw_spin_unlock+0x27/0x40
+  mutex_lock_nested+0x1b/0x20
+  nvdimm_bus_lock+0x21/0x30 [libnvdimm]
+  nvdimm_forget_poison+0x25/0x50 [libnvdimm]
+  nvdimm_clear_poison+0x106/0x140 [libnvdimm]
+  nsio_rw_bytes+0x164/0x270 [libnvdimm]
+  btt_write_pg+0x1de/0x3e0 [nd_btt]
+  ? blk_queue_enter+0x30/0x290
+  btt_make_request+0x11a/0x310 [nd_btt]
+  ? blk_queue_enter+0xb7/0x290
+  ? blk_queue_enter+0x30/0x290
+  generic_make_request+0x118/0x3b0
+
+As a minimal fix, disable error clearing when the BTT is enabled for the
+namespace. For the final fix a larger rework of the poison list locking
+is needed.
+
+Note that this is not a problem in the blk case since that path never
+calls nvdimm_clear_poison().
+
+Fixes: 82bf1037f2ca ("libnvdimm: check and clear poison before writing to pmem")
+Cc: Dave Jiang <dave.jiang@intel.com>
+[jeff: dynamically disable error clearing in the btt case]
+Suggested-by: Jeff Moyer <jmoyer@redhat.com>
+Reviewed-by: Jeff Moyer <jmoyer@redhat.com>
+Reported-by: Vishal Verma <vishal.l.verma@intel.com>
+Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/nvdimm/claim.c |   10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+--- a/drivers/nvdimm/claim.c
++++ b/drivers/nvdimm/claim.c
+@@ -243,7 +243,15 @@ static int nsio_rw_bytes(struct nd_names
+ 	}
+ 
+ 	if (unlikely(is_bad_pmem(&nsio->bb, sector, sz_align))) {
+-		if (IS_ALIGNED(offset, 512) && IS_ALIGNED(size, 512)) {
++		/*
++		 * FIXME: nsio_rw_bytes() may be called from atomic
++		 * context in the btt case and nvdimm_clear_poison()
++		 * takes a sleeping lock. Until the locking can be
++		 * reworked this capability requires that the namespace
++		 * is not claimed by btt.
++		 */
++		if (IS_ALIGNED(offset, 512) && IS_ALIGNED(size, 512)
++				&& (!ndns->claim || !is_nd_btt(ndns->claim))) {
+ 			long cleared;
+ 
+ 			cleared = nvdimm_clear_poison(&ndns->dev, offset, size);
