@@ -1,0 +1,120 @@
+From 1ec1688c5360e14dde4094d6acbf7516bf6db37e Mon Sep 17 00:00:00 2001
+From: Martin Brandenburg <martin@omnibond.com>
+Date: Fri, 14 Apr 2017 14:22:41 -0400
+Subject: orangefs: free superblock when mount fails
+
+From: Martin Brandenburg <martin@omnibond.com>
+
+commit 1ec1688c5360e14dde4094d6acbf7516bf6db37e upstream.
+
+Otherwise lockdep says:
+
+[ 1337.483798] ================================================
+[ 1337.483999] [ BUG: lock held when returning to user space! ]
+[ 1337.484252] 4.11.0-rc6 #19 Not tainted
+[ 1337.484423] ------------------------------------------------
+[ 1337.484626] mount/14766 is leaving the kernel with locks still held!
+[ 1337.484841] 1 lock held by mount/14766:
+[ 1337.485017]  #0:  (&type->s_umount_key#33/1){+.+.+.}, at: [<ffffffff8124171f>] sget_userns+0x2af/0x520
+
+Caught by xfstests generic/413 which tried to mount with the unsupported
+mount option dax.  Then xfstests generic/422 ran sync which deadlocks.
+
+Signed-off-by: Martin Brandenburg <martin@omnibond.com>
+Acked-by: Mike Marshall <hubcap@omnibond.com>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/orangefs/devorangefs-req.c |    9 +++++++--
+ fs/orangefs/orangefs-kernel.h |    1 +
+ fs/orangefs/super.c           |   23 ++++++++++++++++-------
+ 3 files changed, 24 insertions(+), 9 deletions(-)
+
+--- a/fs/orangefs/devorangefs-req.c
++++ b/fs/orangefs/devorangefs-req.c
+@@ -208,14 +208,19 @@ restart:
+ 				continue;
+ 			/*
+ 			 * Skip ops whose filesystem we don't know about unless
+-			 * it is being mounted.
++			 * it is being mounted or unmounted.  It is possible for
++			 * a filesystem we don't know about to be unmounted if
++			 * it fails to mount in the kernel after userspace has
++			 * been sent the mount request.
+ 			 */
+ 			/* XXX: is there a better way to detect this? */
+ 			} else if (ret == -1 &&
+ 				   !(op->upcall.type ==
+ 					ORANGEFS_VFS_OP_FS_MOUNT ||
+ 				     op->upcall.type ==
+-					ORANGEFS_VFS_OP_GETATTR)) {
++					ORANGEFS_VFS_OP_GETATTR ||
++				     op->upcall.type ==
++					ORANGEFS_VFS_OP_FS_UMOUNT)) {
+ 				gossip_debug(GOSSIP_DEV_DEBUG,
+ 				    "orangefs: skipping op tag %llu %s\n",
+ 				    llu(op->tag), get_opname_string(op));
+--- a/fs/orangefs/orangefs-kernel.h
++++ b/fs/orangefs/orangefs-kernel.h
+@@ -249,6 +249,7 @@ struct orangefs_sb_info_s {
+ 	char devname[ORANGEFS_MAX_SERVER_ADDR_LEN];
+ 	struct super_block *sb;
+ 	int mount_pending;
++	int no_list;
+ 	struct list_head list;
+ };
+ 
+--- a/fs/orangefs/super.c
++++ b/fs/orangefs/super.c
+@@ -493,7 +493,7 @@ struct dentry *orangefs_mount(struct fil
+ 
+ 	if (ret) {
+ 		d = ERR_PTR(ret);
+-		goto free_op;
++		goto free_sb_and_op;
+ 	}
+ 
+ 	/*
+@@ -519,6 +519,9 @@ struct dentry *orangefs_mount(struct fil
+ 	spin_unlock(&orangefs_superblocks_lock);
+ 	op_release(new_op);
+ 
++	/* Must be removed from the list now. */
++	ORANGEFS_SB(sb)->no_list = 0;
++
+ 	if (orangefs_userspace_version >= 20906) {
+ 		new_op = op_alloc(ORANGEFS_VFS_OP_FEATURES);
+ 		if (!new_op)
+@@ -533,6 +536,10 @@ struct dentry *orangefs_mount(struct fil
+ 
+ 	return dget(sb->s_root);
+ 
++free_sb_and_op:
++	/* Will call orangefs_kill_sb with sb not in list. */
++	ORANGEFS_SB(sb)->no_list = 1;
++	deactivate_locked_super(sb);
+ free_op:
+ 	gossip_err("orangefs_mount: mount request failed with %d\n", ret);
+ 	if (ret == -EINVAL) {
+@@ -558,12 +565,14 @@ void orangefs_kill_sb(struct super_block
+ 	 */
+ 	 orangefs_unmount_sb(sb);
+ 
+-	/* remove the sb from our list of orangefs specific sb's */
+-
+-	spin_lock(&orangefs_superblocks_lock);
+-	__list_del_entry(&ORANGEFS_SB(sb)->list);	/* not list_del_init */
+-	ORANGEFS_SB(sb)->list.prev = NULL;
+-	spin_unlock(&orangefs_superblocks_lock);
++	if (!ORANGEFS_SB(sb)->no_list) {
++		/* remove the sb from our list of orangefs specific sb's */
++		spin_lock(&orangefs_superblocks_lock);
++		/* not list_del_init */
++		__list_del_entry(&ORANGEFS_SB(sb)->list);
++		ORANGEFS_SB(sb)->list.prev = NULL;
++		spin_unlock(&orangefs_superblocks_lock);
++	}
+ 
+ 	/*
+ 	 * make sure that ORANGEFS_DEV_REMOUNT_ALL loop that might've seen us
