@@ -1,0 +1,167 @@
+From 90db10434b163e46da413d34db8d0e77404cc645 Mon Sep 17 00:00:00 2001
+From: David Hildenbrand <david@redhat.com>
+Date: Thu, 23 Mar 2017 18:24:19 +0100
+Subject: KVM: kvm_io_bus_unregister_dev() should never fail
+
+From: David Hildenbrand <david@redhat.com>
+
+commit 90db10434b163e46da413d34db8d0e77404cc645 upstream.
+
+No caller currently checks the return value of
+kvm_io_bus_unregister_dev(). This is evil, as all callers silently go on
+freeing their device. A stale reference will remain in the io_bus,
+getting at least used again, when the iobus gets teared down on
+kvm_destroy_vm() - leading to use after free errors.
+
+There is nothing the callers could do, except retrying over and over
+again.
+
+So let's simply remove the bus altogether, print an error and make
+sure no one can access this broken bus again (returning -ENOMEM on any
+attempt to access it).
+
+Fixes: e93f8a0f821e ("KVM: convert io_bus to SRCU")
+Reported-by: Dmitry Vyukov <dvyukov@google.com>
+Reviewed-by: Cornelia Huck <cornelia.huck@de.ibm.com>
+Signed-off-by: David Hildenbrand <david@redhat.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ include/linux/kvm_host.h |    4 ++--
+ virt/kvm/eventfd.c       |    3 ++-
+ virt/kvm/kvm_main.c      |   40 +++++++++++++++++++++++-----------------
+ 3 files changed, 27 insertions(+), 20 deletions(-)
+
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -177,8 +177,8 @@ int kvm_io_bus_read(struct kvm *kvm, enu
+ 		    void *val);
+ int kvm_io_bus_register_dev(struct kvm *kvm, enum kvm_bus bus_idx, gpa_t addr,
+ 			    int len, struct kvm_io_device *dev);
+-int kvm_io_bus_unregister_dev(struct kvm *kvm, enum kvm_bus bus_idx,
+-			      struct kvm_io_device *dev);
++void kvm_io_bus_unregister_dev(struct kvm *kvm, enum kvm_bus bus_idx,
++			       struct kvm_io_device *dev);
+ 
+ #ifdef CONFIG_KVM_ASYNC_PF
+ struct kvm_async_pf {
+--- a/virt/kvm/eventfd.c
++++ b/virt/kvm/eventfd.c
+@@ -866,7 +866,8 @@ kvm_deassign_ioeventfd_idx(struct kvm *k
+ 			continue;
+ 
+ 		kvm_io_bus_unregister_dev(kvm, bus_idx, &p->dev);
+-		kvm->buses[bus_idx]->ioeventfd_count--;
++		if (kvm->buses[bus_idx])
++			kvm->buses[bus_idx]->ioeventfd_count--;
+ 		ioeventfd_release(p);
+ 		ret = 0;
+ 		break;
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -615,7 +615,8 @@ static void kvm_destroy_vm(struct kvm *k
+ 	spin_unlock(&kvm_lock);
+ 	kvm_free_irq_routing(kvm);
+ 	for (i = 0; i < KVM_NR_BUSES; i++) {
+-		kvm_io_bus_destroy(kvm->buses[i]);
++		if (kvm->buses[i])
++			kvm_io_bus_destroy(kvm->buses[i]);
+ 		kvm->buses[i] = NULL;
+ 	}
+ 	kvm_coalesced_mmio_free(kvm);
+@@ -2980,6 +2981,8 @@ int kvm_io_bus_write(struct kvm *kvm, en
+ 	};
+ 
+ 	bus = srcu_dereference(kvm->buses[bus_idx], &kvm->srcu);
++	if (!bus)
++		return -ENOMEM;
+ 	r = __kvm_io_bus_write(bus, &range, val);
+ 	return r < 0 ? r : 0;
+ }
+@@ -2997,6 +3000,8 @@ int kvm_io_bus_write_cookie(struct kvm *
+ 	};
+ 
+ 	bus = srcu_dereference(kvm->buses[bus_idx], &kvm->srcu);
++	if (!bus)
++		return -ENOMEM;
+ 
+ 	/* First try the device referenced by cookie. */
+ 	if ((cookie >= 0) && (cookie < bus->dev_count) &&
+@@ -3047,6 +3052,8 @@ int kvm_io_bus_read(struct kvm *kvm, enu
+ 	};
+ 
+ 	bus = srcu_dereference(kvm->buses[bus_idx], &kvm->srcu);
++	if (!bus)
++		return -ENOMEM;
+ 	r = __kvm_io_bus_read(bus, &range, val);
+ 	return r < 0 ? r : 0;
+ }
+@@ -3059,6 +3066,9 @@ int kvm_io_bus_register_dev(struct kvm *
+ 	struct kvm_io_bus *new_bus, *bus;
+ 
+ 	bus = kvm->buses[bus_idx];
++	if (!bus)
++		return -ENOMEM;
++
+ 	/* exclude ioeventfd which is limited by maximum fd */
+ 	if (bus->dev_count - bus->ioeventfd_count > NR_IOBUS_DEVS - 1)
+ 		return -ENOSPC;
+@@ -3078,45 +3088,41 @@ int kvm_io_bus_register_dev(struct kvm *
+ }
+ 
+ /* Caller must hold slots_lock. */
+-int kvm_io_bus_unregister_dev(struct kvm *kvm, enum kvm_bus bus_idx,
+-			      struct kvm_io_device *dev)
++void kvm_io_bus_unregister_dev(struct kvm *kvm, enum kvm_bus bus_idx,
++			       struct kvm_io_device *dev)
+ {
+-	int i, r;
++	int i;
+ 	struct kvm_io_bus *new_bus, *bus;
+ 
+ 	bus = kvm->buses[bus_idx];
+-
+-	/*
+-	 * It's possible the bus being released before hand. If so,
+-	 * we're done here.
+-	 */
+ 	if (!bus)
+-		return 0;
++		return;
+ 
+-	r = -ENOENT;
+ 	for (i = 0; i < bus->dev_count; i++)
+ 		if (bus->range[i].dev == dev) {
+-			r = 0;
+ 			break;
+ 		}
+ 
+-	if (r)
+-		return r;
++	if (i == bus->dev_count)
++		return;
+ 
+ 	new_bus = kzalloc(sizeof(*bus) + ((bus->dev_count - 1) *
+ 			  sizeof(struct kvm_io_range)), GFP_KERNEL);
+-	if (!new_bus)
+-		return -ENOMEM;
++	if (!new_bus)  {
++		pr_err("kvm: failed to shrink bus, removing it completely\n");
++		goto broken;
++	}
+ 
+ 	memcpy(new_bus, bus, sizeof(*bus) + i * sizeof(struct kvm_io_range));
+ 	new_bus->dev_count--;
+ 	memcpy(new_bus->range + i, bus->range + i + 1,
+ 	       (new_bus->dev_count - i) * sizeof(struct kvm_io_range));
+ 
++broken:
+ 	rcu_assign_pointer(kvm->buses[bus_idx], new_bus);
+ 	synchronize_srcu_expedited(&kvm->srcu);
+ 	kfree(bus);
+-	return r;
++	return;
+ }
+ 
+ static struct notifier_block kvm_cpu_notifier = {

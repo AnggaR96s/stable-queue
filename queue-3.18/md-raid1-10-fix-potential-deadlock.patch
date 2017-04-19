@@ -1,0 +1,90 @@
+From 61eb2b43b99ebdc9bc6bc83d9792257b243e7cb3 Mon Sep 17 00:00:00 2001
+From: Shaohua Li <shli@fb.com>
+Date: Tue, 28 Feb 2017 13:00:20 -0800
+Subject: md/raid1/10: fix potential deadlock
+
+From: Shaohua Li <shli@fb.com>
+
+commit 61eb2b43b99ebdc9bc6bc83d9792257b243e7cb3 upstream.
+
+Neil Brown pointed out a potential deadlock in raid 10 code with
+bio_split/chain. The raid1 code could have the same issue, but recent
+barrier rework makes it less likely to happen. The deadlock happens in
+below sequence:
+
+1. generic_make_request(bio), this will set current->bio_list
+2. raid10_make_request will split bio to bio1 and bio2
+3. __make_request(bio1), wait_barrer, add underlayer disk bio to
+current->bio_list
+4. __make_request(bio2), wait_barrer
+
+If raise_barrier happens between 3 & 4, since wait_barrier runs at 3,
+raise_barrier waits for IO completion from 3. And since raise_barrier
+sets barrier, 4 waits for raise_barrier. But IO from 3 can't be
+dispatched because raid10_make_request() doesn't finished yet.
+
+The solution is to adjust the IO ordering. Quotes from Neil:
+"
+It is much safer to:
+
+    if (need to split) {
+        split = bio_split(bio, ...)
+        bio_chain(...)
+        make_request_fn(split);
+        generic_make_request(bio);
+   } else
+        make_request_fn(mddev, bio);
+
+This way we first process the initial section of the bio (in 'split')
+which will queue some requests to the underlying devices.  These
+requests will be queued in generic_make_request.
+Then we queue the remainder of the bio, which will be added to the end
+of the generic_make_request queue.
+Then we return.
+generic_make_request() will pop the lower-level device requests off the
+queue and handle them first.  Then it will process the remainder
+of the original bio once the first section has been fully processed.
+"
+
+Note, this only happens in read path. In write path, the bio is flushed to
+underlaying disks either by blk flush (from schedule) or offladed to raid1/10d.
+It's queued in current->bio_list.
+
+Cc: Coly Li <colyli@suse.de>
+Suggested-by: NeilBrown <neilb@suse.com>
+Reviewed-by: Jack Wang <jinpu.wang@profitbricks.com>
+Signed-off-by: Shaohua Li <shli@fb.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/md/raid10.c |   18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@ -1578,7 +1578,25 @@ static void make_request(struct mddev *m
+ 			split = bio;
+ 		}
+ 
++		/*
++		 * If a bio is splitted, the first part of bio will pass
++		 * barrier but the bio is queued in current->bio_list (see
++		 * generic_make_request). If there is a raise_barrier() called
++		 * here, the second part of bio can't pass barrier. But since
++		 * the first part bio isn't dispatched to underlaying disks
++		 * yet, the barrier is never released, hence raise_barrier will
++		 * alays wait. We have a deadlock.
++		 * Note, this only happens in read path. For write path, the
++		 * first part of bio is dispatched in a schedule() call
++		 * (because of blk plug) or offloaded to raid10d.
++		 * Quitting from the function immediately can change the bio
++		 * order queued in bio_list and avoid the deadlock.
++		 */
+ 		__make_request(mddev, split);
++		if (split != bio && bio_data_dir(bio) == READ) {
++			generic_make_request(bio);
++			break;
++		}
+ 	} while (split != bio);
+ 
+ 	/* In case raid10d snuck in to freeze_array */
