@@ -1,0 +1,159 @@
+From foo@baz Sat Apr 29 08:22:40 CEST 2017
+From: Guillaume Nault <g.nault@alphalink.fr>
+Date: Mon, 3 Apr 2017 12:03:13 +0200
+Subject: l2tp: take reference on sessions being dumped
+
+From: Guillaume Nault <g.nault@alphalink.fr>
+
+
+[ Upstream commit e08293a4ccbcc993ded0fdc46f1e57926b833d63 ]
+
+Take a reference on the sessions returned by l2tp_session_find_nth()
+(and rename it l2tp_session_get_nth() to reflect this change), so that
+caller is assured that the session isn't going to disappear while
+processing it.
+
+For procfs and debugfs handlers, the session is held in the .start()
+callback and dropped in .show(). Given that pppol2tp_seq_session_show()
+dereferences the associated PPPoL2TP socket and that
+l2tp_dfs_seq_session_show() might call pppol2tp_show(), we also need to
+call the session's .ref() callback to prevent the socket from going
+away from under us.
+
+Fixes: fd558d186df2 ("l2tp: Split pppol2tp patch into separate l2tp and ppp parts")
+Fixes: 0ad6614048cf ("l2tp: Add debugfs files for dumping l2tp debug info")
+Fixes: 309795f4bec2 ("l2tp: Add netlink control API for L2TP")
+Signed-off-by: Guillaume Nault <g.nault@alphalink.fr>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/l2tp/l2tp_core.c    |    8 ++++++--
+ net/l2tp/l2tp_core.h    |    3 ++-
+ net/l2tp/l2tp_debugfs.c |   10 +++++++---
+ net/l2tp/l2tp_netlink.c |    7 +++++--
+ net/l2tp/l2tp_ppp.c     |   10 +++++++---
+ 5 files changed, 27 insertions(+), 11 deletions(-)
+
+--- a/net/l2tp/l2tp_core.c
++++ b/net/l2tp/l2tp_core.c
+@@ -278,7 +278,8 @@ struct l2tp_session *l2tp_session_find(s
+ }
+ EXPORT_SYMBOL_GPL(l2tp_session_find);
+ 
+-struct l2tp_session *l2tp_session_find_nth(struct l2tp_tunnel *tunnel, int nth)
++struct l2tp_session *l2tp_session_get_nth(struct l2tp_tunnel *tunnel, int nth,
++					  bool do_ref)
+ {
+ 	int hash;
+ 	struct l2tp_session *session;
+@@ -288,6 +289,9 @@ struct l2tp_session *l2tp_session_find_n
+ 	for (hash = 0; hash < L2TP_HASH_SIZE; hash++) {
+ 		hlist_for_each_entry(session, &tunnel->session_hlist[hash], hlist) {
+ 			if (++count > nth) {
++				l2tp_session_inc_refcount(session);
++				if (do_ref && session->ref)
++					session->ref(session);
+ 				read_unlock_bh(&tunnel->hlist_lock);
+ 				return session;
+ 			}
+@@ -298,7 +302,7 @@ struct l2tp_session *l2tp_session_find_n
+ 
+ 	return NULL;
+ }
+-EXPORT_SYMBOL_GPL(l2tp_session_find_nth);
++EXPORT_SYMBOL_GPL(l2tp_session_get_nth);
+ 
+ /* Lookup a session by interface name.
+  * This is very inefficient but is only used by management interfaces.
+--- a/net/l2tp/l2tp_core.h
++++ b/net/l2tp/l2tp_core.h
+@@ -233,7 +233,8 @@ out:
+ struct l2tp_session *l2tp_session_find(struct net *net,
+ 				       struct l2tp_tunnel *tunnel,
+ 				       u32 session_id);
+-struct l2tp_session *l2tp_session_find_nth(struct l2tp_tunnel *tunnel, int nth);
++struct l2tp_session *l2tp_session_get_nth(struct l2tp_tunnel *tunnel, int nth,
++					  bool do_ref);
+ struct l2tp_session *l2tp_session_find_by_ifname(struct net *net, char *ifname);
+ struct l2tp_tunnel *l2tp_tunnel_find(struct net *net, u32 tunnel_id);
+ struct l2tp_tunnel *l2tp_tunnel_find_nth(struct net *net, int nth);
+--- a/net/l2tp/l2tp_debugfs.c
++++ b/net/l2tp/l2tp_debugfs.c
+@@ -53,7 +53,7 @@ static void l2tp_dfs_next_tunnel(struct
+ 
+ static void l2tp_dfs_next_session(struct l2tp_dfs_seq_data *pd)
+ {
+-	pd->session = l2tp_session_find_nth(pd->tunnel, pd->session_idx);
++	pd->session = l2tp_session_get_nth(pd->tunnel, pd->session_idx, true);
+ 	pd->session_idx++;
+ 
+ 	if (pd->session == NULL) {
+@@ -238,10 +238,14 @@ static int l2tp_dfs_seq_show(struct seq_
+ 	}
+ 
+ 	/* Show the tunnel or session context */
+-	if (pd->session == NULL)
++	if (!pd->session) {
+ 		l2tp_dfs_seq_tunnel_show(m, pd->tunnel);
+-	else
++	} else {
+ 		l2tp_dfs_seq_session_show(m, pd->session);
++		if (pd->session->deref)
++			pd->session->deref(pd->session);
++		l2tp_session_dec_refcount(pd->session);
++	}
+ 
+ out:
+ 	return 0;
+--- a/net/l2tp/l2tp_netlink.c
++++ b/net/l2tp/l2tp_netlink.c
+@@ -852,7 +852,7 @@ static int l2tp_nl_cmd_session_dump(stru
+ 				goto out;
+ 		}
+ 
+-		session = l2tp_session_find_nth(tunnel, si);
++		session = l2tp_session_get_nth(tunnel, si, false);
+ 		if (session == NULL) {
+ 			ti++;
+ 			tunnel = NULL;
+@@ -862,8 +862,11 @@ static int l2tp_nl_cmd_session_dump(stru
+ 
+ 		if (l2tp_nl_session_send(skb, NETLINK_CB(cb->skb).portid,
+ 					 cb->nlh->nlmsg_seq, NLM_F_MULTI,
+-					 session, L2TP_CMD_SESSION_GET) < 0)
++					 session, L2TP_CMD_SESSION_GET) < 0) {
++			l2tp_session_dec_refcount(session);
+ 			break;
++		}
++		l2tp_session_dec_refcount(session);
+ 
+ 		si++;
+ 	}
+--- a/net/l2tp/l2tp_ppp.c
++++ b/net/l2tp/l2tp_ppp.c
+@@ -1555,7 +1555,7 @@ static void pppol2tp_next_tunnel(struct
+ 
+ static void pppol2tp_next_session(struct net *net, struct pppol2tp_seq_data *pd)
+ {
+-	pd->session = l2tp_session_find_nth(pd->tunnel, pd->session_idx);
++	pd->session = l2tp_session_get_nth(pd->tunnel, pd->session_idx, true);
+ 	pd->session_idx++;
+ 
+ 	if (pd->session == NULL) {
+@@ -1682,10 +1682,14 @@ static int pppol2tp_seq_show(struct seq_
+ 
+ 	/* Show the tunnel or session context.
+ 	 */
+-	if (pd->session == NULL)
++	if (!pd->session) {
+ 		pppol2tp_seq_tunnel_show(m, pd->tunnel);
+-	else
++	} else {
+ 		pppol2tp_seq_session_show(m, pd->session);
++		if (pd->session->deref)
++			pd->session->deref(pd->session);
++		l2tp_session_dec_refcount(pd->session);
++	}
+ 
+ out:
+ 	return 0;
