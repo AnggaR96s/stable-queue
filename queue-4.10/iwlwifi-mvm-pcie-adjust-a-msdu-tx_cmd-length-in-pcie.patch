@@ -1,0 +1,199 @@
+From 05e5a7e58d3f8f597ebe6f78aaa13a2656b78239 Mon Sep 17 00:00:00 2001
+From: Johannes Berg <johannes.berg@intel.com>
+Date: Fri, 2 Dec 2016 10:04:49 +0100
+Subject: iwlwifi: mvm/pcie: adjust A-MSDU tx_cmd length in PCIe
+
+From: Johannes Berg <johannes.berg@intel.com>
+
+commit 05e5a7e58d3f8f597ebe6f78aaa13a2656b78239 upstream.
+
+Instead of setting the tx_cmd length in the mvm code, which is
+complicated by the fact that DQA may want to temporarily store
+the SKB on the side, adjust the length in the PCIe code which
+also knows about this since it's responsible for duplicating
+all those headers that are account for in this code.
+
+As the PCIe code already relies on the tx_cmd->len field, this
+doesn't really introduce any new dependencies.
+
+To make this possible we need to move the memcpy() of the TX
+command until after it was updated.
+
+This does even simplify the code though, since the PCIe code
+already does a lot of manipulations to build A-MSDUs correctly
+and changing the length becomes a simple operation to see how
+much was added/removed, rather than predicting it.
+
+Fixes: 24afba7690e4 ("iwlwifi: mvm: support bss dynamic alloc/dealloc of queues")
+Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+Signed-off-by: Luca Coelho <luciano.coelho@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/net/wireless/intel/iwlwifi/mvm/tx.c  |   38 ++-------------------------
+ drivers/net/wireless/intel/iwlwifi/pcie/tx.c |   23 +++++++++++++---
+ 2 files changed, 22 insertions(+), 39 deletions(-)
+
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/tx.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/tx.c
+@@ -202,7 +202,6 @@ void iwl_mvm_set_tx_cmd(struct iwl_mvm *
+ 			struct iwl_tx_cmd *tx_cmd,
+ 			struct ieee80211_tx_info *info, u8 sta_id)
+ {
+-	struct ieee80211_tx_info *skb_info = IEEE80211_SKB_CB(skb);
+ 	struct ieee80211_hdr *hdr = (void *)skb->data;
+ 	__le16 fc = hdr->frame_control;
+ 	u32 tx_flags = le32_to_cpu(tx_cmd->tx_flags);
+@@ -284,9 +283,8 @@ void iwl_mvm_set_tx_cmd(struct iwl_mvm *
+ 		tx_flags |= TX_CMD_FLG_WRITE_TX_POWER;
+ 
+ 	tx_cmd->tx_flags = cpu_to_le32(tx_flags);
+-	/* Total # bytes to be transmitted */
+-	tx_cmd->len = cpu_to_le16((u16)skb->len +
+-		(uintptr_t)skb_info->driver_data[0]);
++	/* Total # bytes to be transmitted - PCIe code will adjust for A-MSDU */
++	tx_cmd->len = cpu_to_le16((u16)skb->len);
+ 	tx_cmd->life_time = cpu_to_le32(TX_CMD_LIFE_TIME_INFINITE);
+ 	tx_cmd->sta_id = sta_id;
+ 
+@@ -555,9 +553,6 @@ int iwl_mvm_tx_skb_non_sta(struct iwl_mv
+ 			  info.hw_queue != info.control.vif->cab_queue)))
+ 		return -1;
+ 
+-	/* This holds the amsdu headers length */
+-	skb_info->driver_data[0] = (void *)(uintptr_t)0;
+-
+ 	queue = info.hw_queue;
+ 
+ 	/*
+@@ -644,7 +639,7 @@ static int iwl_mvm_tx_tso(struct iwl_mvm
+ 	unsigned int num_subframes, tcp_payload_len, subf_len, max_amsdu_len;
+ 	bool ipv4 = (skb->protocol == htons(ETH_P_IP));
+ 	u16 ip_base_id = ipv4 ? ntohs(ip_hdr(skb)->id) : 0;
+-	u16 amsdu_add, snap_ip_tcp, pad, i = 0;
++	u16 snap_ip_tcp, pad, i = 0;
+ 	unsigned int dbg_max_amsdu_len;
+ 	netdev_features_t netdev_features = NETIF_F_CSUM_MASK | NETIF_F_SG;
+ 	u8 *qc, tid, txf;
+@@ -746,21 +741,6 @@ static int iwl_mvm_tx_tso(struct iwl_mvm
+ 
+ 	/* This skb fits in one single A-MSDU */
+ 	if (num_subframes * mss >= tcp_payload_len) {
+-		struct ieee80211_tx_info *skb_info = IEEE80211_SKB_CB(skb);
+-
+-		/*
+-		 * Compute the length of all the data added for the A-MSDU.
+-		 * This will be used to compute the length to write in the TX
+-		 * command. We have: SNAP + IP + TCP for n -1 subframes and
+-		 * ETH header for n subframes. Note that the original skb
+-		 * already had one set of SNAP / IP / TCP headers.
+-		 */
+-		num_subframes = DIV_ROUND_UP(tcp_payload_len, mss);
+-		amsdu_add = num_subframes * sizeof(struct ethhdr) +
+-			(num_subframes - 1) * (snap_ip_tcp + pad);
+-		/* This holds the amsdu headers length */
+-		skb_info->driver_data[0] = (void *)(uintptr_t)amsdu_add;
+-
+ 		__skb_queue_tail(mpdus_skb, skb);
+ 		return 0;
+ 	}
+@@ -799,14 +779,6 @@ segment:
+ 			ip_hdr(tmp)->id = htons(ip_base_id + i * num_subframes);
+ 
+ 		if (tcp_payload_len > mss) {
+-			struct ieee80211_tx_info *skb_info =
+-				IEEE80211_SKB_CB(tmp);
+-
+-			num_subframes = DIV_ROUND_UP(tcp_payload_len, mss);
+-			amsdu_add = num_subframes * sizeof(struct ethhdr) +
+-				(num_subframes - 1) * (snap_ip_tcp + pad);
+-			skb_info->driver_data[0] =
+-				(void *)(uintptr_t)amsdu_add;
+ 			skb_shinfo(tmp)->gso_size = mss;
+ 		} else {
+ 			qc = ieee80211_get_qos_ctl((void *)tmp->data);
+@@ -1052,7 +1024,6 @@ int iwl_mvm_tx_skb(struct iwl_mvm *mvm,
+ 		   struct ieee80211_sta *sta)
+ {
+ 	struct iwl_mvm_sta *mvmsta = iwl_mvm_sta_from_mac80211(sta);
+-	struct ieee80211_tx_info *skb_info = IEEE80211_SKB_CB(skb);
+ 	struct ieee80211_tx_info info;
+ 	struct sk_buff_head mpdus_skbs;
+ 	unsigned int payload_len;
+@@ -1066,9 +1037,6 @@ int iwl_mvm_tx_skb(struct iwl_mvm *mvm,
+ 
+ 	memcpy(&info, skb->cb, sizeof(info));
+ 
+-	/* This holds the amsdu headers length */
+-	skb_info->driver_data[0] = (void *)(uintptr_t)0;
+-
+ 	if (!skb_is_gso(skb))
+ 		return iwl_mvm_tx_mpdu(mvm, skb, &info, sta);
+ 
+--- a/drivers/net/wireless/intel/iwlwifi/pcie/tx.c
++++ b/drivers/net/wireless/intel/iwlwifi/pcie/tx.c
+@@ -2096,6 +2096,7 @@ static int iwl_fill_data_tbs_amsdu(struc
+ 				   struct iwl_cmd_meta *out_meta,
+ 				   struct iwl_device_cmd *dev_cmd, u16 tb1_len)
+ {
++	struct iwl_tx_cmd *tx_cmd = (void *)dev_cmd->payload;
+ 	struct iwl_trans_pcie *trans_pcie = txq->trans_pcie;
+ 	struct ieee80211_hdr *hdr = (void *)skb->data;
+ 	unsigned int snap_ip_tcp_hdrlen, ip_hdrlen, total_len, hdr_room;
+@@ -2145,6 +2146,13 @@ static int iwl_fill_data_tbs_amsdu(struc
+ 	 */
+ 	skb_pull(skb, hdr_len + iv_len);
+ 
++	/*
++	 * Remove the length of all the headers that we don't actually
++	 * have in the MPDU by themselves, but that we duplicate into
++	 * all the different MSDUs inside the A-MSDU.
++	 */
++	le16_add_cpu(&tx_cmd->len, -snap_ip_tcp_hdrlen);
++
+ 	tso_start(skb, &tso);
+ 
+ 	while (total_len) {
+@@ -2155,7 +2163,7 @@ static int iwl_fill_data_tbs_amsdu(struc
+ 		unsigned int hdr_tb_len;
+ 		dma_addr_t hdr_tb_phys;
+ 		struct tcphdr *tcph;
+-		u8 *iph;
++		u8 *iph, *subf_hdrs_start = hdr_page->pos;
+ 
+ 		total_len -= data_left;
+ 
+@@ -2216,6 +2224,8 @@ static int iwl_fill_data_tbs_amsdu(struc
+ 				       hdr_tb_len, false);
+ 		trace_iwlwifi_dev_tx_tso_chunk(trans->dev, start_hdr,
+ 					       hdr_tb_len);
++		/* add this subframe's headers' length to the tx_cmd */
++		le16_add_cpu(&tx_cmd->len, hdr_page->pos - subf_hdrs_start);
+ 
+ 		/* prepare the start_hdr for the next subframe */
+ 		start_hdr = hdr_page->pos;
+@@ -2408,9 +2418,10 @@ int iwl_trans_pcie_tx(struct iwl_trans *
+ 		tb1_len = len;
+ 	}
+ 
+-	/* The first TB points to bi-directional DMA data */
+-	memcpy(&txq->first_tb_bufs[txq->write_ptr], &dev_cmd->hdr,
+-	       IWL_FIRST_TB_SIZE);
++	/*
++	 * The first TB points to bi-directional DMA data, we'll
++	 * memcpy the data into it later.
++	 */
+ 	iwl_pcie_txq_build_tfd(trans, txq, tb0_phys,
+ 			       IWL_FIRST_TB_SIZE, true);
+ 
+@@ -2434,6 +2445,10 @@ int iwl_trans_pcie_tx(struct iwl_trans *
+ 		goto out_err;
+ 	}
+ 
++	/* building the A-MSDU might have changed this data, so memcpy it now */
++	memcpy(&txq->first_tb_bufs[txq->write_ptr], &dev_cmd->hdr,
++	       IWL_FIRST_TB_SIZE);
++
+ 	tfd = iwl_pcie_get_tfd(trans_pcie, txq, txq->write_ptr);
+ 	/* Set up entry for this TFD in Tx byte-count array */
+ 	iwl_pcie_txq_update_byte_cnt_tbl(trans, txq, le16_to_cpu(tx_cmd->len),
