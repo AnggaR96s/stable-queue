@@ -1,0 +1,71 @@
+From ab949d519601880fd46e8bc1445d6a453bf2dc09 Mon Sep 17 00:00:00 2001
+From: Takashi Iwai <tiwai@suse.de>
+Date: Mon, 2 Jan 2017 11:37:04 +0100
+Subject: ALSA: hda - Fix deadlock of controller device lock at unbinding
+
+From: Takashi Iwai <tiwai@suse.de>
+
+commit ab949d519601880fd46e8bc1445d6a453bf2dc09 upstream.
+
+Imre Deak reported a deadlock of HD-audio driver at unbinding while
+it's still in probing.  Since we probe the codecs asynchronously in a
+work, the codec driver probe may still be kicked off while the
+controller itself is being unbound.  And, azx_remove() tries to
+process all pending tasks via cancel_work_sync() for fixing the other
+races (see commit [0b8c82190c12: ALSA: hda - Cancel probe work instead
+of flush at remove]), now we may meet a bizarre deadlock:
+
+Unbind snd_hda_intel via sysfs:
+  device_release_driver() ->
+    device_lock(snd_hda_intel) ->
+      azx_remove() ->
+        cancel_work_sync(azx_probe_work)
+
+azx_probe_work():
+  codec driver probe() ->
+     __driver_attach() ->
+       device_lock(snd_hda_intel)
+
+This deadlock is caused by the fact that both device_release_driver()
+and driver_probe_device() take both the device and its parent locks at
+the same time.  The codec device sets the controller device as its
+parent, and this lock is taken before the probe() callback is called,
+while the controller remove() callback gets called also with the same
+lock.
+
+In this patch, as an ugly workaround, we unlock the controller device
+temporarily during cancel_work_sync() call.  The race against another
+bind call should be still suppressed by the parent's device lock.
+
+Reported-by: Imre Deak <imre.deak@intel.com>
+Fixes: 0b8c82190c12 ("ALSA: hda - Cancel probe work instead of flush at remove")
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ sound/pci/hda/hda_intel.c |   13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+--- a/sound/pci/hda/hda_intel.c
++++ b/sound/pci/hda/hda_intel.c
+@@ -2166,7 +2166,20 @@ static void azx_remove(struct pci_dev *p
+ 		/* cancel the pending probing work */
+ 		chip = card->private_data;
+ 		hda = container_of(chip, struct hda_intel, chip);
++		/* FIXME: below is an ugly workaround.
++		 * Both device_release_driver() and driver_probe_device()
++		 * take *both* the device's and its parent's lock before
++		 * calling the remove() and probe() callbacks.  The codec
++		 * probe takes the locks of both the codec itself and its
++		 * parent, i.e. the PCI controller dev.  Meanwhile, when
++		 * the PCI controller is unbound, it takes its lock, too
++		 * ==> ouch, a deadlock!
++		 * As a workaround, we unlock temporarily here the controller
++		 * device during cancel_work_sync() call.
++		 */
++		device_unlock(&pci->dev);
+ 		cancel_work_sync(&hda->probe_work);
++		device_lock(&pci->dev);
+ 
+ 		snd_card_free(card);
+ 	}
