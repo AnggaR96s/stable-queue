@@ -1,0 +1,447 @@
+From foo@baz Thu May 11 11:03:15 CEST 2017
+From: Eric Dumazet <edumazet@google.com>
+Date: Fri, 5 May 2017 06:56:54 -0700
+Subject: tcp: randomize timestamps on syncookies
+
+From: Eric Dumazet <edumazet@google.com>
+
+
+[ Upstream commit 84b114b98452c431299d99c135f751659e517acb ]
+
+Whole point of randomization was to hide server uptime, but an attacker
+can simply start a syn flood and TCP generates 'old style' timestamps,
+directly revealing server jiffies value.
+
+Also, TSval sent by the server to a particular remote address vary
+depending on syncookies being sent or not, potentially triggering PAWS
+drops for innocent clients.
+
+Lets implement proper randomization, including for SYNcookies.
+
+Also we do not need to export sysctl_tcp_timestamps, since it is not
+used from a module.
+
+In v2, I added Florian feedback and contribution, adding tsoff to
+tcp_get_cookie_sock().
+
+v3 removed one unused variable in tcp_v4_connect() as Florian spotted.
+
+Fixes: 95a22caee396c ("tcp: randomize tcp timestamp offsets for each connection")
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Reviewed-by: Florian Westphal <fw@strlen.de>
+Tested-by: Florian Westphal <fw@strlen.de>
+Cc: Yuchung Cheng <ycheng@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/net/secure_seq.h |   10 ++++++----
+ include/net/tcp.h        |    5 +++--
+ net/core/secure_seq.c    |   34 ++++++++++++++++++++--------------
+ net/ipv4/syncookies.c    |   12 ++++++++++--
+ net/ipv4/tcp_input.c     |    8 +++-----
+ net/ipv4/tcp_ipv4.c      |   32 +++++++++++++++++++-------------
+ net/ipv6/syncookies.c    |   10 +++++++++-
+ net/ipv6/tcp_ipv6.c      |   32 +++++++++++++++++++-------------
+ 8 files changed, 89 insertions(+), 54 deletions(-)
+
+--- a/include/net/secure_seq.h
++++ b/include/net/secure_seq.h
+@@ -6,10 +6,12 @@
+ u32 secure_ipv4_port_ephemeral(__be32 saddr, __be32 daddr, __be16 dport);
+ u32 secure_ipv6_port_ephemeral(const __be32 *saddr, const __be32 *daddr,
+ 			       __be16 dport);
+-u32 secure_tcp_sequence_number(__be32 saddr, __be32 daddr,
+-			       __be16 sport, __be16 dport, u32 *tsoff);
+-u32 secure_tcpv6_sequence_number(const __be32 *saddr, const __be32 *daddr,
+-				 __be16 sport, __be16 dport, u32 *tsoff);
++u32 secure_tcp_seq(__be32 saddr, __be32 daddr,
++		   __be16 sport, __be16 dport);
++u32 secure_tcp_ts_off(__be32 saddr, __be32 daddr);
++u32 secure_tcpv6_seq(const __be32 *saddr, const __be32 *daddr,
++		     __be16 sport, __be16 dport);
++u32 secure_tcpv6_ts_off(const __be32 *saddr, const __be32 *daddr);
+ u64 secure_dccp_sequence_number(__be32 saddr, __be32 daddr,
+ 				__be16 sport, __be16 dport);
+ u64 secure_dccpv6_sequence_number(__be32 *saddr, __be32 *daddr,
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -471,7 +471,7 @@ void inet_sk_rx_dst_set(struct sock *sk,
+ /* From syncookies.c */
+ struct sock *tcp_get_cookie_sock(struct sock *sk, struct sk_buff *skb,
+ 				 struct request_sock *req,
+-				 struct dst_entry *dst);
++				 struct dst_entry *dst, u32 tsoff);
+ int __cookie_v4_check(const struct iphdr *iph, const struct tcphdr *th,
+ 		      u32 cookie);
+ struct sock *cookie_v4_check(struct sock *sk, struct sk_buff *skb);
+@@ -1816,7 +1816,8 @@ struct tcp_request_sock_ops {
+ 	struct dst_entry *(*route_req)(const struct sock *sk, struct flowi *fl,
+ 				       const struct request_sock *req,
+ 				       bool *strict);
+-	__u32 (*init_seq)(const struct sk_buff *skb, u32 *tsoff);
++	u32 (*init_seq)(const struct sk_buff *skb);
++	u32 (*init_ts_off)(const struct sk_buff *skb);
+ 	int (*send_synack)(const struct sock *sk, struct dst_entry *dst,
+ 			   struct flowi *fl, struct request_sock *req,
+ 			   struct tcp_fastopen_cookie *foc,
+--- a/net/core/secure_seq.c
++++ b/net/core/secure_seq.c
+@@ -24,9 +24,13 @@ static siphash_key_t ts_secret __read_mo
+ 
+ static __always_inline void net_secret_init(void)
+ {
+-	net_get_random_once(&ts_secret, sizeof(ts_secret));
+ 	net_get_random_once(&net_secret, sizeof(net_secret));
+ }
++
++static __always_inline void ts_secret_init(void)
++{
++	net_get_random_once(&ts_secret, sizeof(ts_secret));
++}
+ #endif
+ 
+ #ifdef CONFIG_INET
+@@ -47,7 +51,7 @@ static u32 seq_scale(u32 seq)
+ #endif
+ 
+ #if IS_ENABLED(CONFIG_IPV6)
+-static u32 secure_tcpv6_ts_off(const __be32 *saddr, const __be32 *daddr)
++u32 secure_tcpv6_ts_off(const __be32 *saddr, const __be32 *daddr)
+ {
+ 	const struct {
+ 		struct in6_addr saddr;
+@@ -60,12 +64,14 @@ static u32 secure_tcpv6_ts_off(const __b
+ 	if (sysctl_tcp_timestamps != 1)
+ 		return 0;
+ 
++	ts_secret_init();
+ 	return siphash(&combined, offsetofend(typeof(combined), daddr),
+ 		       &ts_secret);
+ }
++EXPORT_SYMBOL(secure_tcpv6_ts_off);
+ 
+-u32 secure_tcpv6_sequence_number(const __be32 *saddr, const __be32 *daddr,
+-				 __be16 sport, __be16 dport, u32 *tsoff)
++u32 secure_tcpv6_seq(const __be32 *saddr, const __be32 *daddr,
++		     __be16 sport, __be16 dport)
+ {
+ 	const struct {
+ 		struct in6_addr saddr;
+@@ -78,14 +84,14 @@ u32 secure_tcpv6_sequence_number(const _
+ 		.sport = sport,
+ 		.dport = dport
+ 	};
+-	u64 hash;
++	u32 hash;
++
+ 	net_secret_init();
+ 	hash = siphash(&combined, offsetofend(typeof(combined), dport),
+ 		       &net_secret);
+-	*tsoff = secure_tcpv6_ts_off(saddr, daddr);
+ 	return seq_scale(hash);
+ }
+-EXPORT_SYMBOL(secure_tcpv6_sequence_number);
++EXPORT_SYMBOL(secure_tcpv6_seq);
+ 
+ u32 secure_ipv6_port_ephemeral(const __be32 *saddr, const __be32 *daddr,
+ 			       __be16 dport)
+@@ -107,30 +113,30 @@ EXPORT_SYMBOL(secure_ipv6_port_ephemeral
+ #endif
+ 
+ #ifdef CONFIG_INET
+-static u32 secure_tcp_ts_off(__be32 saddr, __be32 daddr)
++u32 secure_tcp_ts_off(__be32 saddr, __be32 daddr)
+ {
+ 	if (sysctl_tcp_timestamps != 1)
+ 		return 0;
+ 
++	ts_secret_init();
+ 	return siphash_2u32((__force u32)saddr, (__force u32)daddr,
+ 			    &ts_secret);
+ }
+ 
+-/* secure_tcp_sequence_number(a, b, 0, d) == secure_ipv4_port_ephemeral(a, b, d),
++/* secure_tcp_seq_and_tsoff(a, b, 0, d) == secure_ipv4_port_ephemeral(a, b, d),
+  * but fortunately, `sport' cannot be 0 in any circumstances. If this changes,
+  * it would be easy enough to have the former function use siphash_4u32, passing
+  * the arguments as separate u32.
+  */
+-
+-u32 secure_tcp_sequence_number(__be32 saddr, __be32 daddr,
+-			       __be16 sport, __be16 dport, u32 *tsoff)
++u32 secure_tcp_seq(__be32 saddr, __be32 daddr,
++		   __be16 sport, __be16 dport)
+ {
+-	u64 hash;
++	u32 hash;
++
+ 	net_secret_init();
+ 	hash = siphash_3u32((__force u32)saddr, (__force u32)daddr,
+ 			    (__force u32)sport << 16 | (__force u32)dport,
+ 			    &net_secret);
+-	*tsoff = secure_tcp_ts_off(saddr, daddr);
+ 	return seq_scale(hash);
+ }
+ 
+--- a/net/ipv4/syncookies.c
++++ b/net/ipv4/syncookies.c
+@@ -16,6 +16,7 @@
+ #include <linux/siphash.h>
+ #include <linux/kernel.h>
+ #include <linux/export.h>
++#include <net/secure_seq.h>
+ #include <net/tcp.h>
+ #include <net/route.h>
+ 
+@@ -203,7 +204,7 @@ EXPORT_SYMBOL_GPL(__cookie_v4_check);
+ 
+ struct sock *tcp_get_cookie_sock(struct sock *sk, struct sk_buff *skb,
+ 				 struct request_sock *req,
+-				 struct dst_entry *dst)
++				 struct dst_entry *dst, u32 tsoff)
+ {
+ 	struct inet_connection_sock *icsk = inet_csk(sk);
+ 	struct sock *child;
+@@ -213,6 +214,7 @@ struct sock *tcp_get_cookie_sock(struct
+ 						 NULL, &own_req);
+ 	if (child) {
+ 		atomic_set(&req->rsk_refcnt, 1);
++		tcp_sk(child)->tsoffset = tsoff;
+ 		sock_rps_save_rxhash(child, skb);
+ 		inet_csk_reqsk_queue_add(sk, req, child);
+ 	} else {
+@@ -292,6 +294,7 @@ struct sock *cookie_v4_check(struct sock
+ 	struct rtable *rt;
+ 	__u8 rcv_wscale;
+ 	struct flowi4 fl4;
++	u32 tsoff = 0;
+ 
+ 	if (!sock_net(sk)->ipv4.sysctl_tcp_syncookies || !th->ack || th->rst)
+ 		goto out;
+@@ -311,6 +314,11 @@ struct sock *cookie_v4_check(struct sock
+ 	memset(&tcp_opt, 0, sizeof(tcp_opt));
+ 	tcp_parse_options(skb, &tcp_opt, 0, NULL);
+ 
++	if (tcp_opt.saw_tstamp && tcp_opt.rcv_tsecr) {
++		tsoff = secure_tcp_ts_off(ip_hdr(skb)->daddr, ip_hdr(skb)->saddr);
++		tcp_opt.rcv_tsecr -= tsoff;
++	}
++
+ 	if (!cookie_timestamp_decode(&tcp_opt))
+ 		goto out;
+ 
+@@ -381,7 +389,7 @@ struct sock *cookie_v4_check(struct sock
+ 	ireq->rcv_wscale  = rcv_wscale;
+ 	ireq->ecn_ok = cookie_ecn_ok(&tcp_opt, sock_net(sk), &rt->dst);
+ 
+-	ret = tcp_get_cookie_sock(sk, skb, req, &rt->dst);
++	ret = tcp_get_cookie_sock(sk, skb, req, &rt->dst, tsoff);
+ 	/* ip_queue_xmit() depends on our flow being setup
+ 	 * Normal sockets get it right from inet_csk_route_child_sock()
+ 	 */
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -85,7 +85,6 @@ int sysctl_tcp_dsack __read_mostly = 1;
+ int sysctl_tcp_app_win __read_mostly = 31;
+ int sysctl_tcp_adv_win_scale __read_mostly = 1;
+ EXPORT_SYMBOL(sysctl_tcp_adv_win_scale);
+-EXPORT_SYMBOL(sysctl_tcp_timestamps);
+ 
+ /* rfc5961 challenge ack rate limiting */
+ int sysctl_tcp_challenge_ack_limit = 1000;
+@@ -6332,8 +6331,8 @@ int tcp_conn_request(struct request_sock
+ 	if (security_inet_conn_request(sk, skb, req))
+ 		goto drop_and_free;
+ 
+-	if (isn && tmp_opt.tstamp_ok)
+-		af_ops->init_seq(skb, &tcp_rsk(req)->ts_off);
++	if (tmp_opt.tstamp_ok)
++		tcp_rsk(req)->ts_off = af_ops->init_ts_off(skb);
+ 
+ 	if (!want_cookie && !isn) {
+ 		/* VJ's idea. We save last timestamp seen
+@@ -6375,7 +6374,7 @@ int tcp_conn_request(struct request_sock
+ 			goto drop_and_release;
+ 		}
+ 
+-		isn = af_ops->init_seq(skb, &tcp_rsk(req)->ts_off);
++		isn = af_ops->init_seq(skb);
+ 	}
+ 	if (!dst) {
+ 		dst = af_ops->route_req(sk, &fl, req, NULL);
+@@ -6387,7 +6386,6 @@ int tcp_conn_request(struct request_sock
+ 
+ 	if (want_cookie) {
+ 		isn = cookie_init_sequence(af_ops, sk, skb, &req->mss);
+-		tcp_rsk(req)->ts_off = 0;
+ 		req->cookie_ts = tmp_opt.tstamp_ok;
+ 		if (!tmp_opt.tstamp_ok)
+ 			inet_rsk(req)->ecn_ok = 0;
+--- a/net/ipv4/tcp_ipv4.c
++++ b/net/ipv4/tcp_ipv4.c
+@@ -94,12 +94,18 @@ static int tcp_v4_md5_hash_hdr(char *md5
+ struct inet_hashinfo tcp_hashinfo;
+ EXPORT_SYMBOL(tcp_hashinfo);
+ 
+-static u32 tcp_v4_init_sequence(const struct sk_buff *skb, u32 *tsoff)
++static u32 tcp_v4_init_seq(const struct sk_buff *skb)
+ {
+-	return secure_tcp_sequence_number(ip_hdr(skb)->daddr,
+-					  ip_hdr(skb)->saddr,
+-					  tcp_hdr(skb)->dest,
+-					  tcp_hdr(skb)->source, tsoff);
++	return secure_tcp_seq(ip_hdr(skb)->daddr,
++			      ip_hdr(skb)->saddr,
++			      tcp_hdr(skb)->dest,
++			      tcp_hdr(skb)->source);
++}
++
++static u32 tcp_v4_init_ts_off(const struct sk_buff *skb)
++{
++	return secure_tcp_ts_off(ip_hdr(skb)->daddr,
++				 ip_hdr(skb)->saddr);
+ }
+ 
+ int tcp_twsk_unique(struct sock *sk, struct sock *sktw, void *twp)
+@@ -145,7 +151,6 @@ int tcp_v4_connect(struct sock *sk, stru
+ 	struct flowi4 *fl4;
+ 	struct rtable *rt;
+ 	int err;
+-	u32 seq;
+ 	struct ip_options_rcu *inet_opt;
+ 	struct inet_timewait_death_row *tcp_death_row = &sock_net(sk)->ipv4.tcp_death_row;
+ 
+@@ -236,13 +241,13 @@ int tcp_v4_connect(struct sock *sk, stru
+ 	rt = NULL;
+ 
+ 	if (likely(!tp->repair)) {
+-		seq = secure_tcp_sequence_number(inet->inet_saddr,
+-						 inet->inet_daddr,
+-						 inet->inet_sport,
+-						 usin->sin_port,
+-						 &tp->tsoffset);
+ 		if (!tp->write_seq)
+-			tp->write_seq = seq;
++			tp->write_seq = secure_tcp_seq(inet->inet_saddr,
++						       inet->inet_daddr,
++						       inet->inet_sport,
++						       usin->sin_port);
++		tp->tsoffset = secure_tcp_ts_off(inet->inet_saddr,
++						 inet->inet_daddr);
+ 	}
+ 
+ 	inet->inet_id = tp->write_seq ^ jiffies;
+@@ -1253,7 +1258,8 @@ static const struct tcp_request_sock_ops
+ 	.cookie_init_seq =	cookie_v4_init_sequence,
+ #endif
+ 	.route_req	=	tcp_v4_route_req,
+-	.init_seq	=	tcp_v4_init_sequence,
++	.init_seq	=	tcp_v4_init_seq,
++	.init_ts_off	=	tcp_v4_init_ts_off,
+ 	.send_synack	=	tcp_v4_send_synack,
+ };
+ 
+--- a/net/ipv6/syncookies.c
++++ b/net/ipv6/syncookies.c
+@@ -18,6 +18,7 @@
+ #include <linux/random.h>
+ #include <linux/siphash.h>
+ #include <linux/kernel.h>
++#include <net/secure_seq.h>
+ #include <net/ipv6.h>
+ #include <net/tcp.h>
+ 
+@@ -143,6 +144,7 @@ struct sock *cookie_v6_check(struct sock
+ 	int mss;
+ 	struct dst_entry *dst;
+ 	__u8 rcv_wscale;
++	u32 tsoff = 0;
+ 
+ 	if (!sock_net(sk)->ipv4.sysctl_tcp_syncookies || !th->ack || th->rst)
+ 		goto out;
+@@ -162,6 +164,12 @@ struct sock *cookie_v6_check(struct sock
+ 	memset(&tcp_opt, 0, sizeof(tcp_opt));
+ 	tcp_parse_options(skb, &tcp_opt, 0, NULL);
+ 
++	if (tcp_opt.saw_tstamp && tcp_opt.rcv_tsecr) {
++		tsoff = secure_tcpv6_ts_off(ipv6_hdr(skb)->daddr.s6_addr32,
++					    ipv6_hdr(skb)->saddr.s6_addr32);
++		tcp_opt.rcv_tsecr -= tsoff;
++	}
++
+ 	if (!cookie_timestamp_decode(&tcp_opt))
+ 		goto out;
+ 
+@@ -242,7 +250,7 @@ struct sock *cookie_v6_check(struct sock
+ 	ireq->rcv_wscale = rcv_wscale;
+ 	ireq->ecn_ok = cookie_ecn_ok(&tcp_opt, sock_net(sk), dst);
+ 
+-	ret = tcp_get_cookie_sock(sk, skb, req, dst);
++	ret = tcp_get_cookie_sock(sk, skb, req, dst, tsoff);
+ out:
+ 	return ret;
+ out_free:
+--- a/net/ipv6/tcp_ipv6.c
++++ b/net/ipv6/tcp_ipv6.c
+@@ -101,12 +101,18 @@ static void inet6_sk_rx_dst_set(struct s
+ 	}
+ }
+ 
+-static u32 tcp_v6_init_sequence(const struct sk_buff *skb, u32 *tsoff)
++static u32 tcp_v6_init_seq(const struct sk_buff *skb)
+ {
+-	return secure_tcpv6_sequence_number(ipv6_hdr(skb)->daddr.s6_addr32,
+-					    ipv6_hdr(skb)->saddr.s6_addr32,
+-					    tcp_hdr(skb)->dest,
+-					    tcp_hdr(skb)->source, tsoff);
++	return secure_tcpv6_seq(ipv6_hdr(skb)->daddr.s6_addr32,
++				ipv6_hdr(skb)->saddr.s6_addr32,
++				tcp_hdr(skb)->dest,
++				tcp_hdr(skb)->source);
++}
++
++static u32 tcp_v6_init_ts_off(const struct sk_buff *skb)
++{
++	return secure_tcpv6_ts_off(ipv6_hdr(skb)->daddr.s6_addr32,
++				   ipv6_hdr(skb)->saddr.s6_addr32);
+ }
+ 
+ static int tcp_v6_connect(struct sock *sk, struct sockaddr *uaddr,
+@@ -122,7 +128,6 @@ static int tcp_v6_connect(struct sock *s
+ 	struct flowi6 fl6;
+ 	struct dst_entry *dst;
+ 	int addr_type;
+-	u32 seq;
+ 	int err;
+ 	struct inet_timewait_death_row *tcp_death_row = &sock_net(sk)->ipv4.tcp_death_row;
+ 
+@@ -287,13 +292,13 @@ static int tcp_v6_connect(struct sock *s
+ 	sk_set_txhash(sk);
+ 
+ 	if (likely(!tp->repair)) {
+-		seq = secure_tcpv6_sequence_number(np->saddr.s6_addr32,
+-						   sk->sk_v6_daddr.s6_addr32,
+-						   inet->inet_sport,
+-						   inet->inet_dport,
+-						   &tp->tsoffset);
+ 		if (!tp->write_seq)
+-			tp->write_seq = seq;
++			tp->write_seq = secure_tcpv6_seq(np->saddr.s6_addr32,
++							 sk->sk_v6_daddr.s6_addr32,
++							 inet->inet_sport,
++							 inet->inet_dport);
++		tp->tsoffset = secure_tcpv6_ts_off(np->saddr.s6_addr32,
++						   sk->sk_v6_daddr.s6_addr32);
+ 	}
+ 
+ 	if (tcp_fastopen_defer_connect(sk, &err))
+@@ -757,7 +762,8 @@ static const struct tcp_request_sock_ops
+ 	.cookie_init_seq =	cookie_v6_init_sequence,
+ #endif
+ 	.route_req	=	tcp_v6_route_req,
+-	.init_seq	=	tcp_v6_init_sequence,
++	.init_seq	=	tcp_v6_init_seq,
++	.init_ts_off	=	tcp_v6_init_ts_off,
+ 	.send_synack	=	tcp_v6_send_synack,
+ };
+ 
