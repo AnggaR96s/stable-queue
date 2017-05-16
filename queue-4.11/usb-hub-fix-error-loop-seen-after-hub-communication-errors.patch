@@ -1,0 +1,137 @@
+From 245b2eecee2aac6fdc77dcafaa73c33f9644c3c7 Mon Sep 17 00:00:00 2001
+From: Guenter Roeck <linux@roeck-us.net>
+Date: Mon, 20 Mar 2017 11:16:11 -0700
+Subject: usb: hub: Fix error loop seen after hub communication errors
+
+From: Guenter Roeck <linux@roeck-us.net>
+
+commit 245b2eecee2aac6fdc77dcafaa73c33f9644c3c7 upstream.
+
+While stress testing a usb controller using a bind/unbind looop, the
+following error loop was observed.
+
+usb 7-1.2: new low-speed USB device number 3 using xhci-hcd
+usb 7-1.2: hub failed to enable device, error -108
+usb 7-1-port2: cannot disable (err = -22)
+usb 7-1-port2: couldn't allocate usb_device
+usb 7-1-port2: cannot disable (err = -22)
+hub 7-1:1.0: hub_ext_port_status failed (err = -22)
+hub 7-1:1.0: hub_ext_port_status failed (err = -22)
+hub 7-1:1.0: activate --> -22
+hub 7-1:1.0: hub_ext_port_status failed (err = -22)
+hub 7-1:1.0: hub_ext_port_status failed (err = -22)
+hub 7-1:1.0: activate --> -22
+hub 7-1:1.0: hub_ext_port_status failed (err = -22)
+hub 7-1:1.0: hub_ext_port_status failed (err = -22)
+hub 7-1:1.0: activate --> -22
+hub 7-1:1.0: hub_ext_port_status failed (err = -22)
+hub 7-1:1.0: hub_ext_port_status failed (err = -22)
+hub 7-1:1.0: activate --> -22
+hub 7-1:1.0: hub_ext_port_status failed (err = -22)
+hub 7-1:1.0: hub_ext_port_status failed (err = -22)
+hub 7-1:1.0: activate --> -22
+hub 7-1:1.0: hub_ext_port_status failed (err = -22)
+hub 7-1:1.0: hub_ext_port_status failed (err = -22)
+hub 7-1:1.0: activate --> -22
+hub 7-1:1.0: hub_ext_port_status failed (err = -22)
+hub 7-1:1.0: hub_ext_port_status failed (err = -22)
+hub 7-1:1.0: activate --> -22
+hub 7-1:1.0: hub_ext_port_status failed (err = -22)
+hub 7-1:1.0: hub_ext_port_status failed (err = -22)
+hub 7-1:1.0: activate --> -22
+hub 7-1:1.0: hub_ext_port_status failed (err = -22)
+hub 7-1:1.0: hub_ext_port_status failed (err = -22)
+** 57 printk messages dropped ** hub 7-1:1.0: activate --> -22
+** 82 printk messages dropped ** hub 7-1:1.0: hub_ext_port_status failed (err = -22)
+
+This continues forever. After adding tracebacks into the code,
+the call sequence leading to this is found to be as follows.
+
+[<ffffffc0007fc8e0>] hub_activate+0x368/0x7b8
+[<ffffffc0007fceb4>] hub_resume+0x2c/0x3c
+[<ffffffc00080b3b8>] usb_resume_interface.isra.6+0x128/0x158
+[<ffffffc00080b5d0>] usb_suspend_both+0x1e8/0x288
+[<ffffffc00080c9c4>] usb_runtime_suspend+0x3c/0x98
+[<ffffffc0007820a0>] __rpm_callback+0x48/0x7c
+[<ffffffc00078217c>] rpm_callback+0xa8/0xd4
+[<ffffffc000786234>] rpm_suspend+0x84/0x758
+[<ffffffc000786ca4>] rpm_idle+0x2c8/0x498
+[<ffffffc000786ed4>] __pm_runtime_idle+0x60/0xac
+[<ffffffc00080eba8>] usb_autopm_put_interface+0x6c/0x7c
+[<ffffffc000803798>] hub_event+0x10ac/0x12ac
+[<ffffffc000249bb8>] process_one_work+0x390/0x6b8
+[<ffffffc00024abcc>] worker_thread+0x480/0x610
+[<ffffffc000251a80>] kthread+0x164/0x178
+[<ffffffc0002045d0>] ret_from_fork+0x10/0x40
+
+kick_hub_wq() is called from hub_activate() even after failures to
+communicate with the hub. This results in an endless sequence of
+hub event -> hub activate -> wq trigger -> hub event -> ...
+
+Provide two solutions for the problem.
+
+- Only trigger the hub event queue if communication with the hub
+  is successful.
+- After a suspend failure, only resume already suspended interfaces
+  if the communication with the device is still possible.
+
+Each of the changes fixes the observed problem. Use both to improve
+robustness.
+
+Acked-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Guenter Roeck <linux@roeck-us.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/usb/core/driver.c |   18 ++++++++++++++++++
+ drivers/usb/core/hub.c    |    5 ++++-
+ 2 files changed, 22 insertions(+), 1 deletion(-)
+
+--- a/drivers/usb/core/driver.c
++++ b/drivers/usb/core/driver.c
+@@ -1331,6 +1331,24 @@ static int usb_suspend_both(struct usb_d
+ 		 */
+ 		if (udev->parent && !PMSG_IS_AUTO(msg))
+ 			status = 0;
++
++		/*
++		 * If the device is inaccessible, don't try to resume
++		 * suspended interfaces and just return the error.
++		 */
++		if (status && status != -EBUSY) {
++			int err;
++			u16 devstat;
++
++			err = usb_get_status(udev, USB_RECIP_DEVICE, 0,
++					     &devstat);
++			if (err) {
++				dev_err(&udev->dev,
++					"Failed to suspend device, error %d\n",
++					status);
++				goto done;
++			}
++		}
+ 	}
+ 
+ 	/* If the suspend failed, resume interfaces that did get suspended */
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -1066,6 +1066,9 @@ static void hub_activate(struct usb_hub
+ 
+ 		portstatus = portchange = 0;
+ 		status = hub_port_status(hub, port1, &portstatus, &portchange);
++		if (status)
++			goto abort;
++
+ 		if (udev || (portstatus & USB_PORT_STAT_CONNECTION))
+ 			dev_dbg(&port_dev->dev, "status %04x change %04x\n",
+ 					portstatus, portchange);
+@@ -1198,7 +1201,7 @@ static void hub_activate(struct usb_hub
+ 
+ 	/* Scan all ports that need attention */
+ 	kick_hub_wq(hub);
+-
++ abort:
+ 	if (type == HUB_INIT2 || type == HUB_INIT3) {
+ 		/* Allow autosuspend if it was suppressed */
+  disconnected:
