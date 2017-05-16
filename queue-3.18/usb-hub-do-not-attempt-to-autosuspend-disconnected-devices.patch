@@ -1,0 +1,103 @@
+From f5cccf49428447dfbc9edb7a04bb8fc316269781 Mon Sep 17 00:00:00 2001
+From: Guenter Roeck <linux@roeck-us.net>
+Date: Mon, 20 Mar 2017 14:30:50 -0700
+Subject: usb: hub: Do not attempt to autosuspend disconnected devices
+
+From: Guenter Roeck <linux@roeck-us.net>
+
+commit f5cccf49428447dfbc9edb7a04bb8fc316269781 upstream.
+
+While running a bind/unbind stress test with the dwc3 usb driver on rk3399,
+the following crash was observed.
+
+Unable to handle kernel NULL pointer dereference at virtual address 00000218
+pgd = ffffffc00165f000
+[00000218] *pgd=000000000174f003, *pud=000000000174f003,
+				*pmd=0000000001750003, *pte=00e8000001751713
+Internal error: Oops: 96000005 [#1] PREEMPT SMP
+Modules linked in: uinput uvcvideo videobuf2_vmalloc cmac
+ipt_MASQUERADE nf_nat_masquerade_ipv4 iptable_nat nf_nat_ipv4 nf_nat rfcomm
+xt_mark fuse bridge stp llc zram btusb btrtl btbcm btintel bluetooth
+ip6table_filter mwifiex_pcie mwifiex cfg80211 cdc_ether usbnet r8152 mii joydev
+snd_seq_midi snd_seq_midi_event snd_rawmidi snd_seq snd_seq_device ppp_async
+ppp_generic slhc tun
+CPU: 1 PID: 29814 Comm: kworker/1:1 Not tainted 4.4.52 #507
+Hardware name: Google Kevin (DT)
+Workqueue: pm pm_runtime_work
+task: ffffffc0ac540000 ti: ffffffc0af4d4000 task.ti: ffffffc0af4d4000
+PC is at autosuspend_check+0x74/0x174
+LR is at autosuspend_check+0x70/0x174
+...
+Call trace:
+[<ffffffc00080dcc0>] autosuspend_check+0x74/0x174
+[<ffffffc000810500>] usb_runtime_idle+0x20/0x40
+[<ffffffc000785ae0>] __rpm_callback+0x48/0x7c
+[<ffffffc000786af0>] rpm_idle+0x1e8/0x498
+[<ffffffc000787cdc>] pm_runtime_work+0x88/0xcc
+[<ffffffc000249bb8>] process_one_work+0x390/0x6b8
+[<ffffffc00024abcc>] worker_thread+0x480/0x610
+[<ffffffc000251a80>] kthread+0x164/0x178
+[<ffffffc0002045d0>] ret_from_fork+0x10/0x40
+
+Source:
+
+(gdb) l *0xffffffc00080dcc0
+0xffffffc00080dcc0 is in autosuspend_check
+(drivers/usb/core/driver.c:1778).
+1773		/* We don't need to check interfaces that are
+1774		 * disabled for runtime PM.  Either they are unbound
+1775		 * or else their drivers don't support autosuspend
+1776		 * and so they are permanently active.
+1777		 */
+1778		if (intf->dev.power.disable_depth)
+1779			continue;
+1780		if (atomic_read(&intf->dev.power.usage_count) > 0)
+1781			return -EBUSY;
+1782		w |= intf->needs_remote_wakeup;
+
+Code analysis shows that intf is set to NULL in usb_disable_device() prior
+to setting actconfig to NULL. At the same time, usb_runtime_idle() does not
+lock the usb device, and neither does any of the functions in the
+traceback. This means that there is no protection against a race condition
+where usb_disable_device() is removing dev->actconfig->interface[] pointers
+while those are being accessed from autosuspend_check().
+
+To solve the problem, synchronize and validate device state between
+autosuspend_check() and usb_disconnect().
+
+Acked-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Guenter Roeck <linux@roeck-us.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/usb/core/driver.c |    3 +++
+ drivers/usb/core/hub.c    |    6 ++++++
+ 2 files changed, 9 insertions(+)
+
+--- a/drivers/usb/core/driver.c
++++ b/drivers/usb/core/driver.c
+@@ -1757,6 +1757,9 @@ static int autosuspend_check(struct usb_
+ 	int			w, i;
+ 	struct usb_interface	*intf;
+ 
++	if (udev->state == USB_STATE_NOTATTACHED)
++		return -ENODEV;
++
+ 	/* Fail if autosuspend is disabled, or any interfaces are in use, or
+ 	 * any interface drivers require remote wakeup but it isn't available.
+ 	 */
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -2100,6 +2100,12 @@ void usb_disconnect(struct usb_device **
+ 	dev_info(&udev->dev, "USB disconnect, device number %d\n",
+ 			udev->devnum);
+ 
++	/*
++	 * Ensure that the pm runtime code knows that the USB device
++	 * is in the process of being disconnected.
++	 */
++	pm_runtime_barrier(&udev->dev);
++
+ 	usb_lock_device(udev);
+ 
+ 	hub_disconnect_children(udev);
