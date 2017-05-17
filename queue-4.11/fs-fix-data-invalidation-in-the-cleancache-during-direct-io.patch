@@ -1,0 +1,148 @@
+From 55635ba76ef91f26b418702ace5e6287eb727f6a Mon Sep 17 00:00:00 2001
+From: Andrey Ryabinin <aryabinin@virtuozzo.com>
+Date: Wed, 3 May 2017 14:55:59 -0700
+Subject: fs: fix data invalidation in the cleancache during direct IO
+
+From: Andrey Ryabinin <aryabinin@virtuozzo.com>
+
+commit 55635ba76ef91f26b418702ace5e6287eb727f6a upstream.
+
+Patch series "Properly invalidate data in the cleancache", v2.
+
+We've noticed that after direct IO write, buffered read sometimes gets
+stale data which is coming from the cleancache.  The reason for this is
+that some direct write hooks call call invalidate_inode_pages2[_range]()
+conditionally iff mapping->nrpages is not zero, so we may not invalidate
+data in the cleancache.
+
+Another odd thing is that we check only for ->nrpages and don't check
+for ->nrexceptional, but invalidate_inode_pages2[_range] also
+invalidates exceptional entries as well.  So we invalidate exceptional
+entries only if ->nrpages != 0? This doesn't feel right.
+
+ - Patch 1 fixes direct IO writes by removing ->nrpages check.
+ - Patch 2 fixes similar case in invalidate_bdev().
+     Note: I only fixed conditional cleancache_invalidate_inode() here.
+       Do we also need to add ->nrexceptional check in into invalidate_bdev()?
+
+ - Patches 3-4: some optimizations.
+
+This patch (of 4):
+
+Some direct IO write fs hooks call invalidate_inode_pages2[_range]()
+conditionally iff mapping->nrpages is not zero.  This can't be right,
+because invalidate_inode_pages2[_range]() also invalidate data in the
+cleancache via cleancache_invalidate_inode() call.  So if page cache is
+empty but there is some data in the cleancache, buffered read after
+direct IO write would get stale data from the cleancache.
+
+Also it doesn't feel right to check only for ->nrpages because
+invalidate_inode_pages2[_range] invalidates exceptional entries as well.
+
+Fix this by calling invalidate_inode_pages2[_range]() regardless of
+nrpages state.
+
+Note: nfs,cifs,9p doesn't need similar fix because the never call
+cleancache_get_page() (nor directly, nor via mpage_readpage[s]()), so
+they are not affected by this bug.
+
+Fixes: c515e1fd361c ("mm/fs: add hooks to support cleancache")
+Link: http://lkml.kernel.org/r/20170424164135.22350-2-aryabinin@virtuozzo.com
+Signed-off-by: Andrey Ryabinin <aryabinin@virtuozzo.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Acked-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+Cc: Alexander Viro <viro@zeniv.linux.org.uk>
+Cc: Ross Zwisler <ross.zwisler@linux.intel.com>
+Cc: Jens Axboe <axboe@kernel.dk>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Alexey Kuznetsov <kuznet@virtuozzo.com>
+Cc: Christoph Hellwig <hch@lst.de>
+Cc: Nikolay Borisov <n.borisov.lkml@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/iomap.c   |   20 +++++++++-----------
+ mm/filemap.c |   26 +++++++++++---------------
+ 2 files changed, 20 insertions(+), 26 deletions(-)
+
+--- a/fs/iomap.c
++++ b/fs/iomap.c
+@@ -887,16 +887,14 @@ iomap_dio_rw(struct kiocb *iocb, struct
+ 		flags |= IOMAP_WRITE;
+ 	}
+ 
+-	if (mapping->nrpages) {
+-		ret = filemap_write_and_wait_range(mapping, start, end);
+-		if (ret)
+-			goto out_free_dio;
+-
+-		ret = invalidate_inode_pages2_range(mapping,
+-				start >> PAGE_SHIFT, end >> PAGE_SHIFT);
+-		WARN_ON_ONCE(ret);
+-		ret = 0;
+-	}
++	ret = filemap_write_and_wait_range(mapping, start, end);
++	if (ret)
++		goto out_free_dio;
++
++	ret = invalidate_inode_pages2_range(mapping,
++			start >> PAGE_SHIFT, end >> PAGE_SHIFT);
++	WARN_ON_ONCE(ret);
++	ret = 0;
+ 
+ 	inode_dio_begin(inode);
+ 
+@@ -951,7 +949,7 @@ iomap_dio_rw(struct kiocb *iocb, struct
+ 	 * one is a pretty crazy thing to do, so we don't support it 100%.  If
+ 	 * this invalidation fails, tough, the write still worked...
+ 	 */
+-	if (iov_iter_rw(iter) == WRITE && mapping->nrpages) {
++	if (iov_iter_rw(iter) == WRITE) {
+ 		int err = invalidate_inode_pages2_range(mapping,
+ 				start >> PAGE_SHIFT, end >> PAGE_SHIFT);
+ 		WARN_ON_ONCE(err);
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -2719,18 +2719,16 @@ generic_file_direct_write(struct kiocb *
+ 	 * about to write.  We do this *before* the write so that we can return
+ 	 * without clobbering -EIOCBQUEUED from ->direct_IO().
+ 	 */
+-	if (mapping->nrpages) {
+-		written = invalidate_inode_pages2_range(mapping,
++	written = invalidate_inode_pages2_range(mapping,
+ 					pos >> PAGE_SHIFT, end);
+-		/*
+-		 * If a page can not be invalidated, return 0 to fall back
+-		 * to buffered write.
+-		 */
+-		if (written) {
+-			if (written == -EBUSY)
+-				return 0;
+-			goto out;
+-		}
++	/*
++	 * If a page can not be invalidated, return 0 to fall back
++	 * to buffered write.
++	 */
++	if (written) {
++		if (written == -EBUSY)
++			return 0;
++		goto out;
+ 	}
+ 
+ 	data = *from;
+@@ -2744,10 +2742,8 @@ generic_file_direct_write(struct kiocb *
+ 	 * so we don't support it 100%.  If this invalidation
+ 	 * fails, tough, the write still worked...
+ 	 */
+-	if (mapping->nrpages) {
+-		invalidate_inode_pages2_range(mapping,
+-					      pos >> PAGE_SHIFT, end);
+-	}
++	invalidate_inode_pages2_range(mapping,
++				pos >> PAGE_SHIFT, end);
+ 
+ 	if (written > 0) {
+ 		pos += written;

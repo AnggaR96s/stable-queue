@@ -1,0 +1,237 @@
+From 3998e6b87d4258a70df358296d6f1c7234012bfe Mon Sep 17 00:00:00 2001
+From: Rabin Vincent <rabinv@axis.com>
+Date: Wed, 3 May 2017 17:54:01 +0200
+Subject: CIFS: fix oplock break deadlocks
+
+From: Rabin Vincent <rabinv@axis.com>
+
+commit 3998e6b87d4258a70df358296d6f1c7234012bfe upstream.
+
+When the final cifsFileInfo_put() is called from cifsiod and an oplock
+break work is queued, lockdep complains loudly:
+
+ =============================================
+ [ INFO: possible recursive locking detected ]
+ 4.11.0+ #21 Not tainted
+ ---------------------------------------------
+ kworker/0:2/78 is trying to acquire lock:
+  ("cifsiod"){++++.+}, at: flush_work+0x215/0x350
+
+ but task is already holding lock:
+  ("cifsiod"){++++.+}, at: process_one_work+0x255/0x8e0
+
+ other info that might help us debug this:
+  Possible unsafe locking scenario:
+
+        CPU0
+        ----
+   lock("cifsiod");
+   lock("cifsiod");
+
+  *** DEADLOCK ***
+
+  May be due to missing lock nesting notation
+
+ 2 locks held by kworker/0:2/78:
+  #0:  ("cifsiod"){++++.+}, at: process_one_work+0x255/0x8e0
+  #1:  ((&wdata->work)){+.+...}, at: process_one_work+0x255/0x8e0
+
+ stack backtrace:
+ CPU: 0 PID: 78 Comm: kworker/0:2 Not tainted 4.11.0+ #21
+ Workqueue: cifsiod cifs_writev_complete
+ Call Trace:
+  dump_stack+0x85/0xc2
+  __lock_acquire+0x17dd/0x2260
+  ? match_held_lock+0x20/0x2b0
+  ? trace_hardirqs_off_caller+0x86/0x130
+  ? mark_lock+0xa6/0x920
+  lock_acquire+0xcc/0x260
+  ? lock_acquire+0xcc/0x260
+  ? flush_work+0x215/0x350
+  flush_work+0x236/0x350
+  ? flush_work+0x215/0x350
+  ? destroy_worker+0x170/0x170
+  __cancel_work_timer+0x17d/0x210
+  ? ___preempt_schedule+0x16/0x18
+  cancel_work_sync+0x10/0x20
+  cifsFileInfo_put+0x338/0x7f0
+  cifs_writedata_release+0x2a/0x40
+  ? cifs_writedata_release+0x2a/0x40
+  cifs_writev_complete+0x29d/0x850
+  ? preempt_count_sub+0x18/0xd0
+  process_one_work+0x304/0x8e0
+  worker_thread+0x9b/0x6a0
+  kthread+0x1b2/0x200
+  ? process_one_work+0x8e0/0x8e0
+  ? kthread_create_on_node+0x40/0x40
+  ret_from_fork+0x31/0x40
+
+This is a real warning.  Since the oplock is queued on the same
+workqueue this can deadlock if there is only one worker thread active
+for the workqueue (which will be the case during memory pressure when
+the rescuer thread is handling it).
+
+Furthermore, there is at least one other kind of hang possible due to
+the oplock break handling if there is only worker.  (This can be
+reproduced without introducing memory pressure by having passing 1 for
+the max_active parameter of cifsiod.) cifs_oplock_break() can wait
+indefintely in the filemap_fdatawait() while the cifs_writev_complete()
+work is blocked:
+
+ sysrq: SysRq : Show Blocked State
+   task                        PC stack   pid father
+ kworker/0:1     D    0    16      2 0x00000000
+ Workqueue: cifsiod cifs_oplock_break
+ Call Trace:
+  __schedule+0x562/0xf40
+  ? mark_held_locks+0x4a/0xb0
+  schedule+0x57/0xe0
+  io_schedule+0x21/0x50
+  wait_on_page_bit+0x143/0x190
+  ? add_to_page_cache_lru+0x150/0x150
+  __filemap_fdatawait_range+0x134/0x190
+  ? do_writepages+0x51/0x70
+  filemap_fdatawait_range+0x14/0x30
+  filemap_fdatawait+0x3b/0x40
+  cifs_oplock_break+0x651/0x710
+  ? preempt_count_sub+0x18/0xd0
+  process_one_work+0x304/0x8e0
+  worker_thread+0x9b/0x6a0
+  kthread+0x1b2/0x200
+  ? process_one_work+0x8e0/0x8e0
+  ? kthread_create_on_node+0x40/0x40
+  ret_from_fork+0x31/0x40
+ dd              D    0   683    171 0x00000000
+ Call Trace:
+  __schedule+0x562/0xf40
+  ? mark_held_locks+0x29/0xb0
+  schedule+0x57/0xe0
+  io_schedule+0x21/0x50
+  wait_on_page_bit+0x143/0x190
+  ? add_to_page_cache_lru+0x150/0x150
+  __filemap_fdatawait_range+0x134/0x190
+  ? do_writepages+0x51/0x70
+  filemap_fdatawait_range+0x14/0x30
+  filemap_fdatawait+0x3b/0x40
+  filemap_write_and_wait+0x4e/0x70
+  cifs_flush+0x6a/0xb0
+  filp_close+0x52/0xa0
+  __close_fd+0xdc/0x150
+  SyS_close+0x33/0x60
+  entry_SYSCALL_64_fastpath+0x1f/0xbe
+
+ Showing all locks held in the system:
+ 2 locks held by kworker/0:1/16:
+  #0:  ("cifsiod"){.+.+.+}, at: process_one_work+0x255/0x8e0
+  #1:  ((&cfile->oplock_break)){+.+.+.}, at: process_one_work+0x255/0x8e0
+
+ Showing busy workqueues and worker pools:
+ workqueue cifsiod: flags=0xc
+   pwq 0: cpus=0 node=0 flags=0x0 nice=0 active=1/1
+     in-flight: 16:cifs_oplock_break
+     delayed: cifs_writev_complete, cifs_echo_request
+ pool 0: cpus=0 node=0 flags=0x0 nice=0 hung=0s workers=3 idle: 750 3
+
+Fix these problems by creating a a new workqueue (with a rescuer) for
+the oplock break work.
+
+Signed-off-by: Rabin Vincent <rabinv@axis.com>
+Signed-off-by: Steve French <smfrench@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/cifs/cifsfs.c   |   15 +++++++++++++--
+ fs/cifs/cifsglob.h |    1 +
+ fs/cifs/misc.c     |    2 +-
+ fs/cifs/smb2misc.c |    5 +++--
+ 4 files changed, 18 insertions(+), 5 deletions(-)
+
+--- a/fs/cifs/cifsfs.c
++++ b/fs/cifs/cifsfs.c
+@@ -87,6 +87,7 @@ extern mempool_t *cifs_req_poolp;
+ extern mempool_t *cifs_mid_poolp;
+ 
+ struct workqueue_struct	*cifsiod_wq;
++struct workqueue_struct	*cifsoplockd_wq;
+ __u32 cifs_lock_secret;
+ 
+ /*
+@@ -1369,9 +1370,16 @@ init_cifs(void)
+ 		goto out_clean_proc;
+ 	}
+ 
++	cifsoplockd_wq = alloc_workqueue("cifsoplockd",
++					 WQ_FREEZABLE|WQ_MEM_RECLAIM, 0);
++	if (!cifsoplockd_wq) {
++		rc = -ENOMEM;
++		goto out_destroy_cifsiod_wq;
++	}
++
+ 	rc = cifs_fscache_register();
+ 	if (rc)
+-		goto out_destroy_wq;
++		goto out_destroy_cifsoplockd_wq;
+ 
+ 	rc = cifs_init_inodecache();
+ 	if (rc)
+@@ -1419,7 +1427,9 @@ out_destroy_inodecache:
+ 	cifs_destroy_inodecache();
+ out_unreg_fscache:
+ 	cifs_fscache_unregister();
+-out_destroy_wq:
++out_destroy_cifsoplockd_wq:
++	destroy_workqueue(cifsoplockd_wq);
++out_destroy_cifsiod_wq:
+ 	destroy_workqueue(cifsiod_wq);
+ out_clean_proc:
+ 	cifs_proc_clean();
+@@ -1442,6 +1452,7 @@ exit_cifs(void)
+ 	cifs_destroy_mids();
+ 	cifs_destroy_inodecache();
+ 	cifs_fscache_unregister();
++	destroy_workqueue(cifsoplockd_wq);
+ 	destroy_workqueue(cifsiod_wq);
+ 	cifs_proc_clean();
+ }
+--- a/fs/cifs/cifsglob.h
++++ b/fs/cifs/cifsglob.h
+@@ -1683,6 +1683,7 @@ void cifs_oplock_break(struct work_struc
+ 
+ extern const struct slow_work_ops cifs_oplock_break_ops;
+ extern struct workqueue_struct *cifsiod_wq;
++extern struct workqueue_struct *cifsoplockd_wq;
+ extern __u32 cifs_lock_secret;
+ 
+ extern mempool_t *cifs_mid_poolp;
+--- a/fs/cifs/misc.c
++++ b/fs/cifs/misc.c
+@@ -492,7 +492,7 @@ is_valid_oplock_break(char *buffer, stru
+ 					   CIFS_INODE_DOWNGRADE_OPLOCK_TO_L2,
+ 					   &pCifsInode->flags);
+ 
+-				queue_work(cifsiod_wq,
++				queue_work(cifsoplockd_wq,
+ 					   &netfile->oplock_break);
+ 				netfile->oplock_break_cancelled = false;
+ 
+--- a/fs/cifs/smb2misc.c
++++ b/fs/cifs/smb2misc.c
+@@ -499,7 +499,7 @@ smb2_tcon_has_lease(struct cifs_tcon *tc
+ 		else
+ 			cfile->oplock_break_cancelled = true;
+ 
+-		queue_work(cifsiod_wq, &cfile->oplock_break);
++		queue_work(cifsoplockd_wq, &cfile->oplock_break);
+ 		kfree(lw);
+ 		return true;
+ 	}
+@@ -643,7 +643,8 @@ smb2_is_valid_oplock_break(char *buffer,
+ 					   CIFS_INODE_DOWNGRADE_OPLOCK_TO_L2,
+ 					   &cinode->flags);
+ 				spin_unlock(&cfile->file_info_lock);
+-				queue_work(cifsiod_wq, &cfile->oplock_break);
++				queue_work(cifsoplockd_wq,
++					   &cfile->oplock_break);
+ 
+ 				spin_unlock(&tcon->open_file_lock);
+ 				spin_unlock(&cifs_tcp_ses_lock);
