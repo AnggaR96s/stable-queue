@@ -1,0 +1,196 @@
+From 0cfef2b7410b64d7a430947e0b533314c4f97153 Mon Sep 17 00:00:00 2001
+From: Alex Williamson <alex.williamson@redhat.com>
+Date: Thu, 13 Apr 2017 14:10:15 -0600
+Subject: vfio/type1: Remove locked page accounting workqueue
+
+From: Alex Williamson <alex.williamson@redhat.com>
+
+commit 0cfef2b7410b64d7a430947e0b533314c4f97153 upstream.
+
+If the mmap_sem is contented then the vfio type1 IOMMU backend will
+defer locked page accounting updates to a workqueue task.  This has a
+few problems and depending on which side the user tries to play, they
+might be over-penalized for unmaps that haven't yet been accounted or
+race the workqueue to enter more mappings than they're allowed.  The
+original intent of this workqueue mechanism seems to be focused on
+reducing latency through the ioctl, but we cannot do so at the cost
+of correctness.  Remove this workqueue mechanism and update the
+callers to allow for failure.  We can also now recheck the limit under
+write lock to make sure we don't exceed it.
+
+vfio_pin_pages_remote() also now necessarily includes an unwind path
+which we can jump to directly if the consecutive page pinning finds
+that we're exceeding the user's memory limits.  This avoids the
+current lazy approach which does accounting and mapping up to the
+fault, only to return an error on the next iteration to unwind the
+entire vfio_dma.
+
+Cc: stable@vger.kernel.org
+Reviewed-by: Peter Xu <peterx@redhat.com>
+Reviewed-by: Kirti Wankhede <kwankhede@nvidia.com>
+Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+
+---
+ drivers/vfio/vfio_iommu_type1.c |  100 ++++++++++++++++------------------------
+ 1 file changed, 42 insertions(+), 58 deletions(-)
+
+--- a/drivers/vfio/vfio_iommu_type1.c
++++ b/drivers/vfio/vfio_iommu_type1.c
+@@ -130,57 +130,34 @@ static void vfio_unlink_dma(struct vfio_
+ 	rb_erase(&old->node, &iommu->dma_list);
+ }
+ 
+-struct vwork {
+-	struct mm_struct	*mm;
+-	long			npage;
+-	struct work_struct	work;
+-};
+-
+-/* delayed decrement/increment for locked_vm */
+-static void vfio_lock_acct_bg(struct work_struct *work)
++static int vfio_lock_acct(long npage, bool *lock_cap)
+ {
+-	struct vwork *vwork = container_of(work, struct vwork, work);
+-	struct mm_struct *mm;
++	int ret = 0;
+ 
+-	mm = vwork->mm;
+-	down_write(&mm->mmap_sem);
+-	mm->locked_vm += vwork->npage;
+-	up_write(&mm->mmap_sem);
+-	mmput(mm);
+-	kfree(vwork);
+-}
++	if (!npage)
++		return 0;
+ 
+-static void vfio_lock_acct(long npage)
+-{
+-	struct vwork *vwork;
+-	struct mm_struct *mm;
++	if (!current->mm)
++		return -ESRCH; /* process exited */
+ 
+-	if (!current->mm || !npage)
+-		return; /* process exited or nothing to do */
++	down_write(&current->mm->mmap_sem);
++	if (npage > 0) {
++		if (lock_cap ? !*lock_cap : !capable(CAP_IPC_LOCK)) {
++			unsigned long limit;
+ 
+-	if (down_write_trylock(&current->mm->mmap_sem)) {
+-		current->mm->locked_vm += npage;
+-		up_write(&current->mm->mmap_sem);
+-		return;
+-	}
++			limit = rlimit(RLIMIT_MEMLOCK) >> PAGE_SHIFT;
+ 
+-	/*
+-	 * Couldn't get mmap_sem lock, so must setup to update
+-	 * mm->locked_vm later. If locked_vm were atomic, we
+-	 * wouldn't need this silliness
+-	 */
+-	vwork = kmalloc(sizeof(struct vwork), GFP_KERNEL);
+-	if (!vwork)
+-		return;
+-	mm = get_task_mm(current);
+-	if (!mm) {
+-		kfree(vwork);
+-		return;
++			if (current->mm->locked_vm + npage > limit)
++				ret = -ENOMEM;
++		}
+ 	}
+-	INIT_WORK(&vwork->work, vfio_lock_acct_bg);
+-	vwork->mm = mm;
+-	vwork->npage = npage;
+-	schedule_work(&vwork->work);
++
++	if (!ret)
++		current->mm->locked_vm += npage;
++
++	up_write(&current->mm->mmap_sem);
++
++	return ret;
+ }
+ 
+ /*
+@@ -262,9 +239,9 @@ static int vaddr_get_pfn(unsigned long v
+ static long vfio_pin_pages(unsigned long vaddr, long npage,
+ 			   int prot, unsigned long *pfn_base)
+ {
+-	unsigned long limit = rlimit(RLIMIT_MEMLOCK) >> PAGE_SHIFT;
++	unsigned long pfn = 0, limit = rlimit(RLIMIT_MEMLOCK) >> PAGE_SHIFT;
+ 	bool lock_cap = capable(CAP_IPC_LOCK);
+-	long ret, i;
++	long ret, i = 1;
+ 	bool rsvd;
+ 
+ 	if (!current->mm)
+@@ -283,16 +260,11 @@ static long vfio_pin_pages(unsigned long
+ 		return -ENOMEM;
+ 	}
+ 
+-	if (unlikely(disable_hugepages)) {
+-		if (!rsvd)
+-			vfio_lock_acct(1);
+-		return 1;
+-	}
++	if (unlikely(disable_hugepages))
++		goto out;
+ 
+ 	/* Lock all the consecutive pages from pfn_base */
+-	for (i = 1, vaddr += PAGE_SIZE; i < npage; i++, vaddr += PAGE_SIZE) {
+-		unsigned long pfn = 0;
+-
++	for (vaddr += PAGE_SIZE; i < npage; i++, vaddr += PAGE_SIZE) {
+ 		ret = vaddr_get_pfn(vaddr, prot, &pfn);
+ 		if (ret)
+ 			break;
+@@ -308,12 +280,24 @@ static long vfio_pin_pages(unsigned long
+ 			put_pfn(pfn, prot);
+ 			pr_warn("%s: RLIMIT_MEMLOCK (%ld) exceeded\n",
+ 				__func__, limit << PAGE_SHIFT);
+-			break;
++			ret = -ENOMEM;
++			goto unpin_out;
+ 		}
+ 	}
+ 
++out:
+ 	if (!rsvd)
+-		vfio_lock_acct(i);
++		ret = vfio_lock_acct(i, &lock_cap);
++
++unpin_out:
++	if (ret) {
++		if (!rsvd) {
++			for (pfn = *pfn_base ; i ; pfn++, i--)
++				put_pfn(pfn, prot);
++		}
++
++		return ret;
++	}
+ 
+ 	return i;
+ }
+@@ -328,7 +312,7 @@ static long vfio_unpin_pages(unsigned lo
+ 		unlocked += put_pfn(pfn++, prot);
+ 
+ 	if (do_accounting)
+-		vfio_lock_acct(-unlocked);
++		vfio_lock_acct(-unlocked, NULL);
+ 
+ 	return unlocked;
+ }
+@@ -390,7 +374,7 @@ static void vfio_unmap_unpin(struct vfio
+ 		cond_resched();
+ 	}
+ 
+-	vfio_lock_acct(-unlocked);
++	vfio_lock_acct(-unlocked, NULL);
+ }
+ 
+ static void vfio_remove_dma(struct vfio_iommu *iommu, struct vfio_dma *dma)
