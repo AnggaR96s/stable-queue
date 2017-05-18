@@ -1,0 +1,166 @@
+From 272f98f6846277378e1758a49a49d7bf39343c02 Mon Sep 17 00:00:00 2001
+From: Eric Biggers <ebiggers@google.com>
+Date: Fri, 7 Apr 2017 10:58:37 -0700
+Subject: fscrypt: fix context consistency check when key(s) unavailable
+
+From: Eric Biggers <ebiggers@google.com>
+
+commit 272f98f6846277378e1758a49a49d7bf39343c02 upstream.
+
+To mitigate some types of offline attacks, filesystem encryption is
+designed to enforce that all files in an encrypted directory tree use
+the same encryption policy (i.e. the same encryption context excluding
+the nonce).  However, the fscrypt_has_permitted_context() function which
+enforces this relies on comparing struct fscrypt_info's, which are only
+available when we have the encryption keys.  This can cause two
+incorrect behaviors:
+
+1. If we have the parent directory's key but not the child's key, or
+   vice versa, then fscrypt_has_permitted_context() returned false,
+   causing applications to see EPERM or ENOKEY.  This is incorrect if
+   the encryption contexts are in fact consistent.  Although we'd
+   normally have either both keys or neither key in that case since the
+   master_key_descriptors would be the same, this is not guaranteed
+   because keys can be added or removed from keyrings at any time.
+
+2. If we have neither the parent's key nor the child's key, then
+   fscrypt_has_permitted_context() returned true, causing applications
+   to see no error (or else an error for some other reason).  This is
+   incorrect if the encryption contexts are in fact inconsistent, since
+   in that case we should deny access.
+
+To fix this, retrieve and compare the fscrypt_contexts if we are unable
+to set up both fscrypt_infos.
+
+While this slightly hurts performance when accessing an encrypted
+directory tree without the key, this isn't a case we really need to be
+optimizing for; access *with* the key is much more important.
+Furthermore, the performance hit is barely noticeable given that we are
+already retrieving the fscrypt_context and doing two keyring searches in
+fscrypt_get_encryption_info().  If we ever actually wanted to optimize
+this case we might start by caching the fscrypt_contexts.
+
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/crypto/policy.c |   87 +++++++++++++++++++++++++++++++++++++++++------------
+ 1 file changed, 68 insertions(+), 19 deletions(-)
+
+--- a/fs/crypto/policy.c
++++ b/fs/crypto/policy.c
+@@ -169,27 +169,61 @@ int fscrypt_ioctl_get_policy(struct file
+ }
+ EXPORT_SYMBOL(fscrypt_ioctl_get_policy);
+ 
++/**
++ * fscrypt_has_permitted_context() - is a file's encryption policy permitted
++ *				     within its directory?
++ *
++ * @parent: inode for parent directory
++ * @child: inode for file being looked up, opened, or linked into @parent
++ *
++ * Filesystems must call this before permitting access to an inode in a
++ * situation where the parent directory is encrypted (either before allowing
++ * ->lookup() to succeed, or for a regular file before allowing it to be opened)
++ * and before any operation that involves linking an inode into an encrypted
++ * directory, including link, rename, and cross rename.  It enforces the
++ * constraint that within a given encrypted directory tree, all files use the
++ * same encryption policy.  The pre-access check is needed to detect potentially
++ * malicious offline violations of this constraint, while the link and rename
++ * checks are needed to prevent online violations of this constraint.
++ *
++ * Return: 1 if permitted, 0 if forbidden.  If forbidden, the caller must fail
++ * the filesystem operation with EPERM.
++ */
+ int fscrypt_has_permitted_context(struct inode *parent, struct inode *child)
+ {
+-	struct fscrypt_info *parent_ci, *child_ci;
++	const struct fscrypt_operations *cops = parent->i_sb->s_cop;
++	const struct fscrypt_info *parent_ci, *child_ci;
++	struct fscrypt_context parent_ctx, child_ctx;
+ 	int res;
+ 
+-	if ((parent == NULL) || (child == NULL)) {
+-		printk(KERN_ERR	"parent %p child %p\n", parent, child);
+-		BUG_ON(1);
+-	}
+-
+ 	/* No restrictions on file types which are never encrypted */
+ 	if (!S_ISREG(child->i_mode) && !S_ISDIR(child->i_mode) &&
+ 	    !S_ISLNK(child->i_mode))
+ 		return 1;
+ 
+-	/* no restrictions if the parent directory is not encrypted */
+-	if (!parent->i_sb->s_cop->is_encrypted(parent))
++	/* No restrictions if the parent directory is unencrypted */
++	if (!cops->is_encrypted(parent))
+ 		return 1;
+-	/* if the child directory is not encrypted, this is always a problem */
+-	if (!parent->i_sb->s_cop->is_encrypted(child))
++
++	/* Encrypted directories must not contain unencrypted files */
++	if (!cops->is_encrypted(child))
+ 		return 0;
++
++	/*
++	 * Both parent and child are encrypted, so verify they use the same
++	 * encryption policy.  Compare the fscrypt_info structs if the keys are
++	 * available, otherwise retrieve and compare the fscrypt_contexts.
++	 *
++	 * Note that the fscrypt_context retrieval will be required frequently
++	 * when accessing an encrypted directory tree without the key.
++	 * Performance-wise this is not a big deal because we already don't
++	 * really optimize for file access without the key (to the extent that
++	 * such access is even possible), given that any attempted access
++	 * already causes a fscrypt_context retrieval and keyring search.
++	 *
++	 * In any case, if an unexpected error occurs, fall back to "forbidden".
++	 */
++
+ 	res = fscrypt_get_encryption_info(parent);
+ 	if (res)
+ 		return 0;
+@@ -198,17 +232,32 @@ int fscrypt_has_permitted_context(struct
+ 		return 0;
+ 	parent_ci = parent->i_crypt_info;
+ 	child_ci = child->i_crypt_info;
+-	if (!parent_ci && !child_ci)
+-		return 1;
+-	if (!parent_ci || !child_ci)
++
++	if (parent_ci && child_ci) {
++		return memcmp(parent_ci->ci_master_key, child_ci->ci_master_key,
++			      FS_KEY_DESCRIPTOR_SIZE) == 0 &&
++			(parent_ci->ci_data_mode == child_ci->ci_data_mode) &&
++			(parent_ci->ci_filename_mode ==
++			 child_ci->ci_filename_mode) &&
++			(parent_ci->ci_flags == child_ci->ci_flags);
++	}
++
++	res = cops->get_context(parent, &parent_ctx, sizeof(parent_ctx));
++	if (res != sizeof(parent_ctx))
++		return 0;
++
++	res = cops->get_context(child, &child_ctx, sizeof(child_ctx));
++	if (res != sizeof(child_ctx))
+ 		return 0;
+ 
+-	return (memcmp(parent_ci->ci_master_key,
+-			child_ci->ci_master_key,
+-			FS_KEY_DESCRIPTOR_SIZE) == 0 &&
+-		(parent_ci->ci_data_mode == child_ci->ci_data_mode) &&
+-		(parent_ci->ci_filename_mode == child_ci->ci_filename_mode) &&
+-		(parent_ci->ci_flags == child_ci->ci_flags));
++	return memcmp(parent_ctx.master_key_descriptor,
++		      child_ctx.master_key_descriptor,
++		      FS_KEY_DESCRIPTOR_SIZE) == 0 &&
++		(parent_ctx.contents_encryption_mode ==
++		 child_ctx.contents_encryption_mode) &&
++		(parent_ctx.filenames_encryption_mode ==
++		 child_ctx.filenames_encryption_mode) &&
++		(parent_ctx.flags == child_ctx.flags);
+ }
+ EXPORT_SYMBOL(fscrypt_has_permitted_context);
+ 
