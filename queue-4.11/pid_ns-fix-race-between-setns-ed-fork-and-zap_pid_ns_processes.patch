@@ -1,0 +1,103 @@
+From 3fd37226216620c1a468afa999739d5016fbc349 Mon Sep 17 00:00:00 2001
+From: Kirill Tkhai <ktkhai@virtuozzo.com>
+Date: Fri, 12 May 2017 19:11:31 +0300
+Subject: pid_ns: Fix race between setns'ed fork() and zap_pid_ns_processes()
+
+From: Kirill Tkhai <ktkhai@virtuozzo.com>
+
+commit 3fd37226216620c1a468afa999739d5016fbc349 upstream.
+
+Imagine we have a pid namespace and a task from its parent's pid_ns,
+which made setns() to the pid namespace. The task is doing fork(),
+while the pid namespace's child reaper is dying. We have the race
+between them:
+
+Task from parent pid_ns             Child reaper
+copy_process()                      ..
+  alloc_pid()                       ..
+  ..                                zap_pid_ns_processes()
+  ..                                  disable_pid_allocation()
+  ..                                  read_lock(&tasklist_lock)
+  ..                                  iterate over pids in pid_ns
+  ..                                    kill tasks linked to pids
+  ..                                  read_unlock(&tasklist_lock)
+  write_lock_irq(&tasklist_lock);   ..
+  attach_pid(p, PIDTYPE_PID);       ..
+  ..                                ..
+
+So, just created task p won't receive SIGKILL signal,
+and the pid namespace will be in contradictory state.
+Only manual kill will help there, but does the userspace
+care about this? I suppose, the most users just inject
+a task into a pid namespace and wait a SIGCHLD from it.
+
+The patch fixes the problem. It simply checks for
+(pid_ns->nr_hashed & PIDNS_HASH_ADDING) in copy_process().
+We do it under the tasklist_lock, and can't skip
+PIDNS_HASH_ADDING as noted by Oleg:
+
+"zap_pid_ns_processes() does disable_pid_allocation()
+and then takes tasklist_lock to kill the whole namespace.
+Given that copy_process() checks PIDNS_HASH_ADDING
+under write_lock(tasklist) they can't race;
+if copy_process() takes this lock first, the new child will
+be killed, otherwise copy_process() can't miss
+the change in ->nr_hashed."
+
+If allocation is disabled, we just return -ENOMEM
+like it's made for such cases in alloc_pid().
+
+v2: Do not move disable_pid_allocation(), do not
+introduce a new variable in copy_process() and simplify
+the patch as suggested by Oleg Nesterov.
+Account the problem with double irq enabling
+found by Eric W. Biederman.
+
+Fixes: c876ad768215 ("pidns: Stop pid allocation when init dies")
+Signed-off-by: Kirill Tkhai <ktkhai@virtuozzo.com>
+CC: Andrew Morton <akpm@linux-foundation.org>
+CC: Ingo Molnar <mingo@kernel.org>
+CC: Peter Zijlstra <peterz@infradead.org>
+CC: Oleg Nesterov <oleg@redhat.com>
+CC: Mike Rapoport <rppt@linux.vnet.ibm.com>
+CC: Michal Hocko <mhocko@suse.com>
+CC: Andy Lutomirski <luto@kernel.org>
+CC: "Eric W. Biederman" <ebiederm@xmission.com>
+CC: Andrei Vagin <avagin@openvz.org>
+CC: Cyrill Gorcunov <gorcunov@openvz.org>
+CC: Serge Hallyn <serge@hallyn.com>
+Acked-by: Oleg Nesterov <oleg@redhat.com>
+Signed-off-by: Eric W. Biederman <ebiederm@xmission.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ kernel/fork.c |    8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1815,11 +1815,13 @@ static __latent_entropy struct task_stru
+ 	*/
+ 	recalc_sigpending();
+ 	if (signal_pending(current)) {
+-		spin_unlock(&current->sighand->siglock);
+-		write_unlock_irq(&tasklist_lock);
+ 		retval = -ERESTARTNOINTR;
+ 		goto bad_fork_cancel_cgroup;
+ 	}
++	if (unlikely(!(ns_of_pid(pid)->nr_hashed & PIDNS_HASH_ADDING))) {
++		retval = -ENOMEM;
++		goto bad_fork_cancel_cgroup;
++	}
+ 
+ 	if (likely(p->pid)) {
+ 		ptrace_init_task(p, (clone_flags & CLONE_PTRACE) || trace);
+@@ -1877,6 +1879,8 @@ static __latent_entropy struct task_stru
+ 	return p;
+ 
+ bad_fork_cancel_cgroup:
++	spin_unlock(&current->sighand->siglock);
++	write_unlock_irq(&tasklist_lock);
+ 	cgroup_cancel_fork(p);
+ bad_fork_free_pid:
+ 	cgroup_threadgroup_change_end(current);
