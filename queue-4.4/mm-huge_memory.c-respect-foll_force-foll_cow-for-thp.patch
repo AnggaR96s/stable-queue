@@ -1,0 +1,117 @@
+From 8310d48b125d19fcd9521d83b8293e63eb1646aa Mon Sep 17 00:00:00 2001
+From: Keno Fischer <keno@juliacomputing.com>
+Date: Tue, 24 Jan 2017 15:17:48 -0800
+Subject: mm/huge_memory.c: respect FOLL_FORCE/FOLL_COW for thp
+
+From: Keno Fischer <keno@juliacomputing.com>
+
+commit 8310d48b125d19fcd9521d83b8293e63eb1646aa upstream.
+
+In commit 19be0eaffa3a ("mm: remove gup_flags FOLL_WRITE games from
+__get_user_pages()"), the mm code was changed from unsetting FOLL_WRITE
+after a COW was resolved to setting the (newly introduced) FOLL_COW
+instead.  Simultaneously, the check in gup.c was updated to still allow
+writes with FOLL_FORCE set if FOLL_COW had also been set.
+
+However, a similar check in huge_memory.c was forgotten.  As a result,
+remote memory writes to ro regions of memory backed by transparent huge
+pages cause an infinite loop in the kernel (handle_mm_fault sets
+FOLL_COW and returns 0 causing a retry, but follow_trans_huge_pmd bails
+out immidiately because `(flags & FOLL_WRITE) && !pmd_write(*pmd)` is
+true.
+
+While in this state the process is stil SIGKILLable, but little else
+works (e.g.  no ptrace attach, no other signals).  This is easily
+reproduced with the following code (assuming thp are set to always):
+
+    #include <assert.h>
+    #include <fcntl.h>
+    #include <stdint.h>
+    #include <stdio.h>
+    #include <string.h>
+    #include <sys/mman.h>
+    #include <sys/stat.h>
+    #include <sys/types.h>
+    #include <sys/wait.h>
+    #include <unistd.h>
+
+    #define TEST_SIZE 5 * 1024 * 1024
+
+    int main(void) {
+      int status;
+      pid_t child;
+      int fd = open("/proc/self/mem", O_RDWR);
+      void *addr = mmap(NULL, TEST_SIZE, PROT_READ,
+                        MAP_ANONYMOUS | MAP_PRIVATE, 0, 0);
+      assert(addr != MAP_FAILED);
+      pid_t parent_pid = getpid();
+      if ((child = fork()) == 0) {
+        void *addr2 = mmap(NULL, TEST_SIZE, PROT_READ | PROT_WRITE,
+                           MAP_ANONYMOUS | MAP_PRIVATE, 0, 0);
+        assert(addr2 != MAP_FAILED);
+        memset(addr2, 'a', TEST_SIZE);
+        pwrite(fd, addr2, TEST_SIZE, (uintptr_t)addr);
+        return 0;
+      }
+      assert(child == waitpid(child, &status, 0));
+      assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+      return 0;
+    }
+
+Fix this by updating follow_trans_huge_pmd in huge_memory.c analogously
+to the update in gup.c in the original commit.  The same pattern exists
+in follow_devmap_pmd.  However, we should not be able to reach that
+check with FOLL_COW set, so add WARN_ONCE to make sure we notice if we
+ever do.
+
+[akpm@linux-foundation.org: coding-style fixes]
+Link: http://lkml.kernel.org/r/20170106015025.GA38411@juliacomputing.com
+Signed-off-by: Keno Fischer <keno@juliacomputing.com>
+Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: Greg Thelen <gthelen@google.com>
+Cc: Nicholas Piggin <npiggin@gmail.com>
+Cc: Willy Tarreau <w@1wt.eu>
+Cc: Oleg Nesterov <oleg@redhat.com>
+Cc: Kees Cook <keescook@chromium.org>
+Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+[AmitP: Minor refactoring of upstream changes for linux-3.18.y,
+        where follow_devmap_pmd() doesn't exist.]
+Signed-off-by: Amit Pundir <amit.pundir@linaro.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ mm/huge_memory.c |   12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -1269,6 +1269,16 @@ out_unlock:
+ 	return ret;
+ }
+ 
++/*
++ * FOLL_FORCE can write to even unwritable pmd's, but only
++ * after we've gone through a COW cycle and they are dirty.
++ */
++static inline bool can_follow_write_pmd(pmd_t pmd, unsigned int flags)
++{
++	return pmd_write(pmd) ||
++	       ((flags & FOLL_FORCE) && (flags & FOLL_COW) && pmd_dirty(pmd));
++}
++
+ struct page *follow_trans_huge_pmd(struct vm_area_struct *vma,
+ 				   unsigned long addr,
+ 				   pmd_t *pmd,
+@@ -1279,7 +1289,7 @@ struct page *follow_trans_huge_pmd(struc
+ 
+ 	assert_spin_locked(pmd_lockptr(mm, pmd));
+ 
+-	if (flags & FOLL_WRITE && !pmd_write(*pmd))
++	if (flags & FOLL_WRITE && !can_follow_write_pmd(*pmd, flags))
+ 		goto out;
+ 
+ 	/* Avoid dumping huge zero page */
