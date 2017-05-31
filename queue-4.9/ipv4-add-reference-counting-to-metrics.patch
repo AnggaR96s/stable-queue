@@ -1,0 +1,254 @@
+From foo@baz Wed May 31 09:13:34 JST 2017
+From: Eric Dumazet <edumazet@google.com>
+Date: Thu, 25 May 2017 14:27:35 -0700
+Subject: ipv4: add reference counting to metrics
+
+From: Eric Dumazet <edumazet@google.com>
+
+
+[ Upstream commit 3fb07daff8e99243366a081e5129560734de4ada ]
+
+Andrey Konovalov reported crashes in ipv4_mtu()
+
+I could reproduce the issue with KASAN kernels, between
+10.246.7.151 and 10.246.7.152 :
+
+1) 20 concurrent netperf -t TCP_RR -H 10.246.7.152 -l 1000 &
+
+2) At the same time run following loop :
+while :
+do
+ ip ro add 10.246.7.152 dev eth0 src 10.246.7.151 mtu 1500
+ ip ro del 10.246.7.152 dev eth0 src 10.246.7.151 mtu 1500
+done
+
+Cong Wang attempted to add back rt->fi in commit
+82486aa6f1b9 ("ipv4: restore rt->fi for reference counting")
+but this proved to add some issues that were complex to solve.
+
+Instead, I suggested to add a refcount to the metrics themselves,
+being a standalone object (in particular, no reference to other objects)
+
+I tried to make this patch as small as possible to ease its backport,
+instead of being super clean. Note that we believe that only ipv4 dst
+need to take care of the metric refcount. But if this is wrong,
+this patch adds the basic infrastructure to extend this to other
+families.
+
+Many thanks to Julian Anastasov for reviewing this patch, and Cong Wang
+for his efforts on this problem.
+
+Fixes: 2860583fe840 ("ipv4: Kill rt->fi")
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Reported-by: Andrey Konovalov <andreyknvl@google.com>
+Reviewed-by: Julian Anastasov <ja@ssi.bg>
+Acked-by: Cong Wang <xiyou.wangcong@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/net/dst.h        |    8 +++++++-
+ include/net/ip_fib.h     |   10 +++++-----
+ net/core/dst.c           |   23 ++++++++++++++---------
+ net/ipv4/fib_semantics.c |   17 ++++++++++-------
+ net/ipv4/route.c         |   10 +++++++++-
+ 5 files changed, 45 insertions(+), 23 deletions(-)
+
+--- a/include/net/dst.h
++++ b/include/net/dst.h
+@@ -107,10 +107,16 @@ struct dst_entry {
+ 	};
+ };
+ 
++struct dst_metrics {
++	u32		metrics[RTAX_MAX];
++	atomic_t	refcnt;
++};
++extern const struct dst_metrics dst_default_metrics;
++
+ u32 *dst_cow_metrics_generic(struct dst_entry *dst, unsigned long old);
+-extern const u32 dst_default_metrics[];
+ 
+ #define DST_METRICS_READ_ONLY		0x1UL
++#define DST_METRICS_REFCOUNTED		0x2UL
+ #define DST_METRICS_FLAGS		0x3UL
+ #define __DST_METRICS_PTR(Y)	\
+ 	((u32 *)((Y) & ~DST_METRICS_FLAGS))
+--- a/include/net/ip_fib.h
++++ b/include/net/ip_fib.h
+@@ -114,11 +114,11 @@ struct fib_info {
+ 	__be32			fib_prefsrc;
+ 	u32			fib_tb_id;
+ 	u32			fib_priority;
+-	u32			*fib_metrics;
+-#define fib_mtu fib_metrics[RTAX_MTU-1]
+-#define fib_window fib_metrics[RTAX_WINDOW-1]
+-#define fib_rtt fib_metrics[RTAX_RTT-1]
+-#define fib_advmss fib_metrics[RTAX_ADVMSS-1]
++	struct dst_metrics	*fib_metrics;
++#define fib_mtu fib_metrics->metrics[RTAX_MTU-1]
++#define fib_window fib_metrics->metrics[RTAX_WINDOW-1]
++#define fib_rtt fib_metrics->metrics[RTAX_RTT-1]
++#define fib_advmss fib_metrics->metrics[RTAX_ADVMSS-1]
+ 	int			fib_nhs;
+ #ifdef CONFIG_IP_ROUTE_MULTIPATH
+ 	int			fib_weight;
+--- a/net/core/dst.c
++++ b/net/core/dst.c
+@@ -151,13 +151,13 @@ int dst_discard_out(struct net *net, str
+ }
+ EXPORT_SYMBOL(dst_discard_out);
+ 
+-const u32 dst_default_metrics[RTAX_MAX + 1] = {
++const struct dst_metrics dst_default_metrics = {
+ 	/* This initializer is needed to force linker to place this variable
+ 	 * into const section. Otherwise it might end into bss section.
+ 	 * We really want to avoid false sharing on this variable, and catch
+ 	 * any writes on it.
+ 	 */
+-	[RTAX_MAX] = 0xdeadbeef,
++	.refcnt = ATOMIC_INIT(1),
+ };
+ 
+ void dst_init(struct dst_entry *dst, struct dst_ops *ops,
+@@ -169,7 +169,7 @@ void dst_init(struct dst_entry *dst, str
+ 	if (dev)
+ 		dev_hold(dev);
+ 	dst->ops = ops;
+-	dst_init_metrics(dst, dst_default_metrics, true);
++	dst_init_metrics(dst, dst_default_metrics.metrics, true);
+ 	dst->expires = 0UL;
+ 	dst->path = dst;
+ 	dst->from = NULL;
+@@ -315,25 +315,30 @@ EXPORT_SYMBOL(dst_release);
+ 
+ u32 *dst_cow_metrics_generic(struct dst_entry *dst, unsigned long old)
+ {
+-	u32 *p = kmalloc(sizeof(u32) * RTAX_MAX, GFP_ATOMIC);
++	struct dst_metrics *p = kmalloc(sizeof(*p), GFP_ATOMIC);
+ 
+ 	if (p) {
+-		u32 *old_p = __DST_METRICS_PTR(old);
++		struct dst_metrics *old_p = (struct dst_metrics *)__DST_METRICS_PTR(old);
+ 		unsigned long prev, new;
+ 
+-		memcpy(p, old_p, sizeof(u32) * RTAX_MAX);
++		atomic_set(&p->refcnt, 1);
++		memcpy(p->metrics, old_p->metrics, sizeof(p->metrics));
+ 
+ 		new = (unsigned long) p;
+ 		prev = cmpxchg(&dst->_metrics, old, new);
+ 
+ 		if (prev != old) {
+ 			kfree(p);
+-			p = __DST_METRICS_PTR(prev);
++			p = (struct dst_metrics *)__DST_METRICS_PTR(prev);
+ 			if (prev & DST_METRICS_READ_ONLY)
+ 				p = NULL;
++		} else if (prev & DST_METRICS_REFCOUNTED) {
++			if (atomic_dec_and_test(&old_p->refcnt))
++				kfree(old_p);
+ 		}
+ 	}
+-	return p;
++	BUILD_BUG_ON(offsetof(struct dst_metrics, metrics) != 0);
++	return (u32 *)p;
+ }
+ EXPORT_SYMBOL(dst_cow_metrics_generic);
+ 
+@@ -342,7 +347,7 @@ void __dst_destroy_metrics_generic(struc
+ {
+ 	unsigned long prev, new;
+ 
+-	new = ((unsigned long) dst_default_metrics) | DST_METRICS_READ_ONLY;
++	new = ((unsigned long) &dst_default_metrics) | DST_METRICS_READ_ONLY;
+ 	prev = cmpxchg(&dst->_metrics, old, new);
+ 	if (prev == old)
+ 		kfree(__DST_METRICS_PTR(old));
+--- a/net/ipv4/fib_semantics.c
++++ b/net/ipv4/fib_semantics.c
+@@ -204,6 +204,7 @@ static void rt_fibinfo_free_cpus(struct
+ static void free_fib_info_rcu(struct rcu_head *head)
+ {
+ 	struct fib_info *fi = container_of(head, struct fib_info, rcu);
++	struct dst_metrics *m;
+ 
+ 	change_nexthops(fi) {
+ 		if (nexthop_nh->nh_dev)
+@@ -214,8 +215,9 @@ static void free_fib_info_rcu(struct rcu
+ 		rt_fibinfo_free(&nexthop_nh->nh_rth_input);
+ 	} endfor_nexthops(fi);
+ 
+-	if (fi->fib_metrics != (u32 *) dst_default_metrics)
+-		kfree(fi->fib_metrics);
++	m = fi->fib_metrics;
++	if (m != &dst_default_metrics && atomic_dec_and_test(&m->refcnt))
++		kfree(m);
+ 	kfree(fi);
+ }
+ 
+@@ -982,11 +984,11 @@ fib_convert_metrics(struct fib_info *fi,
+ 			val = 255;
+ 		if (type == RTAX_FEATURES && (val & ~RTAX_FEATURE_MASK))
+ 			return -EINVAL;
+-		fi->fib_metrics[type - 1] = val;
++		fi->fib_metrics->metrics[type - 1] = val;
+ 	}
+ 
+ 	if (ecn_ca)
+-		fi->fib_metrics[RTAX_FEATURES - 1] |= DST_FEATURE_ECN_CA;
++		fi->fib_metrics->metrics[RTAX_FEATURES - 1] |= DST_FEATURE_ECN_CA;
+ 
+ 	return 0;
+ }
+@@ -1044,11 +1046,12 @@ struct fib_info *fib_create_info(struct
+ 		goto failure;
+ 	fib_info_cnt++;
+ 	if (cfg->fc_mx) {
+-		fi->fib_metrics = kzalloc(sizeof(u32) * RTAX_MAX, GFP_KERNEL);
++		fi->fib_metrics = kzalloc(sizeof(*fi->fib_metrics), GFP_KERNEL);
+ 		if (!fi->fib_metrics)
+ 			goto failure;
++		atomic_set(&fi->fib_metrics->refcnt, 1);
+ 	} else
+-		fi->fib_metrics = (u32 *) dst_default_metrics;
++		fi->fib_metrics = (struct dst_metrics *)&dst_default_metrics;
+ 
+ 	fi->fib_net = net;
+ 	fi->fib_protocol = cfg->fc_protocol;
+@@ -1252,7 +1255,7 @@ int fib_dump_info(struct sk_buff *skb, u
+ 	if (fi->fib_priority &&
+ 	    nla_put_u32(skb, RTA_PRIORITY, fi->fib_priority))
+ 		goto nla_put_failure;
+-	if (rtnetlink_put_metrics(skb, fi->fib_metrics) < 0)
++	if (rtnetlink_put_metrics(skb, fi->fib_metrics->metrics) < 0)
+ 		goto nla_put_failure;
+ 
+ 	if (fi->fib_prefsrc &&
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@ -1364,8 +1364,12 @@ static void rt_add_uncached_list(struct
+ 
+ static void ipv4_dst_destroy(struct dst_entry *dst)
+ {
++	struct dst_metrics *p = (struct dst_metrics *)DST_METRICS_PTR(dst);
+ 	struct rtable *rt = (struct rtable *) dst;
+ 
++	if (p != &dst_default_metrics && atomic_dec_and_test(&p->refcnt))
++		kfree(p);
++
+ 	if (!list_empty(&rt->rt_uncached)) {
+ 		struct uncached_list *ul = rt->rt_uncached_list;
+ 
+@@ -1417,7 +1421,11 @@ static void rt_set_nexthop(struct rtable
+ 			rt->rt_gateway = nh->nh_gw;
+ 			rt->rt_uses_gateway = 1;
+ 		}
+-		dst_init_metrics(&rt->dst, fi->fib_metrics, true);
++		dst_init_metrics(&rt->dst, fi->fib_metrics->metrics, true);
++		if (fi->fib_metrics != &dst_default_metrics) {
++			rt->dst._metrics |= DST_METRICS_REFCOUNTED;
++			atomic_inc(&fi->fib_metrics->refcnt);
++		}
+ #ifdef CONFIG_IP_ROUTE_CLASSID
+ 		rt->dst.tclassid = nh->nh_tclassid;
+ #endif
