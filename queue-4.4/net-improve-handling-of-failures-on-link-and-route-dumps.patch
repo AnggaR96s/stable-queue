@@ -1,0 +1,205 @@
+From foo@baz Fri Jun  2 09:29:55 JST 2017
+From: David Ahern <dsahern@gmail.com>
+Date: Mon, 15 May 2017 23:19:17 -0700
+Subject: net: Improve handling of failures on link and route dumps
+
+From: David Ahern <dsahern@gmail.com>
+
+
+[ Upstream commit f6c5775ff0bfa62b072face6bf1d40f659f194b2 ]
+
+In general, rtnetlink dumps do not anticipate failure to dump a single
+object (e.g., link or route) on a single pass. As both route and link
+objects have grown via more attributes, that is no longer a given.
+
+netlink dumps can handle a failure if the dump function returns an
+error; specifically, netlink_dump adds the return code to the response
+if it is <= 0 so userspace is notified of the failure. The missing
+piece is the rtnetlink dump functions returning the error.
+
+Fix route and link dump functions to return the errors if no object is
+added to an skb (detected by skb->len != 0). IPv6 route dumps
+(rt6_dump_route) already return the error; this patch updates IPv4 and
+link dumps. Other dump functions may need to be ajusted as well.
+
+Reported-by: Jan Moskyto Matejka <mq@ucw.cz>
+Signed-off-by: David Ahern <dsahern@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/core/rtnetlink.c    |   36 ++++++++++++++++++++++++------------
+ net/ipv4/fib_frontend.c |   15 +++++++++++----
+ net/ipv4/fib_trie.c     |   26 ++++++++++++++------------
+ 3 files changed, 49 insertions(+), 28 deletions(-)
+
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@ -1458,13 +1458,13 @@ static int rtnl_dump_ifinfo(struct sk_bu
+ 					       cb->nlh->nlmsg_seq, 0,
+ 					       NLM_F_MULTI,
+ 					       ext_filter_mask);
+-			/* If we ran out of room on the first message,
+-			 * we're in trouble
+-			 */
+-			WARN_ON((err == -EMSGSIZE) && (skb->len == 0));
+ 
+-			if (err < 0)
+-				goto out;
++			if (err < 0) {
++				if (likely(skb->len))
++					goto out;
++
++				goto out_err;
++			}
+ 
+ 			nl_dump_check_consistent(cb, nlmsg_hdr(skb));
+ cont:
+@@ -1472,10 +1472,12 @@ cont:
+ 		}
+ 	}
+ out:
++	err = skb->len;
++out_err:
+ 	cb->args[1] = idx;
+ 	cb->args[0] = h;
+ 
+-	return skb->len;
++	return err;
+ }
+ 
+ int rtnl_nla_parse_ifla(struct nlattr **tb, const struct nlattr *head, int len)
+@@ -3127,8 +3129,12 @@ static int rtnl_bridge_getlink(struct sk
+ 				err = br_dev->netdev_ops->ndo_bridge_getlink(
+ 						skb, portid, seq, dev,
+ 						filter_mask, NLM_F_MULTI);
+-				if (err < 0 && err != -EOPNOTSUPP)
+-					break;
++				if (err < 0 && err != -EOPNOTSUPP) {
++					if (likely(skb->len))
++						break;
++
++					goto out_err;
++				}
+ 			}
+ 			idx++;
+ 		}
+@@ -3139,16 +3145,22 @@ static int rtnl_bridge_getlink(struct sk
+ 							      seq, dev,
+ 							      filter_mask,
+ 							      NLM_F_MULTI);
+-				if (err < 0 && err != -EOPNOTSUPP)
+-					break;
++				if (err < 0 && err != -EOPNOTSUPP) {
++					if (likely(skb->len))
++						break;
++
++					goto out_err;
++				}
+ 			}
+ 			idx++;
+ 		}
+ 	}
++	err = skb->len;
++out_err:
+ 	rcu_read_unlock();
+ 	cb->args[0] = idx;
+ 
+-	return skb->len;
++	return err;
+ }
+ 
+ static inline size_t bridge_nlmsg_size(void)
+--- a/net/ipv4/fib_frontend.c
++++ b/net/ipv4/fib_frontend.c
+@@ -757,7 +757,7 @@ static int inet_dump_fib(struct sk_buff
+ 	unsigned int e = 0, s_e;
+ 	struct fib_table *tb;
+ 	struct hlist_head *head;
+-	int dumped = 0;
++	int dumped = 0, err;
+ 
+ 	if (nlmsg_len(cb->nlh) >= sizeof(struct rtmsg) &&
+ 	    ((struct rtmsg *) nlmsg_data(cb->nlh))->rtm_flags & RTM_F_CLONED)
+@@ -777,20 +777,27 @@ static int inet_dump_fib(struct sk_buff
+ 			if (dumped)
+ 				memset(&cb->args[2], 0, sizeof(cb->args) -
+ 						 2 * sizeof(cb->args[0]));
+-			if (fib_table_dump(tb, skb, cb) < 0)
+-				goto out;
++			err = fib_table_dump(tb, skb, cb);
++			if (err < 0) {
++				if (likely(skb->len))
++					goto out;
++
++				goto out_err;
++			}
+ 			dumped = 1;
+ next:
+ 			e++;
+ 		}
+ 	}
+ out:
++	err = skb->len;
++out_err:
+ 	rcu_read_unlock();
+ 
+ 	cb->args[1] = e;
+ 	cb->args[0] = h;
+ 
+-	return skb->len;
++	return err;
+ }
+ 
+ /* Prepare and feed intra-kernel routing request.
+--- a/net/ipv4/fib_trie.c
++++ b/net/ipv4/fib_trie.c
+@@ -1906,6 +1906,8 @@ static int fn_trie_dump_leaf(struct key_
+ 
+ 	/* rcu_read_lock is hold by caller */
+ 	hlist_for_each_entry_rcu(fa, &l->leaf, fa_list) {
++		int err;
++
+ 		if (i < s_i) {
+ 			i++;
+ 			continue;
+@@ -1916,17 +1918,14 @@ static int fn_trie_dump_leaf(struct key_
+ 			continue;
+ 		}
+ 
+-		if (fib_dump_info(skb, NETLINK_CB(cb->skb).portid,
+-				  cb->nlh->nlmsg_seq,
+-				  RTM_NEWROUTE,
+-				  tb->tb_id,
+-				  fa->fa_type,
+-				  xkey,
+-				  KEYLENGTH - fa->fa_slen,
+-				  fa->fa_tos,
+-				  fa->fa_info, NLM_F_MULTI) < 0) {
++		err = fib_dump_info(skb, NETLINK_CB(cb->skb).portid,
++				    cb->nlh->nlmsg_seq, RTM_NEWROUTE,
++				    tb->tb_id, fa->fa_type,
++				    xkey, KEYLENGTH - fa->fa_slen,
++				    fa->fa_tos, fa->fa_info, NLM_F_MULTI);
++		if (err < 0) {
+ 			cb->args[4] = i;
+-			return -1;
++			return err;
+ 		}
+ 		i++;
+ 	}
+@@ -1948,10 +1947,13 @@ int fib_table_dump(struct fib_table *tb,
+ 	t_key key = cb->args[3];
+ 
+ 	while ((l = leaf_walk_rcu(&tp, key)) != NULL) {
+-		if (fn_trie_dump_leaf(l, tb, skb, cb) < 0) {
++		int err;
++
++		err = fn_trie_dump_leaf(l, tb, skb, cb);
++		if (err < 0) {
+ 			cb->args[3] = key;
+ 			cb->args[2] = count;
+-			return -1;
++			return err;
+ 		}
+ 
+ 		++count;
