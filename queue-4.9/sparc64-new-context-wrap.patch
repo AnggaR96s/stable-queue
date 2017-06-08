@@ -1,0 +1,178 @@
+From foo@baz Thu Jun  8 08:58:54 CEST 2017
+From: Pavel Tatashin <pasha.tatashin@oracle.com>
+Date: Wed, 31 May 2017 11:25:24 -0400
+Subject: sparc64: new context wrap
+
+From: Pavel Tatashin <pasha.tatashin@oracle.com>
+
+
+[ Upstream commit a0582f26ec9dfd5360ea2f35dd9a1b026f8adda0 ]
+
+The current wrap implementation has a race issue: it is called outside of
+the ctx_alloc_lock, and also does not wait for all CPUs to complete the
+wrap.  This means that a thread can get a new context with a new version
+and another thread might still be running with the same context. The
+problem is especially severe on CPUs with shared TLBs, like sun4v. I used
+the following test to very quickly reproduce the problem:
+- start over 8K processes (must be more than context IDs)
+- write and read values at a  memory location in every process.
+
+Very quickly memory corruptions start happening, and what we read back
+does not equal what we wrote.
+
+Several approaches were explored before settling on this one:
+
+Approach 1:
+Move smp_new_mmu_context_version() inside ctx_alloc_lock, and wait for
+every process to complete the wrap. (Note: every CPU must WAIT before
+leaving smp_new_mmu_context_version_client() until every one arrives).
+
+This approach ends up with deadlocks, as some threads own locks which other
+threads are waiting for, and they never receive softint until these threads
+exit smp_new_mmu_context_version_client(). Since we do not allow the exit,
+deadlock happens.
+
+Approach 2:
+Handle wrap right during mondo interrupt. Use etrap/rtrap to enter into
+into C code, and issue new versions to every CPU.
+This approach adds some overhead to runtime: in switch_mm() we must add
+some checks to make sure that versions have not changed due to wrap while
+we were loading the new secondary context. (could be protected by PSTATE_IE
+but that degrades performance as on M7 and older CPUs as it takes 50 cycles
+for each access). Also, we still need a global per-cpu array of MMs to know
+where we need to load new contexts, otherwise we can change context to a
+thread that is going way (if we received mondo between switch_mm() and
+switch_to() time). Finally, there are some issues with window registers in
+rtrap() when context IDs are changed during CPU mondo time.
+
+The approach in this patch is the simplest and has almost no impact on
+runtime.  We use the array with mm's where last secondary contexts were
+loaded onto CPUs and bump their versions to the new generation without
+changing context IDs. If a new process comes in to get a context ID, it
+will go through get_new_mmu_context() because of version mismatch. But the
+running processes do not need to be interrupted. And wrap is quicker as we
+do not need to xcall and wait for everyone to receive and complete wrap.
+
+Signed-off-by: Pavel Tatashin <pasha.tatashin@oracle.com>
+Reviewed-by: Bob Picco <bob.picco@oracle.com>
+Reviewed-by: Steven Sistare <steven.sistare@oracle.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/sparc/mm/init_64.c |   81 ++++++++++++++++++++++++++++++++----------------
+ 1 file changed, 54 insertions(+), 27 deletions(-)
+
+--- a/arch/sparc/mm/init_64.c
++++ b/arch/sparc/mm/init_64.c
+@@ -664,6 +664,53 @@ unsigned long tlb_context_cache = CTX_FI
+ DECLARE_BITMAP(mmu_context_bmap, MAX_CTX_NR);
+ DEFINE_PER_CPU(struct mm_struct *, per_cpu_secondary_mm) = {0};
+ 
++static void mmu_context_wrap(void)
++{
++	unsigned long old_ver = tlb_context_cache & CTX_VERSION_MASK;
++	unsigned long new_ver, new_ctx, old_ctx;
++	struct mm_struct *mm;
++	int cpu;
++
++	bitmap_zero(mmu_context_bmap, 1 << CTX_NR_BITS);
++
++	/* Reserve kernel context */
++	set_bit(0, mmu_context_bmap);
++
++	new_ver = (tlb_context_cache & CTX_VERSION_MASK) + CTX_FIRST_VERSION;
++	if (unlikely(new_ver == 0))
++		new_ver = CTX_FIRST_VERSION;
++	tlb_context_cache = new_ver;
++
++	/*
++	 * Make sure that any new mm that are added into per_cpu_secondary_mm,
++	 * are going to go through get_new_mmu_context() path.
++	 */
++	mb();
++
++	/*
++	 * Updated versions to current on those CPUs that had valid secondary
++	 * contexts
++	 */
++	for_each_online_cpu(cpu) {
++		/*
++		 * If a new mm is stored after we took this mm from the array,
++		 * it will go into get_new_mmu_context() path, because we
++		 * already bumped the version in tlb_context_cache.
++		 */
++		mm = per_cpu(per_cpu_secondary_mm, cpu);
++
++		if (unlikely(!mm || mm == &init_mm))
++			continue;
++
++		old_ctx = mm->context.sparc64_ctx_val;
++		if (likely((old_ctx & CTX_VERSION_MASK) == old_ver)) {
++			new_ctx = (old_ctx & ~CTX_VERSION_MASK) | new_ver;
++			set_bit(new_ctx & CTX_NR_MASK, mmu_context_bmap);
++			mm->context.sparc64_ctx_val = new_ctx;
++		}
++	}
++}
++
+ /* Caller does TLB context flushing on local CPU if necessary.
+  * The caller also ensures that CTX_VALID(mm->context) is false.
+  *
+@@ -678,50 +725,30 @@ void get_new_mmu_context(struct mm_struc
+ {
+ 	unsigned long ctx, new_ctx;
+ 	unsigned long orig_pgsz_bits;
+-	int new_version;
+ 
+ 	spin_lock(&ctx_alloc_lock);
++retry:
++	/* wrap might have happened, test again if our context became valid */
++	if (unlikely(CTX_VALID(mm->context)))
++		goto out;
+ 	orig_pgsz_bits = (mm->context.sparc64_ctx_val & CTX_PGSZ_MASK);
+ 	ctx = (tlb_context_cache + 1) & CTX_NR_MASK;
+ 	new_ctx = find_next_zero_bit(mmu_context_bmap, 1 << CTX_NR_BITS, ctx);
+-	new_version = 0;
+ 	if (new_ctx >= (1 << CTX_NR_BITS)) {
+ 		new_ctx = find_next_zero_bit(mmu_context_bmap, ctx, 1);
+ 		if (new_ctx >= ctx) {
+-			int i;
+-			new_ctx = (tlb_context_cache & CTX_VERSION_MASK) +
+-				CTX_FIRST_VERSION + 1;
+-			if (new_ctx == 1)
+-				new_ctx = CTX_FIRST_VERSION + 1;
+-
+-			/* Don't call memset, for 16 entries that's just
+-			 * plain silly...
+-			 */
+-			mmu_context_bmap[0] = 3;
+-			mmu_context_bmap[1] = 0;
+-			mmu_context_bmap[2] = 0;
+-			mmu_context_bmap[3] = 0;
+-			for (i = 4; i < CTX_BMAP_SLOTS; i += 4) {
+-				mmu_context_bmap[i + 0] = 0;
+-				mmu_context_bmap[i + 1] = 0;
+-				mmu_context_bmap[i + 2] = 0;
+-				mmu_context_bmap[i + 3] = 0;
+-			}
+-			new_version = 1;
+-			goto out;
++			mmu_context_wrap();
++			goto retry;
+ 		}
+ 	}
+ 	if (mm->context.sparc64_ctx_val)
+ 		cpumask_clear(mm_cpumask(mm));
+ 	mmu_context_bmap[new_ctx>>6] |= (1UL << (new_ctx & 63));
+ 	new_ctx |= (tlb_context_cache & CTX_VERSION_MASK);
+-out:
+ 	tlb_context_cache = new_ctx;
+ 	mm->context.sparc64_ctx_val = new_ctx | orig_pgsz_bits;
++out:
+ 	spin_unlock(&ctx_alloc_lock);
+-
+-	if (unlikely(new_version))
+-		smp_new_mmu_context_version();
+ }
+ 
+ static int numa_enabled = 1;
