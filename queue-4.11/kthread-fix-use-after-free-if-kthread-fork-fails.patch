@@ -1,0 +1,92 @@
+From 4d6501dce079c1eb6bf0b1d8f528a5e81770109e Mon Sep 17 00:00:00 2001
+From: Vegard Nossum <vegard.nossum@oracle.com>
+Date: Tue, 9 May 2017 09:39:59 +0200
+Subject: kthread: Fix use-after-free if kthread fork fails
+
+From: Vegard Nossum <vegard.nossum@oracle.com>
+
+commit 4d6501dce079c1eb6bf0b1d8f528a5e81770109e upstream.
+
+If a kthread forks (e.g. usermodehelper since commit 1da5c46fa965) but
+fails in copy_process() between calling dup_task_struct() and setting
+p->set_child_tid, then the value of p->set_child_tid will be inherited
+from the parent and get prematurely freed by free_kthread_struct().
+
+    kthread()
+     - worker_thread()
+        - process_one_work()
+        |  - call_usermodehelper_exec_work()
+        |     - kernel_thread()
+        |        - _do_fork()
+        |           - copy_process()
+        |              - dup_task_struct()
+        |                 - arch_dup_task_struct()
+        |                    - tsk->set_child_tid = current->set_child_tid // implied
+        |              - ...
+        |              - goto bad_fork_*
+        |              - ...
+        |              - free_task(tsk)
+        |                 - free_kthread_struct(tsk)
+        |                    - kfree(tsk->set_child_tid)
+        - ...
+        - schedule()
+           - __schedule()
+              - wq_worker_sleeping()
+                 - kthread_data(task)->flags // UAF
+
+The problem started showing up with commit 1da5c46fa965 since it reused
+->set_child_tid for the kthread worker data.
+
+A better long-term solution might be to get rid of the ->set_child_tid
+abuse. The comment in set_kthread_struct() also looks slightly wrong.
+
+Debugged-by: Jamie Iles <jamie.iles@oracle.com>
+Fixes: 1da5c46fa965 ("kthread: Make struct kthread kmalloc'ed")
+Signed-off-by: Vegard Nossum <vegard.nossum@oracle.com>
+Acked-by: Oleg Nesterov <oleg@redhat.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Frederic Weisbecker <fweisbec@gmail.com>
+Cc: Jamie Iles <jamie.iles@oracle.com>
+Link: http://lkml.kernel.org/r/20170509073959.17858-1-vegard.nossum@oracle.com
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ kernel/fork.c |   17 ++++++++++++-----
+ 1 file changed, 12 insertions(+), 5 deletions(-)
+
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1552,6 +1552,18 @@ static __latent_entropy struct task_stru
+ 	if (!p)
+ 		goto fork_out;
+ 
++	/*
++	 * This _must_ happen before we call free_task(), i.e. before we jump
++	 * to any of the bad_fork_* labels. This is to avoid freeing
++	 * p->set_child_tid which is (ab)used as a kthread's data pointer for
++	 * kernel threads (PF_KTHREAD).
++	 */
++	p->set_child_tid = (clone_flags & CLONE_CHILD_SETTID) ? child_tidptr : NULL;
++	/*
++	 * Clear TID on mm_release()?
++	 */
++	p->clear_child_tid = (clone_flags & CLONE_CHILD_CLEARTID) ? child_tidptr : NULL;
++
+ 	ftrace_graph_init_task(p);
+ 
+ 	rt_mutex_init_task(p);
+@@ -1715,11 +1727,6 @@ static __latent_entropy struct task_stru
+ 		}
+ 	}
+ 
+-	p->set_child_tid = (clone_flags & CLONE_CHILD_SETTID) ? child_tidptr : NULL;
+-	/*
+-	 * Clear TID on mm_release()?
+-	 */
+-	p->clear_child_tid = (clone_flags & CLONE_CHILD_CLEARTID) ? child_tidptr : NULL;
+ #ifdef CONFIG_BLOCK
+ 	p->plug = NULL;
+ #endif
