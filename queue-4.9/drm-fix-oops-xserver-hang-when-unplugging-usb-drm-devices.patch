@@ -1,0 +1,153 @@
+From 75fb636324a839c2c31be9f81644034c6142e469 Mon Sep 17 00:00:00 2001
+From: Hans de Goede <hdegoede@redhat.com>
+Date: Thu, 1 Jun 2017 13:54:30 +0200
+Subject: drm: Fix oops + Xserver hang when unplugging USB drm devices
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+From: Hans de Goede <hdegoede@redhat.com>
+
+commit 75fb636324a839c2c31be9f81644034c6142e469 upstream.
+
+commit a39be606f99d ("drm: Do a full device unregister when unplugging")
+causes backtraces like this one when unplugging an usb drm device while
+it is in use:
+
+usb 2-3: USB disconnect, device number 25
+------------[ cut here ]------------
+WARNING: CPU: 0 PID: 242 at drivers/gpu/drm/drm_mode_config.c:424
+   drm_mode_config_cleanup+0x220/0x280 [drm]
+...
+RIP: 0010:drm_mode_config_cleanup+0x220/0x280 [drm]
+...
+Call Trace:
+ gm12u320_modeset_cleanup+0xe/0x10 [gm12u320]
+ gm12u320_driver_unload+0x35/0x70 [gm12u320]
+ drm_dev_unregister+0x3c/0xe0 [drm]
+ drm_unplug_dev+0x12/0x60 [drm]
+ gm12u320_usb_disconnect+0x36/0x40 [gm12u320]
+ usb_unbind_interface+0x72/0x280
+ device_release_driver_internal+0x158/0x210
+ device_release_driver+0x12/0x20
+ bus_remove_device+0x104/0x180
+ device_del+0x1d2/0x350
+ usb_disable_device+0x9f/0x270
+ usb_disconnect+0xc6/0x260
+...
+[drm:drm_mode_config_cleanup [drm]] *ERROR* connector Unknown-1 leaked!
+------------[ cut here ]------------
+WARNING: CPU: 0 PID: 242 at drivers/gpu/drm/drm_mode_config.c:458
+   drm_mode_config_cleanup+0x268/0x280 [drm]
+...
+<same Call Trace>
+---[ end trace 80df975dae439ed6 ]---
+general protection fault: 0000 [#1] SMP
+...
+Call Trace:
+ ? __switch_to+0x225/0x450
+ drm_mode_rmfb_work_fn+0x55/0x70 [drm]
+ process_one_work+0x193/0x3c0
+ worker_thread+0x4a/0x3a0
+...
+RIP: drm_framebuffer_remove+0x62/0x3f0 [drm] RSP: ffffb776c39dfd98
+---[ end trace 80df975dae439ed7 ]---
+
+After which the system is unusable this is caused by drm_dev_unregister
+getting called immediately on unplug, which calls the drivers unload
+function which calls drm_mode_config_cleanup which removes the framebuffer
+object while userspace is still holding a reference to it.
+
+Reverting commit a39be606f99d ("drm: Do a full device unregister
+when unplugging") leads to the following oops on unplug instead,
+when userspace closes the last fd referencing the drm_dev:
+
+sysfs group 'power' not found for kobject 'card1-Unknown-1'
+------------[ cut here ]------------
+WARNING: CPU: 0 PID: 2459 at fs/sysfs/group.c:237
+   sysfs_remove_group+0x80/0x90
+...
+RIP: 0010:sysfs_remove_group+0x80/0x90
+...
+Call Trace:
+ dpm_sysfs_remove+0x57/0x60
+ device_del+0xfd/0x350
+ device_unregister+0x1a/0x60
+ drm_sysfs_connector_remove+0x39/0x50 [drm]
+ drm_connector_unregister+0x5a/0x70 [drm]
+ drm_connector_unregister_all+0x45/0xa0 [drm]
+ drm_modeset_unregister_all+0x12/0x30 [drm]
+ drm_dev_unregister+0xca/0xe0 [drm]
+ drm_put_dev+0x32/0x60 [drm]
+ drm_release+0x2f3/0x380 [drm]
+ __fput+0xdf/0x1e0
+...
+---[ end trace ecfb91ac85688bbe ]---
+BUG: unable to handle kernel NULL pointer dereference at 00000000000000a8
+IP: down_write+0x1f/0x40
+...
+Call Trace:
+ debugfs_remove_recursive+0x55/0x1b0
+ drm_debugfs_connector_remove+0x21/0x40 [drm]
+ drm_connector_unregister+0x62/0x70 [drm]
+ drm_connector_unregister_all+0x45/0xa0 [drm]
+ drm_modeset_unregister_all+0x12/0x30 [drm]
+ drm_dev_unregister+0xca/0xe0 [drm]
+ drm_put_dev+0x32/0x60 [drm]
+ drm_release+0x2f3/0x380 [drm]
+ __fput+0xdf/0x1e0
+...
+---[ end trace ecfb91ac85688bbf ]---
+
+This is caused by the revert moving back to drm_unplug_dev calling
+drm_minor_unregister which does:
+
+        device_del(minor->kdev);
+        dev_set_drvdata(minor->kdev, NULL); /* safety belt */
+        drm_debugfs_cleanup(minor);
+
+Causing the sysfs entries to already be removed even though we still
+have references to them in e.g. drm_connector.
+
+Note we must call drm_minor_unregister to notify userspace of the unplug
+of the device, so calling drm_dev_unregister is not completely wrong the
+problem is that drm_dev_unregister does too much.
+
+This commit fixes drm_unplug_dev by not only reverting
+commit a39be606f99d ("drm: Do a full device unregister when unplugging")
+but by also adding a call to drm_modeset_unregister_all before the
+drm_minor_unregister calls to make sure all sysfs entries are removed
+before calling device_del(minor->kdev) thereby also fixing the second
+set of oopses caused by just reverting the commit.
+
+Fixes: a39be606f99d ("drm: Do a full device unregister when unplugging")
+Cc: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Jeffy <jeffy.chen@rock-chips.com>
+Cc: Marco Diego Aurélio Mesquita <marcodiegomesquita@gmail.com>
+Reported-by: Marco Diego Aurélio Mesquita <marcodiegomesquita@gmail.com>
+Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Sean Paul <seanpaul@chromium.org>
+Link: http://patchwork.freedesktop.org/patch/msgid/20170601115430.4113-1-hdegoede@redhat.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/gpu/drm/drm_drv.c |    7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+--- a/drivers/gpu/drm/drm_drv.c
++++ b/drivers/gpu/drm/drm_drv.c
+@@ -379,7 +379,12 @@ EXPORT_SYMBOL(drm_put_dev);
+ void drm_unplug_dev(struct drm_device *dev)
+ {
+ 	/* for a USB device */
+-	drm_dev_unregister(dev);
++	if (drm_core_check_feature(dev, DRIVER_MODESET))
++		drm_modeset_unregister_all(dev);
++
++	drm_minor_unregister(dev, DRM_MINOR_PRIMARY);
++	drm_minor_unregister(dev, DRM_MINOR_RENDER);
++	drm_minor_unregister(dev, DRM_MINOR_CONTROL);
+ 
+ 	mutex_lock(&drm_global_mutex);
+ 
