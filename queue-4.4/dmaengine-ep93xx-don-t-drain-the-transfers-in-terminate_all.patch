@@ -1,0 +1,160 @@
+From 98f9de366fccee7572c646af226b2d4b4841e3b5 Mon Sep 17 00:00:00 2001
+From: Alexander Sverdlin <alexander.sverdlin@gmail.com>
+Date: Mon, 22 May 2017 16:05:23 +0200
+Subject: dmaengine: ep93xx: Don't drain the transfers in terminate_all()
+
+From: Alexander Sverdlin <alexander.sverdlin@gmail.com>
+
+commit 98f9de366fccee7572c646af226b2d4b4841e3b5 upstream.
+
+Draining the transfers in terminate_all callback happens with IRQs disabled,
+therefore induces huge latency:
+
+ irqsoff latency trace v1.1.5 on 4.11.0
+ --------------------------------------------------------------------
+ latency: 39770 us, #57/57, CPU#0 | (M:preempt VP:0, KP:0, SP:0 HP:0)
+    -----------------
+    | task: process-129 (uid:0 nice:0 policy:2 rt_prio:50)
+    -----------------
+  => started at: _snd_pcm_stream_lock_irqsave
+  => ended at:   snd_pcm_stream_unlock_irqrestore
+
+                  _------=> CPU#
+                 / _-----=> irqs-off
+                | / _----=> need-resched
+                || / _---=> hardirq/softirq
+                ||| / _--=> preempt-depth
+                |||| /     delay
+  cmd     pid   ||||| time  |   caller
+     \   /      |||||  \    |   /
+process-129     0d.s.    3us : _snd_pcm_stream_lock_irqsave
+process-129     0d.s1    9us : snd_pcm_stream_lock <-_snd_pcm_stream_lock_irqsave
+process-129     0d.s1   15us : preempt_count_add <-snd_pcm_stream_lock
+process-129     0d.s2   22us : preempt_count_add <-snd_pcm_stream_lock
+process-129     0d.s3   32us : snd_pcm_update_hw_ptr0 <-snd_pcm_period_elapsed
+process-129     0d.s3   41us : soc_pcm_pointer <-snd_pcm_update_hw_ptr0
+process-129     0d.s3   50us : dmaengine_pcm_pointer <-soc_pcm_pointer
+process-129     0d.s3   58us+: snd_dmaengine_pcm_pointer_no_residue <-dmaengine_pcm_pointer
+process-129     0d.s3   96us : update_audio_tstamp <-snd_pcm_update_hw_ptr0
+process-129     0d.s3  103us : snd_pcm_update_state <-snd_pcm_update_hw_ptr0
+process-129     0d.s3  112us : xrun <-snd_pcm_update_state
+process-129     0d.s3  119us : snd_pcm_stop <-xrun
+process-129     0d.s3  126us : snd_pcm_action <-snd_pcm_stop
+process-129     0d.s3  134us : snd_pcm_action_single <-snd_pcm_action
+process-129     0d.s3  141us : snd_pcm_pre_stop <-snd_pcm_action_single
+process-129     0d.s3  150us : snd_pcm_do_stop <-snd_pcm_action_single
+process-129     0d.s3  157us : soc_pcm_trigger <-snd_pcm_do_stop
+process-129     0d.s3  166us : snd_dmaengine_pcm_trigger <-soc_pcm_trigger
+process-129     0d.s3  175us : ep93xx_dma_terminate_all <-snd_dmaengine_pcm_trigger
+process-129     0d.s3  182us : preempt_count_add <-ep93xx_dma_terminate_all
+process-129     0d.s4  189us*: m2p_hw_shutdown <-ep93xx_dma_terminate_all
+process-129     0d.s4 39472us : m2p_hw_setup <-ep93xx_dma_terminate_all
+
+ ... rest skipped...
+
+process-129     0d.s. 40080us : <stack trace>
+ => ep93xx_dma_tasklet
+ => tasklet_action
+ => __do_softirq
+ => irq_exit
+ => __handle_domain_irq
+ => vic_handle_irq
+ => __irq_usr
+ => 0xb66c6668
+
+Just abort the transfers and warn if the HW state is not what we expect.
+Move draining into device_synchronize callback.
+
+Signed-off-by: Alexander Sverdlin <alexander.sverdlin@gmail.com>
+Signed-off-by: Vinod Koul <vinod.koul@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/dma/ep93xx_dma.c |   37 +++++++++++++++++++++++++++++++++----
+ 1 file changed, 33 insertions(+), 4 deletions(-)
+
+--- a/drivers/dma/ep93xx_dma.c
++++ b/drivers/dma/ep93xx_dma.c
+@@ -201,6 +201,7 @@ struct ep93xx_dma_engine {
+ 	struct dma_device	dma_dev;
+ 	bool			m2m;
+ 	int			(*hw_setup)(struct ep93xx_dma_chan *);
++	void			(*hw_synchronize)(struct ep93xx_dma_chan *);
+ 	void			(*hw_shutdown)(struct ep93xx_dma_chan *);
+ 	void			(*hw_submit)(struct ep93xx_dma_chan *);
+ 	int			(*hw_interrupt)(struct ep93xx_dma_chan *);
+@@ -335,21 +336,27 @@ static inline u32 m2p_channel_state(stru
+ 	return (readl(edmac->regs + M2P_STATUS) >> 4) & 0x3;
+ }
+ 
+-static void m2p_hw_shutdown(struct ep93xx_dma_chan *edmac)
++static void m2p_hw_synchronize(struct ep93xx_dma_chan *edmac)
+ {
++	unsigned long flags;
+ 	u32 control;
+ 
++	spin_lock_irqsave(&edmac->lock, flags);
+ 	control = readl(edmac->regs + M2P_CONTROL);
+ 	control &= ~(M2P_CONTROL_STALLINT | M2P_CONTROL_NFBINT);
+ 	m2p_set_control(edmac, control);
++	spin_unlock_irqrestore(&edmac->lock, flags);
+ 
+ 	while (m2p_channel_state(edmac) >= M2P_STATE_ON)
+-		cpu_relax();
++		schedule();
++}
+ 
++static void m2p_hw_shutdown(struct ep93xx_dma_chan *edmac)
++{
+ 	m2p_set_control(edmac, 0);
+ 
+-	while (m2p_channel_state(edmac) == M2P_STATE_STALL)
+-		cpu_relax();
++	while (m2p_channel_state(edmac) != M2P_STATE_IDLE)
++		dev_warn(chan2dev(edmac), "M2P: Not yet IDLE\n");
+ }
+ 
+ static void m2p_fill_desc(struct ep93xx_dma_chan *edmac)
+@@ -1165,6 +1172,26 @@ fail:
+ }
+ 
+ /**
++ * ep93xx_dma_synchronize - Synchronizes the termination of transfers to the
++ * current context.
++ * @chan: channel
++ *
++ * Synchronizes the DMA channel termination to the current context. When this
++ * function returns it is guaranteed that all transfers for previously issued
++ * descriptors have stopped and and it is safe to free the memory associated
++ * with them. Furthermore it is guaranteed that all complete callback functions
++ * for a previously submitted descriptor have finished running and it is safe to
++ * free resources accessed from within the complete callbacks.
++ */
++static void ep93xx_dma_synchronize(struct dma_chan *chan)
++{
++	struct ep93xx_dma_chan *edmac = to_ep93xx_dma_chan(chan);
++
++	if (edmac->edma->hw_synchronize)
++		edmac->edma->hw_synchronize(edmac);
++}
++
++/**
+  * ep93xx_dma_terminate_all - terminate all transactions
+  * @chan: channel
+  *
+@@ -1327,6 +1354,7 @@ static int __init ep93xx_dma_probe(struc
+ 	dma_dev->device_prep_slave_sg = ep93xx_dma_prep_slave_sg;
+ 	dma_dev->device_prep_dma_cyclic = ep93xx_dma_prep_dma_cyclic;
+ 	dma_dev->device_config = ep93xx_dma_slave_config;
++	dma_dev->device_synchronize = ep93xx_dma_synchronize;
+ 	dma_dev->device_terminate_all = ep93xx_dma_terminate_all;
+ 	dma_dev->device_issue_pending = ep93xx_dma_issue_pending;
+ 	dma_dev->device_tx_status = ep93xx_dma_tx_status;
+@@ -1344,6 +1372,7 @@ static int __init ep93xx_dma_probe(struc
+ 	} else {
+ 		dma_cap_set(DMA_PRIVATE, dma_dev->cap_mask);
+ 
++		edma->hw_synchronize = m2p_hw_synchronize;
+ 		edma->hw_setup = m2p_hw_setup;
+ 		edma->hw_shutdown = m2p_hw_shutdown;
+ 		edma->hw_submit = m2p_hw_submit;
