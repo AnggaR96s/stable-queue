@@ -1,0 +1,115 @@
+From b425e50492583b10cceb388af36ef0bd3bdf842a Mon Sep 17 00:00:00 2001
+From: Bart Van Assche <bart.vanassche@sandisk.com>
+Date: Wed, 31 May 2017 14:43:45 -0700
+Subject: block: Avoid that blk_exit_rl() triggers a use-after-free
+
+From: Bart Van Assche <bart.vanassche@sandisk.com>
+
+commit b425e50492583b10cceb388af36ef0bd3bdf842a upstream.
+
+Since the introduction of .init_rq_fn() and .exit_rq_fn() it is
+essential that the memory allocated for struct request_queue
+stays around until all blk_exit_rl() calls have finished. Hence
+make blk_init_rl() take a reference on struct request_queue.
+
+This patch fixes the following crash:
+
+general protection fault: 0000 [#2] SMP
+CPU: 3 PID: 28 Comm: ksoftirqd/3 Tainted: G      D         4.12.0-rc2-dbg+ #2
+Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS 1.0.0-prebuilt.qemu-project.org 04/01/2014
+task: ffff88013a108040 task.stack: ffffc9000071c000
+RIP: 0010:free_request_size+0x1a/0x30
+RSP: 0018:ffffc9000071fd38 EFLAGS: 00010202
+RAX: 6b6b6b6b6b6b6b6b RBX: ffff880067362a88 RCX: 0000000000000003
+RDX: ffff880067464178 RSI: ffff880067362a88 RDI: ffff880135ea4418
+RBP: ffffc9000071fd40 R08: 0000000000000000 R09: 0000000100180009
+R10: ffffc9000071fd38 R11: ffffffff81110800 R12: ffff88006752d3d8
+R13: ffff88006752d3d8 R14: ffff88013a108040 R15: 000000000000000a
+FS:  0000000000000000(0000) GS:ffff88013fd80000(0000) knlGS:0000000000000000
+CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+CR2: 00007fa8ec1edb00 CR3: 0000000138ee8000 CR4: 00000000001406e0
+Call Trace:
+ mempool_destroy.part.10+0x21/0x40
+ mempool_destroy+0xe/0x10
+ blk_exit_rl+0x12/0x20
+ blkg_free+0x4d/0xa0
+ __blkg_release_rcu+0x59/0x170
+ rcu_process_callbacks+0x260/0x4e0
+ __do_softirq+0x116/0x250
+ smpboot_thread_fn+0x123/0x1e0
+ kthread+0x109/0x140
+ ret_from_fork+0x31/0x40
+
+Fixes: commit e9c787e65c0c ("scsi: allocate scsi_cmnd structures as part of struct request")
+Signed-off-by: Bart Van Assche <bart.vanassche@sandisk.com>
+Acked-by: Tejun Heo <tj@kernel.org>
+Reviewed-by: Hannes Reinecke <hare@suse.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Cc: Jan Kara <jack@suse.cz>
+Signed-off-by: Jens Axboe <axboe@fb.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ block/blk-cgroup.c |    2 +-
+ block/blk-core.c   |   10 ++++++++--
+ block/blk-sysfs.c  |    2 +-
+ block/blk.h        |    2 +-
+ 4 files changed, 11 insertions(+), 5 deletions(-)
+
+--- a/block/blk-cgroup.c
++++ b/block/blk-cgroup.c
+@@ -74,7 +74,7 @@ static void blkg_free(struct blkcg_gq *b
+ 			blkcg_policy[i]->pd_free_fn(blkg->pd[i]);
+ 
+ 	if (blkg->blkcg != &blkcg_root)
+-		blk_exit_rl(&blkg->rl);
++		blk_exit_rl(blkg->q, &blkg->rl);
+ 
+ 	blkg_rwstat_exit(&blkg->stat_ios);
+ 	blkg_rwstat_exit(&blkg->stat_bytes);
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -643,13 +643,19 @@ int blk_init_rl(struct request_list *rl,
+ 	if (!rl->rq_pool)
+ 		return -ENOMEM;
+ 
++	if (rl != &q->root_rl)
++		WARN_ON_ONCE(!blk_get_queue(q));
++
+ 	return 0;
+ }
+ 
+-void blk_exit_rl(struct request_list *rl)
++void blk_exit_rl(struct request_queue *q, struct request_list *rl)
+ {
+-	if (rl->rq_pool)
++	if (rl->rq_pool) {
+ 		mempool_destroy(rl->rq_pool);
++		if (rl != &q->root_rl)
++			blk_put_queue(q);
++	}
+ }
+ 
+ struct request_queue *blk_alloc_queue(gfp_t gfp_mask)
+--- a/block/blk-sysfs.c
++++ b/block/blk-sysfs.c
+@@ -819,7 +819,7 @@ static void blk_release_queue(struct kob
+ 		elevator_exit(q, q->elevator);
+ 	}
+ 
+-	blk_exit_rl(&q->root_rl);
++	blk_exit_rl(q, &q->root_rl);
+ 
+ 	if (q->queue_tags)
+ 		__blk_queue_free_tags(q);
+--- a/block/blk.h
++++ b/block/blk.h
+@@ -59,7 +59,7 @@ void blk_free_flush_queue(struct blk_flu
+ 
+ int blk_init_rl(struct request_list *rl, struct request_queue *q,
+ 		gfp_t gfp_mask);
+-void blk_exit_rl(struct request_list *rl);
++void blk_exit_rl(struct request_queue *q, struct request_list *rl);
+ void init_request_from_bio(struct request *req, struct bio *bio);
+ void blk_rq_bio_prep(struct request_queue *q, struct request *rq,
+ 			struct bio *bio);

@@ -1,0 +1,98 @@
+From dc9217b69dd6089dcfeb86ed4b3c671504326087 Mon Sep 17 00:00:00 2001
+From: Thinh Nguyen <Thinh.Nguyen@synopsys.com>
+Date: Thu, 11 May 2017 17:26:48 -0700
+Subject: usb: gadget: f_mass_storage: Serialize wake and sleep execution
+
+From: Thinh Nguyen <Thinh.Nguyen@synopsys.com>
+
+commit dc9217b69dd6089dcfeb86ed4b3c671504326087 upstream.
+
+f_mass_storage has a memorry barrier issue with the sleep and wake
+functions that can cause a deadlock. This results in intermittent hangs
+during MSC file transfer. The host will reset the device after receiving
+no response to resume the transfer. This issue is seen when dwc3 is
+processing 2 transfer-in-progress events at the same time, invoking
+completion handlers for CSW and CBW. Also this issue occurs depending on
+the system timing and latency.
+
+To increase the chance to hit this issue, you can force dwc3 driver to
+wait and process those 2 events at once by adding a small delay (~100us)
+in dwc3_check_event_buf() whenever the request is for CSW and read the
+event count again. Avoid debugging with printk and ftrace as extra
+delays and memory barrier will mask this issue.
+
+Scenario which can lead to failure:
+-----------------------------------
+1) The main thread sleeps and waits for the next command in
+   get_next_command().
+2) bulk_in_complete() wakes up main thread for CSW.
+3) bulk_out_complete() tries to wake up the running main thread for CBW.
+4) thread_wakeup_needed is not loaded with correct value in
+   sleep_thread().
+5) Main thread goes to sleep again.
+
+The pattern is shown below. Note the 2 critical variables.
+ * common->thread_wakeup_needed
+ * bh->state
+
+	CPU 0 (sleep_thread)		CPU 1 (wakeup_thread)
+	==============================  ===============================
+
+					bh->state = BH_STATE_FULL;
+					smp_wmb();
+	thread_wakeup_needed = 0;	thread_wakeup_needed = 1;
+	smp_rmb();
+	if (bh->state != BH_STATE_FULL)
+		sleep again ...
+
+As pointed out by Alan Stern, this is an R-pattern issue. The issue can
+be seen when there are two wakeups in quick succession. The
+thread_wakeup_needed can be overwritten in sleep_thread, and the read of
+the bh->state maybe reordered before the write to thread_wakeup_needed.
+
+This patch applies full memory barrier smp_mb() in both sleep_thread()
+and wakeup_thread() to ensure the order which the thread_wakeup_needed
+and bh->state are written and loaded.
+
+However, a better solution in the future would be to use wait_queue
+method that takes care of managing memory barrier between waker and
+waiter.
+
+Acked-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Thinh Nguyen <thinhn@synopsys.com>
+Signed-off-by: Felipe Balbi <felipe.balbi@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/usb/gadget/function/f_mass_storage.c |   13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+--- a/drivers/usb/gadget/function/f_mass_storage.c
++++ b/drivers/usb/gadget/function/f_mass_storage.c
+@@ -396,7 +396,11 @@ static int fsg_set_halt(struct fsg_dev *
+ /* Caller must hold fsg->lock */
+ static void wakeup_thread(struct fsg_common *common)
+ {
+-	smp_wmb();	/* ensure the write of bh->state is complete */
++	/*
++	 * Ensure the reading of thread_wakeup_needed
++	 * and the writing of bh->state are completed
++	 */
++	smp_mb();
+ 	/* Tell the main thread that something has happened */
+ 	common->thread_wakeup_needed = 1;
+ 	if (common->thread_task)
+@@ -627,7 +631,12 @@ static int sleep_thread(struct fsg_commo
+ 	}
+ 	__set_current_state(TASK_RUNNING);
+ 	common->thread_wakeup_needed = 0;
+-	smp_rmb();	/* ensure the latest bh->state is visible */
++
++	/*
++	 * Ensure the writing of thread_wakeup_needed
++	 * and the reading of bh->state are completed
++	 */
++	smp_mb();
+ 	return rc;
+ }
+ 
