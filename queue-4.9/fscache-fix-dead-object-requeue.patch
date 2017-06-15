@@ -1,0 +1,189 @@
+From foo@baz Thu Jun 15 12:25:36 CEST 2017
+From: David Howells <dhowells@redhat.com>
+Date: Tue, 23 May 2017 21:54:04 -0400
+Subject: fscache: Fix dead object requeue
+
+From: David Howells <dhowells@redhat.com>
+
+
+[ Upstream commit e26bfebdfc0d212d366de9990a096665d5c0209a ]
+
+Under some circumstances, an fscache object can become queued such that it
+fscache_object_work_func() can be called once the object is in the
+OBJECT_DEAD state.  This results in the kernel oopsing when it tries to
+invoke the handler for the state (which is hard coded to 0x2).
+
+The way this comes about is something like the following:
+
+ (1) The object dispatcher is processing a work state for an object.  This
+     is done in workqueue context.
+
+ (2) An out-of-band event comes in that isn't masked, causing the object to
+     be queued, say EV_KILL.
+
+ (3) The object dispatcher finishes processing the current work state on
+     that object and then sees there's another event to process, so,
+     without returning to the workqueue core, it processes that event too.
+     It then follows the chain of events that initiates until we reach
+     OBJECT_DEAD without going through a wait state (such as
+     WAIT_FOR_CLEARANCE).
+
+     At this point, object->events may be 0, object->event_mask will be 0
+     and oob_event_mask will be 0.
+
+ (4) The object dispatcher returns to the workqueue processor, and in due
+     course, this sees that the object's work item is still queued and
+     invokes it again.
+
+ (5) The current state is a work state (OBJECT_DEAD), so the dispatcher
+     jumps to it - resulting in an OOPS.
+
+When I'm seeing this, the work state in (1) appears to have been either
+LOOK_UP_OBJECT or CREATE_OBJECT (object->oob_table is
+fscache_osm_lookup_oob).
+
+The window for (2) is very small:
+
+ (A) object->event_mask is cleared whilst the event dispatch process is
+     underway - though there's no memory barrier to force this to the top
+     of the function.
+
+     The window, therefore is from the time the object was selected by the
+     workqueue processor and made requeueable to the time the mask was
+     cleared.
+
+ (B) fscache_raise_event() will only queue the object if it manages to set
+     the event bit and the corresponding event_mask bit was set.
+
+     The enqueuement is then deferred slightly whilst we get a ref on the
+     object and get the per-CPU variable for workqueue congestion.  This
+     slight deferral slightly increases the probability by allowing extra
+     time for the workqueue to make the item requeueable.
+
+Handle this by giving the dead state a processor function and checking the
+for the dead state address rather than seeing if the processor function is
+address 0x2.  The dead state processor function can then set a flag to
+indicate that it's occurred and give a warning if it occurs more than once
+per object.
+
+If this race occurs, an oops similar to the following is seen (note the RIP
+value):
+
+BUG: unable to handle kernel NULL pointer dereference at 0000000000000002
+IP: [<0000000000000002>] 0x1
+PGD 0
+Oops: 0010 [#1] SMP
+Modules linked in: ...
+CPU: 17 PID: 16077 Comm: kworker/u48:9 Not tainted 3.10.0-327.18.2.el7.x86_64 #1
+Hardware name: HP ProLiant DL380 Gen9/ProLiant DL380 Gen9, BIOS P89 12/27/2015
+Workqueue: fscache_object fscache_object_work_func [fscache]
+task: ffff880302b63980 ti: ffff880717544000 task.ti: ffff880717544000
+RIP: 0010:[<0000000000000002>]  [<0000000000000002>] 0x1
+RSP: 0018:ffff880717547df8  EFLAGS: 00010202
+RAX: ffffffffa0368640 RBX: ffff880edf7a4480 RCX: dead000000200200
+RDX: 0000000000000002 RSI: 00000000ffffffff RDI: ffff880edf7a4480
+RBP: ffff880717547e18 R08: 0000000000000000 R09: dfc40a25cb3a4510
+R10: dfc40a25cb3a4510 R11: 0000000000000400 R12: 0000000000000000
+R13: ffff880edf7a4510 R14: ffff8817f6153400 R15: 0000000000000600
+FS:  0000000000000000(0000) GS:ffff88181f420000(0000) knlGS:0000000000000000
+CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+CR2: 0000000000000002 CR3: 000000000194a000 CR4: 00000000001407e0
+DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+DR3: 0000000000000000 DR6: 00000000ffff0ff0 DR7: 0000000000000400
+Stack:
+ ffffffffa0363695 ffff880edf7a4510 ffff88093f16f900 ffff8817faa4ec00
+ ffff880717547e60 ffffffff8109d5db 00000000faa4ec18 0000000000000000
+ ffff8817faa4ec18 ffff88093f16f930 ffff880302b63980 ffff88093f16f900
+Call Trace:
+ [<ffffffffa0363695>] ? fscache_object_work_func+0xa5/0x200 [fscache]
+ [<ffffffff8109d5db>] process_one_work+0x17b/0x470
+ [<ffffffff8109e4ac>] worker_thread+0x21c/0x400
+ [<ffffffff8109e290>] ? rescuer_thread+0x400/0x400
+ [<ffffffff810a5acf>] kthread+0xcf/0xe0
+ [<ffffffff810a5a00>] ? kthread_create_on_node+0x140/0x140
+ [<ffffffff816460d8>] ret_from_fork+0x58/0x90
+ [<ffffffff810a5a00>] ? kthread_create_on_node+0x140/0x140
+
+Signed-off-by: David Howells <dhowells@redhat.com>
+Acked-by: Jeremy McNicoll <jeremymc@redhat.com>
+Tested-by: Frank Sorenson <sorenson@redhat.com>
+Tested-by: Benjamin Coddington <bcodding@redhat.com>
+Reviewed-by: Benjamin Coddington <bcodding@redhat.com>
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/fscache/object.c           |   26 ++++++++++++++++++++++++--
+ include/linux/fscache-cache.h |    1 +
+ 2 files changed, 25 insertions(+), 2 deletions(-)
+
+--- a/fs/fscache/object.c
++++ b/fs/fscache/object.c
+@@ -30,6 +30,7 @@ static const struct fscache_state *fscac
+ static const struct fscache_state *fscache_object_available(struct fscache_object *, int);
+ static const struct fscache_state *fscache_parent_ready(struct fscache_object *, int);
+ static const struct fscache_state *fscache_update_object(struct fscache_object *, int);
++static const struct fscache_state *fscache_object_dead(struct fscache_object *, int);
+ 
+ #define __STATE_NAME(n) fscache_osm_##n
+ #define STATE(n) (&__STATE_NAME(n))
+@@ -91,7 +92,7 @@ static WORK_STATE(LOOKUP_FAILURE,	"LCFL"
+ static WORK_STATE(KILL_OBJECT,		"KILL", fscache_kill_object);
+ static WORK_STATE(KILL_DEPENDENTS,	"KDEP", fscache_kill_dependents);
+ static WORK_STATE(DROP_OBJECT,		"DROP", fscache_drop_object);
+-static WORK_STATE(OBJECT_DEAD,		"DEAD", (void*)2UL);
++static WORK_STATE(OBJECT_DEAD,		"DEAD", fscache_object_dead);
+ 
+ static WAIT_STATE(WAIT_FOR_INIT,	"?INI",
+ 		  TRANSIT_TO(INIT_OBJECT,	1 << FSCACHE_OBJECT_EV_NEW_CHILD));
+@@ -229,6 +230,10 @@ execute_work_state:
+ 	event = -1;
+ 	if (new_state == NO_TRANSIT) {
+ 		_debug("{OBJ%x} %s notrans", object->debug_id, state->name);
++		if (unlikely(state == STATE(OBJECT_DEAD))) {
++			_leave(" [dead]");
++			return;
++		}
+ 		fscache_enqueue_object(object);
+ 		event_mask = object->oob_event_mask;
+ 		goto unmask_events;
+@@ -239,7 +244,7 @@ execute_work_state:
+ 	object->state = state = new_state;
+ 
+ 	if (state->work) {
+-		if (unlikely(state->work == ((void *)2UL))) {
++		if (unlikely(state == STATE(OBJECT_DEAD))) {
+ 			_leave(" [dead]");
+ 			return;
+ 		}
+@@ -1077,3 +1082,20 @@ void fscache_object_mark_killed(struct f
+ 	}
+ }
+ EXPORT_SYMBOL(fscache_object_mark_killed);
++
++/*
++ * The object is dead.  We can get here if an object gets queued by an event
++ * that would lead to its death (such as EV_KILL) when the dispatcher is
++ * already running (and so can be requeued) but hasn't yet cleared the event
++ * mask.
++ */
++static const struct fscache_state *fscache_object_dead(struct fscache_object *object,
++						       int event)
++{
++	if (!test_and_set_bit(FSCACHE_OBJECT_RUN_AFTER_DEAD,
++			      &object->flags))
++		return NO_TRANSIT;
++
++	WARN(true, "FS-Cache object redispatched after death");
++	return NO_TRANSIT;
++}
+--- a/include/linux/fscache-cache.h
++++ b/include/linux/fscache-cache.h
+@@ -360,6 +360,7 @@ struct fscache_object {
+ #define FSCACHE_OBJECT_IS_AVAILABLE	5	/* T if object has become active */
+ #define FSCACHE_OBJECT_RETIRED		6	/* T if object was retired on relinquishment */
+ #define FSCACHE_OBJECT_KILLED_BY_CACHE	7	/* T if object was killed by the cache */
++#define FSCACHE_OBJECT_RUN_AFTER_DEAD	8	/* T if object has been dispatched after death */
+ 
+ 	struct list_head	cache_link;	/* link in cache->object_list */
+ 	struct hlist_node	cookie_link;	/* link in cookie->backing_objects */
