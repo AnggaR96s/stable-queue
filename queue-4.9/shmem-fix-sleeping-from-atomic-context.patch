@@ -1,0 +1,105 @@
+From foo@baz Thu Jun 15 11:38:13 CEST 2017
+From: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
+Date: Tue, 23 May 2017 21:53:56 -0400
+Subject: shmem: fix sleeping from atomic context
+
+From: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
+
+
+[ Upstream commit 253fd0f02040a19c6fe80e4171659fa3482a422d ]
+
+Syzkaller fuzzer managed to trigger this:
+
+    BUG: sleeping function called from invalid context at mm/shmem.c:852
+    in_atomic(): 1, irqs_disabled(): 0, pid: 529, name: khugepaged
+    3 locks held by khugepaged/529:
+     #0:  (shrinker_rwsem){++++..}, at: [<ffffffff818d7ef1>] shrink_slab.part.59+0x121/0xd30 mm/vmscan.c:451
+     #1:  (&type->s_umount_key#29){++++..}, at: [<ffffffff81a63630>] trylock_super+0x20/0x100 fs/super.c:392
+     #2:  (&(&sbinfo->shrinklist_lock)->rlock){+.+.-.}, at: [<ffffffff818fd83e>] spin_lock include/linux/spinlock.h:302 [inline]
+     #2:  (&(&sbinfo->shrinklist_lock)->rlock){+.+.-.}, at: [<ffffffff818fd83e>] shmem_unused_huge_shrink+0x28e/0x1490 mm/shmem.c:427
+    CPU: 2 PID: 529 Comm: khugepaged Not tainted 4.10.0-rc5+ #201
+    Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS Bochs 01/01/2011
+    Call Trace:
+       shmem_undo_range+0xb20/0x2710 mm/shmem.c:852
+       shmem_truncate_range+0x27/0xa0 mm/shmem.c:939
+       shmem_evict_inode+0x35f/0xca0 mm/shmem.c:1030
+       evict+0x46e/0x980 fs/inode.c:553
+       iput_final fs/inode.c:1515 [inline]
+       iput+0x589/0xb20 fs/inode.c:1542
+       shmem_unused_huge_shrink+0xbad/0x1490 mm/shmem.c:446
+       shmem_unused_huge_scan+0x10c/0x170 mm/shmem.c:512
+       super_cache_scan+0x376/0x450 fs/super.c:106
+       do_shrink_slab mm/vmscan.c:378 [inline]
+       shrink_slab.part.59+0x543/0xd30 mm/vmscan.c:481
+       shrink_slab mm/vmscan.c:2592 [inline]
+       shrink_node+0x2c7/0x870 mm/vmscan.c:2592
+       shrink_zones mm/vmscan.c:2734 [inline]
+       do_try_to_free_pages+0x369/0xc80 mm/vmscan.c:2776
+       try_to_free_pages+0x3c6/0x900 mm/vmscan.c:2982
+       __perform_reclaim mm/page_alloc.c:3301 [inline]
+       __alloc_pages_direct_reclaim mm/page_alloc.c:3322 [inline]
+       __alloc_pages_slowpath+0xa24/0x1c30 mm/page_alloc.c:3683
+       __alloc_pages_nodemask+0x544/0xae0 mm/page_alloc.c:3848
+       __alloc_pages include/linux/gfp.h:426 [inline]
+       __alloc_pages_node include/linux/gfp.h:439 [inline]
+       khugepaged_alloc_page+0xc2/0x1b0 mm/khugepaged.c:750
+       collapse_huge_page+0x182/0x1fe0 mm/khugepaged.c:955
+       khugepaged_scan_pmd+0xfdf/0x12a0 mm/khugepaged.c:1208
+       khugepaged_scan_mm_slot mm/khugepaged.c:1727 [inline]
+       khugepaged_do_scan mm/khugepaged.c:1808 [inline]
+       khugepaged+0xe9b/0x1590 mm/khugepaged.c:1853
+       kthread+0x326/0x3f0 kernel/kthread.c:227
+       ret_from_fork+0x31/0x40 arch/x86/entry/entry_64.S:430
+
+The iput() from atomic context was a bad idea: if after igrab() somebody
+else calls iput() and we left with the last inode reference, our iput()
+would lead to inode eviction and therefore sleeping.
+
+This patch should fix the situation.
+
+Link: http://lkml.kernel.org/r/20170131093141.GA15899@node.shutemov.name
+Signed-off-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Reported-by: Dmitry Vyukov <dvyukov@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ mm/shmem.c |   11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@ -412,6 +412,7 @@ static unsigned long shmem_unused_huge_s
+ 		struct shrink_control *sc, unsigned long nr_to_split)
+ {
+ 	LIST_HEAD(list), *pos, *next;
++	LIST_HEAD(to_remove);
+ 	struct inode *inode;
+ 	struct shmem_inode_info *info;
+ 	struct page *page;
+@@ -438,9 +439,8 @@ static unsigned long shmem_unused_huge_s
+ 		/* Check if there's anything to gain */
+ 		if (round_up(inode->i_size, PAGE_SIZE) ==
+ 				round_up(inode->i_size, HPAGE_PMD_SIZE)) {
+-			list_del_init(&info->shrinklist);
++			list_move(&info->shrinklist, &to_remove);
+ 			removed++;
+-			iput(inode);
+ 			goto next;
+ 		}
+ 
+@@ -451,6 +451,13 @@ next:
+ 	}
+ 	spin_unlock(&sbinfo->shrinklist_lock);
+ 
++	list_for_each_safe(pos, next, &to_remove) {
++		info = list_entry(pos, struct shmem_inode_info, shrinklist);
++		inode = &info->vfs_inode;
++		list_del_init(&info->shrinklist);
++		iput(inode);
++	}
++
+ 	list_for_each_safe(pos, next, &list) {
+ 		int ret;
+ 
