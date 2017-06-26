@@ -1,0 +1,141 @@
+From 73d4e580ccc5c3e05cea002f18111f66c9c07034 Mon Sep 17 00:00:00 2001
+From: Nicholas Bellinger <nab@linux-iscsi.org>
+Date: Fri, 2 Jun 2017 20:00:17 -0700
+Subject: target: Fix kref->refcount underflow in transport_cmd_finish_abort
+
+From: Nicholas Bellinger <nab@linux-iscsi.org>
+
+commit 73d4e580ccc5c3e05cea002f18111f66c9c07034 upstream.
+
+This patch fixes a se_cmd->cmd_kref underflow during CMD_T_ABORTED
+when a fabric driver drops it's second reference from below the
+target_core_tmr.c based callers of transport_cmd_finish_abort().
+
+Recently with the conversion of kref to refcount_t, this bug was
+manifesting itself as:
+
+[705519.601034] refcount_t: underflow; use-after-free.
+[705519.604034] INFO: NMI handler (kgdb_nmi_handler) took too long to run: 20116.512 msecs
+[705539.719111] ------------[ cut here ]------------
+[705539.719117] WARNING: CPU: 3 PID: 26510 at lib/refcount.c:184 refcount_sub_and_test+0x33/0x51
+
+Since the original kref atomic_t based kref_put() didn't check for
+underflow and only invoked the final callback when zero was reached,
+this bug did not manifest in practice since all se_cmd memory is
+using preallocated tags.
+
+To address this, go ahead and propigate the existing return from
+transport_put_cmd() up via transport_cmd_finish_abort(), and
+change transport_cmd_finish_abort() + core_tmr_handle_tas_abort()
+callers to only do their local target_put_sess_cmd() if necessary.
+
+Reported-by: Bart Van Assche <bart.vanassche@sandisk.com>
+Tested-by: Bart Van Assche <bart.vanassche@sandisk.com>
+Cc: Mike Christie <mchristi@redhat.com>
+Cc: Hannes Reinecke <hare@suse.de>
+Cc: Christoph Hellwig <hch@lst.de>
+Cc: Himanshu Madhani <himanshu.madhani@qlogic.com>
+Cc: Sagi Grimberg <sagig@mellanox.com>
+Tested-by: Gary Guo <ghg@datera.io>
+Tested-by: Chu Yuan Lin <cyl@datera.io>
+Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/target/target_core_internal.h  |    2 +-
+ drivers/target/target_core_tmr.c       |   16 ++++++++--------
+ drivers/target/target_core_transport.c |    9 ++++++---
+ 3 files changed, 15 insertions(+), 12 deletions(-)
+
+--- a/drivers/target/target_core_internal.h
++++ b/drivers/target/target_core_internal.h
+@@ -131,7 +131,7 @@ int	init_se_kmem_caches(void);
+ void	release_se_kmem_caches(void);
+ u32	scsi_get_new_index(scsi_index_t);
+ void	transport_subsystem_check_init(void);
+-void	transport_cmd_finish_abort(struct se_cmd *, int);
++int	transport_cmd_finish_abort(struct se_cmd *, int);
+ unsigned char *transport_dump_cmd_direction(struct se_cmd *);
+ void	transport_dump_dev_state(struct se_device *, char *, int *);
+ void	transport_dump_dev_info(struct se_device *, struct se_lun *,
+--- a/drivers/target/target_core_tmr.c
++++ b/drivers/target/target_core_tmr.c
+@@ -75,7 +75,7 @@ void core_tmr_release_req(struct se_tmr_
+ 	kfree(tmr);
+ }
+ 
+-static void core_tmr_handle_tas_abort(struct se_cmd *cmd, int tas)
++static int core_tmr_handle_tas_abort(struct se_cmd *cmd, int tas)
+ {
+ 	unsigned long flags;
+ 	bool remove = true, send_tas;
+@@ -91,7 +91,7 @@ static void core_tmr_handle_tas_abort(st
+ 		transport_send_task_abort(cmd);
+ 	}
+ 
+-	transport_cmd_finish_abort(cmd, remove);
++	return transport_cmd_finish_abort(cmd, remove);
+ }
+ 
+ static int target_check_cdb_and_preempt(struct list_head *list,
+@@ -185,8 +185,8 @@ void core_tmr_abort_task(
+ 		cancel_work_sync(&se_cmd->work);
+ 		transport_wait_for_tasks(se_cmd);
+ 
+-		transport_cmd_finish_abort(se_cmd, true);
+-		target_put_sess_cmd(se_cmd);
++		if (!transport_cmd_finish_abort(se_cmd, true))
++			target_put_sess_cmd(se_cmd);
+ 
+ 		printk("ABORT_TASK: Sending TMR_FUNCTION_COMPLETE for"
+ 				" ref_tag: %llu\n", ref_tag);
+@@ -286,8 +286,8 @@ static void core_tmr_drain_tmr_list(
+ 		cancel_work_sync(&cmd->work);
+ 		transport_wait_for_tasks(cmd);
+ 
+-		transport_cmd_finish_abort(cmd, 1);
+-		target_put_sess_cmd(cmd);
++		if (!transport_cmd_finish_abort(cmd, 1))
++			target_put_sess_cmd(cmd);
+ 	}
+ }
+ 
+@@ -385,8 +385,8 @@ static void core_tmr_drain_state_list(
+ 		cancel_work_sync(&cmd->work);
+ 		transport_wait_for_tasks(cmd);
+ 
+-		core_tmr_handle_tas_abort(cmd, tas);
+-		target_put_sess_cmd(cmd);
++		if (!core_tmr_handle_tas_abort(cmd, tas))
++			target_put_sess_cmd(cmd);
+ 	}
+ }
+ 
+--- a/drivers/target/target_core_transport.c
++++ b/drivers/target/target_core_transport.c
+@@ -673,9 +673,10 @@ static void transport_lun_remove_cmd(str
+ 		percpu_ref_put(&lun->lun_ref);
+ }
+ 
+-void transport_cmd_finish_abort(struct se_cmd *cmd, int remove)
++int transport_cmd_finish_abort(struct se_cmd *cmd, int remove)
+ {
+ 	bool ack_kref = (cmd->se_cmd_flags & SCF_ACK_KREF);
++	int ret = 0;
+ 
+ 	if (cmd->se_cmd_flags & SCF_SE_LUN_CMD)
+ 		transport_lun_remove_cmd(cmd);
+@@ -687,9 +688,11 @@ void transport_cmd_finish_abort(struct s
+ 		cmd->se_tfo->aborted_task(cmd);
+ 
+ 	if (transport_cmd_check_stop_to_fabric(cmd))
+-		return;
++		return 1;
+ 	if (remove && ack_kref)
+-		transport_put_cmd(cmd);
++		ret = transport_put_cmd(cmd);
++
++	return ret;
+ }
+ 
+ static void target_complete_failure_work(struct work_struct *work)
