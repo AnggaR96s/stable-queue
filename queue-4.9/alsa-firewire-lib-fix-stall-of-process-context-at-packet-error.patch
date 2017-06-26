@@ -1,0 +1,148 @@
+From 4a9bfafc64f44ef83de4e00ca1b57352af6cd8c2 Mon Sep 17 00:00:00 2001
+From: Takashi Sakamoto <o-takashi@sakamocchi.jp>
+Date: Sun, 11 Jun 2017 16:08:21 +0900
+Subject: ALSA: firewire-lib: Fix stall of process context at packet error
+
+From: Takashi Sakamoto <o-takashi@sakamocchi.jp>
+
+commit 4a9bfafc64f44ef83de4e00ca1b57352af6cd8c2 upstream.
+
+At Linux v3.5, packet processing can be done in process context of ALSA
+PCM application as well as software IRQ context for OHCI 1394. Below is
+an example of the callgraph (some calls are omitted).
+
+ioctl(2) with e.g. HWSYNC
+(sound/core/pcm_native.c)
+->snd_pcm_common_ioctl1()
+  ->snd_pcm_hwsync()
+    ->snd_pcm_stream_lock_irq
+    (sound/core/pcm_lib.c)
+    ->snd_pcm_update_hw_ptr()
+      ->snd_pcm_udpate_hw_ptr0()
+        ->struct snd_pcm_ops.pointer()
+        (sound/firewire/*)
+        = Each handler on drivers in ALSA firewire stack
+          (sound/firewire/amdtp-stream.c)
+          ->amdtp_stream_pcm_pointer()
+            (drivers/firewire/core-iso.c)
+            ->fw_iso_context_flush_completions()
+              ->struct fw_card_driver.flush_iso_completion()
+              (drivers/firewire/ohci.c)
+              = flush_iso_completions()
+                ->struct fw_iso_context.callback.sc
+                (sound/firewire/amdtp-stream.c)
+                = in_stream_callback() or out_stream_callback()
+                  ->...
+    ->snd_pcm_stream_unlock_irq
+
+When packet queueing error occurs or detecting invalid packets in
+'in_stream_callback()' or 'out_stream_callback()', 'snd_pcm_stop_xrun()'
+is called on local CPU with disabled IRQ.
+
+(sound/firewire/amdtp-stream.c)
+in_stream_callback() or out_stream_callback()
+->amdtp_stream_pcm_abort()
+  ->snd_pcm_stop_xrun()
+    ->snd_pcm_stream_lock_irqsave()
+    ->snd_pcm_stop()
+    ->snd_pcm_stream_unlock_irqrestore()
+
+The process is stalled on the CPU due to attempt to acquire recursive lock.
+
+[  562.630853] INFO: rcu_sched detected stalls on CPUs/tasks:
+[  562.630861]      2-...: (1 GPs behind) idle=37d/140000000000000/0 softirq=38323/38323 fqs=7140
+[  562.630862]      (detected by 3, t=15002 jiffies, g=21036, c=21035, q=5933)
+[  562.630866] Task dump for CPU 2:
+[  562.630867] alsa-source-OXF R  running task        0  6619      1 0x00000008
+[  562.630870] Call Trace:
+[  562.630876]  ? vt_console_print+0x79/0x3e0
+[  562.630880]  ? msg_print_text+0x9d/0x100
+[  562.630883]  ? up+0x32/0x50
+[  562.630885]  ? irq_work_queue+0x8d/0xa0
+[  562.630886]  ? console_unlock+0x2b6/0x4b0
+[  562.630888]  ? vprintk_emit+0x312/0x4a0
+[  562.630892]  ? dev_vprintk_emit+0xbf/0x230
+[  562.630895]  ? do_sys_poll+0x37a/0x550
+[  562.630897]  ? dev_printk_emit+0x4e/0x70
+[  562.630900]  ? __dev_printk+0x3c/0x80
+[  562.630903]  ? _raw_spin_lock+0x20/0x30
+[  562.630909]  ? snd_pcm_stream_lock+0x31/0x50 [snd_pcm]
+[  562.630914]  ? _snd_pcm_stream_lock_irqsave+0x2e/0x40 [snd_pcm]
+[  562.630918]  ? snd_pcm_stop_xrun+0x16/0x70 [snd_pcm]
+[  562.630922]  ? in_stream_callback+0x3e6/0x450 [snd_firewire_lib]
+[  562.630925]  ? handle_ir_packet_per_buffer+0x8e/0x1a0 [firewire_ohci]
+[  562.630928]  ? ohci_flush_iso_completions+0xa3/0x130 [firewire_ohci]
+[  562.630932]  ? fw_iso_context_flush_completions+0x15/0x20 [firewire_core]
+[  562.630935]  ? amdtp_stream_pcm_pointer+0x2d/0x40 [snd_firewire_lib]
+[  562.630938]  ? pcm_capture_pointer+0x19/0x20 [snd_oxfw]
+[  562.630943]  ? snd_pcm_update_hw_ptr0+0x47/0x3d0 [snd_pcm]
+[  562.630945]  ? poll_select_copy_remaining+0x150/0x150
+[  562.630947]  ? poll_select_copy_remaining+0x150/0x150
+[  562.630952]  ? snd_pcm_update_hw_ptr+0x10/0x20 [snd_pcm]
+[  562.630956]  ? snd_pcm_hwsync+0x45/0xb0 [snd_pcm]
+[  562.630960]  ? snd_pcm_common_ioctl1+0x1ff/0xc90 [snd_pcm]
+[  562.630962]  ? futex_wake+0x90/0x170
+[  562.630966]  ? snd_pcm_capture_ioctl1+0x136/0x260 [snd_pcm]
+[  562.630970]  ? snd_pcm_capture_ioctl+0x27/0x40 [snd_pcm]
+[  562.630972]  ? do_vfs_ioctl+0xa3/0x610
+[  562.630974]  ? vfs_read+0x11b/0x130
+[  562.630976]  ? SyS_ioctl+0x79/0x90
+[  562.630978]  ? entry_SYSCALL_64_fastpath+0x1e/0xad
+
+This commit fixes the above bug. This assumes two cases:
+1. Any error is detected in software IRQ context of OHCI 1394 context.
+In this case, PCM substream should be aborted in packet handler. On the
+other hand, it should not be done in any process context. TO distinguish
+these two context, use 'in_interrupt()' macro.
+2. Any error is detect in process context of ALSA PCM application.
+In this case, PCM substream should not be aborted in packet handler
+because PCM substream lock is acquired. The task to abort PCM substream
+should be done in ALSA PCM core. For this purpose, SNDRV_PCM_POS_XRUN is
+returned at 'struct snd_pcm_ops.pointer()'.
+
+Suggested-by: Clemens Ladisch <clemens@ladisch.de>
+Fixes: e9148dddc3c7("ALSA: firewire-lib: flush completed packets when reading PCM position")
+Signed-off-by: Takashi Sakamoto <o-takashi@sakamocchi.jp>
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ sound/firewire/amdtp-stream.c |    8 ++++++--
+ sound/firewire/amdtp-stream.h |    2 +-
+ 2 files changed, 7 insertions(+), 3 deletions(-)
+
+--- a/sound/firewire/amdtp-stream.c
++++ b/sound/firewire/amdtp-stream.c
+@@ -606,7 +606,9 @@ static void out_stream_callback(struct f
+ 		cycle = increment_cycle_count(cycle, 1);
+ 		if (handle_out_packet(s, cycle, i) < 0) {
+ 			s->packet_index = -1;
+-			amdtp_stream_pcm_abort(s);
++			if (in_interrupt())
++				amdtp_stream_pcm_abort(s);
++			WRITE_ONCE(s->pcm_buffer_pointer, SNDRV_PCM_POS_XRUN);
+ 			return;
+ 		}
+ 	}
+@@ -658,7 +660,9 @@ static void in_stream_callback(struct fw
+ 	/* Queueing error or detecting invalid payload. */
+ 	if (i < packets) {
+ 		s->packet_index = -1;
+-		amdtp_stream_pcm_abort(s);
++		if (in_interrupt())
++			amdtp_stream_pcm_abort(s);
++		WRITE_ONCE(s->pcm_buffer_pointer, SNDRV_PCM_POS_XRUN);
+ 		return;
+ 	}
+ 
+--- a/sound/firewire/amdtp-stream.h
++++ b/sound/firewire/amdtp-stream.h
+@@ -124,7 +124,7 @@ struct amdtp_stream {
+ 	/* For a PCM substream processing. */
+ 	struct snd_pcm_substream *pcm;
+ 	struct tasklet_struct period_tasklet;
+-	unsigned int pcm_buffer_pointer;
++	snd_pcm_uframes_t pcm_buffer_pointer;
+ 	unsigned int pcm_period_pointer;
+ 
+ 	/* To wait for first packet. */
