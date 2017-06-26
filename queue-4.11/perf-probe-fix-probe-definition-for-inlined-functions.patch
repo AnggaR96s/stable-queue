@@ -1,0 +1,165 @@
+From 7598f8bc1383ffd77686cb4e92e749bef3c75937 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Bj=C3=B6rn=20T=C3=B6pel?= <bjorn.topel@intel.com>
+Date: Wed, 21 Jun 2017 18:41:34 +0200
+Subject: perf probe: Fix probe definition for inlined functions
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+From: Björn Töpel <bjorn.topel@intel.com>
+
+commit 7598f8bc1383ffd77686cb4e92e749bef3c75937 upstream.
+
+In commit 613f050d68a8 ("perf probe: Fix to probe on gcc generated
+functions in modules"), the offset from symbol is, incorrectly, added
+to the trace point address. This leads to incorrect probe trace points
+for inlined functions and when using relative line number on symbols.
+
+Prior this patch:
+  $ perf probe -m nf_nat -D in_range
+  p:probe/in_range nf_nat:in_range.isra.9+0
+  $ perf probe -m i40e -D i40e_clean_rx_irq
+  p:probe/i40e_clean_rx_irq i40e:i40e_napi_poll+2212
+  $ perf probe -m i40e -D i40e_clean_rx_irq:16
+  p:probe/i40e_clean_rx_irq i40e:i40e_lan_xmit_frame+626
+
+After:
+  $ perf probe -m nf_nat -D in_range
+  p:probe/in_range nf_nat:in_range.isra.9+0
+  $ perf probe -m i40e -D i40e_clean_rx_irq
+  p:probe/i40e_clean_rx_irq i40e:i40e_napi_poll+1106
+  $ perf probe -m i40e -D i40e_clean_rx_irq:16
+  p:probe/i40e_clean_rx_irq i40e:i40e_napi_poll+2665
+
+Committer testing:
+
+Using 'pfunct', a tool found in the 'dwarves' package [1], one can ask what are
+the functions that while not being explicitely marked as inline, were inlined
+by the compiler:
+
+  # pfunct --cc_inlined /lib/modules/4.12.0-rc4+/kernel/drivers/net/ethernet/intel/e1000e/e1000e.ko | head
+  __ew32
+  e1000_regdump
+  e1000e_dump_ps_pages
+  e1000_desc_unused
+  e1000e_systim_to_hwtstamp
+  e1000e_rx_hwtstamp
+  e1000e_update_rdt_wa
+  e1000e_update_tdt_wa
+  e1000_put_txbuf
+  e1000_consume_page
+
+Then ask 'perf probe' to produce the kprobe_tracer probe definitions for two of
+them:
+
+  # perf probe -m e1000e -D e1000e_rx_hwtstamp
+  p:probe/e1000e_rx_hwtstamp e1000e:e1000_receive_skb+74
+
+  # perf probe -m e1000e -D e1000_consume_page
+  p:probe/e1000_consume_page e1000e:e1000_clean_jumbo_rx_irq+876
+  p:probe/e1000_consume_page_1 e1000e:e1000_clean_jumbo_rx_irq+1506
+  p:probe/e1000_consume_page_2 e1000e:e1000_clean_rx_irq_ps+1074
+
+Now lets concentrate on the 'e1000_consume_page' one, that was inlined twice in
+e1000_clean_jumbo_rx_irq(), lets see what readelf says about the DWARF tags for
+that function:
+
+  $ readelf -wi /lib/modules/4.12.0-rc4+/kernel/drivers/net/ethernet/intel/e1000e/e1000e.ko
+  <SNIP>
+  <1><13e27b>: Abbrev Number: 121 (DW_TAG_subprogram)
+    <13e27c>   DW_AT_name        : (indirect string, offset: 0xa8945): e1000_clean_jumbo_rx_irq
+    <13e287>   DW_AT_low_pc      : 0x17a30
+  <3><13e6ef>: Abbrev Number: 119 (DW_TAG_inlined_subroutine)
+    <13e6f0>   DW_AT_abstract_origin: <0x13ed2c>
+    <13e6f4>   DW_AT_low_pc      : 0x17be6
+  <SNIP>
+  <1><13ed2c>: Abbrev Number: 142 (DW_TAG_subprogram)
+     <13ed2e>   DW_AT_name        : (indirect string, offset: 0xa54c3): e1000_consume_page
+
+So, the first time in e1000_clean_jumbo_rx_irq() where e1000_consume_page() is
+inlined is at PC 0x17be6, which subtracted from e1000_clean_jumbo_rx_irq()'s
+address, gives us the offset we should use in the probe definition:
+
+  0x17be6 - 0x17a30 = 438
+
+but above we have 876, which is twice as much.
+
+Lets see the second inline expansion of e1000_consume_page() in
+e1000_clean_jumbo_rx_irq():
+
+  <3><13e86e>: Abbrev Number: 119 (DW_TAG_inlined_subroutine)
+    <13e86f>   DW_AT_abstract_origin: <0x13ed2c>
+    <13e873>   DW_AT_low_pc      : 0x17d21
+
+  0x17d21 - 0x17a30 = 753
+
+So we where adding it at twice the offset from the containing function as we
+should.
+
+And then after this patch:
+
+  # perf probe -m e1000e -D e1000e_rx_hwtstamp
+  p:probe/e1000e_rx_hwtstamp e1000e:e1000_receive_skb+37
+
+  # perf probe -m e1000e -D e1000_consume_page
+  p:probe/e1000_consume_page e1000e:e1000_clean_jumbo_rx_irq+438
+  p:probe/e1000_consume_page_1 e1000e:e1000_clean_jumbo_rx_irq+753
+  p:probe/e1000_consume_page_2 e1000e:e1000_clean_jumbo_rx_irq+1353
+  #
+
+Which matches the two first expansions and shows that because we were
+doubling the offset it would spill over the next function:
+
+  readelf -sw /lib/modules/4.12.0-rc4+/kernel/drivers/net/ethernet/intel/e1000e/e1000e.ko
+   673: 0000000000017a30  1626 FUNC    LOCAL  DEFAULT    2 e1000_clean_jumbo_rx_irq
+   674: 0000000000018090  2013 FUNC    LOCAL  DEFAULT    2 e1000_clean_rx_irq_ps
+
+This is the 3rd inline expansion of e1000_consume_page() in
+e1000_clean_jumbo_rx_irq():
+
+   <3><13ec77>: Abbrev Number: 119 (DW_TAG_inlined_subroutine)
+    <13ec78>   DW_AT_abstract_origin: <0x13ed2c>
+    <13ec7c>   DW_AT_low_pc      : 0x17f79
+
+  0x17f79 - 0x17a30 = 1353
+
+ So:
+
+   0x17a30 + 2 * 1353 = 0x184c2
+
+  And:
+
+   0x184c2 - 0x18090 = 1074
+
+Which explains the bogus third expansion for e1000_consume_page() to end up at:
+
+   p:probe/e1000_consume_page_2 e1000e:e1000_clean_rx_irq_ps+1074
+
+All fixed now :-)
+
+[1] https://git.kernel.org/pub/scm/devel/pahole/pahole.git/
+
+Signed-off-by: Björn Töpel <bjorn.topel@intel.com>
+Tested-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+Acked-by: Magnus Karlsson <magnus.karlsson@intel.com>
+Acked-by: Masami Hiramatsu <mhiramat@kernel.org>
+Fixes: 613f050d68a8 ("perf probe: Fix to probe on gcc generated functions in modules")
+Link: http://lkml.kernel.org/r/20170621164134.5701-1-bjorn.topel@gmail.com
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ tools/perf/util/probe-event.c |    2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+--- a/tools/perf/util/probe-event.c
++++ b/tools/perf/util/probe-event.c
+@@ -615,7 +615,7 @@ static int post_process_probe_trace_poin
+ 					   struct map *map, unsigned long offs)
+ {
+ 	struct symbol *sym;
+-	u64 addr = tp->address + tp->offset - offs;
++	u64 addr = tp->address - offs;
+ 
+ 	sym = map__find_symbol(map, addr);
+ 	if (!sym)

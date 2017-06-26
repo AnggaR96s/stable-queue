@@ -1,0 +1,152 @@
+From 57db7e4a2d92c2d3dfbca4ef8057849b2682436b Mon Sep 17 00:00:00 2001
+From: "Eric W. Biederman" <ebiederm@xmission.com>
+Date: Tue, 13 Jun 2017 04:31:16 -0500
+Subject: signal: Only reschedule timers on signals timers have sent
+
+From: Eric W. Biederman <ebiederm@xmission.com>
+
+commit 57db7e4a2d92c2d3dfbca4ef8057849b2682436b upstream.
+
+Thomas Gleixner  wrote:
+> The CRIU support added a 'feature' which allows a user space task to send
+> arbitrary (kernel) signals to itself. The changelog says:
+>
+>   The kernel prevents sending of siginfo with positive si_code, because
+>   these codes are reserved for kernel.  I think we can allow a task to
+>   send such a siginfo to itself.  This operation should not be dangerous.
+>
+> Quite contrary to that claim, it turns out that it is outright dangerous
+> for signals with info->si_code == SI_TIMER. The following code sequence in
+> a user space task allows to crash the kernel:
+>
+>    id = timer_create(CLOCK_XXX, ..... signo = SIGX);
+>    timer_set(id, ....);
+>    info->si_signo = SIGX;
+>    info->si_code = SI_TIMER:
+>    info->_sifields._timer._tid = id;
+>    info->_sifields._timer._sys_private = 2;
+>    rt_[tg]sigqueueinfo(..., SIGX, info);
+>    sigemptyset(&sigset);
+>    sigaddset(&sigset, SIGX);
+>    rt_sigtimedwait(sigset, info);
+>
+> For timers based on CLOCK_PROCESS_CPUTIME_ID, CLOCK_THREAD_CPUTIME_ID this
+> results in a kernel crash because sigwait() dequeues the signal and the
+> dequeue code observes:
+>
+>   info->si_code == SI_TIMER && info->_sifields._timer._sys_private != 0
+>
+> which triggers the following callchain:
+>
+>  do_schedule_next_timer() -> posix_cpu_timer_schedule() -> arm_timer()
+>
+> arm_timer() executes a list_add() on the timer, which is already armed via
+> the timer_set() syscall. That's a double list add which corrupts the posix
+> cpu timer list. As a consequence the kernel crashes on the next operation
+> touching the posix cpu timer list.
+>
+> Posix clocks which are internally implemented based on hrtimers are not
+> affected by this because hrtimer_start() can handle already armed timers
+> nicely, but it's a reliable way to trigger the WARN_ON() in
+> hrtimer_forward(), which complains about calling that function on an
+> already armed timer.
+
+This problem has existed since the posix timer code was merged into
+2.5.63. A few releases earlier in 2.5.60 ptrace gained the ability to
+inject not just a signal (which linux has supported since 1.0) but the
+full siginfo of a signal.
+
+The core problem is that the code will reschedule in response to
+signals getting dequeued not just for signals the timers sent but
+for other signals that happen to a si_code of SI_TIMER.
+
+Avoid this confusion by testing to see if the queued signal was
+preallocated as all timer signals are preallocated, and so far
+only the timer code preallocates signals.
+
+Move the check for if a timer needs to be rescheduled up into
+collect_signal where the preallocation check must be performed,
+and pass the result back to dequeue_signal where the code reschedules
+timers.   This makes it clear why the code cares about preallocated
+timers.
+
+Reported-by: Thomas Gleixner <tglx@linutronix.de>
+History Tree: https://git.kernel.org/pub/scm/linux/kernel/git/tglx/history.git
+Reference: 66dd34ad31e5 ("signal: allow to send any siginfo to itself")
+Reference: 1669ce53e2ff ("Add PTRACE_GETSIGINFO and PTRACE_SETSIGINFO")
+Fixes: db8b50ba75f2 ("[PATCH] POSIX clocks & timers")
+Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ kernel/signal.c |   20 ++++++++++++++------
+ 1 file changed, 14 insertions(+), 6 deletions(-)
+
+--- a/kernel/signal.c
++++ b/kernel/signal.c
+@@ -510,7 +510,8 @@ int unhandled_signal(struct task_struct
+ 	return !tsk->ptrace;
+ }
+ 
+-static void collect_signal(int sig, struct sigpending *list, siginfo_t *info)
++static void collect_signal(int sig, struct sigpending *list, siginfo_t *info,
++			   bool *resched_timer)
+ {
+ 	struct sigqueue *q, *first = NULL;
+ 
+@@ -532,6 +533,12 @@ static void collect_signal(int sig, stru
+ still_pending:
+ 		list_del_init(&first->list);
+ 		copy_siginfo(info, &first->info);
++
++		*resched_timer =
++			(first->flags & SIGQUEUE_PREALLOC) &&
++			(info->si_code == SI_TIMER) &&
++			(info->si_sys_private);
++
+ 		__sigqueue_free(first);
+ 	} else {
+ 		/*
+@@ -548,12 +555,12 @@ still_pending:
+ }
+ 
+ static int __dequeue_signal(struct sigpending *pending, sigset_t *mask,
+-			siginfo_t *info)
++			siginfo_t *info, bool *resched_timer)
+ {
+ 	int sig = next_signal(pending, mask);
+ 
+ 	if (sig)
+-		collect_signal(sig, pending, info);
++		collect_signal(sig, pending, info, resched_timer);
+ 	return sig;
+ }
+ 
+@@ -565,15 +572,16 @@ static int __dequeue_signal(struct sigpe
+  */
+ int dequeue_signal(struct task_struct *tsk, sigset_t *mask, siginfo_t *info)
+ {
++	bool resched_timer = false;
+ 	int signr;
+ 
+ 	/* We only dequeue private signals from ourselves, we don't let
+ 	 * signalfd steal them
+ 	 */
+-	signr = __dequeue_signal(&tsk->pending, mask, info);
++	signr = __dequeue_signal(&tsk->pending, mask, info, &resched_timer);
+ 	if (!signr) {
+ 		signr = __dequeue_signal(&tsk->signal->shared_pending,
+-					 mask, info);
++					 mask, info, &resched_timer);
+ #ifdef CONFIG_POSIX_TIMERS
+ 		/*
+ 		 * itimer signal ?
+@@ -621,7 +629,7 @@ int dequeue_signal(struct task_struct *t
+ 		current->jobctl |= JOBCTL_STOP_DEQUEUED;
+ 	}
+ #ifdef CONFIG_POSIX_TIMERS
+-	if ((info->si_code & __SI_MASK) == __SI_TIMER && info->si_sys_private) {
++	if (resched_timer) {
+ 		/*
+ 		 * Release the siglock to ensure proper locking order
+ 		 * of timer locks outside of siglocks.  Note, we leave
