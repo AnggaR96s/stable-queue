@@ -1,0 +1,136 @@
+From foo@baz Mon Jul  3 13:37:32 CEST 2017
+From: Masami Hiramatsu <mhiramat@kernel.org>
+Date: Wed, 11 Jan 2017 14:59:38 +0900
+Subject: perf probe: Fix to show correct locations for events on modules
+
+From: Masami Hiramatsu <mhiramat@kernel.org>
+
+
+[ Upstream commit d2d4edbebe07ddb77980656abe7b9bc7a9e0cdf7 ]
+
+Fix to show correct locations for events on modules by relocating given
+address instead of retrying after failure.
+
+This happens when the module text size is big enough, bigger than
+sh_addr, because the original code retries with given address + sh_addr
+if it failed to find CU DIE at the given address.
+
+Any address smaller than sh_addr always fails and it retries with the
+correct address, but addresses bigger than sh_addr will get a CU DIE
+which is on the given address (not adjusted by sh_addr).
+
+In my environment(x86-64), the sh_addr of ".text" section is 0x10030.
+Since i915 is a huge kernel module, we can see this issue as below.
+
+  $ grep "[Tt] .*\[i915\]" /proc/kallsyms | sort | head -n1
+  ffffffffc0270000 t i915_switcheroo_can_switch	[i915]
+
+ffffffffc0270000 + 0x10030 = ffffffffc0280030, so we'll check
+symbols cross this boundary.
+
+  $ grep "[Tt] .*\[i915\]" /proc/kallsyms | grep -B1 ^ffffffffc028\
+  | head -n 2
+  ffffffffc027ff80 t haswell_init_clock_gating	[i915]
+  ffffffffc0280110 t valleyview_init_clock_gating	[i915]
+
+So setup probes on both function and see what happen.
+
+  $ sudo ./perf probe -m i915 -a haswell_init_clock_gating \
+        -a valleyview_init_clock_gating
+  Added new events:
+    probe:haswell_init_clock_gating (on haswell_init_clock_gating in i915)
+    probe:valleyview_init_clock_gating (on valleyview_init_clock_gating in i915)
+
+  You can now use it in all perf tools, such as:
+
+  	perf record -e probe:valleyview_init_clock_gating -aR sleep 1
+
+  $ sudo ./perf probe -l
+    probe:haswell_init_clock_gating (on haswell_init_clock_gating@gpu/drm/i915/intel_pm.c in i915)
+    probe:valleyview_init_clock_gating (on i915_vga_set_decode:4@gpu/drm/i915/i915_drv.c in i915)
+
+As you can see, haswell_init_clock_gating is correctly shown,
+but valleyview_init_clock_gating is not.
+
+With this patch, both events are shown correctly.
+
+  $ sudo ./perf probe -l
+    probe:haswell_init_clock_gating (on haswell_init_clock_gating@gpu/drm/i915/intel_pm.c in i915)
+    probe:valleyview_init_clock_gating (on valleyview_init_clock_gating@gpu/drm/i915/intel_pm.c in i915)
+
+Committer notes:
+
+In my case:
+
+  # perf probe -m i915 -a haswell_init_clock_gating -a valleyview_init_clock_gating
+  Added new events:
+    probe:haswell_init_clock_gating (on haswell_init_clock_gating in i915)
+    probe:valleyview_init_clock_gating (on valleyview_init_clock_gating in i915)
+
+  You can now use it in all perf tools, such as:
+
+	  perf record -e probe:valleyview_init_clock_gating -aR sleep 1
+
+  # perf probe -l
+    probe:haswell_init_clock_gating (on i915_getparam+432@gpu/drm/i915/i915_drv.c in i915)
+    probe:valleyview_init_clock_gating (on __i915_printk+240@gpu/drm/i915/i915_drv.c in i915)
+  #
+
+  # readelf -SW /lib/modules/4.9.0+/build/vmlinux | egrep -w '.text|Name'
+   [Nr] Name   Type      Address          Off    Size   ES Flg Lk Inf Al
+   [ 1] .text  PROGBITS  ffffffff81000000 200000 822fd3 00  AX  0   0 4096
+  #
+
+  So both are b0rked, now with the fix:
+
+  # perf probe -m i915 -a haswell_init_clock_gating -a valleyview_init_clock_gating
+  Added new events:
+    probe:haswell_init_clock_gating (on haswell_init_clock_gating in i915)
+    probe:valleyview_init_clock_gating (on valleyview_init_clock_gating in i915)
+
+  You can now use it in all perf tools, such as:
+
+	perf record -e probe:valleyview_init_clock_gating -aR sleep 1
+
+  # perf probe -l
+    probe:haswell_init_clock_gating (on haswell_init_clock_gating@gpu/drm/i915/intel_pm.c in i915)
+    probe:valleyview_init_clock_gating (on valleyview_init_clock_gating@gpu/drm/i915/intel_pm.c in i915)
+  #
+
+Both looks correct.
+
+Signed-off-by: Masami Hiramatsu <mhiramat@kernel.org>
+Tested-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+Cc: Jiri Olsa <jolsa@redhat.com>
+Cc: Namhyung Kim <namhyung@kernel.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/148411436777.9978.1440275861947194930.stgit@devbox
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ tools/perf/util/probe-finder.c |   10 +++-------
+ 1 file changed, 3 insertions(+), 7 deletions(-)
+
+--- a/tools/perf/util/probe-finder.c
++++ b/tools/perf/util/probe-finder.c
+@@ -1543,16 +1543,12 @@ int debuginfo__find_probe_point(struct d
+ 	Dwarf_Addr _addr = 0, baseaddr = 0;
+ 	const char *fname = NULL, *func = NULL, *basefunc = NULL, *tmp;
+ 	int baseline = 0, lineno = 0, ret = 0;
+-	bool reloc = false;
+ 
+-retry:
++	/* We always need to relocate the address for aranges */
++	if (debuginfo__get_text_offset(dbg, &baseaddr) == 0)
++		addr += baseaddr;
+ 	/* Find cu die */
+ 	if (!dwarf_addrdie(dbg->dbg, (Dwarf_Addr)addr, &cudie)) {
+-		if (!reloc && debuginfo__get_text_offset(dbg, &baseaddr) == 0) {
+-			addr += baseaddr;
+-			reloc = true;
+-			goto retry;
+-		}
+ 		pr_warning("Failed to find debug information for address %lx\n",
+ 			   addr);
+ 		ret = -EINVAL;

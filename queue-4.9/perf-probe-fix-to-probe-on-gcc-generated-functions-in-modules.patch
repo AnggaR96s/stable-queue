@@ -1,0 +1,194 @@
+From foo@baz Mon Jul  3 13:37:32 CEST 2017
+From: Masami Hiramatsu <mhiramat@kernel.org>
+Date: Wed, 11 Jan 2017 15:01:57 +0900
+Subject: perf probe: Fix to probe on gcc generated functions in modules
+
+From: Masami Hiramatsu <mhiramat@kernel.org>
+
+
+[ Upstream commit 613f050d68a8ed3c0b18b9568698908ef7bbc1f7 ]
+
+Fix to probe on gcc generated functions on modules. Since
+probing on a module is based on its symbol name, it should
+be adjusted on actual symbols.
+
+E.g. without this fix, perf probe shows probe definition
+on non-exist symbol as below.
+
+  $ perf probe -m build-x86_64/net/netfilter/nf_nat.ko -F in_range*
+  in_range.isra.12
+  $ perf probe -m build-x86_64/net/netfilter/nf_nat.ko -D in_range
+  p:probe/in_range nf_nat:in_range+0
+
+With this fix, perf probe correctly shows a probe on
+gcc-generated symbol.
+
+  $ perf probe -m build-x86_64/net/netfilter/nf_nat.ko -D in_range
+  p:probe/in_range nf_nat:in_range.isra.12+0
+
+This also fixes same problem on online module as below.
+
+  $ perf probe -m i915 -D assert_plane
+  p:probe/assert_plane i915:assert_plane.constprop.134+0
+
+Signed-off-by: Masami Hiramatsu <mhiramat@kernel.org>
+Tested-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+Cc: Jiri Olsa <jolsa@redhat.com>
+Cc: Namhyung Kim <namhyung@kernel.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/148411450673.9978.14905987549651656075.stgit@devbox
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ tools/perf/util/probe-event.c  |   45 ++++++++++++++++++++++++++---------------
+ tools/perf/util/probe-finder.c |    7 ++++--
+ tools/perf/util/probe-finder.h |    3 ++
+ 3 files changed, 37 insertions(+), 18 deletions(-)
+
+--- a/tools/perf/util/probe-event.c
++++ b/tools/perf/util/probe-event.c
+@@ -645,18 +645,31 @@ static int add_exec_to_probe_trace_event
+ 	return ret;
+ }
+ 
+-static int add_module_to_probe_trace_events(struct probe_trace_event *tevs,
+-					    int ntevs, const char *module)
++static int
++post_process_module_probe_trace_events(struct probe_trace_event *tevs,
++				       int ntevs, const char *module,
++				       struct debuginfo *dinfo)
+ {
++	Dwarf_Addr text_offs = 0;
+ 	int i, ret = 0;
+ 	char *mod_name = NULL;
++	struct map *map;
+ 
+ 	if (!module)
+ 		return 0;
+ 
+-	mod_name = find_module_name(module);
++	map = get_target_map(module, false);
++	if (!map || debuginfo__get_text_offset(dinfo, &text_offs, true) < 0) {
++		pr_warning("Failed to get ELF symbols for %s\n", module);
++		return -EINVAL;
++	}
+ 
++	mod_name = find_module_name(module);
+ 	for (i = 0; i < ntevs; i++) {
++		ret = post_process_probe_trace_point(&tevs[i].point,
++						map, (unsigned long)text_offs);
++		if (ret < 0)
++			break;
+ 		tevs[i].point.module =
+ 			strdup(mod_name ? mod_name : module);
+ 		if (!tevs[i].point.module) {
+@@ -666,6 +679,8 @@ static int add_module_to_probe_trace_eve
+ 	}
+ 
+ 	free(mod_name);
++	map__put(map);
++
+ 	return ret;
+ }
+ 
+@@ -722,7 +737,7 @@ arch__post_process_probe_trace_events(st
+ static int post_process_probe_trace_events(struct perf_probe_event *pev,
+ 					   struct probe_trace_event *tevs,
+ 					   int ntevs, const char *module,
+-					   bool uprobe)
++					   bool uprobe, struct debuginfo *dinfo)
+ {
+ 	int ret;
+ 
+@@ -730,7 +745,8 @@ static int post_process_probe_trace_even
+ 		ret = add_exec_to_probe_trace_events(tevs, ntevs, module);
+ 	else if (module)
+ 		/* Currently ref_reloc_sym based probe is not for drivers */
+-		ret = add_module_to_probe_trace_events(tevs, ntevs, module);
++		ret = post_process_module_probe_trace_events(tevs, ntevs,
++							     module, dinfo);
+ 	else
+ 		ret = post_process_kernel_probe_trace_events(tevs, ntevs);
+ 
+@@ -774,30 +790,27 @@ static int try_to_find_probe_trace_event
+ 		}
+ 	}
+ 
+-	debuginfo__delete(dinfo);
+-
+ 	if (ntevs > 0) {	/* Succeeded to find trace events */
+ 		pr_debug("Found %d probe_trace_events.\n", ntevs);
+ 		ret = post_process_probe_trace_events(pev, *tevs, ntevs,
+-						pev->target, pev->uprobes);
++					pev->target, pev->uprobes, dinfo);
+ 		if (ret < 0 || ret == ntevs) {
++			pr_debug("Post processing failed or all events are skipped. (%d)\n", ret);
+ 			clear_probe_trace_events(*tevs, ntevs);
+ 			zfree(tevs);
++			ntevs = 0;
+ 		}
+-		if (ret != ntevs)
+-			return ret < 0 ? ret : ntevs;
+-		ntevs = 0;
+-		/* Fall through */
+ 	}
+ 
++	debuginfo__delete(dinfo);
++
+ 	if (ntevs == 0)	{	/* No error but failed to find probe point. */
+ 		pr_warning("Probe point '%s' not found.\n",
+ 			   synthesize_perf_probe_point(&pev->point));
+ 		return -ENOENT;
+-	}
+-	/* Error path : ntevs < 0 */
+-	pr_debug("An error occurred in debuginfo analysis (%d).\n", ntevs);
+-	if (ntevs < 0) {
++	} else if (ntevs < 0) {
++		/* Error path : ntevs < 0 */
++		pr_debug("An error occurred in debuginfo analysis (%d).\n", ntevs);
+ 		if (ntevs == -EBADF)
+ 			pr_warning("Warning: No dwarf info found in the vmlinux - "
+ 				"please rebuild kernel with CONFIG_DEBUG_INFO=y.\n");
+--- a/tools/perf/util/probe-finder.c
++++ b/tools/perf/util/probe-finder.c
+@@ -1501,7 +1501,8 @@ int debuginfo__find_available_vars_at(st
+ }
+ 
+ /* For the kernel module, we need a special code to get a DIE */
+-static int debuginfo__get_text_offset(struct debuginfo *dbg, Dwarf_Addr *offs)
++int debuginfo__get_text_offset(struct debuginfo *dbg, Dwarf_Addr *offs,
++				bool adjust_offset)
+ {
+ 	int n, i;
+ 	Elf32_Word shndx;
+@@ -1530,6 +1531,8 @@ static int debuginfo__get_text_offset(st
+ 			if (!shdr)
+ 				return -ENOENT;
+ 			*offs = shdr->sh_addr;
++			if (adjust_offset)
++				*offs -= shdr->sh_offset;
+ 		}
+ 	}
+ 	return 0;
+@@ -1545,7 +1548,7 @@ int debuginfo__find_probe_point(struct d
+ 	int baseline = 0, lineno = 0, ret = 0;
+ 
+ 	/* We always need to relocate the address for aranges */
+-	if (debuginfo__get_text_offset(dbg, &baseaddr) == 0)
++	if (debuginfo__get_text_offset(dbg, &baseaddr, false) == 0)
+ 		addr += baseaddr;
+ 	/* Find cu die */
+ 	if (!dwarf_addrdie(dbg->dbg, (Dwarf_Addr)addr, &cudie)) {
+--- a/tools/perf/util/probe-finder.h
++++ b/tools/perf/util/probe-finder.h
+@@ -46,6 +46,9 @@ int debuginfo__find_trace_events(struct
+ int debuginfo__find_probe_point(struct debuginfo *dbg, unsigned long addr,
+ 				struct perf_probe_point *ppt);
+ 
++int debuginfo__get_text_offset(struct debuginfo *dbg, Dwarf_Addr *offs,
++			       bool adjust_offset);
++
+ /* Find a line range */
+ int debuginfo__find_line_range(struct debuginfo *dbg, struct line_range *lr);
+ 
