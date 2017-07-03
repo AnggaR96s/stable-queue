@@ -1,0 +1,282 @@
+From foo@baz Mon Jul  3 11:54:13 CEST 2017
+From: Daniel Borkmann <daniel@iogearbox.net>
+Date: Wed, 18 Jan 2017 15:14:17 +0100
+Subject: bpf: don't trigger OOM killer under pressure with map alloc
+
+From: Daniel Borkmann <daniel@iogearbox.net>
+
+
+[ Upstream commit d407bd25a204bd66b7346dde24bd3d37ef0e0b05 ]
+
+This patch adds two helpers, bpf_map_area_alloc() and bpf_map_area_free(),
+that are to be used for map allocations. Using kmalloc() for very large
+allocations can cause excessive work within the page allocator, so i) fall
+back earlier to vmalloc() when the attempt is considered costly anyway,
+and even more importantly ii) don't trigger OOM killer with any of the
+allocators.
+
+Since this is based on a user space request, for example, when creating
+maps with element pre-allocation, we really want such requests to fail
+instead of killing other user space processes.
+
+Also, don't spam the kernel log with warnings should any of the allocations
+fail under pressure. Given that, we can make backend selection in
+bpf_map_area_alloc() generic, and convert all maps over to use this API
+for spots with potentially large allocation requests.
+
+Note, replacing the one kmalloc_array() is fine as overflow checks happen
+earlier in htab_map_alloc(), since it must also protect the multiplication
+for vmalloc() should kmalloc_array() fail.
+
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/linux/bpf.h   |    2 ++
+ kernel/bpf/arraymap.c |   18 +++++++-----------
+ kernel/bpf/hashtab.c  |   22 +++++++++-------------
+ kernel/bpf/stackmap.c |   20 ++++++++------------
+ kernel/bpf/syscall.c  |   26 ++++++++++++++++++++++++++
+ 5 files changed, 52 insertions(+), 36 deletions(-)
+
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -243,6 +243,8 @@ struct bpf_map *bpf_map_inc(struct bpf_m
+ void bpf_map_put_with_uref(struct bpf_map *map);
+ void bpf_map_put(struct bpf_map *map);
+ int bpf_map_precharge_memlock(u32 pages);
++void *bpf_map_area_alloc(size_t size);
++void bpf_map_area_free(void *base);
+ 
+ extern int sysctl_unprivileged_bpf_disabled;
+ 
+--- a/kernel/bpf/arraymap.c
++++ b/kernel/bpf/arraymap.c
+@@ -11,7 +11,6 @@
+  */
+ #include <linux/bpf.h>
+ #include <linux/err.h>
+-#include <linux/vmalloc.h>
+ #include <linux/slab.h>
+ #include <linux/mm.h>
+ #include <linux/filter.h>
+@@ -74,14 +73,10 @@ static struct bpf_map *array_map_alloc(u
+ 	if (array_size >= U32_MAX - PAGE_SIZE)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-
+ 	/* allocate all map elements and zero-initialize them */
+-	array = kzalloc(array_size, GFP_USER | __GFP_NOWARN);
+-	if (!array) {
+-		array = vzalloc(array_size);
+-		if (!array)
+-			return ERR_PTR(-ENOMEM);
+-	}
++	array = bpf_map_area_alloc(array_size);
++	if (!array)
++		return ERR_PTR(-ENOMEM);
+ 
+ 	/* copy mandatory map attributes */
+ 	array->map.map_type = attr->map_type;
+@@ -97,7 +92,7 @@ static struct bpf_map *array_map_alloc(u
+ 
+ 	if (array_size >= U32_MAX - PAGE_SIZE ||
+ 	    elem_size > PCPU_MIN_UNIT_SIZE || bpf_array_alloc_percpu(array)) {
+-		kvfree(array);
++		bpf_map_area_free(array);
+ 		return ERR_PTR(-ENOMEM);
+ 	}
+ out:
+@@ -262,7 +257,7 @@ static void array_map_free(struct bpf_ma
+ 	if (array->map.map_type == BPF_MAP_TYPE_PERCPU_ARRAY)
+ 		bpf_array_free_percpu(array);
+ 
+-	kvfree(array);
++	bpf_map_area_free(array);
+ }
+ 
+ static const struct bpf_map_ops array_ops = {
+@@ -319,7 +314,8 @@ static void fd_array_map_free(struct bpf
+ 	/* make sure it's empty */
+ 	for (i = 0; i < array->map.max_entries; i++)
+ 		BUG_ON(array->ptrs[i] != NULL);
+-	kvfree(array);
++
++	bpf_map_area_free(array);
+ }
+ 
+ static void *fd_array_map_lookup_elem(struct bpf_map *map, void *key)
+--- a/kernel/bpf/hashtab.c
++++ b/kernel/bpf/hashtab.c
+@@ -13,7 +13,6 @@
+ #include <linux/bpf.h>
+ #include <linux/jhash.h>
+ #include <linux/filter.h>
+-#include <linux/vmalloc.h>
+ #include "percpu_freelist.h"
+ 
+ struct bucket {
+@@ -84,14 +83,15 @@ static void htab_free_elems(struct bpf_h
+ 		free_percpu(pptr);
+ 	}
+ free_elems:
+-	vfree(htab->elems);
++	bpf_map_area_free(htab->elems);
+ }
+ 
+ static int prealloc_elems_and_freelist(struct bpf_htab *htab)
+ {
+ 	int err = -ENOMEM, i;
+ 
+-	htab->elems = vzalloc(htab->elem_size * htab->map.max_entries);
++	htab->elems = bpf_map_area_alloc(htab->elem_size *
++					 htab->map.max_entries);
+ 	if (!htab->elems)
+ 		return -ENOMEM;
+ 
+@@ -227,14 +227,10 @@ static struct bpf_map *htab_map_alloc(un
+ 		goto free_htab;
+ 
+ 	err = -ENOMEM;
+-	htab->buckets = kmalloc_array(htab->n_buckets, sizeof(struct bucket),
+-				      GFP_USER | __GFP_NOWARN);
+-
+-	if (!htab->buckets) {
+-		htab->buckets = vmalloc(htab->n_buckets * sizeof(struct bucket));
+-		if (!htab->buckets)
+-			goto free_htab;
+-	}
++	htab->buckets = bpf_map_area_alloc(htab->n_buckets *
++					   sizeof(struct bucket));
++	if (!htab->buckets)
++		goto free_htab;
+ 
+ 	for (i = 0; i < htab->n_buckets; i++) {
+ 		INIT_HLIST_HEAD(&htab->buckets[i].head);
+@@ -258,7 +254,7 @@ static struct bpf_map *htab_map_alloc(un
+ free_extra_elems:
+ 	free_percpu(htab->extra_elems);
+ free_buckets:
+-	kvfree(htab->buckets);
++	bpf_map_area_free(htab->buckets);
+ free_htab:
+ 	kfree(htab);
+ 	return ERR_PTR(err);
+@@ -715,7 +711,7 @@ static void htab_map_free(struct bpf_map
+ 		pcpu_freelist_destroy(&htab->freelist);
+ 	}
+ 	free_percpu(htab->extra_elems);
+-	kvfree(htab->buckets);
++	bpf_map_area_free(htab->buckets);
+ 	kfree(htab);
+ }
+ 
+--- a/kernel/bpf/stackmap.c
++++ b/kernel/bpf/stackmap.c
+@@ -7,7 +7,6 @@
+ #include <linux/bpf.h>
+ #include <linux/jhash.h>
+ #include <linux/filter.h>
+-#include <linux/vmalloc.h>
+ #include <linux/stacktrace.h>
+ #include <linux/perf_event.h>
+ #include "percpu_freelist.h"
+@@ -32,7 +31,7 @@ static int prealloc_elems_and_freelist(s
+ 	u32 elem_size = sizeof(struct stack_map_bucket) + smap->map.value_size;
+ 	int err;
+ 
+-	smap->elems = vzalloc(elem_size * smap->map.max_entries);
++	smap->elems = bpf_map_area_alloc(elem_size * smap->map.max_entries);
+ 	if (!smap->elems)
+ 		return -ENOMEM;
+ 
+@@ -45,7 +44,7 @@ static int prealloc_elems_and_freelist(s
+ 	return 0;
+ 
+ free_elems:
+-	vfree(smap->elems);
++	bpf_map_area_free(smap->elems);
+ 	return err;
+ }
+ 
+@@ -76,12 +75,9 @@ static struct bpf_map *stack_map_alloc(u
+ 	if (cost >= U32_MAX - PAGE_SIZE)
+ 		return ERR_PTR(-E2BIG);
+ 
+-	smap = kzalloc(cost, GFP_USER | __GFP_NOWARN);
+-	if (!smap) {
+-		smap = vzalloc(cost);
+-		if (!smap)
+-			return ERR_PTR(-ENOMEM);
+-	}
++	smap = bpf_map_area_alloc(cost);
++	if (!smap)
++		return ERR_PTR(-ENOMEM);
+ 
+ 	err = -E2BIG;
+ 	cost += n_buckets * (value_size + sizeof(struct stack_map_bucket));
+@@ -112,7 +108,7 @@ static struct bpf_map *stack_map_alloc(u
+ put_buffers:
+ 	put_callchain_buffers();
+ free_smap:
+-	kvfree(smap);
++	bpf_map_area_free(smap);
+ 	return ERR_PTR(err);
+ }
+ 
+@@ -262,9 +258,9 @@ static void stack_map_free(struct bpf_ma
+ 	/* wait for bpf programs to complete before freeing stack map */
+ 	synchronize_rcu();
+ 
+-	vfree(smap->elems);
++	bpf_map_area_free(smap->elems);
+ 	pcpu_freelist_destroy(&smap->freelist);
+-	kvfree(smap);
++	bpf_map_area_free(smap);
+ 	put_callchain_buffers();
+ }
+ 
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -12,6 +12,8 @@
+ #include <linux/bpf.h>
+ #include <linux/syscalls.h>
+ #include <linux/slab.h>
++#include <linux/vmalloc.h>
++#include <linux/mmzone.h>
+ #include <linux/anon_inodes.h>
+ #include <linux/file.h>
+ #include <linux/license.h>
+@@ -48,6 +50,30 @@ void bpf_register_map_type(struct bpf_ma
+ 	list_add(&tl->list_node, &bpf_map_types);
+ }
+ 
++void *bpf_map_area_alloc(size_t size)
++{
++	/* We definitely need __GFP_NORETRY, so OOM killer doesn't
++	 * trigger under memory pressure as we really just want to
++	 * fail instead.
++	 */
++	const gfp_t flags = __GFP_NOWARN | __GFP_NORETRY | __GFP_ZERO;
++	void *area;
++
++	if (size <= (PAGE_SIZE << PAGE_ALLOC_COSTLY_ORDER)) {
++		area = kmalloc(size, GFP_USER | flags);
++		if (area != NULL)
++			return area;
++	}
++
++	return __vmalloc(size, GFP_KERNEL | __GFP_HIGHMEM | flags,
++			 PAGE_KERNEL);
++}
++
++void bpf_map_area_free(void *area)
++{
++	kvfree(area);
++}
++
+ int bpf_map_precharge_memlock(u32 pages)
+ {
+ 	struct user_struct *user = get_current_user();
