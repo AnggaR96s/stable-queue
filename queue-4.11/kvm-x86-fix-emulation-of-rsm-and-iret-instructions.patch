@@ -1,0 +1,183 @@
+From 6ed071f051e12cf7baa1b69d3becb8f232fdfb7b Mon Sep 17 00:00:00 2001
+From: Ladi Prosek <lprosek@redhat.com>
+Date: Tue, 25 Apr 2017 16:42:44 +0200
+Subject: KVM: x86: fix emulation of RSM and IRET instructions
+
+From: Ladi Prosek <lprosek@redhat.com>
+
+commit 6ed071f051e12cf7baa1b69d3becb8f232fdfb7b upstream.
+
+On AMD, the effect of set_nmi_mask called by emulate_iret_real and em_rsm
+on hflags is reverted later on in x86_emulate_instruction where hflags are
+overwritten with ctxt->emul_flags (the kvm_set_hflags call). This manifests
+as a hang when rebooting Windows VMs with QEMU, OVMF, and >1 vcpu.
+
+Instead of trying to merge ctxt->emul_flags into vcpu->arch.hflags after
+an instruction is emulated, this commit deletes emul_flags altogether and
+makes the emulator access vcpu->arch.hflags using two new accessors. This
+way all changes, on the emulator side as well as in functions called from
+the emulator and accessing vcpu state with emul_to_vcpu, are preserved.
+
+More details on the bug and its manifestation with Windows and OVMF:
+
+  It's a KVM bug in the interaction between SMI/SMM and NMI, specific to AMD.
+  I believe that the SMM part explains why we started seeing this only with
+  OVMF.
+
+  KVM masks and unmasks NMI when entering and leaving SMM. When KVM emulates
+  the RSM instruction in em_rsm, the set_nmi_mask call doesn't stick because
+  later on in x86_emulate_instruction we overwrite arch.hflags with
+  ctxt->emul_flags, effectively reverting the effect of the set_nmi_mask call.
+  The AMD-specific hflag of interest here is HF_NMI_MASK.
+
+  When rebooting the system, Windows sends an NMI IPI to all but the current
+  cpu to shut them down. Only after all of them are parked in HLT will the
+  initiating cpu finish the restart. If NMI is masked, other cpus never get
+  the memo and the initiating cpu spins forever, waiting for
+  hal!HalpInterruptProcessorsStarted to drop. That's the symptom we observe.
+
+Fixes: a584539b24b8 ("KVM: x86: pass the whole hflags field to emulator and back")
+Signed-off-by: Ladi Prosek <lprosek@redhat.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ arch/x86/include/asm/kvm_emulate.h |    4 +++-
+ arch/x86/kvm/emulate.c             |   16 +++++++++-------
+ arch/x86/kvm/x86.c                 |   15 ++++++++++++---
+ 3 files changed, 24 insertions(+), 11 deletions(-)
+
+--- a/arch/x86/include/asm/kvm_emulate.h
++++ b/arch/x86/include/asm/kvm_emulate.h
+@@ -221,6 +221,9 @@ struct x86_emulate_ops {
+ 	void (*get_cpuid)(struct x86_emulate_ctxt *ctxt,
+ 			  u32 *eax, u32 *ebx, u32 *ecx, u32 *edx);
+ 	void (*set_nmi_mask)(struct x86_emulate_ctxt *ctxt, bool masked);
++
++	unsigned (*get_hflags)(struct x86_emulate_ctxt *ctxt);
++	void (*set_hflags)(struct x86_emulate_ctxt *ctxt, unsigned hflags);
+ };
+ 
+ typedef u32 __attribute__((vector_size(16))) sse128_t;
+@@ -290,7 +293,6 @@ struct x86_emulate_ctxt {
+ 
+ 	/* interruptibility state, as a result of execution of STI or MOV SS */
+ 	int interruptibility;
+-	int emul_flags;
+ 
+ 	bool perm_ok; /* do not check permissions if true */
+ 	bool ud;	/* inject an #UD if host doesn't support insn */
+--- a/arch/x86/kvm/emulate.c
++++ b/arch/x86/kvm/emulate.c
+@@ -2547,7 +2547,7 @@ static int em_rsm(struct x86_emulate_ctx
+ 	u64 smbase;
+ 	int ret;
+ 
+-	if ((ctxt->emul_flags & X86EMUL_SMM_MASK) == 0)
++	if ((ctxt->ops->get_hflags(ctxt) & X86EMUL_SMM_MASK) == 0)
+ 		return emulate_ud(ctxt);
+ 
+ 	/*
+@@ -2596,11 +2596,11 @@ static int em_rsm(struct x86_emulate_ctx
+ 		return X86EMUL_UNHANDLEABLE;
+ 	}
+ 
+-	if ((ctxt->emul_flags & X86EMUL_SMM_INSIDE_NMI_MASK) == 0)
++	if ((ctxt->ops->get_hflags(ctxt) & X86EMUL_SMM_INSIDE_NMI_MASK) == 0)
+ 		ctxt->ops->set_nmi_mask(ctxt, false);
+ 
+-	ctxt->emul_flags &= ~X86EMUL_SMM_INSIDE_NMI_MASK;
+-	ctxt->emul_flags &= ~X86EMUL_SMM_MASK;
++	ctxt->ops->set_hflags(ctxt, ctxt->ops->get_hflags(ctxt) &
++		~(X86EMUL_SMM_INSIDE_NMI_MASK | X86EMUL_SMM_MASK));
+ 	return X86EMUL_CONTINUE;
+ }
+ 
+@@ -5317,6 +5317,7 @@ int x86_emulate_insn(struct x86_emulate_
+ 	const struct x86_emulate_ops *ops = ctxt->ops;
+ 	int rc = X86EMUL_CONTINUE;
+ 	int saved_dst_type = ctxt->dst.type;
++	unsigned emul_flags;
+ 
+ 	ctxt->mem_read.pos = 0;
+ 
+@@ -5331,6 +5332,7 @@ int x86_emulate_insn(struct x86_emulate_
+ 		goto done;
+ 	}
+ 
++	emul_flags = ctxt->ops->get_hflags(ctxt);
+ 	if (unlikely(ctxt->d &
+ 		     (No64|Undefined|Sse|Mmx|Intercept|CheckPerm|Priv|Prot|String))) {
+ 		if ((ctxt->mode == X86EMUL_MODE_PROT64 && (ctxt->d & No64)) ||
+@@ -5364,7 +5366,7 @@ int x86_emulate_insn(struct x86_emulate_
+ 				fetch_possible_mmx_operand(ctxt, &ctxt->dst);
+ 		}
+ 
+-		if (unlikely(ctxt->emul_flags & X86EMUL_GUEST_MASK) && ctxt->intercept) {
++		if (unlikely(emul_flags & X86EMUL_GUEST_MASK) && ctxt->intercept) {
+ 			rc = emulator_check_intercept(ctxt, ctxt->intercept,
+ 						      X86_ICPT_PRE_EXCEPT);
+ 			if (rc != X86EMUL_CONTINUE)
+@@ -5393,7 +5395,7 @@ int x86_emulate_insn(struct x86_emulate_
+ 				goto done;
+ 		}
+ 
+-		if (unlikely(ctxt->emul_flags & X86EMUL_GUEST_MASK) && (ctxt->d & Intercept)) {
++		if (unlikely(emul_flags & X86EMUL_GUEST_MASK) && (ctxt->d & Intercept)) {
+ 			rc = emulator_check_intercept(ctxt, ctxt->intercept,
+ 						      X86_ICPT_POST_EXCEPT);
+ 			if (rc != X86EMUL_CONTINUE)
+@@ -5447,7 +5449,7 @@ int x86_emulate_insn(struct x86_emulate_
+ 
+ special_insn:
+ 
+-	if (unlikely(ctxt->emul_flags & X86EMUL_GUEST_MASK) && (ctxt->d & Intercept)) {
++	if (unlikely(emul_flags & X86EMUL_GUEST_MASK) && (ctxt->d & Intercept)) {
+ 		rc = emulator_check_intercept(ctxt, ctxt->intercept,
+ 					      X86_ICPT_POST_MEMACCESS);
+ 		if (rc != X86EMUL_CONTINUE)
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -5248,6 +5248,16 @@ static void emulator_set_nmi_mask(struct
+ 	kvm_x86_ops->set_nmi_mask(emul_to_vcpu(ctxt), masked);
+ }
+ 
++static unsigned emulator_get_hflags(struct x86_emulate_ctxt *ctxt)
++{
++	return emul_to_vcpu(ctxt)->arch.hflags;
++}
++
++static void emulator_set_hflags(struct x86_emulate_ctxt *ctxt, unsigned emul_flags)
++{
++	kvm_set_hflags(emul_to_vcpu(ctxt), emul_flags);
++}
++
+ static const struct x86_emulate_ops emulate_ops = {
+ 	.read_gpr            = emulator_read_gpr,
+ 	.write_gpr           = emulator_write_gpr,
+@@ -5287,6 +5297,8 @@ static const struct x86_emulate_ops emul
+ 	.intercept           = emulator_intercept,
+ 	.get_cpuid           = emulator_get_cpuid,
+ 	.set_nmi_mask        = emulator_set_nmi_mask,
++	.get_hflags          = emulator_get_hflags,
++	.set_hflags          = emulator_set_hflags,
+ };
+ 
+ static void toggle_interruptibility(struct kvm_vcpu *vcpu, u32 mask)
+@@ -5341,7 +5353,6 @@ static void init_emulate_ctxt(struct kvm
+ 	BUILD_BUG_ON(HF_GUEST_MASK != X86EMUL_GUEST_MASK);
+ 	BUILD_BUG_ON(HF_SMM_MASK != X86EMUL_SMM_MASK);
+ 	BUILD_BUG_ON(HF_SMM_INSIDE_NMI_MASK != X86EMUL_SMM_INSIDE_NMI_MASK);
+-	ctxt->emul_flags = vcpu->arch.hflags;
+ 
+ 	init_decode_cache(ctxt);
+ 	vcpu->arch.emulate_regs_need_sync_from_vcpu = false;
+@@ -5744,8 +5755,6 @@ restart:
+ 		unsigned long rflags = kvm_x86_ops->get_rflags(vcpu);
+ 		toggle_interruptibility(vcpu, ctxt->interruptibility);
+ 		vcpu->arch.emulate_regs_need_sync_to_vcpu = false;
+-		if (vcpu->arch.hflags != ctxt->emul_flags)
+-			kvm_set_hflags(vcpu, ctxt->emul_flags);
+ 		kvm_rip_write(vcpu, ctxt->eip);
+ 		if (r == EMULATE_DONE &&
+ 		    (ctxt->tf || (vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP)))
