@@ -1,0 +1,162 @@
+From foo@baz Mon Jul 17 18:46:41 CEST 2017
+From: "Guilherme G. Piccoli" <gpiccoli@linux.vnet.ibm.com>
+Date: Mon, 10 Jul 2017 10:55:46 -0300
+Subject: cxgb4: fix BUG() on interrupt deallocating path of ULD
+
+From: "Guilherme G. Piccoli" <gpiccoli@linux.vnet.ibm.com>
+
+
+[ Upstream commit 6a146f3a5894b751cef16feb3d7903e45e3c445c ]
+
+Since the introduction of ULD (Upper-Layer Drivers), the MSI-X
+deallocating path changed in cxgb4: the driver frees the interrupts
+of ULD when unregistering it or on shutdown PCI handler.
+
+Problem is that if a MSI-X is not freed before deallocated in the PCI
+layer, it will trigger a BUG() due to still "alive" interrupt being
+tentatively quiesced.
+
+The below trace was observed when doing a simple unbind of Chelsio's
+adapter PCI function, like:
+  "echo 001e:80:00.4 > /sys/bus/pci/drivers/cxgb4/unbind"
+
+Trace:
+
+  kernel BUG at drivers/pci/msi.c:352!
+  Oops: Exception in kernel mode, sig: 5 [#1]
+  ...
+  NIP [c0000000005a5e60] free_msi_irqs+0xa0/0x250
+  LR [c0000000005a5e50] free_msi_irqs+0x90/0x250
+  Call Trace:
+  [c0000000005a5e50] free_msi_irqs+0x90/0x250 (unreliable)
+  [c0000000005a72c4] pci_disable_msix+0x124/0x180
+  [d000000011e06708] disable_msi+0x88/0xb0 [cxgb4]
+  [d000000011e06948] free_some_resources+0xa8/0x160 [cxgb4]
+  [d000000011e06d60] remove_one+0x170/0x3c0 [cxgb4]
+  [c00000000058a910] pci_device_remove+0x70/0x110
+  [c00000000064ef04] device_release_driver_internal+0x1f4/0x2c0
+  ...
+
+This patch fixes the issue by refactoring the shutdown path of ULD on
+cxgb4 driver, by properly freeing and disabling interrupts on PCI
+remove handler too.
+
+Fixes: 0fbc81b3ad51 ("Allocate resources dynamically for all cxgb4 ULD's")
+Reported-by: Harsha Thyagaraja <hathyaga@in.ibm.com>
+Signed-off-by: Guilherme G. Piccoli <gpiccoli@linux.vnet.ibm.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c |   16 ++++++---
+ drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.c  |   42 ++++++++++++++----------
+ 2 files changed, 36 insertions(+), 22 deletions(-)
+
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_main.c
+@@ -2055,12 +2055,12 @@ static void detach_ulds(struct adapter *
+ 
+ 	mutex_lock(&uld_mutex);
+ 	list_del(&adap->list_node);
++
+ 	for (i = 0; i < CXGB4_ULD_MAX; i++)
+-		if (adap->uld && adap->uld[i].handle) {
++		if (adap->uld && adap->uld[i].handle)
+ 			adap->uld[i].state_change(adap->uld[i].handle,
+ 					     CXGB4_STATE_DETACH);
+-			adap->uld[i].handle = NULL;
+-		}
++
+ 	if (netevent_registered && list_empty(&adapter_list)) {
+ 		unregister_netevent_notifier(&cxgb4_netevent_nb);
+ 		netevent_registered = false;
+@@ -5086,8 +5086,10 @@ static void remove_one(struct pci_dev *p
+ 		 */
+ 		destroy_workqueue(adapter->workq);
+ 
+-		if (is_uld(adapter))
++		if (is_uld(adapter)) {
+ 			detach_ulds(adapter);
++			t4_uld_clean_up(adapter);
++		}
+ 
+ 		disable_interrupts(adapter);
+ 
+@@ -5164,7 +5166,11 @@ static void shutdown_one(struct pci_dev
+ 			if (adapter->port[i]->reg_state == NETREG_REGISTERED)
+ 				cxgb_close(adapter->port[i]);
+ 
+-		t4_uld_clean_up(adapter);
++		if (is_uld(adapter)) {
++			detach_ulds(adapter);
++			t4_uld_clean_up(adapter);
++		}
++
+ 		disable_interrupts(adapter);
+ 		disable_msi(adapter);
+ 
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.c
+@@ -589,22 +589,37 @@ void t4_uld_mem_free(struct adapter *ada
+ 	kfree(adap->uld);
+ }
+ 
++/* This function should be called with uld_mutex taken. */
++static void cxgb4_shutdown_uld_adapter(struct adapter *adap, enum cxgb4_uld type)
++{
++	if (adap->uld[type].handle) {
++		adap->uld[type].handle = NULL;
++		adap->uld[type].add = NULL;
++		release_sge_txq_uld(adap, type);
++
++		if (adap->flags & FULL_INIT_DONE)
++			quiesce_rx_uld(adap, type);
++
++		if (adap->flags & USING_MSIX)
++			free_msix_queue_irqs_uld(adap, type);
++
++		free_sge_queues_uld(adap, type);
++		free_queues_uld(adap, type);
++	}
++}
++
+ void t4_uld_clean_up(struct adapter *adap)
+ {
+ 	unsigned int i;
+ 
+-	if (!adap->uld)
+-		return;
++	mutex_lock(&uld_mutex);
+ 	for (i = 0; i < CXGB4_ULD_MAX; i++) {
+ 		if (!adap->uld[i].handle)
+ 			continue;
+-		if (adap->flags & FULL_INIT_DONE)
+-			quiesce_rx_uld(adap, i);
+-		if (adap->flags & USING_MSIX)
+-			free_msix_queue_irqs_uld(adap, i);
+-		free_sge_queues_uld(adap, i);
+-		free_queues_uld(adap, i);
++
++		cxgb4_shutdown_uld_adapter(adap, i);
+ 	}
++	mutex_unlock(&uld_mutex);
+ }
+ 
+ static void uld_init(struct adapter *adap, struct cxgb4_lld_info *lld)
+@@ -782,15 +797,8 @@ int cxgb4_unregister_uld(enum cxgb4_uld
+ 			continue;
+ 		if (type == CXGB4_ULD_ISCSIT && is_t4(adap->params.chip))
+ 			continue;
+-		adap->uld[type].handle = NULL;
+-		adap->uld[type].add = NULL;
+-		release_sge_txq_uld(adap, type);
+-		if (adap->flags & FULL_INIT_DONE)
+-			quiesce_rx_uld(adap, type);
+-		if (adap->flags & USING_MSIX)
+-			free_msix_queue_irqs_uld(adap, type);
+-		free_sge_queues_uld(adap, type);
+-		free_queues_uld(adap, type);
++
++		cxgb4_shutdown_uld_adapter(adap, type);
+ 	}
+ 	mutex_unlock(&uld_mutex);
+ 
