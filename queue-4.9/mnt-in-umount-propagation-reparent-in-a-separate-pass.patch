@@ -1,0 +1,171 @@
+From 570487d3faf2a1d8a220e6ee10f472163123d7da Mon Sep 17 00:00:00 2001
+From: "Eric W. Biederman" <ebiederm@xmission.com>
+Date: Mon, 15 May 2017 14:42:07 -0500
+Subject: mnt: In umount propagation reparent in a separate pass
+
+From: Eric W. Biederman <ebiederm@xmission.com>
+
+commit 570487d3faf2a1d8a220e6ee10f472163123d7da upstream.
+
+It was observed that in some pathlogical cases that the current code
+does not unmount everything it should.  After investigation it
+was determined that the issue is that mnt_change_mntpoint can
+can change which mounts are available to be unmounted during mount
+propagation which is wrong.
+
+The trivial reproducer is:
+$ cat ./pathological.sh
+
+mount -t tmpfs test-base /mnt
+cd /mnt
+mkdir 1 2 1/1
+mount --bind 1 1
+mount --make-shared 1
+mount --bind 1 2
+mount --bind 1/1 1/1
+mount --bind 1/1 1/1
+echo
+grep test-base /proc/self/mountinfo
+umount 1/1
+echo
+grep test-base /proc/self/mountinfo
+
+$ unshare -Urm ./pathological.sh
+
+The expected output looks like:
+46 31 0:25 / /mnt rw,relatime - tmpfs test-base rw,uid=1000,gid=1000
+47 46 0:25 /1 /mnt/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+48 46 0:25 /1 /mnt/2 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+49 54 0:25 /1/1 /mnt/1/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+50 53 0:25 /1/1 /mnt/2/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+51 49 0:25 /1/1 /mnt/1/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+54 47 0:25 /1/1 /mnt/1/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+53 48 0:25 /1/1 /mnt/2/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+52 50 0:25 /1/1 /mnt/2/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+
+46 31 0:25 / /mnt rw,relatime - tmpfs test-base rw,uid=1000,gid=1000
+47 46 0:25 /1 /mnt/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+48 46 0:25 /1 /mnt/2 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+
+The output without the fix looks like:
+46 31 0:25 / /mnt rw,relatime - tmpfs test-base rw,uid=1000,gid=1000
+47 46 0:25 /1 /mnt/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+48 46 0:25 /1 /mnt/2 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+49 54 0:25 /1/1 /mnt/1/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+50 53 0:25 /1/1 /mnt/2/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+51 49 0:25 /1/1 /mnt/1/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+54 47 0:25 /1/1 /mnt/1/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+53 48 0:25 /1/1 /mnt/2/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+52 50 0:25 /1/1 /mnt/2/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+
+46 31 0:25 / /mnt rw,relatime - tmpfs test-base rw,uid=1000,gid=1000
+47 46 0:25 /1 /mnt/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+48 46 0:25 /1 /mnt/2 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+52 48 0:25 /1/1 /mnt/2/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+
+That last mount in the output was in the propgation tree to be unmounted but
+was missed because the mnt_change_mountpoint changed it's parent before the walk
+through the mount propagation tree observed it.
+
+Fixes: 1064f874abc0 ("mnt: Tuck mounts under others instead of creating shadow/side mounts.")
+Acked-by: Andrei Vagin <avagin@virtuozzo.com>
+Reviewed-by: Ram Pai <linuxram@us.ibm.com>
+Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/mount.h     |    1 +
+ fs/namespace.c |    1 +
+ fs/pnode.c     |   35 ++++++++++++++++++++++++++++++-----
+ 3 files changed, 32 insertions(+), 5 deletions(-)
+
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -58,6 +58,7 @@ struct mount {
+ 	struct mnt_namespace *mnt_ns;	/* containing namespace */
+ 	struct mountpoint *mnt_mp;	/* where is it mounted */
+ 	struct hlist_node mnt_mp_list;	/* list mounts with the same mountpoint */
++	struct list_head mnt_reparent;	/* reparent list entry */
+ #ifdef CONFIG_FSNOTIFY
+ 	struct hlist_head mnt_fsnotify_marks;
+ 	__u32 mnt_fsnotify_mask;
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -237,6 +237,7 @@ static struct mount *alloc_vfsmnt(const
+ 		INIT_LIST_HEAD(&mnt->mnt_slave_list);
+ 		INIT_LIST_HEAD(&mnt->mnt_slave);
+ 		INIT_HLIST_NODE(&mnt->mnt_mp_list);
++		INIT_LIST_HEAD(&mnt->mnt_reparent);
+ #ifdef CONFIG_FSNOTIFY
+ 		INIT_HLIST_HEAD(&mnt->mnt_fsnotify_marks);
+ #endif
+--- a/fs/pnode.c
++++ b/fs/pnode.c
+@@ -441,7 +441,7 @@ static void mark_umount_candidates(struc
+  * NOTE: unmounting 'mnt' naturally propagates to all other mounts its
+  * parent propagates to.
+  */
+-static void __propagate_umount(struct mount *mnt)
++static void __propagate_umount(struct mount *mnt, struct list_head *to_reparent)
+ {
+ 	struct mount *parent = mnt->mnt_parent;
+ 	struct mount *m;
+@@ -466,17 +466,38 @@ static void __propagate_umount(struct mo
+ 		 */
+ 		topper = find_topper(child);
+ 		if (topper)
+-			mnt_change_mountpoint(child->mnt_parent, child->mnt_mp,
+-					      topper);
++			list_add_tail(&topper->mnt_reparent, to_reparent);
+ 
+-		if (list_empty(&child->mnt_mounts)) {
++		if (topper || list_empty(&child->mnt_mounts)) {
+ 			list_del_init(&child->mnt_child);
++			list_del_init(&child->mnt_reparent);
+ 			child->mnt.mnt_flags |= MNT_UMOUNT;
+ 			list_move_tail(&child->mnt_list, &mnt->mnt_list);
+ 		}
+ 	}
+ }
+ 
++static void reparent_mounts(struct list_head *to_reparent)
++{
++	while (!list_empty(to_reparent)) {
++		struct mount *mnt, *parent;
++		struct mountpoint *mp;
++
++		mnt = list_first_entry(to_reparent, struct mount, mnt_reparent);
++		list_del_init(&mnt->mnt_reparent);
++
++		/* Where should this mount be reparented to? */
++		mp = mnt->mnt_mp;
++		parent = mnt->mnt_parent;
++		while (parent->mnt.mnt_flags & MNT_UMOUNT) {
++			mp = parent->mnt_mp;
++			parent = parent->mnt_parent;
++		}
++
++		mnt_change_mountpoint(parent, mp, mnt);
++	}
++}
++
+ /*
+  * collect all mounts that receive propagation from the mount in @list,
+  * and return these additional mounts in the same list.
+@@ -487,11 +508,15 @@ static void __propagate_umount(struct mo
+ int propagate_umount(struct list_head *list)
+ {
+ 	struct mount *mnt;
++	LIST_HEAD(to_reparent);
+ 
+ 	list_for_each_entry_reverse(mnt, list, mnt_list)
+ 		mark_umount_candidates(mnt);
+ 
+ 	list_for_each_entry(mnt, list, mnt_list)
+-		__propagate_umount(mnt);
++		__propagate_umount(mnt, &to_reparent);
++
++	reparent_mounts(&to_reparent);
++
+ 	return 0;
+ }
