@@ -1,0 +1,147 @@
+From ea0212f40c6bc0594c8eff79266759e3ecd4bacc Mon Sep 17 00:00:00 2001
+From: Thomas Gleixner <tglx@linutronix.de>
+Date: Sun, 25 Jun 2017 19:31:13 +0200
+Subject: PM / wakeirq: Convert to SRCU
+
+From: Thomas Gleixner <tglx@linutronix.de>
+
+commit ea0212f40c6bc0594c8eff79266759e3ecd4bacc upstream.
+
+The wakeirq infrastructure uses RCU to protect the list of wakeirqs. That
+breaks the irq bus locking infrastructure, which is allows sleeping
+functions to be called so interrupt controllers behind slow busses,
+e.g. i2c, can be handled.
+
+The wakeirq functions hold rcu_read_lock and call into irq functions, which
+in case of interrupts using the irq bus locking will trigger a
+might_sleep() splat.
+
+Convert the wakeirq infrastructure to Sleepable RCU and unbreak it.
+
+Fixes: 4990d4fe327b (PM / Wakeirq: Add automated device wake IRQ handling)
+Reported-by: Brian Norris <briannorris@chromium.org>
+Suggested-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Reviewed-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+Tested-by: Tony Lindgren <tony@atomide.com>
+Tested-by: Brian Norris <briannorris@chromium.org>
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/base/power/wakeup.c |   32 ++++++++++++++++++--------------
+ 1 file changed, 18 insertions(+), 14 deletions(-)
+
+--- a/drivers/base/power/wakeup.c
++++ b/drivers/base/power/wakeup.c
+@@ -60,6 +60,8 @@ static LIST_HEAD(wakeup_sources);
+ 
+ static DECLARE_WAIT_QUEUE_HEAD(wakeup_count_wait_queue);
+ 
++DEFINE_STATIC_SRCU(wakeup_srcu);
++
+ static struct wakeup_source deleted_ws = {
+ 	.name = "deleted",
+ 	.lock =  __SPIN_LOCK_UNLOCKED(deleted_ws.lock),
+@@ -198,7 +200,7 @@ void wakeup_source_remove(struct wakeup_
+ 	spin_lock_irqsave(&events_lock, flags);
+ 	list_del_rcu(&ws->entry);
+ 	spin_unlock_irqrestore(&events_lock, flags);
+-	synchronize_rcu();
++	synchronize_srcu(&wakeup_srcu);
+ }
+ EXPORT_SYMBOL_GPL(wakeup_source_remove);
+ 
+@@ -332,12 +334,12 @@ void device_wakeup_detach_irq(struct dev
+ void device_wakeup_arm_wake_irqs(void)
+ {
+ 	struct wakeup_source *ws;
++	int srcuidx;
+ 
+-	rcu_read_lock();
++	srcuidx = srcu_read_lock(&wakeup_srcu);
+ 	list_for_each_entry_rcu(ws, &wakeup_sources, entry)
+ 		dev_pm_arm_wake_irq(ws->wakeirq);
+-
+-	rcu_read_unlock();
++	srcu_read_unlock(&wakeup_srcu, srcuidx);
+ }
+ 
+ /**
+@@ -348,12 +350,12 @@ void device_wakeup_arm_wake_irqs(void)
+ void device_wakeup_disarm_wake_irqs(void)
+ {
+ 	struct wakeup_source *ws;
++	int srcuidx;
+ 
+-	rcu_read_lock();
++	srcuidx = srcu_read_lock(&wakeup_srcu);
+ 	list_for_each_entry_rcu(ws, &wakeup_sources, entry)
+ 		dev_pm_disarm_wake_irq(ws->wakeirq);
+-
+-	rcu_read_unlock();
++	srcu_read_unlock(&wakeup_srcu, srcuidx);
+ }
+ 
+ /**
+@@ -805,10 +807,10 @@ EXPORT_SYMBOL_GPL(pm_wakeup_event);
+ void pm_print_active_wakeup_sources(void)
+ {
+ 	struct wakeup_source *ws;
+-	int active = 0;
++	int srcuidx, active = 0;
+ 	struct wakeup_source *last_activity_ws = NULL;
+ 
+-	rcu_read_lock();
++	srcuidx = srcu_read_lock(&wakeup_srcu);
+ 	list_for_each_entry_rcu(ws, &wakeup_sources, entry) {
+ 		if (ws->active) {
+ 			pr_debug("active wakeup source: %s\n", ws->name);
+@@ -824,7 +826,7 @@ void pm_print_active_wakeup_sources(void
+ 	if (!active && last_activity_ws)
+ 		pr_debug("last active wakeup source: %s\n",
+ 			last_activity_ws->name);
+-	rcu_read_unlock();
++	srcu_read_unlock(&wakeup_srcu, srcuidx);
+ }
+ EXPORT_SYMBOL_GPL(pm_print_active_wakeup_sources);
+ 
+@@ -951,8 +953,9 @@ void pm_wakep_autosleep_enabled(bool set
+ {
+ 	struct wakeup_source *ws;
+ 	ktime_t now = ktime_get();
++	int srcuidx;
+ 
+-	rcu_read_lock();
++	srcuidx = srcu_read_lock(&wakeup_srcu);
+ 	list_for_each_entry_rcu(ws, &wakeup_sources, entry) {
+ 		spin_lock_irq(&ws->lock);
+ 		if (ws->autosleep_enabled != set) {
+@@ -966,7 +969,7 @@ void pm_wakep_autosleep_enabled(bool set
+ 		}
+ 		spin_unlock_irq(&ws->lock);
+ 	}
+-	rcu_read_unlock();
++	srcu_read_unlock(&wakeup_srcu, srcuidx);
+ }
+ #endif /* CONFIG_PM_AUTOSLEEP */
+ 
+@@ -1027,15 +1030,16 @@ static int print_wakeup_source_stats(str
+ static int wakeup_sources_stats_show(struct seq_file *m, void *unused)
+ {
+ 	struct wakeup_source *ws;
++	int srcuidx;
+ 
+ 	seq_puts(m, "name\t\tactive_count\tevent_count\twakeup_count\t"
+ 		"expire_count\tactive_since\ttotal_time\tmax_time\t"
+ 		"last_change\tprevent_suspend_time\n");
+ 
+-	rcu_read_lock();
++	srcuidx = srcu_read_lock(&wakeup_srcu);
+ 	list_for_each_entry_rcu(ws, &wakeup_sources, entry)
+ 		print_wakeup_source_stats(m, ws);
+-	rcu_read_unlock();
++	srcu_read_unlock(&wakeup_srcu, srcuidx);
+ 
+ 	print_wakeup_source_stats(m, &deleted_ws);
+ 
