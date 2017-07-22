@@ -1,0 +1,181 @@
+From 8535107aa4ef92520cbb9a4739563b389c5f8e2c Mon Sep 17 00:00:00 2001
+From: Brian Norris <briannorris@chromium.org>
+Date: Fri, 12 May 2017 09:41:58 -0700
+Subject: mwifiex: fixup error cases in mwifiex_add_virtual_intf()
+
+From: Brian Norris <briannorris@chromium.org>
+
+commit 8535107aa4ef92520cbb9a4739563b389c5f8e2c upstream.
+
+If we fail to add an interface in mwifiex_add_virtual_intf(), we might
+hit a BUG_ON() in the networking code, because we didn't tear things
+down properly. Among the problems:
+
+ (a) when failing to allocate workqueues, we fail to unregister the
+     netdev before calling free_netdev()
+ (b) even if we do try to unregister the netdev, we're still holding the
+     rtnl lock, so the device never properly unregistered; we'll be at
+     state NETREG_UNREGISTERING, and then hit free_netdev()'s:
+	BUG_ON(dev->reg_state != NETREG_UNREGISTERED);
+ (c) we're allocating some dependent resources (e.g., DFS workqueues)
+     after we've registered the interface; this may or may not cause
+     problems, but it's good practice to allocate these before registering
+ (d) we're not even trying to unwind anything when mwifiex_send_cmd() or
+     mwifiex_sta_init_cmd() fail
+
+To fix these issues, let's:
+
+ * add a stacked set of error handling labels, to keep error handling
+   consistent and properly ordered (resolving (a) and (d))
+ * move the workqueue allocations before the registration (to resolve
+   (c); also resolves (b) by avoiding error cases where we have to
+   unregister)
+
+[Incidentally, it's pretty easy to interrupt the alloc_workqueue() in,
+e.g., the following:
+
+  iw phy phy0 interface add mlan0 type station
+
+by sending it SIGTERM.]
+
+This bugfix covers commits like commit 7d652034d1a0 ("mwifiex: channel
+switch support for mwifiex"), but parts of this bug exist all the way
+back to the introduction of dynamic interface handling in commit
+93a1df48d224 ("mwifiex: add cfg80211 handlers add/del_virtual_intf").
+
+Signed-off-by: Brian Norris <briannorris@chromium.org>
+Signed-off-by: Kalle Valo <kvalo@codeaurora.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/net/wireless/marvell/mwifiex/cfg80211.c |   71 +++++++++++-------------
+ 1 file changed, 35 insertions(+), 36 deletions(-)
+
+--- a/drivers/net/wireless/marvell/mwifiex/cfg80211.c
++++ b/drivers/net/wireless/marvell/mwifiex/cfg80211.c
+@@ -2964,10 +2964,8 @@ struct wireless_dev *mwifiex_add_virtual
+ 	if (!dev) {
+ 		mwifiex_dbg(adapter, ERROR,
+ 			    "no memory available for netdevice\n");
+-		memset(&priv->wdev, 0, sizeof(priv->wdev));
+-		priv->wdev.iftype = NL80211_IFTYPE_UNSPECIFIED;
+-		priv->bss_mode = NL80211_IFTYPE_UNSPECIFIED;
+-		return ERR_PTR(-ENOMEM);
++		ret = -ENOMEM;
++		goto err_alloc_netdev;
+ 	}
+ 
+ 	mwifiex_init_priv_params(priv, dev);
+@@ -2976,11 +2974,11 @@ struct wireless_dev *mwifiex_add_virtual
+ 	ret = mwifiex_send_cmd(priv, HostCmd_CMD_SET_BSS_MODE,
+ 			       HostCmd_ACT_GEN_SET, 0, NULL, true);
+ 	if (ret)
+-		return ERR_PTR(ret);
++		goto err_set_bss_mode;
+ 
+ 	ret = mwifiex_sta_init_cmd(priv, false, false);
+ 	if (ret)
+-		return ERR_PTR(ret);
++		goto err_sta_init;
+ 
+ 	mwifiex_setup_ht_caps(&wiphy->bands[NL80211_BAND_2GHZ]->ht_cap, priv);
+ 	if (adapter->is_hw_11ac_capable)
+@@ -3011,31 +3009,14 @@ struct wireless_dev *mwifiex_add_virtual
+ 
+ 	SET_NETDEV_DEV(dev, adapter->dev);
+ 
+-	/* Register network device */
+-	if (register_netdevice(dev)) {
+-		mwifiex_dbg(adapter, ERROR,
+-			    "cannot register virtual network device\n");
+-		free_netdev(dev);
+-		priv->bss_mode = NL80211_IFTYPE_UNSPECIFIED;
+-		priv->netdev = NULL;
+-		memset(&priv->wdev, 0, sizeof(priv->wdev));
+-		priv->wdev.iftype = NL80211_IFTYPE_UNSPECIFIED;
+-		return ERR_PTR(-EFAULT);
+-	}
+-
+ 	priv->dfs_cac_workqueue = alloc_workqueue("MWIFIEX_DFS_CAC%s",
+ 						  WQ_HIGHPRI |
+ 						  WQ_MEM_RECLAIM |
+ 						  WQ_UNBOUND, 1, name);
+ 	if (!priv->dfs_cac_workqueue) {
+-		mwifiex_dbg(adapter, ERROR,
+-			    "cannot register virtual network device\n");
+-		free_netdev(dev);
+-		priv->bss_mode = NL80211_IFTYPE_UNSPECIFIED;
+-		priv->netdev = NULL;
+-		memset(&priv->wdev, 0, sizeof(priv->wdev));
+-		priv->wdev.iftype = NL80211_IFTYPE_UNSPECIFIED;
+-		return ERR_PTR(-ENOMEM);
++		mwifiex_dbg(adapter, ERROR, "cannot alloc DFS CAC queue\n");
++		ret = -ENOMEM;
++		goto err_alloc_cac;
+ 	}
+ 
+ 	INIT_DELAYED_WORK(&priv->dfs_cac_work, mwifiex_dfs_cac_work_queue);
+@@ -3044,16 +3025,9 @@ struct wireless_dev *mwifiex_add_virtual
+ 						      WQ_HIGHPRI | WQ_UNBOUND |
+ 						      WQ_MEM_RECLAIM, 1, name);
+ 	if (!priv->dfs_chan_sw_workqueue) {
+-		mwifiex_dbg(adapter, ERROR,
+-			    "cannot register virtual network device\n");
+-		free_netdev(dev);
+-		priv->bss_mode = NL80211_IFTYPE_UNSPECIFIED;
+-		priv->netdev = NULL;
+-		memset(&priv->wdev, 0, sizeof(priv->wdev));
+-		priv->wdev.iftype = NL80211_IFTYPE_UNSPECIFIED;
+-		destroy_workqueue(priv->dfs_cac_workqueue);
+-		priv->dfs_cac_workqueue = NULL;
+-		return ERR_PTR(-ENOMEM);
++		mwifiex_dbg(adapter, ERROR, "cannot alloc DFS channel sw queue\n");
++		ret = -ENOMEM;
++		goto err_alloc_chsw;
+ 	}
+ 
+ 	INIT_DELAYED_WORK(&priv->dfs_chan_sw_work,
+@@ -3061,6 +3035,13 @@ struct wireless_dev *mwifiex_add_virtual
+ 
+ 	sema_init(&priv->async_sem, 1);
+ 
++	/* Register network device */
++	if (register_netdevice(dev)) {
++		mwifiex_dbg(adapter, ERROR, "cannot register network device\n");
++		ret = -EFAULT;
++		goto err_reg_netdev;
++	}
++
+ 	mwifiex_dbg(adapter, INFO,
+ 		    "info: %s: Marvell 802.11 Adapter\n", dev->name);
+ 
+@@ -3081,11 +3062,29 @@ struct wireless_dev *mwifiex_add_virtual
+ 		adapter->curr_iface_comb.p2p_intf++;
+ 		break;
+ 	default:
++		/* This should be dead code; checked above */
+ 		mwifiex_dbg(adapter, ERROR, "type not supported\n");
+ 		return ERR_PTR(-EINVAL);
+ 	}
+ 
+ 	return &priv->wdev;
++
++err_reg_netdev:
++	destroy_workqueue(priv->dfs_chan_sw_workqueue);
++	priv->dfs_chan_sw_workqueue = NULL;
++err_alloc_chsw:
++	destroy_workqueue(priv->dfs_cac_workqueue);
++	priv->dfs_cac_workqueue = NULL;
++err_alloc_cac:
++	free_netdev(dev);
++	priv->netdev = NULL;
++err_sta_init:
++err_set_bss_mode:
++err_alloc_netdev:
++	memset(&priv->wdev, 0, sizeof(priv->wdev));
++	priv->wdev.iftype = NL80211_IFTYPE_UNSPECIFIED;
++	priv->bss_mode = NL80211_IFTYPE_UNSPECIFIED;
++	return ERR_PTR(ret);
+ }
+ EXPORT_SYMBOL_GPL(mwifiex_add_virtual_intf);
+ 
