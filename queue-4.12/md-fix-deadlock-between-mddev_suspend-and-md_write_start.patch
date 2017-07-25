@@ -1,0 +1,420 @@
+From cc27b0c78c79680d128dbac79de0d40556d041bb Mon Sep 17 00:00:00 2001
+From: NeilBrown <neilb@suse.com>
+Date: Mon, 5 Jun 2017 16:49:39 +1000
+Subject: md: fix deadlock between mddev_suspend() and md_write_start()
+
+From: NeilBrown <neilb@suse.com>
+
+commit cc27b0c78c79680d128dbac79de0d40556d041bb upstream.
+
+If mddev_suspend() races with md_write_start() we can deadlock
+with mddev_suspend() waiting for the request that is currently
+in md_write_start() to complete the ->make_request() call,
+and md_write_start() waiting for the metadata to be updated
+to mark the array as 'dirty'.
+As metadata updates done by md_check_recovery() only happen then
+the mddev_lock() can be claimed, and as mddev_suspend() is often
+called with the lock held, these threads wait indefinitely for each
+other.
+
+We fix this by having md_write_start() abort if mddev_suspend()
+is happening, and ->make_request() aborts if md_write_start()
+aborted.
+md_make_request() can detect this abort, decrease the ->active_io
+count, and wait for mddev_suspend().
+
+Reported-by: Nix <nix@esperi.org.uk>
+Fix: 68866e425be2(MD: no sync IO while suspended)
+Signed-off-by: NeilBrown <neilb@suse.com>
+Signed-off-by: Shaohua Li <shli@fb.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/md/faulty.c    |    5 +++--
+ drivers/md/linear.c    |    7 ++++---
+ drivers/md/md.c        |   22 +++++++++++++++++-----
+ drivers/md/md.h        |    4 ++--
+ drivers/md/multipath.c |    8 ++++----
+ drivers/md/raid0.c     |    7 ++++---
+ drivers/md/raid1.c     |   11 +++++++----
+ drivers/md/raid10.c    |   10 ++++++----
+ drivers/md/raid5.c     |   17 +++++++++--------
+ 9 files changed, 56 insertions(+), 35 deletions(-)
+
+--- a/drivers/md/faulty.c
++++ b/drivers/md/faulty.c
+@@ -170,7 +170,7 @@ static void add_sector(struct faulty_con
+ 		conf->nfaults = n+1;
+ }
+ 
+-static void faulty_make_request(struct mddev *mddev, struct bio *bio)
++static bool faulty_make_request(struct mddev *mddev, struct bio *bio)
+ {
+ 	struct faulty_conf *conf = mddev->private;
+ 	int failit = 0;
+@@ -182,7 +182,7 @@ static void faulty_make_request(struct m
+ 			 * just fail immediately
+ 			 */
+ 			bio_io_error(bio);
+-			return;
++			return true;
+ 		}
+ 
+ 		if (check_sector(conf, bio->bi_iter.bi_sector,
+@@ -224,6 +224,7 @@ static void faulty_make_request(struct m
+ 		bio->bi_bdev = conf->rdev->bdev;
+ 
+ 	generic_make_request(bio);
++	return true;
+ }
+ 
+ static void faulty_status(struct seq_file *seq, struct mddev *mddev)
+--- a/drivers/md/linear.c
++++ b/drivers/md/linear.c
+@@ -245,7 +245,7 @@ static void linear_free(struct mddev *md
+ 	kfree(conf);
+ }
+ 
+-static void linear_make_request(struct mddev *mddev, struct bio *bio)
++static bool linear_make_request(struct mddev *mddev, struct bio *bio)
+ {
+ 	char b[BDEVNAME_SIZE];
+ 	struct dev_info *tmp_dev;
+@@ -254,7 +254,7 @@ static void linear_make_request(struct m
+ 
+ 	if (unlikely(bio->bi_opf & REQ_PREFLUSH)) {
+ 		md_flush_request(mddev, bio);
+-		return;
++		return true;
+ 	}
+ 
+ 	tmp_dev = which_dev(mddev, bio_sector);
+@@ -292,7 +292,7 @@ static void linear_make_request(struct m
+ 		mddev_check_write_zeroes(mddev, bio);
+ 		generic_make_request(bio);
+ 	}
+-	return;
++	return true;
+ 
+ out_of_bounds:
+ 	pr_err("md/linear:%s: make_request: Sector %llu out of bounds on dev %s: %llu sectors, offset %llu\n",
+@@ -302,6 +302,7 @@ out_of_bounds:
+ 	       (unsigned long long)tmp_dev->rdev->sectors,
+ 	       (unsigned long long)start_sector);
+ 	bio_io_error(bio);
++	return true;
+ }
+ 
+ static void linear_status (struct seq_file *seq, struct mddev *mddev)
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -277,7 +277,7 @@ static blk_qc_t md_make_request(struct r
+ 		bio_endio(bio);
+ 		return BLK_QC_T_NONE;
+ 	}
+-	smp_rmb(); /* Ensure implications of  'active' are visible */
++check_suspended:
+ 	rcu_read_lock();
+ 	if (mddev->suspended) {
+ 		DEFINE_WAIT(__wait);
+@@ -302,7 +302,11 @@ static blk_qc_t md_make_request(struct r
+ 	sectors = bio_sectors(bio);
+ 	/* bio could be mergeable after passing to underlayer */
+ 	bio->bi_opf &= ~REQ_NOMERGE;
+-	mddev->pers->make_request(mddev, bio);
++	if (!mddev->pers->make_request(mddev, bio)) {
++		atomic_dec(&mddev->active_io);
++		wake_up(&mddev->sb_wait);
++		goto check_suspended;
++	}
+ 
+ 	cpu = part_stat_lock();
+ 	part_stat_inc(cpu, &mddev->gendisk->part0, ios[rw]);
+@@ -327,6 +331,7 @@ void mddev_suspend(struct mddev *mddev)
+ 	if (mddev->suspended++)
+ 		return;
+ 	synchronize_rcu();
++	wake_up(&mddev->sb_wait);
+ 	wait_event(mddev->sb_wait, atomic_read(&mddev->active_io) == 0);
+ 	mddev->pers->quiesce(mddev, 1);
+ 
+@@ -7950,12 +7955,14 @@ EXPORT_SYMBOL(md_done_sync);
+  * If we need to update some array metadata (e.g. 'active' flag
+  * in superblock) before writing, schedule a superblock update
+  * and wait for it to complete.
++ * A return value of 'false' means that the write wasn't recorded
++ * and cannot proceed as the array is being suspend.
+  */
+-void md_write_start(struct mddev *mddev, struct bio *bi)
++bool md_write_start(struct mddev *mddev, struct bio *bi)
+ {
+ 	int did_change = 0;
+ 	if (bio_data_dir(bi) != WRITE)
+-		return;
++		return true;
+ 
+ 	BUG_ON(mddev->ro == 1);
+ 	if (mddev->ro == 2) {
+@@ -7987,7 +7994,12 @@ void md_write_start(struct mddev *mddev,
+ 	if (did_change)
+ 		sysfs_notify_dirent_safe(mddev->sysfs_state);
+ 	wait_event(mddev->sb_wait,
+-		   !test_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags));
++		   !test_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags) && !mddev->suspended);
++	if (test_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags)) {
++		percpu_ref_put(&mddev->writes_pending);
++		return false;
++	}
++	return true;
+ }
+ EXPORT_SYMBOL(md_write_start);
+ 
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@ -510,7 +510,7 @@ struct md_personality
+ 	int level;
+ 	struct list_head list;
+ 	struct module *owner;
+-	void (*make_request)(struct mddev *mddev, struct bio *bio);
++	bool (*make_request)(struct mddev *mddev, struct bio *bio);
+ 	int (*run)(struct mddev *mddev);
+ 	void (*free)(struct mddev *mddev, void *priv);
+ 	void (*status)(struct seq_file *seq, struct mddev *mddev);
+@@ -649,7 +649,7 @@ extern void md_wakeup_thread(struct md_t
+ extern void md_check_recovery(struct mddev *mddev);
+ extern void md_reap_sync_thread(struct mddev *mddev);
+ extern int mddev_init_writes_pending(struct mddev *mddev);
+-extern void md_write_start(struct mddev *mddev, struct bio *bi);
++extern bool md_write_start(struct mddev *mddev, struct bio *bi);
+ extern void md_write_inc(struct mddev *mddev, struct bio *bi);
+ extern void md_write_end(struct mddev *mddev);
+ extern void md_done_sync(struct mddev *mddev, int blocks, int ok);
+--- a/drivers/md/multipath.c
++++ b/drivers/md/multipath.c
+@@ -106,7 +106,7 @@ static void multipath_end_request(struct
+ 	rdev_dec_pending(rdev, conf->mddev);
+ }
+ 
+-static void multipath_make_request(struct mddev *mddev, struct bio * bio)
++static bool multipath_make_request(struct mddev *mddev, struct bio * bio)
+ {
+ 	struct mpconf *conf = mddev->private;
+ 	struct multipath_bh * mp_bh;
+@@ -114,7 +114,7 @@ static void multipath_make_request(struc
+ 
+ 	if (unlikely(bio->bi_opf & REQ_PREFLUSH)) {
+ 		md_flush_request(mddev, bio);
+-		return;
++		return true;
+ 	}
+ 
+ 	mp_bh = mempool_alloc(conf->pool, GFP_NOIO);
+@@ -126,7 +126,7 @@ static void multipath_make_request(struc
+ 	if (mp_bh->path < 0) {
+ 		bio_io_error(bio);
+ 		mempool_free(mp_bh, conf->pool);
+-		return;
++		return true;
+ 	}
+ 	multipath = conf->multipaths + mp_bh->path;
+ 
+@@ -141,7 +141,7 @@ static void multipath_make_request(struc
+ 	mddev_check_writesame(mddev, &mp_bh->bio);
+ 	mddev_check_write_zeroes(mddev, &mp_bh->bio);
+ 	generic_make_request(&mp_bh->bio);
+-	return;
++	return true;
+ }
+ 
+ static void multipath_status(struct seq_file *seq, struct mddev *mddev)
+--- a/drivers/md/raid0.c
++++ b/drivers/md/raid0.c
+@@ -548,7 +548,7 @@ static void raid0_handle_discard(struct
+ 	bio_endio(bio);
+ }
+ 
+-static void raid0_make_request(struct mddev *mddev, struct bio *bio)
++static bool raid0_make_request(struct mddev *mddev, struct bio *bio)
+ {
+ 	struct strip_zone *zone;
+ 	struct md_rdev *tmp_dev;
+@@ -559,12 +559,12 @@ static void raid0_make_request(struct md
+ 
+ 	if (unlikely(bio->bi_opf & REQ_PREFLUSH)) {
+ 		md_flush_request(mddev, bio);
+-		return;
++		return true;
+ 	}
+ 
+ 	if (unlikely((bio_op(bio) == REQ_OP_DISCARD))) {
+ 		raid0_handle_discard(mddev, bio);
+-		return;
++		return true;
+ 	}
+ 
+ 	bio_sector = bio->bi_iter.bi_sector;
+@@ -599,6 +599,7 @@ static void raid0_make_request(struct md
+ 	mddev_check_writesame(mddev, bio);
+ 	mddev_check_write_zeroes(mddev, bio);
+ 	generic_make_request(bio);
++	return true;
+ }
+ 
+ static void raid0_status(struct seq_file *seq, struct mddev *mddev)
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@ -1321,7 +1321,6 @@ static void raid1_write_request(struct m
+ 	 * Continue immediately if no resync is active currently.
+ 	 */
+ 
+-	md_write_start(mddev, bio); /* wait on superblock update early */
+ 
+ 	if ((bio_end_sector(bio) > mddev->suspend_lo &&
+ 	    bio->bi_iter.bi_sector < mddev->suspend_hi) ||
+@@ -1553,13 +1552,13 @@ static void raid1_write_request(struct m
+ 	wake_up(&conf->wait_barrier);
+ }
+ 
+-static void raid1_make_request(struct mddev *mddev, struct bio *bio)
++static bool raid1_make_request(struct mddev *mddev, struct bio *bio)
+ {
+ 	sector_t sectors;
+ 
+ 	if (unlikely(bio->bi_opf & REQ_PREFLUSH)) {
+ 		md_flush_request(mddev, bio);
+-		return;
++		return true;
+ 	}
+ 
+ 	/*
+@@ -1574,8 +1573,12 @@ static void raid1_make_request(struct md
+ 
+ 	if (bio_data_dir(bio) == READ)
+ 		raid1_read_request(mddev, bio, sectors, NULL);
+-	else
++	else {
++		if (!md_write_start(mddev,bio))
++			return false;
+ 		raid1_write_request(mddev, bio, sectors);
++	}
++	return true;
+ }
+ 
+ static void raid1_status(struct seq_file *seq, struct mddev *mddev)
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@ -1303,8 +1303,6 @@ static void raid10_write_request(struct
+ 	sector_t sectors;
+ 	int max_sectors;
+ 
+-	md_write_start(mddev, bio);
+-
+ 	/*
+ 	 * Register the new request and wait if the reconstruction
+ 	 * thread has put up a bar for new requests.
+@@ -1525,7 +1523,7 @@ static void __make_request(struct mddev
+ 		raid10_write_request(mddev, bio, r10_bio);
+ }
+ 
+-static void raid10_make_request(struct mddev *mddev, struct bio *bio)
++static bool raid10_make_request(struct mddev *mddev, struct bio *bio)
+ {
+ 	struct r10conf *conf = mddev->private;
+ 	sector_t chunk_mask = (conf->geo.chunk_mask & conf->prev.chunk_mask);
+@@ -1534,9 +1532,12 @@ static void raid10_make_request(struct m
+ 
+ 	if (unlikely(bio->bi_opf & REQ_PREFLUSH)) {
+ 		md_flush_request(mddev, bio);
+-		return;
++		return true;
+ 	}
+ 
++	if (!md_write_start(mddev, bio))
++		return false;
++
+ 	/*
+ 	 * If this request crosses a chunk boundary, we need to split
+ 	 * it.
+@@ -1553,6 +1554,7 @@ static void raid10_make_request(struct m
+ 
+ 	/* In case raid10d snuck in to freeze_array */
+ 	wake_up(&conf->wait_barrier);
++	return true;
+ }
+ 
+ static void raid10_status(struct seq_file *seq, struct mddev *mddev)
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -5479,7 +5479,6 @@ static void make_discard_request(struct
+ 	last_sector = bi->bi_iter.bi_sector + (bi->bi_iter.bi_size>>9);
+ 
+ 	bi->bi_next = NULL;
+-	md_write_start(mddev, bi);
+ 
+ 	stripe_sectors = conf->chunk_sectors *
+ 		(conf->raid_disks - conf->max_degraded);
+@@ -5549,11 +5548,10 @@ static void make_discard_request(struct
+ 		release_stripe_plug(mddev, sh);
+ 	}
+ 
+-	md_write_end(mddev);
+ 	bio_endio(bi);
+ }
+ 
+-static void raid5_make_request(struct mddev *mddev, struct bio * bi)
++static bool raid5_make_request(struct mddev *mddev, struct bio * bi)
+ {
+ 	struct r5conf *conf = mddev->private;
+ 	int dd_idx;
+@@ -5569,10 +5567,10 @@ static void raid5_make_request(struct md
+ 		int ret = r5l_handle_flush_request(conf->log, bi);
+ 
+ 		if (ret == 0)
+-			return;
++			return true;
+ 		if (ret == -ENODEV) {
+ 			md_flush_request(mddev, bi);
+-			return;
++			return true;
+ 		}
+ 		/* ret == -EAGAIN, fallback */
+ 		/*
+@@ -5582,6 +5580,8 @@ static void raid5_make_request(struct md
+ 		do_flush = bi->bi_opf & REQ_PREFLUSH;
+ 	}
+ 
++	if (!md_write_start(mddev, bi))
++		return false;
+ 	/*
+ 	 * If array is degraded, better not do chunk aligned read because
+ 	 * later we might have to read it again in order to reconstruct
+@@ -5591,18 +5591,18 @@ static void raid5_make_request(struct md
+ 	    mddev->reshape_position == MaxSector) {
+ 		bi = chunk_aligned_read(mddev, bi);
+ 		if (!bi)
+-			return;
++			return true;
+ 	}
+ 
+ 	if (unlikely(bio_op(bi) == REQ_OP_DISCARD)) {
+ 		make_discard_request(mddev, bi);
+-		return;
++		md_write_end(mddev);
++		return true;
+ 	}
+ 
+ 	logical_sector = bi->bi_iter.bi_sector & ~((sector_t)STRIPE_SECTORS-1);
+ 	last_sector = bio_end_sector(bi);
+ 	bi->bi_next = NULL;
+-	md_write_start(mddev, bi);
+ 
+ 	prepare_to_wait(&conf->wait_for_overlap, &w, TASK_UNINTERRUPTIBLE);
+ 	for (;logical_sector < last_sector; logical_sector += STRIPE_SECTORS) {
+@@ -5743,6 +5743,7 @@ static void raid5_make_request(struct md
+ 	if (rw == WRITE)
+ 		md_write_end(mddev);
+ 	bio_endio(bi);
++	return true;
+ }
+ 
+ static sector_t raid5_size(struct mddev *mddev, sector_t sectors, int raid_disks);
