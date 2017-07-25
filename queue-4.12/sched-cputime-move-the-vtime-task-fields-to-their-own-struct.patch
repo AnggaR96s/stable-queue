@@ -1,0 +1,343 @@
+From bac5b6b6b11560f323e71d0ebac4061cfe5f56c0 Mon Sep 17 00:00:00 2001
+From: Frederic Weisbecker <fweisbec@gmail.com>
+Date: Thu, 29 Jun 2017 19:15:10 +0200
+Subject: sched/cputime: Move the vtime task fields to their own struct
+
+From: Frederic Weisbecker <fweisbec@gmail.com>
+
+commit bac5b6b6b11560f323e71d0ebac4061cfe5f56c0 upstream.
+
+We are about to add vtime accumulation fields to the task struct. Let's
+avoid more bloatification and gather vtime information to their own
+struct.
+
+Tested-by: Luiz Capitulino <lcapitulino@redhat.com>
+Signed-off-by: Frederic Weisbecker <fweisbec@gmail.com>
+Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+Acked-by: Rik van Riel <riel@redhat.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Wanpeng Li <kernellwp@gmail.com>
+Link: http://lkml.kernel.org/r/1498756511-11714-5-git-send-email-fweisbec@gmail.com
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ include/linux/init_task.h |    6 +-
+ include/linux/sched.h     |   26 ++++++----
+ kernel/fork.c             |    6 +-
+ kernel/sched/cputime.c    |  114 ++++++++++++++++++++++++++--------------------
+ 4 files changed, 87 insertions(+), 65 deletions(-)
+
+--- a/include/linux/init_task.h
++++ b/include/linux/init_task.h
+@@ -170,9 +170,9 @@ extern struct cred init_cred;
+ 
+ #ifdef CONFIG_VIRT_CPU_ACCOUNTING_GEN
+ # define INIT_VTIME(tsk)						\
+-	.vtime_seqcount = SEQCNT_ZERO(tsk.vtime_seqcount),	\
+-	.vtime_starttime = 0,				\
+-	.vtime_state = VTIME_SYS,
++	.vtime.seqcount = SEQCNT_ZERO(tsk.vtime.seqcount),		\
++	.vtime.starttime = 0,						\
++	.vtime.state = VTIME_SYS,
+ #else
+ # define INIT_VTIME(tsk)
+ #endif
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -223,6 +223,21 @@ struct task_cputime {
+ #define prof_exp			stime
+ #define sched_exp			sum_exec_runtime
+ 
++enum vtime_state {
++	/* Task is sleeping or running in a CPU with VTIME inactive: */
++	VTIME_INACTIVE = 0,
++	/* Task runs in userspace in a CPU with VTIME active: */
++	VTIME_USER,
++	/* Task runs in kernelspace in a CPU with VTIME active: */
++	VTIME_SYS,
++};
++
++struct vtime {
++	seqcount_t		seqcount;
++	unsigned long long	starttime;
++	enum vtime_state	state;
++};
++
+ struct sched_info {
+ #ifdef CONFIG_SCHED_INFO
+ 	/* Cumulative counters: */
+@@ -670,16 +685,7 @@ struct task_struct {
+ 	u64				gtime;
+ 	struct prev_cputime		prev_cputime;
+ #ifdef CONFIG_VIRT_CPU_ACCOUNTING_GEN
+-	seqcount_t			vtime_seqcount;
+-	unsigned long long		vtime_starttime;
+-	enum {
+-		/* Task is sleeping or running in a CPU with VTIME inactive: */
+-		VTIME_INACTIVE = 0,
+-		/* Task runs in userspace in a CPU with VTIME active: */
+-		VTIME_USER,
+-		/* Task runs in kernelspace in a CPU with VTIME active: */
+-		VTIME_SYS,
+-	} vtime_state;
++	struct vtime			vtime;
+ #endif
+ 
+ #ifdef CONFIG_NO_HZ_FULL
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1637,9 +1637,9 @@ static __latent_entropy struct task_stru
+ 	prev_cputime_init(&p->prev_cputime);
+ 
+ #ifdef CONFIG_VIRT_CPU_ACCOUNTING_GEN
+-	seqcount_init(&p->vtime_seqcount);
+-	p->vtime_starttime = 0;
+-	p->vtime_state = VTIME_INACTIVE;
++	seqcount_init(&p->vtime.seqcount);
++	p->vtime.starttime = 0;
++	p->vtime.state = VTIME_INACTIVE;
+ #endif
+ 
+ #if defined(SPLIT_RSS_COUNTING)
+--- a/kernel/sched/cputime.c
++++ b/kernel/sched/cputime.c
+@@ -679,17 +679,17 @@ void thread_group_cputime_adjusted(struc
+ #endif /* !CONFIG_VIRT_CPU_ACCOUNTING_NATIVE */
+ 
+ #ifdef CONFIG_VIRT_CPU_ACCOUNTING_GEN
+-static u64 vtime_delta(struct task_struct *tsk)
++static u64 vtime_delta(struct vtime *vtime)
+ {
+ 	unsigned long now = READ_ONCE(jiffies);
+ 
+-	if (time_before(now, (unsigned long)tsk->vtime_starttime))
++	if (time_before(now, (unsigned long)vtime->starttime))
+ 		return 0;
+ 
+-	return jiffies_to_nsecs(now - tsk->vtime_starttime);
++	return jiffies_to_nsecs(now - vtime->starttime);
+ }
+ 
+-static u64 get_vtime_delta(struct task_struct *tsk)
++static u64 get_vtime_delta(struct vtime *vtime)
+ {
+ 	unsigned long now = READ_ONCE(jiffies);
+ 	u64 delta, other;
+@@ -701,49 +701,56 @@ static u64 get_vtime_delta(struct task_s
+ 	 * elapsed time. Limit account_other_time to prevent rounding
+ 	 * errors from causing elapsed vtime to go negative.
+ 	 */
+-	delta = jiffies_to_nsecs(now - tsk->vtime_starttime);
++	delta = jiffies_to_nsecs(now - vtime->starttime);
+ 	other = account_other_time(delta);
+-	WARN_ON_ONCE(tsk->vtime_state == VTIME_INACTIVE);
+-	tsk->vtime_starttime = now;
++	WARN_ON_ONCE(vtime->state == VTIME_INACTIVE);
++	vtime->starttime = now;
+ 
+ 	return delta - other;
+ }
+ 
+ static void __vtime_account_system(struct task_struct *tsk)
+ {
+-	account_system_time(tsk, irq_count(), get_vtime_delta(tsk));
++	account_system_time(tsk, irq_count(), get_vtime_delta(&tsk->vtime));
+ }
+ 
+ void vtime_account_system(struct task_struct *tsk)
+ {
+-	if (!vtime_delta(tsk))
++	struct vtime *vtime = &tsk->vtime;
++
++	if (!vtime_delta(vtime))
+ 		return;
+ 
+-	write_seqcount_begin(&tsk->vtime_seqcount);
++	write_seqcount_begin(&vtime->seqcount);
+ 	__vtime_account_system(tsk);
+-	write_seqcount_end(&tsk->vtime_seqcount);
++	write_seqcount_end(&vtime->seqcount);
+ }
+ 
+ void vtime_user_enter(struct task_struct *tsk)
+ {
+-	write_seqcount_begin(&tsk->vtime_seqcount);
+-	if (vtime_delta(tsk))
++	struct vtime *vtime = &tsk->vtime;
++
++	write_seqcount_begin(&vtime->seqcount);
++	if (vtime_delta(vtime))
+ 		__vtime_account_system(tsk);
+-	tsk->vtime_snap_whence = VTIME_USER;
+-	write_seqcount_end(&tsk->vtime_seqcount);
++	vtime->state = VTIME_USER;
++	write_seqcount_end(&vtime->seqcount);
+ }
+ 
+ void vtime_user_exit(struct task_struct *tsk)
+ {
+-	write_seqcount_begin(&tsk->vtime_seqcount);
+-	if (vtime_delta(tsk))
+-		account_user_time(tsk, get_vtime_delta(tsk));
+-	tsk->vtime_snap_whence = VTIME_SYS;
+-	write_seqcount_end(&tsk->vtime_seqcount);
++	struct vtime *vtime = &tsk->vtime;
++
++	write_seqcount_begin(&vtime->seqcount);
++	if (vtime_delta(vtime))
++		account_user_time(tsk, get_vtime_delta(vtime));
++	vtime->state = VTIME_SYS;
++	write_seqcount_end(&vtime->seqcount);
+ }
+ 
+ void vtime_guest_enter(struct task_struct *tsk)
+ {
++	struct vtime *vtime = &tsk->vtime;
+ 	/*
+ 	 * The flags must be updated under the lock with
+ 	 * the vtime_starttime flush and update.
+@@ -751,54 +758,62 @@ void vtime_guest_enter(struct task_struc
+ 	 * synchronization against the reader (task_gtime())
+ 	 * that can thus safely catch up with a tickless delta.
+ 	 */
+-	write_seqcount_begin(&tsk->vtime_seqcount);
+-	if (vtime_delta(tsk))
++	write_seqcount_begin(&vtime->seqcount);
++	if (vtime_delta(vtime))
+ 		__vtime_account_system(tsk);
+ 	current->flags |= PF_VCPU;
+-	write_seqcount_end(&tsk->vtime_seqcount);
++	write_seqcount_end(&vtime->seqcount);
+ }
+ EXPORT_SYMBOL_GPL(vtime_guest_enter);
+ 
+ void vtime_guest_exit(struct task_struct *tsk)
+ {
+-	write_seqcount_begin(&tsk->vtime_seqcount);
++	struct vtime *vtime = &tsk->vtime;
++
++	write_seqcount_begin(&vtime->seqcount);
+ 	__vtime_account_system(tsk);
+ 	current->flags &= ~PF_VCPU;
+-	write_seqcount_end(&tsk->vtime_seqcount);
++	write_seqcount_end(&vtime->seqcount);
+ }
+ EXPORT_SYMBOL_GPL(vtime_guest_exit);
+ 
+ void vtime_account_idle(struct task_struct *tsk)
+ {
+-	account_idle_time(get_vtime_delta(tsk));
++	account_idle_time(get_vtime_delta(&tsk->vtime));
+ }
+ 
+ void arch_vtime_task_switch(struct task_struct *prev)
+ {
+-	write_seqcount_begin(&prev->vtime_seqcount);
+-	prev->vtime_state = VTIME_INACTIVE;
+-	write_seqcount_end(&prev->vtime_seqcount);
+-
+-	write_seqcount_begin(&current->vtime_seqcount);
+-	current->vtime_state = VTIME_SYS;
+-	current->vtime_starttime = jiffies;
+-	write_seqcount_end(&current->vtime_seqcount);
++	struct vtime *vtime = &prev->vtime;
++
++	write_seqcount_begin(&vtime->seqcount);
++	vtime->state = VTIME_INACTIVE;
++	write_seqcount_end(&vtime->seqcount);
++
++	vtime = &current->vtime;
++
++	write_seqcount_begin(&vtime->seqcount);
++	vtime->state = VTIME_SYS;
++	vtime->starttime = jiffies;
++	write_seqcount_end(&vtime->seqcount);
+ }
+ 
+ void vtime_init_idle(struct task_struct *t, int cpu)
+ {
++	struct vtime *vtime = &t->vtime;
+ 	unsigned long flags;
+ 
+ 	local_irq_save(flags);
+-	write_seqcount_begin(&t->vtime_seqcount);
+-	t->vtime_state = VTIME_SYS;
+-	t->vtime_starttime = jiffies;
+-	write_seqcount_end(&t->vtime_seqcount);
++	write_seqcount_begin(&vtime->seqcount);
++	vtime->state = VTIME_SYS;
++	vtime->starttime = jiffies;
++	write_seqcount_end(&vtime->seqcount);
+ 	local_irq_restore(flags);
+ }
+ 
+ u64 task_gtime(struct task_struct *t)
+ {
++	struct vtime *vtime = &t->vtime;
+ 	unsigned int seq;
+ 	u64 gtime;
+ 
+@@ -806,13 +821,13 @@ u64 task_gtime(struct task_struct *t)
+ 		return t->gtime;
+ 
+ 	do {
+-		seq = read_seqcount_begin(&t->vtime_seqcount);
++		seq = read_seqcount_begin(&vtime->seqcount);
+ 
+ 		gtime = t->gtime;
+-		if (t->vtime_state == VTIME_SYS && t->flags & PF_VCPU)
+-			gtime += vtime_delta(t);
++		if (vtime->state == VTIME_SYS && t->flags & PF_VCPU)
++			gtime += vtime_delta(vtime);
+ 
+-	} while (read_seqcount_retry(&t->vtime_seqcount, seq));
++	} while (read_seqcount_retry(&vtime->seqcount, seq));
+ 
+ 	return gtime;
+ }
+@@ -824,8 +839,9 @@ u64 task_gtime(struct task_struct *t)
+  */
+ void task_cputime(struct task_struct *t, u64 *utime, u64 *stime)
+ {
+-	u64 delta;
++	struct vtime *vtime = &t->vtime;
+ 	unsigned int seq;
++	u64 delta;
+ 
+ 	if (!vtime_accounting_enabled()) {
+ 		*utime = t->utime;
+@@ -834,25 +850,25 @@ void task_cputime(struct task_struct *t,
+ 	}
+ 
+ 	do {
+-		seq = read_seqcount_begin(&t->vtime_seqcount);
++		seq = read_seqcount_begin(&vtime->seqcount);
+ 
+ 		*utime = t->utime;
+ 		*stime = t->stime;
+ 
+ 		/* Task is sleeping, nothing to add */
+-		if (t->vtime_state == VTIME_INACTIVE || is_idle_task(t))
++		if (vtime->state == VTIME_INACTIVE || is_idle_task(t))
+ 			continue;
+ 
+-		delta = vtime_delta(t);
++		delta = vtime_delta(vtime);
+ 
+ 		/*
+ 		 * Task runs either in user or kernel space, add pending nohz time to
+ 		 * the right place.
+ 		 */
+-		if (t->vtime_state == VTIME_USER || t->flags & PF_VCPU)
++		if (vtime->state == VTIME_USER || t->flags & PF_VCPU)
+ 			*utime += delta;
+-		else if (t->vtime_state == VTIME_SYS)
++		else if (vtime->state == VTIME_SYS)
+ 			*stime += delta;
+-	} while (read_seqcount_retry(&t->vtime_seqcount, seq));
++	} while (read_seqcount_retry(&vtime->seqcount, seq));
+ }
+ #endif /* CONFIG_VIRT_CPU_ACCOUNTING_GEN */

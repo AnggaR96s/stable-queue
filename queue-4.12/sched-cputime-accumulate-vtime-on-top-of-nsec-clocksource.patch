@@ -1,0 +1,228 @@
+From 2a42eb9594a1480b4ead9e036e06ee1290e5fa6d Mon Sep 17 00:00:00 2001
+From: Wanpeng Li <wanpeng.li@hotmail.com>
+Date: Thu, 29 Jun 2017 19:15:11 +0200
+Subject: sched/cputime: Accumulate vtime on top of nsec clocksource
+
+From: Wanpeng Li <wanpeng.li@hotmail.com>
+
+commit 2a42eb9594a1480b4ead9e036e06ee1290e5fa6d upstream.
+
+Currently the cputime source used by vtime is jiffies. When we cross
+a context boundary and jiffies have changed since the last snapshot, the
+pending cputime is accounted to the switching out context.
+
+This system works ok if the ticks are not aligned across CPUs. If they
+instead are aligned (ie: all fire at the same time) and the CPUs run in
+userspace, the jiffies change is only observed on tick exit and therefore
+the user cputime is accounted as system cputime. This is because the
+CPU that maintains timekeeping fires its tick at the same time as the
+others. It updates jiffies in the middle of the tick and the other CPUs
+see that update on IRQ exit:
+
+    CPU 0 (timekeeper)                  CPU 1
+    -------------------              -------------
+                      jiffies = N
+    ...                              run in userspace for a jiffy
+    tick entry                       tick entry (sees jiffies = N)
+    set jiffies = N + 1
+    tick exit                        tick exit (sees jiffies = N + 1)
+                                                account 1 jiffy as stime
+
+Fix this with using a nanosec clock source instead of jiffies. The
+cputime is then accumulated and flushed everytime the pending delta
+reaches a jiffy in order to mitigate the accounting overhead.
+
+[ fweisbec: changelog, rebase on struct vtime, field renames, add delta
+  on cputime readers, keep idle vtime as-is (low overhead accounting),
+  harmonize clock sources. ]
+
+Suggested-by: Thomas Gleixner <tglx@linutronix.de>
+Reported-by: Luiz Capitulino <lcapitulino@redhat.com>
+Tested-by: Luiz Capitulino <lcapitulino@redhat.com>
+Signed-off-by: Wanpeng Li <wanpeng.li@hotmail.com>
+Signed-off-by: Frederic Weisbecker <fweisbec@gmail.com>
+Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+Acked-by: Rik van Riel <riel@redhat.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Wanpeng Li <kernellwp@gmail.com>
+Link: http://lkml.kernel.org/r/1498756511-11714-6-git-send-email-fweisbec@gmail.com
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ include/linux/sched.h  |    3 ++
+ kernel/sched/cputime.c |   64 ++++++++++++++++++++++++++++++++-----------------
+ 2 files changed, 45 insertions(+), 22 deletions(-)
+
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -236,6 +236,9 @@ struct vtime {
+ 	seqcount_t		seqcount;
+ 	unsigned long long	starttime;
+ 	enum vtime_state	state;
++	u64			utime;
++	u64			stime;
++	u64			gtime;
+ };
+ 
+ struct sched_info {
+--- a/kernel/sched/cputime.c
++++ b/kernel/sched/cputime.c
+@@ -681,18 +681,19 @@ void thread_group_cputime_adjusted(struc
+ #ifdef CONFIG_VIRT_CPU_ACCOUNTING_GEN
+ static u64 vtime_delta(struct vtime *vtime)
+ {
+-	unsigned long now = READ_ONCE(jiffies);
++	unsigned long long clock;
+ 
+-	if (time_before(now, (unsigned long)vtime->starttime))
++	clock = sched_clock_cpu(smp_processor_id());
++	if (clock < vtime->starttime)
+ 		return 0;
+ 
+-	return jiffies_to_nsecs(now - vtime->starttime);
++	return clock - vtime->starttime;
+ }
+ 
+ static u64 get_vtime_delta(struct vtime *vtime)
+ {
+-	unsigned long now = READ_ONCE(jiffies);
+-	u64 delta, other;
++	u64 delta = vtime_delta(vtime);
++	u64 other;
+ 
+ 	/*
+ 	 * Unlike tick based timing, vtime based timing never has lost
+@@ -701,17 +702,31 @@ static u64 get_vtime_delta(struct vtime
+ 	 * elapsed time. Limit account_other_time to prevent rounding
+ 	 * errors from causing elapsed vtime to go negative.
+ 	 */
+-	delta = jiffies_to_nsecs(now - vtime->starttime);
+ 	other = account_other_time(delta);
+ 	WARN_ON_ONCE(vtime->state == VTIME_INACTIVE);
+-	vtime->starttime = now;
++	vtime->starttime += delta;
+ 
+ 	return delta - other;
+ }
+ 
+-static void __vtime_account_system(struct task_struct *tsk)
++static void __vtime_account_system(struct task_struct *tsk,
++				   struct vtime *vtime)
+ {
+-	account_system_time(tsk, irq_count(), get_vtime_delta(&tsk->vtime));
++	vtime->stime += get_vtime_delta(vtime);
++	if (vtime->stime >= TICK_NSEC) {
++		account_system_time(tsk, irq_count(), vtime->stime);
++		vtime->stime = 0;
++	}
++}
++
++static void vtime_account_guest(struct task_struct *tsk,
++				struct vtime *vtime)
++{
++	vtime->gtime += get_vtime_delta(vtime);
++	if (vtime->gtime >= TICK_NSEC) {
++		account_guest_time(tsk, vtime->gtime);
++		vtime->gtime = 0;
++	}
+ }
+ 
+ void vtime_account_system(struct task_struct *tsk)
+@@ -722,7 +737,11 @@ void vtime_account_system(struct task_st
+ 		return;
+ 
+ 	write_seqcount_begin(&vtime->seqcount);
+-	__vtime_account_system(tsk);
++	/* We might have scheduled out from guest path */
++	if (current->flags & PF_VCPU)
++		vtime_account_guest(tsk, vtime);
++	else
++		__vtime_account_system(tsk, vtime);
+ 	write_seqcount_end(&vtime->seqcount);
+ }
+ 
+@@ -731,8 +750,7 @@ void vtime_user_enter(struct task_struct
+ 	struct vtime *vtime = &tsk->vtime;
+ 
+ 	write_seqcount_begin(&vtime->seqcount);
+-	if (vtime_delta(vtime))
+-		__vtime_account_system(tsk);
++	__vtime_account_system(tsk, vtime);
+ 	vtime->state = VTIME_USER;
+ 	write_seqcount_end(&vtime->seqcount);
+ }
+@@ -742,8 +760,11 @@ void vtime_user_exit(struct task_struct
+ 	struct vtime *vtime = &tsk->vtime;
+ 
+ 	write_seqcount_begin(&vtime->seqcount);
+-	if (vtime_delta(vtime))
+-		account_user_time(tsk, get_vtime_delta(vtime));
++	vtime->utime += get_vtime_delta(vtime);
++	if (vtime->utime >= TICK_NSEC) {
++		account_user_time(tsk, vtime->utime);
++		vtime->utime = 0;
++	}
+ 	vtime->state = VTIME_SYS;
+ 	write_seqcount_end(&vtime->seqcount);
+ }
+@@ -759,8 +780,7 @@ void vtime_guest_enter(struct task_struc
+ 	 * that can thus safely catch up with a tickless delta.
+ 	 */
+ 	write_seqcount_begin(&vtime->seqcount);
+-	if (vtime_delta(vtime))
+-		__vtime_account_system(tsk);
++	__vtime_account_system(tsk, vtime);
+ 	current->flags |= PF_VCPU;
+ 	write_seqcount_end(&vtime->seqcount);
+ }
+@@ -771,7 +791,7 @@ void vtime_guest_exit(struct task_struct
+ 	struct vtime *vtime = &tsk->vtime;
+ 
+ 	write_seqcount_begin(&vtime->seqcount);
+-	__vtime_account_system(tsk);
++	vtime_account_guest(tsk, vtime);
+ 	current->flags &= ~PF_VCPU;
+ 	write_seqcount_end(&vtime->seqcount);
+ }
+@@ -794,7 +814,7 @@ void arch_vtime_task_switch(struct task_
+ 
+ 	write_seqcount_begin(&vtime->seqcount);
+ 	vtime->state = VTIME_SYS;
+-	vtime->starttime = jiffies;
++	vtime->starttime = sched_clock_cpu(smp_processor_id());
+ 	write_seqcount_end(&vtime->seqcount);
+ }
+ 
+@@ -806,7 +826,7 @@ void vtime_init_idle(struct task_struct
+ 	local_irq_save(flags);
+ 	write_seqcount_begin(&vtime->seqcount);
+ 	vtime->state = VTIME_SYS;
+-	vtime->starttime = jiffies;
++	vtime->starttime = sched_clock_cpu(cpu);
+ 	write_seqcount_end(&vtime->seqcount);
+ 	local_irq_restore(flags);
+ }
+@@ -825,7 +845,7 @@ u64 task_gtime(struct task_struct *t)
+ 
+ 		gtime = t->gtime;
+ 		if (vtime->state == VTIME_SYS && t->flags & PF_VCPU)
+-			gtime += vtime_delta(vtime);
++			gtime += vtime->gtime + vtime_delta(vtime);
+ 
+ 	} while (read_seqcount_retry(&vtime->seqcount, seq));
+ 
+@@ -866,9 +886,9 @@ void task_cputime(struct task_struct *t,
+ 		 * the right place.
+ 		 */
+ 		if (vtime->state == VTIME_USER || t->flags & PF_VCPU)
+-			*utime += delta;
++			*utime += vtime->utime + delta;
+ 		else if (vtime->state == VTIME_SYS)
+-			*stime += delta;
++			*stime += vtime->stime + delta;
+ 	} while (read_seqcount_retry(&vtime->seqcount, seq));
+ }
+ #endif /* CONFIG_VIRT_CPU_ACCOUNTING_GEN */
