@@ -1,0 +1,125 @@
+From 6e34e1f23d780978da65968327cbba6d7013a73f Mon Sep 17 00:00:00 2001
+From: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+Date: Thu, 13 Jul 2017 15:03:51 -0700
+Subject: cpufreq: intel_pstate: Correct the busy calculation for KNL
+
+From: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+
+commit 6e34e1f23d780978da65968327cbba6d7013a73f upstream.
+
+The busy percent calculated for the Knights Landing (KNL) platform
+is 1024 times smaller than the correct busy value.  This causes
+performance to get stuck at the lowest ratio.
+
+The scaling algorithm used for KNL is performance-based, but it still
+looks at the CPU load to set the scaled busy factor to 0 when the
+load is less than 1 percent.  In this case, since the computed load
+is 1024x smaller than it should be, the scaled busy factor will
+always be 0, irrespective of CPU business.
+
+This needs a fix similar to the turbostat one in commit b2b34dfe4d9a
+(tools/power turbostat: KNL workaround for %Busy and Avg_MHz).
+
+For this reason, add one more callback to processor-specific
+callbacks to specify an MPERF multiplier represented by a number of
+bit positions to shift the value of that register to the left to
+copmensate for its rate difference with respect to the TSC.  This
+shift value is used during CPU busy calculations.
+
+Fixes: ffb810563c (intel_pstate: Avoid getting stuck in high P-states when idle)
+Reported-and-tested-by: Artem Bityutskiy <artem.bityutskiy@linux.intel.com>
+Signed-off-by: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+[ rjw: Changelog ]
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/cpufreq/intel_pstate.c |   21 +++++++++++++++++++--
+ 1 file changed, 19 insertions(+), 2 deletions(-)
+
+--- a/drivers/cpufreq/intel_pstate.c
++++ b/drivers/cpufreq/intel_pstate.c
+@@ -225,6 +225,9 @@ struct global_params {
+  * @vid:		Stores VID limits for this CPU
+  * @pid:		Stores PID parameters for this CPU
+  * @last_sample_time:	Last Sample time
++ * @aperf_mperf_shift:	Number of clock cycles after aperf, merf is incremented
++ *			This shift is a multiplier to mperf delta to
++ *			calculate CPU busy.
+  * @prev_aperf:		Last APERF value read from APERF MSR
+  * @prev_mperf:		Last MPERF value read from MPERF MSR
+  * @prev_tsc:		Last timestamp counter (TSC) value
+@@ -261,6 +264,7 @@ struct cpudata {
+ 
+ 	u64	last_update;
+ 	u64	last_sample_time;
++	u64	aperf_mperf_shift;
+ 	u64	prev_aperf;
+ 	u64	prev_mperf;
+ 	u64	prev_tsc;
+@@ -323,6 +327,7 @@ struct pstate_funcs {
+ 	int (*get_min)(void);
+ 	int (*get_turbo)(void);
+ 	int (*get_scaling)(void);
++	int (*get_aperf_mperf_shift)(void);
+ 	u64 (*get_val)(struct cpudata*, int pstate);
+ 	void (*get_vid)(struct cpudata *);
+ 	void (*update_util)(struct update_util_data *data, u64 time,
+@@ -1485,6 +1490,11 @@ static u64 core_get_val(struct cpudata *
+ 	return val;
+ }
+ 
++static int knl_get_aperf_mperf_shift(void)
++{
++	return 10;
++}
++
+ static int knl_get_turbo_pstate(void)
+ {
+ 	u64 value;
+@@ -1543,6 +1553,9 @@ static void intel_pstate_get_cpu_pstates
+ 	cpu->pstate.max_freq = cpu->pstate.max_pstate * cpu->pstate.scaling;
+ 	cpu->pstate.turbo_freq = cpu->pstate.turbo_pstate * cpu->pstate.scaling;
+ 
++	if (pstate_funcs.get_aperf_mperf_shift)
++		cpu->aperf_mperf_shift = pstate_funcs.get_aperf_mperf_shift();
++
+ 	if (pstate_funcs.get_vid)
+ 		pstate_funcs.get_vid(cpu);
+ 
+@@ -1619,7 +1632,8 @@ static inline int32_t get_target_pstate_
+ 	if (cpu->policy == CPUFREQ_POLICY_PERFORMANCE)
+ 		return cpu->pstate.turbo_pstate;
+ 
+-	busy_frac = div_fp(sample->mperf, sample->tsc);
++	busy_frac = div_fp(sample->mperf << cpu->aperf_mperf_shift,
++			   sample->tsc);
+ 
+ 	boost = cpu->iowait_boost;
+ 	cpu->iowait_boost >>= 1;
+@@ -1681,7 +1695,8 @@ static inline int32_t get_target_pstate_
+ 		sample_ratio = div_fp(pid_params.sample_rate_ns, duration_ns);
+ 		perf_scaled = mul_fp(perf_scaled, sample_ratio);
+ 	} else {
+-		sample_ratio = div_fp(100 * cpu->sample.mperf, cpu->sample.tsc);
++		sample_ratio = div_fp(100 * (cpu->sample.mperf << cpu->aperf_mperf_shift),
++				      cpu->sample.tsc);
+ 		if (sample_ratio < int_tofp(1))
+ 			perf_scaled = 0;
+ 	}
+@@ -1824,6 +1839,7 @@ static const struct pstate_funcs knl_fun
+ 	.get_max_physical = core_get_max_pstate_physical,
+ 	.get_min = core_get_min_pstate,
+ 	.get_turbo = knl_get_turbo_pstate,
++	.get_aperf_mperf_shift = knl_get_aperf_mperf_shift,
+ 	.get_scaling = core_get_scaling,
+ 	.get_val = core_get_val,
+ 	.update_util = intel_pstate_update_util_pid,
+@@ -2408,6 +2424,7 @@ static void __init copy_cpu_funcs(struct
+ 	pstate_funcs.get_val   = funcs->get_val;
+ 	pstate_funcs.get_vid   = funcs->get_vid;
+ 	pstate_funcs.update_util = funcs->update_util;
++	pstate_funcs.get_aperf_mperf_shift = funcs->get_aperf_mperf_shift;
+ 
+ 	intel_pstate_use_acpi_profile();
+ }
