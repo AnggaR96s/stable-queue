@@ -1,0 +1,97 @@
+From cc89684c9a265828ce061037f1f79f4a68ccd3f7 Mon Sep 17 00:00:00 2001
+From: NeilBrown <neilb@suse.com>
+Date: Wed, 5 Jul 2017 12:22:20 +1000
+Subject: NFS: only invalidate dentrys that are clearly invalid.
+
+From: NeilBrown <neilb@suse.com>
+
+commit cc89684c9a265828ce061037f1f79f4a68ccd3f7 upstream.
+
+Since commit bafc9b754f75 ("vfs: More precise tests in d_invalidate")
+in v3.18, a return of '0' from ->d_revalidate() will cause the dentry
+to be invalidated even if it has filesystems mounted on or it or on a
+descendant.  The mounted filesystem is unmounted.
+
+This means we need to be careful not to return 0 unless the directory
+referred to truly is invalid.  So -ESTALE or -ENOENT should invalidate
+the directory.  Other errors such a -EPERM or -ERESTARTSYS should be
+returned from ->d_revalidate() so they are propagated to the caller.
+
+A particular problem can be demonstrated by:
+
+1/ mount an NFS filesystem using NFSv3 on /mnt
+2/ mount any other filesystem on /mnt/foo
+3/ ls /mnt/foo
+4/ turn off network, or otherwise make the server unable to respond
+5/ ls /mnt/foo &
+6/ cat /proc/$!/stack # note that nfs_lookup_revalidate is in the call stack
+7/ kill -9 $! # this results in -ERESTARTSYS being returned
+8/ observe that /mnt/foo has been unmounted.
+
+This patch changes nfs_lookup_revalidate() to only treat
+  -ESTALE from nfs_lookup_verify_inode() and
+  -ESTALE or -ENOENT from ->lookup()
+as indicating an invalid inode.  Other errors are returned.
+
+Also nfs_check_inode_attributes() is changed to return -ESTALE rather
+than -EIO.  This is consistent with the error returned in similar
+circumstances from nfs_update_inode().
+
+As this bug allows any user to unmount a filesystem mounted on an NFS
+filesystem, this fix is suitable for stable kernels.
+
+Fixes: bafc9b754f75 ("vfs: More precise tests in d_invalidate")
+Signed-off-by: NeilBrown <neilb@suse.com>
+Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/nfs/dir.c   |   12 ++++++++----
+ fs/nfs/inode.c |    4 ++--
+ 2 files changed, 10 insertions(+), 6 deletions(-)
+
+--- a/fs/nfs/dir.c
++++ b/fs/nfs/dir.c
+@@ -1167,11 +1167,13 @@ static int nfs_lookup_revalidate(struct
+ 	/* Force a full look up iff the parent directory has changed */
+ 	if (!nfs_is_exclusive_create(dir, flags) &&
+ 	    nfs_check_verifier(dir, dentry, flags & LOOKUP_RCU)) {
+-
+-		if (nfs_lookup_verify_inode(inode, flags)) {
++		error = nfs_lookup_verify_inode(inode, flags);
++		if (error) {
+ 			if (flags & LOOKUP_RCU)
+ 				return -ECHILD;
+-			goto out_zap_parent;
++			if (error == -ESTALE)
++				goto out_zap_parent;
++			goto out_error;
+ 		}
+ 		goto out_valid;
+ 	}
+@@ -1195,8 +1197,10 @@ static int nfs_lookup_revalidate(struct
+ 	trace_nfs_lookup_revalidate_enter(dir, dentry, flags);
+ 	error = NFS_PROTO(dir)->lookup(dir, &dentry->d_name, fhandle, fattr, label);
+ 	trace_nfs_lookup_revalidate_exit(dir, dentry, flags, error);
+-	if (error)
++	if (error == -ESTALE || error == -ENOENT)
+ 		goto out_bad;
++	if (error)
++		goto out_error;
+ 	if (nfs_compare_fh(NFS_FH(inode), fhandle))
+ 		goto out_bad;
+ 	if ((error = nfs_refresh_inode(inode, fattr)) != 0)
+--- a/fs/nfs/inode.c
++++ b/fs/nfs/inode.c
+@@ -1278,9 +1278,9 @@ static int nfs_check_inode_attributes(st
+ 		return 0;
+ 	/* Has the inode gone and changed behind our back? */
+ 	if ((fattr->valid & NFS_ATTR_FATTR_FILEID) && nfsi->fileid != fattr->fileid)
+-		return -EIO;
++		return -ESTALE;
+ 	if ((fattr->valid & NFS_ATTR_FATTR_TYPE) && (inode->i_mode & S_IFMT) != (fattr->mode & S_IFMT))
+-		return -EIO;
++		return -ESTALE;
+ 
+ 	if (!nfs_file_has_buffered_writers(nfsi)) {
+ 		/* Verify a few of the more important attributes */
