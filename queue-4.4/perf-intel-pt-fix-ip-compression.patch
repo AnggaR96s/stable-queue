@@ -1,0 +1,207 @@
+From e1717e0485af4f47fc4da1e979ac817f9ad61b0f Mon Sep 17 00:00:00 2001
+From: Adrian Hunter <adrian.hunter@intel.com>
+Date: Wed, 20 Jul 2016 12:00:06 +0300
+Subject: perf intel-pt: Fix ip compression
+
+From: Adrian Hunter <adrian.hunter@intel.com>
+
+commit e1717e0485af4f47fc4da1e979ac817f9ad61b0f upstream.
+
+The June 2015 Intel SDM introduced IP Compression types 4 and 6. Refer
+to section 36.4.2.2 Target IP (TIP) Packet - IP Compression.
+
+Existing Intel PT packet decoder did not support type 4, and got type 6
+wrong.  Because type 3 and type 4 have the same number of bytes, the
+packet 'count' has been changed from being the number of ip bytes to
+being the type code.  That allows the Intel PT decoder to correctly
+decide whether to sign-extend or use the last ip.  However that also
+meant the code had to be adjusted in a number of places.
+
+Currently hardware is not using the new compression types, so this fix
+has no effect on existing hardware.
+
+Signed-off-by: Adrian Hunter <adrian.hunter@intel.com>
+Cc: Jiri Olsa <jolsa@redhat.com>
+Link: http://lkml.kernel.org/r/1469005206-3049-1-git-send-email-adrian.hunter@intel.com
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ tools/perf/util/intel-pt-decoder/intel-pt-decoder.c     |   44 ++++++++--------
+ tools/perf/util/intel-pt-decoder/intel-pt-pkt-decoder.c |   24 ++++++--
+ 2 files changed, 40 insertions(+), 28 deletions(-)
+
+--- a/tools/perf/util/intel-pt-decoder/intel-pt-decoder.c
++++ b/tools/perf/util/intel-pt-decoder/intel-pt-decoder.c
+@@ -145,8 +145,6 @@ struct intel_pt_decoder {
+ 	bool have_calc_cyc_to_tsc;
+ 	int exec_mode;
+ 	unsigned int insn_bytes;
+-	uint64_t sign_bit;
+-	uint64_t sign_bits;
+ 	uint64_t period;
+ 	enum intel_pt_period_type period_type;
+ 	uint64_t tot_insn_cnt;
+@@ -214,9 +212,6 @@ struct intel_pt_decoder *intel_pt_decode
+ 	decoder->data               = params->data;
+ 	decoder->return_compression = params->return_compression;
+ 
+-	decoder->sign_bit           = (uint64_t)1 << 47;
+-	decoder->sign_bits          = ~(((uint64_t)1 << 48) - 1);
+-
+ 	decoder->period             = params->period;
+ 	decoder->period_type        = params->period_type;
+ 
+@@ -385,21 +380,30 @@ int intel_pt__strerror(int code, char *b
+ 	return 0;
+ }
+ 
+-static uint64_t intel_pt_calc_ip(struct intel_pt_decoder *decoder,
+-				 const struct intel_pt_pkt *packet,
++static uint64_t intel_pt_calc_ip(const struct intel_pt_pkt *packet,
+ 				 uint64_t last_ip)
+ {
+ 	uint64_t ip;
+ 
+ 	switch (packet->count) {
+-	case 2:
++	case 1:
+ 		ip = (last_ip & (uint64_t)0xffffffffffff0000ULL) |
+ 		     packet->payload;
+ 		break;
+-	case 4:
++	case 2:
+ 		ip = (last_ip & (uint64_t)0xffffffff00000000ULL) |
+ 		     packet->payload;
+ 		break;
++	case 3:
++		ip = packet->payload;
++		/* Sign-extend 6-byte ip */
++		if (ip & (uint64_t)0x800000000000ULL)
++			ip |= (uint64_t)0xffff000000000000ULL;
++		break;
++	case 4:
++		ip = (last_ip & (uint64_t)0xffff000000000000ULL) |
++		     packet->payload;
++		break;
+ 	case 6:
+ 		ip = packet->payload;
+ 		break;
+@@ -407,16 +411,12 @@ static uint64_t intel_pt_calc_ip(struct
+ 		return 0;
+ 	}
+ 
+-	if (ip & decoder->sign_bit)
+-		return ip | decoder->sign_bits;
+-
+ 	return ip;
+ }
+ 
+ static inline void intel_pt_set_last_ip(struct intel_pt_decoder *decoder)
+ {
+-	decoder->last_ip = intel_pt_calc_ip(decoder, &decoder->packet,
+-					    decoder->last_ip);
++	decoder->last_ip = intel_pt_calc_ip(&decoder->packet, decoder->last_ip);
+ }
+ 
+ static inline void intel_pt_set_ip(struct intel_pt_decoder *decoder)
+@@ -1718,6 +1718,12 @@ next:
+ 	}
+ }
+ 
++static inline bool intel_pt_have_ip(struct intel_pt_decoder *decoder)
++{
++	return decoder->last_ip || decoder->packet.count == 0 ||
++	       decoder->packet.count == 3 || decoder->packet.count == 6;
++}
++
+ /* Walk PSB+ packets to get in sync. */
+ static int intel_pt_walk_psb(struct intel_pt_decoder *decoder)
+ {
+@@ -1739,8 +1745,7 @@ static int intel_pt_walk_psb(struct inte
+ 
+ 		case INTEL_PT_FUP:
+ 			decoder->pge = true;
+-			if (decoder->last_ip || decoder->packet.count == 6 ||
+-			    decoder->packet.count == 0) {
++			if (intel_pt_have_ip(decoder)) {
+ 				uint64_t current_ip = decoder->ip;
+ 
+ 				intel_pt_set_ip(decoder);
+@@ -1832,8 +1837,7 @@ static int intel_pt_walk_to_ip(struct in
+ 		case INTEL_PT_TIP_PGE:
+ 		case INTEL_PT_TIP:
+ 			decoder->pge = decoder->packet.type != INTEL_PT_TIP_PGD;
+-			if (decoder->last_ip || decoder->packet.count == 6 ||
+-			    decoder->packet.count == 0)
++			if (intel_pt_have_ip(decoder))
+ 				intel_pt_set_ip(decoder);
+ 			if (decoder->ip)
+ 				return 0;
+@@ -1841,9 +1845,7 @@ static int intel_pt_walk_to_ip(struct in
+ 
+ 		case INTEL_PT_FUP:
+ 			if (decoder->overflow) {
+-				if (decoder->last_ip ||
+-				    decoder->packet.count == 6 ||
+-				    decoder->packet.count == 0)
++				if (intel_pt_have_ip(decoder))
+ 					intel_pt_set_ip(decoder);
+ 				if (decoder->ip)
+ 					return 0;
+--- a/tools/perf/util/intel-pt-decoder/intel-pt-pkt-decoder.c
++++ b/tools/perf/util/intel-pt-decoder/intel-pt-pkt-decoder.c
+@@ -293,36 +293,46 @@ static int intel_pt_get_ip(enum intel_pt
+ 			   const unsigned char *buf, size_t len,
+ 			   struct intel_pt_pkt *packet)
+ {
+-	switch (byte >> 5) {
++	int ip_len;
++
++	packet->count = byte >> 5;
++
++	switch (packet->count) {
+ 	case 0:
+-		packet->count = 0;
++		ip_len = 0;
+ 		break;
+ 	case 1:
+ 		if (len < 3)
+ 			return INTEL_PT_NEED_MORE_BYTES;
+-		packet->count = 2;
++		ip_len = 2;
+ 		packet->payload = le16_to_cpu(*(uint16_t *)(buf + 1));
+ 		break;
+ 	case 2:
+ 		if (len < 5)
+ 			return INTEL_PT_NEED_MORE_BYTES;
+-		packet->count = 4;
++		ip_len = 4;
+ 		packet->payload = le32_to_cpu(*(uint32_t *)(buf + 1));
+ 		break;
+ 	case 3:
+-	case 6:
++	case 4:
+ 		if (len < 7)
+ 			return INTEL_PT_NEED_MORE_BYTES;
+-		packet->count = 6;
++		ip_len = 6;
+ 		memcpy_le64(&packet->payload, buf + 1, 6);
+ 		break;
++	case 6:
++		if (len < 9)
++			return INTEL_PT_NEED_MORE_BYTES;
++		ip_len = 8;
++		packet->payload = le64_to_cpu(*(uint64_t *)(buf + 1));
++		break;
+ 	default:
+ 		return INTEL_PT_BAD_PACKET;
+ 	}
+ 
+ 	packet->type = type;
+ 
+-	return packet->count + 1;
++	return ip_len + 1;
+ }
+ 
+ static int intel_pt_get_mode(const unsigned char *buf, size_t len,
