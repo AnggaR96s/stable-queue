@@ -1,0 +1,120 @@
+From 5ec8a1753bc29efa7e4b1391d691c9c719b30257 Mon Sep 17 00:00:00 2001
+From: Calvin Owens <calvinowens@fb.com>
+Date: Fri, 18 Mar 2016 12:45:42 -0700
+Subject: mpt3sas: Don't overreach ioc->reply_post[] during initialization
+
+From: Calvin Owens <calvinowens@fb.com>
+
+commit 5ec8a1753bc29efa7e4b1391d691c9c719b30257 upstream.
+
+In _base_make_ioc_operational(), we walk ioc->reply_queue_list and pull
+a pointer out of successive elements of ioc->reply_post[] for each entry
+in that list if RDPQ is enabled.
+
+Since the code pulls the pointer for the next iteration at the bottom of
+the loop, it triggers the a KASAN dump on the final iteration:
+
+    BUG: KASAN: slab-out-of-bounds in _base_make_ioc_operational+0x47b7/0x47e0 [mpt3sas] at addr ffff880754816ab0
+    Read of size 8 by task modprobe/305
+    <snip>
+    Call Trace:
+     [<ffffffff81dfc591>] dump_stack+0x4d/0x6c
+     [<ffffffff814c9689>] print_trailer+0xf9/0x150
+     [<ffffffff814ceda4>] object_err+0x34/0x40
+     [<ffffffff814d1231>] kasan_report_error+0x221/0x530
+     [<ffffffff814d1673>] __asan_report_load8_noabort+0x43/0x50
+     [<ffffffffa0043637>] _base_make_ioc_operational+0x47b7/0x47e0 [mpt3sas]
+     [<ffffffffa0049a51>] mpt3sas_base_attach+0x1991/0x2120 [mpt3sas]
+     [<ffffffffa0053c93>] _scsih_probe+0xeb3/0x16b0 [mpt3sas]
+     [<ffffffff81ebd047>] local_pci_probe+0xc7/0x170
+     [<ffffffff81ebf2cf>] pci_device_probe+0x20f/0x290
+     [<ffffffff820d50cd>] really_probe+0x17d/0x600
+     [<ffffffff820d56a3>] __driver_attach+0x153/0x190
+     [<ffffffff820cffac>] bus_for_each_dev+0x11c/0x1a0
+     [<ffffffff820d421d>] driver_attach+0x3d/0x50
+     [<ffffffff820d378a>] bus_add_driver+0x44a/0x5f0
+     [<ffffffff820d666c>] driver_register+0x18c/0x3b0
+     [<ffffffff81ebcb76>] __pci_register_driver+0x156/0x200
+     [<ffffffffa00c8135>] _mpt3sas_init+0x135/0x1000 [mpt3sas]
+     [<ffffffff81000423>] do_one_initcall+0x113/0x2b0
+     [<ffffffff813caa5a>] do_init_module+0x1d0/0x4d8
+     [<ffffffff81273909>] load_module+0x6729/0x8dc0
+     [<ffffffff81276123>] SYSC_init_module+0x183/0x1a0
+     [<ffffffff8127625e>] SyS_init_module+0xe/0x10
+     [<ffffffff828fe7d7>] entry_SYSCALL_64_fastpath+0x12/0x6a
+
+Fix this by pulling the value at the beginning of the loop.
+
+Signed-off-by: Calvin Owens <calvinowens@fb.com>
+Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+Reviewed-by: Jens Axboe <axboe@fb.com>
+Acked-by: Chaitra Basappa <chaitra.basappa@broadcom.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Amit Pundir <amit.pundir@linaro.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/scsi/mpt3sas/mpt3sas_base.c |   33 ++++++++++++++++-----------------
+ 1 file changed, 16 insertions(+), 17 deletions(-)
+
+--- a/drivers/scsi/mpt3sas/mpt3sas_base.c
++++ b/drivers/scsi/mpt3sas/mpt3sas_base.c
+@@ -4378,14 +4378,13 @@ _base_make_ioc_ready(struct MPT3SAS_ADAP
+ static int
+ _base_make_ioc_operational(struct MPT3SAS_ADAPTER *ioc, int sleep_flag)
+ {
+-	int r, i;
++	int r, i, index;
+ 	unsigned long	flags;
+ 	u32 reply_address;
+ 	u16 smid;
+ 	struct _tr_list *delayed_tr, *delayed_tr_next;
+ 	struct adapter_reply_queue *reply_q;
+-	long reply_post_free;
+-	u32 reply_post_free_sz, index = 0;
++	Mpi2ReplyDescriptorsUnion_t *reply_post_free_contig;
+ 
+ 	dinitprintk(ioc, pr_info(MPT3SAS_FMT "%s\n", ioc->name,
+ 	    __func__));
+@@ -4456,27 +4455,27 @@ _base_make_ioc_operational(struct MPT3SA
+ 		_base_assign_reply_queues(ioc);
+ 
+ 	/* initialize Reply Post Free Queue */
+-	reply_post_free_sz = ioc->reply_post_queue_depth *
+-	    sizeof(Mpi2DefaultReplyDescriptor_t);
+-	reply_post_free = (long)ioc->reply_post[index].reply_post_free;
++	index = 0;
++	reply_post_free_contig = ioc->reply_post[0].reply_post_free;
+ 	list_for_each_entry(reply_q, &ioc->reply_queue_list, list) {
++		/*
++		 * If RDPQ is enabled, switch to the next allocation.
++		 * Otherwise advance within the contiguous region.
++		 */
++		if (ioc->rdpq_array_enable) {
++			reply_q->reply_post_free =
++				ioc->reply_post[index++].reply_post_free;
++		} else {
++			reply_q->reply_post_free = reply_post_free_contig;
++			reply_post_free_contig += ioc->reply_post_queue_depth;
++		}
++
+ 		reply_q->reply_post_host_index = 0;
+-		reply_q->reply_post_free = (Mpi2ReplyDescriptorsUnion_t *)
+-		    reply_post_free;
+ 		for (i = 0; i < ioc->reply_post_queue_depth; i++)
+ 			reply_q->reply_post_free[i].Words =
+ 			    cpu_to_le64(ULLONG_MAX);
+ 		if (!_base_is_controller_msix_enabled(ioc))
+ 			goto skip_init_reply_post_free_queue;
+-		/*
+-		 * If RDPQ is enabled, switch to the next allocation.
+-		 * Otherwise advance within the contiguous region.
+-		 */
+-		if (ioc->rdpq_array_enable)
+-			reply_post_free = (long)
+-			    ioc->reply_post[++index].reply_post_free;
+-		else
+-			reply_post_free += reply_post_free_sz;
+ 	}
+  skip_init_reply_post_free_queue:
+ 
