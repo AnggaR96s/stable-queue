@@ -1,0 +1,106 @@
+From 2497128133f8169b24b928852ba6eae34fc495e5 Mon Sep 17 00:00:00 2001
+From: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+Date: Sat, 4 Feb 2017 10:16:56 +0900
+Subject: nfc: Fix hangup of RC-S380* in port100_send_ack()
+
+From: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+
+commit 2497128133f8169b24b928852ba6eae34fc495e5 upstream.
+
+If port100_send_ack() was called twice or more, it has race to hangup.
+
+  port100_send_ack()          port100_send_ack()
+    init_completion()
+    [...]
+    dev->cmd_cancel = true
+                                /* this removes previous from completion */
+                                init_completion()
+				[...]
+                                dev->cmd_cancel = true
+                                wait_for_completion()
+    /* never be waked up */
+    wait_for_completion()
+
+Like above race, this code is not assuming port100_send_ack() is
+called twice or more.
+
+To fix, this checks dev->cmd_cancel to know if prior cancel is
+in-flight or not. And never be remove prior task from completion by
+using reinit_completion(), so this guarantees to be waked up properly
+soon or later.
+
+Signed-off-by: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+Signed-off-by: Samuel Ortiz <sameo@linux.intel.com>
+Signed-off-by: Amit Pundir <amit.pundir@linaro.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/nfc/port100.c |   37 ++++++++++++++++++++++++-------------
+ 1 file changed, 24 insertions(+), 13 deletions(-)
+
+--- a/drivers/nfc/port100.c
++++ b/drivers/nfc/port100.c
+@@ -725,23 +725,33 @@ static int port100_submit_urb_for_ack(st
+ 
+ static int port100_send_ack(struct port100 *dev)
+ {
+-	int rc;
++	int rc = 0;
+ 
+ 	mutex_lock(&dev->out_urb_lock);
+ 
+-	init_completion(&dev->cmd_cancel_done);
+-
+-	usb_kill_urb(dev->out_urb);
++	/*
++	 * If prior cancel is in-flight (dev->cmd_cancel == true), we
++	 * can skip to send cancel. Then this will wait the prior
++	 * cancel, or merged into the next cancel rarely if next
++	 * cancel was started before waiting done. In any case, this
++	 * will be waked up soon or later.
++	 */
++	if (!dev->cmd_cancel) {
++		reinit_completion(&dev->cmd_cancel_done);
+ 
+-	dev->out_urb->transfer_buffer = ack_frame;
+-	dev->out_urb->transfer_buffer_length = sizeof(ack_frame);
+-	rc = usb_submit_urb(dev->out_urb, GFP_KERNEL);
++		usb_kill_urb(dev->out_urb);
+ 
+-	/* Set the cmd_cancel flag only if the URB has been successfully
+-	 * submitted. It will be reset by the out URB completion callback
+-	 * port100_send_complete().
+-	 */
+-	dev->cmd_cancel = !rc;
++		dev->out_urb->transfer_buffer = ack_frame;
++		dev->out_urb->transfer_buffer_length = sizeof(ack_frame);
++		rc = usb_submit_urb(dev->out_urb, GFP_KERNEL);
++
++		/*
++		 * Set the cmd_cancel flag only if the URB has been
++		 * successfully submitted. It will be reset by the out
++		 * URB completion callback port100_send_complete().
++		 */
++		dev->cmd_cancel = !rc;
++	}
+ 
+ 	mutex_unlock(&dev->out_urb_lock);
+ 
+@@ -928,8 +938,8 @@ static void port100_send_complete(struct
+ 	struct port100 *dev = urb->context;
+ 
+ 	if (dev->cmd_cancel) {
++		complete_all(&dev->cmd_cancel_done);
+ 		dev->cmd_cancel = false;
+-		complete(&dev->cmd_cancel_done);
+ 	}
+ 
+ 	switch (urb->status) {
+@@ -1543,6 +1553,7 @@ static int port100_probe(struct usb_inte
+ 			    PORT100_COMM_RF_HEAD_MAX_LEN;
+ 	dev->skb_tailroom = PORT100_FRAME_TAIL_LEN;
+ 
++	init_completion(&dev->cmd_cancel_done);
+ 	INIT_WORK(&dev->cmd_complete_work, port100_wq_cmd_complete);
+ 
+ 	/* The first thing to do with the Port-100 is to set the command type
