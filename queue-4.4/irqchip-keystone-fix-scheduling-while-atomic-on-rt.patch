@@ -1,0 +1,129 @@
+From foo@baz Fri Aug  4 13:34:53 PDT 2017
+From: "Strashko, Grygorii" <grygorii.strashko@ti.com>
+Date: Thu, 8 Dec 2016 17:33:10 -0600
+Subject: irqchip/keystone: Fix "scheduling while atomic" on rt
+
+From: "Strashko, Grygorii" <grygorii.strashko@ti.com>
+
+
+[ Upstream commit 2f884e6e688a0deb69e6c9552e51aef8b7e3f5f1 ]
+
+The below call chain generates "scheduling while atomic" backtrace and
+causes system crash when Keystone 2 IRQ chip driver is used with RT-kernel:
+
+gic_handle_irq()
+ |-__handle_domain_irq()
+  |-generic_handle_irq()
+   |-keystone_irq_handler()
+    |-regmap_read()
+     |-regmap_lock_spinlock()
+      |-rt_spin_lock()
+
+The reason is that Keystone driver dispatches IRQ using chained IRQ handler
+and accesses I/O memory through syscon->regmap(mmio) which is implemented
+as fast_io regmap and uses regular spinlocks for synchronization, but
+spinlocks transformed to rt_mutexes on RT.
+
+Hence, convert Keystone 2 IRQ driver to use generic irq handler instead of
+chained IRQ handler. This way it will be compatible with RT kernel where it
+will be forced thread IRQ handler while in non-RT kernel it still will be
+executed in HW IRQ context.
+
+Cc: Suman Anna <s-anna@ti.com>
+Signed-off-by: Grygorii Strashko <grygorii.strashko@ti.com>
+Tested-by: Suman Anna <s-anna@ti.com>
+Link: https://lkml.kernel.org/r/20161208233310.10329-1-grygorii.strashko@ti.com
+Signed-off-by: Jason Cooper <jason@lakedaemon.net>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/irqchip/irq-keystone.c |   28 +++++++++++++++++++---------
+ 1 file changed, 19 insertions(+), 9 deletions(-)
+
+--- a/drivers/irqchip/irq-keystone.c
++++ b/drivers/irqchip/irq-keystone.c
+@@ -19,9 +19,9 @@
+ #include <linux/bitops.h>
+ #include <linux/module.h>
+ #include <linux/moduleparam.h>
++#include <linux/interrupt.h>
+ #include <linux/irqdomain.h>
+ #include <linux/irqchip.h>
+-#include <linux/irqchip/chained_irq.h>
+ #include <linux/of.h>
+ #include <linux/of_platform.h>
+ #include <linux/mfd/syscon.h>
+@@ -39,6 +39,7 @@ struct keystone_irq_device {
+ 	struct irq_domain	*irqd;
+ 	struct regmap		*devctrl_regs;
+ 	u32			devctrl_offset;
++	raw_spinlock_t		wa_lock;
+ };
+ 
+ static inline u32 keystone_irq_readl(struct keystone_irq_device *kirq)
+@@ -83,17 +84,15 @@ static void keystone_irq_ack(struct irq_
+ 	/* nothing to do here */
+ }
+ 
+-static void keystone_irq_handler(struct irq_desc *desc)
++static irqreturn_t keystone_irq_handler(int irq, void *keystone_irq)
+ {
+-	unsigned int irq = irq_desc_get_irq(desc);
+-	struct keystone_irq_device *kirq = irq_desc_get_handler_data(desc);
++	struct keystone_irq_device *kirq = keystone_irq;
++	unsigned long wa_lock_flags;
+ 	unsigned long pending;
+ 	int src, virq;
+ 
+ 	dev_dbg(kirq->dev, "start irq %d\n", irq);
+ 
+-	chained_irq_enter(irq_desc_get_chip(desc), desc);
+-
+ 	pending = keystone_irq_readl(kirq);
+ 	keystone_irq_writel(kirq, pending);
+ 
+@@ -111,13 +110,15 @@ static void keystone_irq_handler(struct
+ 			if (!virq)
+ 				dev_warn(kirq->dev, "sporious irq detected hwirq %d, virq %d\n",
+ 					 src, virq);
++			raw_spin_lock_irqsave(&kirq->wa_lock, wa_lock_flags);
+ 			generic_handle_irq(virq);
++			raw_spin_unlock_irqrestore(&kirq->wa_lock,
++						   wa_lock_flags);
+ 		}
+ 	}
+ 
+-	chained_irq_exit(irq_desc_get_chip(desc), desc);
+-
+ 	dev_dbg(kirq->dev, "end irq %d\n", irq);
++	return IRQ_HANDLED;
+ }
+ 
+ static int keystone_irq_map(struct irq_domain *h, unsigned int virq,
+@@ -182,9 +183,16 @@ static int keystone_irq_probe(struct pla
+ 		return -ENODEV;
+ 	}
+ 
++	raw_spin_lock_init(&kirq->wa_lock);
++
+ 	platform_set_drvdata(pdev, kirq);
+ 
+-	irq_set_chained_handler_and_data(kirq->irq, keystone_irq_handler, kirq);
++	ret = request_irq(kirq->irq, keystone_irq_handler,
++			  0, dev_name(dev), kirq);
++	if (ret) {
++		irq_domain_remove(kirq->irqd);
++		return ret;
++	}
+ 
+ 	/* clear all source bits */
+ 	keystone_irq_writel(kirq, ~0x0);
+@@ -199,6 +207,8 @@ static int keystone_irq_remove(struct pl
+ 	struct keystone_irq_device *kirq = platform_get_drvdata(pdev);
+ 	int hwirq;
+ 
++	free_irq(kirq->irq, kirq);
++
+ 	for (hwirq = 0; hwirq < KEYSTONE_N_IRQ; hwirq++)
+ 		irq_dispose_mapping(irq_find_mapping(kirq->irqd, hwirq));
+ 
