@@ -1,0 +1,162 @@
+From 663deb47880f2283809669563c5a52ac7c6aef1a Mon Sep 17 00:00:00 2001
+From: Joel Fernandes <joelaf@google.com>
+Date: Thu, 20 Oct 2016 00:34:01 -0700
+Subject: pstore: Allow prz to control need for locking
+
+From: Joel Fernandes <joelaf@google.com>
+
+commit 663deb47880f2283809669563c5a52ac7c6aef1a upstream.
+
+In preparation of not locking at all for certain buffers depending on if
+there's contention, make locking optional depending on the initialization
+of the prz.
+
+Signed-off-by: Joel Fernandes <joelaf@google.com>
+[kees: moved locking flag into prz instead of via caller arguments]
+Signed-off-by: Kees Cook <keescook@chromium.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/pstore/ram.c            |    5 +++--
+ fs/pstore/ram_core.c       |   24 +++++++++++++++---------
+ include/linux/pstore_ram.h |   10 +++++++++-
+ 3 files changed, 27 insertions(+), 12 deletions(-)
+
+--- a/fs/pstore/ram.c
++++ b/fs/pstore/ram.c
+@@ -413,7 +413,7 @@ static int ramoops_init_przs(struct devi
+ 	for (i = 0; i < cxt->max_dump_cnt; i++) {
+ 		cxt->przs[i] = persistent_ram_new(*paddr, cxt->record_size, 0,
+ 						  &cxt->ecc_info,
+-						  cxt->memtype);
++						  cxt->memtype, 0);
+ 		if (IS_ERR(cxt->przs[i])) {
+ 			err = PTR_ERR(cxt->przs[i]);
+ 			dev_err(dev, "failed to request mem region (0x%zx@0x%llx): %d\n",
+@@ -450,7 +450,8 @@ static int ramoops_init_prz(struct devic
+ 		return -ENOMEM;
+ 	}
+ 
+-	*prz = persistent_ram_new(*paddr, sz, sig, &cxt->ecc_info, cxt->memtype);
++	*prz = persistent_ram_new(*paddr, sz, sig, &cxt->ecc_info,
++				  cxt->memtype, 0);
+ 	if (IS_ERR(*prz)) {
+ 		int err = PTR_ERR(*prz);
+ 
+--- a/fs/pstore/ram_core.c
++++ b/fs/pstore/ram_core.c
+@@ -52,9 +52,10 @@ static size_t buffer_start_add(struct pe
+ {
+ 	int old;
+ 	int new;
+-	unsigned long flags;
++	unsigned long flags = 0;
+ 
+-	raw_spin_lock_irqsave(&prz->buffer_lock, flags);
++	if (!(prz->flags & PRZ_FLAG_NO_LOCK))
++		raw_spin_lock_irqsave(&prz->buffer_lock, flags);
+ 
+ 	old = atomic_read(&prz->buffer->start);
+ 	new = old + a;
+@@ -62,7 +63,8 @@ static size_t buffer_start_add(struct pe
+ 		new -= prz->buffer_size;
+ 	atomic_set(&prz->buffer->start, new);
+ 
+-	raw_spin_unlock_irqrestore(&prz->buffer_lock, flags);
++	if (!(prz->flags & PRZ_FLAG_NO_LOCK))
++		raw_spin_unlock_irqrestore(&prz->buffer_lock, flags);
+ 
+ 	return old;
+ }
+@@ -72,9 +74,10 @@ static void buffer_size_add(struct persi
+ {
+ 	size_t old;
+ 	size_t new;
+-	unsigned long flags;
++	unsigned long flags = 0;
+ 
+-	raw_spin_lock_irqsave(&prz->buffer_lock, flags);
++	if (!(prz->flags & PRZ_FLAG_NO_LOCK))
++		raw_spin_lock_irqsave(&prz->buffer_lock, flags);
+ 
+ 	old = atomic_read(&prz->buffer->size);
+ 	if (old == prz->buffer_size)
+@@ -86,7 +89,8 @@ static void buffer_size_add(struct persi
+ 	atomic_set(&prz->buffer->size, new);
+ 
+ exit:
+-	raw_spin_unlock_irqrestore(&prz->buffer_lock, flags);
++	if (!(prz->flags & PRZ_FLAG_NO_LOCK))
++		raw_spin_unlock_irqrestore(&prz->buffer_lock, flags);
+ }
+ 
+ static void notrace persistent_ram_encode_rs8(struct persistent_ram_zone *prz,
+@@ -420,7 +424,8 @@ static int persistent_ram_buffer_map(phy
+ }
+ 
+ static int persistent_ram_post_init(struct persistent_ram_zone *prz, u32 sig,
+-				    struct persistent_ram_ecc_info *ecc_info)
++				    struct persistent_ram_ecc_info *ecc_info,
++				    unsigned long flags)
+ {
+ 	int ret;
+ 
+@@ -449,6 +454,7 @@ static int persistent_ram_post_init(stru
+ 	prz->buffer->sig = sig;
+ 	persistent_ram_zap(prz);
+ 	prz->buffer_lock = __RAW_SPIN_LOCK_UNLOCKED(buffer_lock);
++	prz->flags = flags;
+ 
+ 	return 0;
+ }
+@@ -473,7 +479,7 @@ void persistent_ram_free(struct persiste
+ 
+ struct persistent_ram_zone *persistent_ram_new(phys_addr_t start, size_t size,
+ 			u32 sig, struct persistent_ram_ecc_info *ecc_info,
+-			unsigned int memtype)
++			unsigned int memtype, u32 flags)
+ {
+ 	struct persistent_ram_zone *prz;
+ 	int ret = -ENOMEM;
+@@ -488,7 +494,7 @@ struct persistent_ram_zone *persistent_r
+ 	if (ret)
+ 		goto err;
+ 
+-	ret = persistent_ram_post_init(prz, sig, ecc_info);
++	ret = persistent_ram_post_init(prz, sig, ecc_info, flags);
+ 	if (ret)
+ 		goto err;
+ 
+--- a/include/linux/pstore_ram.h
++++ b/include/linux/pstore_ram.h
+@@ -23,6 +23,13 @@
+ #include <linux/types.h>
+ #include <linux/init.h>
+ 
++/*
++ * Choose whether access to the RAM zone requires locking or not.  If a zone
++ * can be written to from different CPUs like with ftrace for example, then
++ * PRZ_FLAG_NO_LOCK is used. For all other cases, locking is required.
++ */
++#define PRZ_FLAG_NO_LOCK	BIT(0)
++
+ struct persistent_ram_buffer;
+ struct rs_control;
+ 
+@@ -39,6 +46,7 @@ struct persistent_ram_zone {
+ 	void *vaddr;
+ 	struct persistent_ram_buffer *buffer;
+ 	size_t buffer_size;
++	u32 flags;
+ 	raw_spinlock_t buffer_lock;
+ 
+ 	/* ECC correction */
+@@ -55,7 +63,7 @@ struct persistent_ram_zone {
+ 
+ struct persistent_ram_zone *persistent_ram_new(phys_addr_t start, size_t size,
+ 			u32 sig, struct persistent_ram_ecc_info *ecc_info,
+-			unsigned int memtype);
++			unsigned int memtype, u32 flags);
+ void persistent_ram_free(struct persistent_ram_zone *prz);
+ void persistent_ram_zap(struct persistent_ram_zone *prz);
+ 
