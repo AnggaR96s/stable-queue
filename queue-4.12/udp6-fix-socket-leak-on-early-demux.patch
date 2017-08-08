@@ -1,0 +1,127 @@
+From foo@baz Tue Aug  8 16:27:29 PDT 2017
+From: Paolo Abeni <pabeni@redhat.com>
+Date: Thu, 27 Jul 2017 14:45:09 +0200
+Subject: udp6: fix socket leak on early demux
+
+From: Paolo Abeni <pabeni@redhat.com>
+
+
+[ Upstream commit c9f2c1ae123a751d4e4f949144500219354d5ee1 ]
+
+When an early demuxed packet reaches __udp6_lib_lookup_skb(), the
+sk reference is retrieved and used, but the relevant reference
+count is leaked and the socket destructor is never called.
+Beyond leaking the sk memory, if there are pending UDP packets
+in the receive queue, even the related accounted memory is leaked.
+
+In the long run, this will cause persistent forward allocation errors
+and no UDP skbs (both ipv4 and ipv6) will be able to reach the
+user-space.
+
+Fix this by explicitly accessing the early demux reference before
+the lookup, and properly decreasing the socket reference count
+after usage.
+
+Also drop the skb_steal_sock() in __udp6_lib_lookup_skb(), and
+the now obsoleted comment about "socket cache".
+
+The newly added code is derived from the current ipv4 code for the
+similar path.
+
+v1 -> v2:
+  fixed the __udp6_lib_rcv() return code for resubmission,
+  as suggested by Eric
+
+Reported-by: Sam Edwards <CFSworks@gmail.com>
+Reported-by: Marc Haber <mh+netdev@zugschlus.de>
+Fixes: 5425077d73e0 ("net: ipv6: Add early demux handler for UDP unicast")
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Acked-by: Eric Dumazet <edumazet@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/net/udp.h |    1 +
+ net/ipv4/udp.c    |    3 ++-
+ net/ipv6/udp.c    |   27 ++++++++++++++++++---------
+ 3 files changed, 21 insertions(+), 10 deletions(-)
+
+--- a/include/net/udp.h
++++ b/include/net/udp.h
+@@ -265,6 +265,7 @@ static inline struct sk_buff *skb_recv_u
+ }
+ 
+ void udp_v4_early_demux(struct sk_buff *skb);
++void udp_sk_rx_dst_set(struct sock *sk, struct dst_entry *dst);
+ int udp_get_port(struct sock *sk, unsigned short snum,
+ 		 int (*saddr_cmp)(const struct sock *,
+ 				  const struct sock *));
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@ -1762,7 +1762,7 @@ drop:
+ /* For TCP sockets, sk_rx_dst is protected by socket lock
+  * For UDP, we use xchg() to guard against concurrent changes.
+  */
+-static void udp_sk_rx_dst_set(struct sock *sk, struct dst_entry *dst)
++void udp_sk_rx_dst_set(struct sock *sk, struct dst_entry *dst)
+ {
+ 	struct dst_entry *old;
+ 
+@@ -2120,6 +2120,7 @@ void udp_destroy_sock(struct sock *sk)
+ 			encap_destroy(sk);
+ 	}
+ }
++EXPORT_SYMBOL(udp_sk_rx_dst_set);
+ 
+ /*
+  *	Socket option code for UDP
+--- a/net/ipv6/udp.c
++++ b/net/ipv6/udp.c
+@@ -291,11 +291,7 @@ static struct sock *__udp6_lib_lookup_sk
+ 					  struct udp_table *udptable)
+ {
+ 	const struct ipv6hdr *iph = ipv6_hdr(skb);
+-	struct sock *sk;
+ 
+-	sk = skb_steal_sock(skb);
+-	if (unlikely(sk))
+-		return sk;
+ 	return __udp6_lib_lookup(dev_net(skb->dev), &iph->saddr, sport,
+ 				 &iph->daddr, dport, inet6_iif(skb),
+ 				 udptable, skb);
+@@ -798,6 +794,24 @@ int __udp6_lib_rcv(struct sk_buff *skb,
+ 	if (udp6_csum_init(skb, uh, proto))
+ 		goto csum_error;
+ 
++	/* Check if the socket is already available, e.g. due to early demux */
++	sk = skb_steal_sock(skb);
++	if (sk) {
++		struct dst_entry *dst = skb_dst(skb);
++		int ret;
++
++		if (unlikely(sk->sk_rx_dst != dst))
++			udp_sk_rx_dst_set(sk, dst);
++
++		ret = udpv6_queue_rcv_skb(sk, skb);
++		sock_put(sk);
++
++		/* a return value > 0 means to resubmit the input */
++		if (ret > 0)
++			return ret;
++		return 0;
++	}
++
+ 	/*
+ 	 *	Multicast receive code
+ 	 */
+@@ -806,11 +820,6 @@ int __udp6_lib_rcv(struct sk_buff *skb,
+ 				saddr, daddr, udptable, proto);
+ 
+ 	/* Unicast */
+-
+-	/*
+-	 * check socket cache ... must talk to Alan about his plans
+-	 * for sock caches... i'll skip this for now.
+-	 */
+ 	sk = __udp6_lib_lookup_skb(skb, uh->source, uh->dest, udptable);
+ 	if (sk) {
+ 		int ret;
