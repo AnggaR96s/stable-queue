@@ -1,0 +1,170 @@
+From 5e0cf5e6c43b9e19fc0284f69e5cd2b4a47523b0 Mon Sep 17 00:00:00 2001
+From: Jiang Yi <jiangyilism@gmail.com>
+Date: Tue, 16 May 2017 17:57:55 +0800
+Subject: iscsi-target: Always wait for kthread_should_stop() before kthread exit
+
+From: Jiang Yi <jiangyilism@gmail.com>
+
+commit 5e0cf5e6c43b9e19fc0284f69e5cd2b4a47523b0 upstream.
+
+There are three timing problems in the kthread usages of iscsi_target_mod:
+
+ - np_thread of struct iscsi_np
+ - rx_thread and tx_thread of struct iscsi_conn
+
+In iscsit_close_connection(), it calls
+
+ send_sig(SIGINT, conn->tx_thread, 1);
+ kthread_stop(conn->tx_thread);
+
+In conn->tx_thread, which is iscsi_target_tx_thread(), when it receive
+SIGINT the kthread will exit without checking the return value of
+kthread_should_stop().
+
+So if iscsi_target_tx_thread() exit right between send_sig(SIGINT...)
+and kthread_stop(...), the kthread_stop() will try to stop an already
+stopped kthread.
+
+This is invalid according to the documentation of kthread_stop().
+
+(Fix -ECONNRESET logout handling in iscsi_target_tx_thread and
+ early iscsi_target_rx_thread failure case - nab)
+
+Signed-off-by: Jiang Yi <jiangyilism@gmail.com>
+Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+
+---
+ drivers/target/iscsi/iscsi_target.c       |   28 ++++++++++++++++++++++------
+ drivers/target/iscsi/iscsi_target_erl0.c  |    6 +++++-
+ drivers/target/iscsi/iscsi_target_erl0.h  |    2 +-
+ drivers/target/iscsi/iscsi_target_login.c |    4 ++++
+ 4 files changed, 32 insertions(+), 8 deletions(-)
+
+--- a/drivers/target/iscsi/iscsi_target.c
++++ b/drivers/target/iscsi/iscsi_target.c
+@@ -3965,6 +3965,8 @@ int iscsi_target_tx_thread(void *arg)
+ {
+ 	int ret = 0;
+ 	struct iscsi_conn *conn = arg;
++	bool conn_freed = false;
++
+ 	/*
+ 	 * Allow ourselves to be interrupted by SIGINT so that a
+ 	 * connection recovery / failure event can be triggered externally.
+@@ -3990,12 +3992,14 @@ get_immediate:
+ 			goto transport_err;
+ 
+ 		ret = iscsit_handle_response_queue(conn);
+-		if (ret == 1)
++		if (ret == 1) {
+ 			goto get_immediate;
+-		else if (ret == -ECONNRESET)
++		} else if (ret == -ECONNRESET) {
++			conn_freed = true;
+ 			goto out;
+-		else if (ret < 0)
++		} else if (ret < 0) {
+ 			goto transport_err;
++		}
+ 	}
+ 
+ transport_err:
+@@ -4005,8 +4009,13 @@ transport_err:
+ 	 * responsible for cleaning up the early connection failure.
+ 	 */
+ 	if (conn->conn_state != TARG_CONN_STATE_IN_LOGIN)
+-		iscsit_take_action_for_connection_exit(conn);
++		iscsit_take_action_for_connection_exit(conn, &conn_freed);
+ out:
++	if (!conn_freed) {
++		while (!kthread_should_stop()) {
++			msleep(100);
++		}
++	}
+ 	return 0;
+ }
+ 
+@@ -4105,6 +4114,7 @@ int iscsi_target_rx_thread(void *arg)
+ 	u32 checksum = 0, digest = 0;
+ 	struct iscsi_conn *conn = arg;
+ 	struct kvec iov;
++	bool conn_freed = false;
+ 	/*
+ 	 * Allow ourselves to be interrupted by SIGINT so that a
+ 	 * connection recovery / failure event can be triggered externally.
+@@ -4116,7 +4126,7 @@ int iscsi_target_rx_thread(void *arg)
+ 	 */
+ 	rc = wait_for_completion_interruptible(&conn->rx_login_comp);
+ 	if (rc < 0 || iscsi_target_check_conn_state(conn))
+-		return 0;
++		goto out;
+ 
+ 	if (conn->conn_transport->transport_type == ISCSI_INFINIBAND) {
+ 		struct completion comp;
+@@ -4201,7 +4211,13 @@ int iscsi_target_rx_thread(void *arg)
+ transport_err:
+ 	if (!signal_pending(current))
+ 		atomic_set(&conn->transport_failed, 1);
+-	iscsit_take_action_for_connection_exit(conn);
++	iscsit_take_action_for_connection_exit(conn, &conn_freed);
++out:
++	if (!conn_freed) {
++		while (!kthread_should_stop()) {
++			msleep(100);
++		}
++	}
+ 	return 0;
+ }
+ 
+--- a/drivers/target/iscsi/iscsi_target_erl0.c
++++ b/drivers/target/iscsi/iscsi_target_erl0.c
+@@ -930,8 +930,10 @@ static void iscsit_handle_connection_cle
+ 	}
+ }
+ 
+-void iscsit_take_action_for_connection_exit(struct iscsi_conn *conn)
++void iscsit_take_action_for_connection_exit(struct iscsi_conn *conn, bool *conn_freed)
+ {
++	*conn_freed = false;
++
+ 	spin_lock_bh(&conn->state_lock);
+ 	if (atomic_read(&conn->connection_exit)) {
+ 		spin_unlock_bh(&conn->state_lock);
+@@ -942,6 +944,7 @@ void iscsit_take_action_for_connection_e
+ 	if (conn->conn_state == TARG_CONN_STATE_IN_LOGOUT) {
+ 		spin_unlock_bh(&conn->state_lock);
+ 		iscsit_close_connection(conn);
++		*conn_freed = true;
+ 		return;
+ 	}
+ 
+@@ -955,4 +958,5 @@ void iscsit_take_action_for_connection_e
+ 	spin_unlock_bh(&conn->state_lock);
+ 
+ 	iscsit_handle_connection_cleanup(conn);
++	*conn_freed = true;
+ }
+--- a/drivers/target/iscsi/iscsi_target_erl0.h
++++ b/drivers/target/iscsi/iscsi_target_erl0.h
+@@ -9,6 +9,6 @@ extern int iscsit_stop_time2retain_timer
+ extern void iscsit_connection_reinstatement_rcfr(struct iscsi_conn *);
+ extern void iscsit_cause_connection_reinstatement(struct iscsi_conn *, int);
+ extern void iscsit_fall_back_to_erl0(struct iscsi_session *);
+-extern void iscsit_take_action_for_connection_exit(struct iscsi_conn *);
++extern void iscsit_take_action_for_connection_exit(struct iscsi_conn *, bool *);
+ 
+ #endif   /*** ISCSI_TARGET_ERL0_H ***/
+--- a/drivers/target/iscsi/iscsi_target_login.c
++++ b/drivers/target/iscsi/iscsi_target_login.c
+@@ -1436,5 +1436,9 @@ int iscsi_target_login_thread(void *arg)
+ 			break;
+ 	}
+ 
++	while (!kthread_should_stop()) {
++		msleep(100);
++	}
++
+ 	return 0;
+ }
