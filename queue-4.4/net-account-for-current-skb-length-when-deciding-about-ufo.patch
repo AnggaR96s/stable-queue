@@ -1,0 +1,78 @@
+From foo@baz Wed Aug  9 11:19:16 PDT 2017
+From: Michal Kubeček <mkubecek@suse.cz>
+Date: Mon, 19 Jun 2017 13:03:43 +0200
+Subject: net: account for current skb length when deciding about UFO
+
+From: Michal Kubeček <mkubecek@suse.cz>
+
+
+[ Upstream commit a5cb659bbc1c8644efa0c3138a757a1e432a4880 ]
+
+Our customer encountered stuck NFS writes for blocks starting at specific
+offsets w.r.t. page boundary caused by networking stack sending packets via
+UFO enabled device with wrong checksum. The problem can be reproduced by
+composing a long UDP datagram from multiple parts using MSG_MORE flag:
+
+  sendto(sd, buff, 1000, MSG_MORE, ...);
+  sendto(sd, buff, 1000, MSG_MORE, ...);
+  sendto(sd, buff, 3000, 0, ...);
+
+Assume this packet is to be routed via a device with MTU 1500 and
+NETIF_F_UFO enabled. When second sendto() gets into __ip_append_data(),
+this condition is tested (among others) to decide whether to call
+ip_ufo_append_data():
+
+  ((length + fragheaderlen) > mtu) || (skb && skb_is_gso(skb))
+
+At the moment, we already have skb with 1028 bytes of data which is not
+marked for GSO so that the test is false (fragheaderlen is usually 20).
+Thus we append second 1000 bytes to this skb without invoking UFO. Third
+sendto(), however, has sufficient length to trigger the UFO path so that we
+end up with non-UFO skb followed by a UFO one. Later on, udp_send_skb()
+uses udp_csum() to calculate the checksum but that assumes all fragments
+have correct checksum in skb->csum which is not true for UFO fragments.
+
+When checking against MTU, we need to add skb->len to length of new segment
+if we already have a partially filled skb and fragheaderlen only if there
+isn't one.
+
+In the IPv6 case, skb can only be null if this is the first segment so that
+we have to use headersize (length of the first IPv6 header) rather than
+fragheaderlen (length of IPv6 header of further fragments) for skb == NULL.
+
+Fixes: e89e9cf539a2 ("[IPv4/IPv6]: UFO Scatter-gather approach")
+Fixes: e4c5e13aa45c ("ipv6: Should use consistent conditional judgement for
+	ip6 fragment between __ip6_append_data and ip6_finish_output")
+Signed-off-by: Michal Kubecek <mkubecek@suse.cz>
+Acked-by: Vlad Yasevich <vyasevic@redhat.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/ipv4/ip_output.c  |    3 ++-
+ net/ipv6/ip6_output.c |    2 +-
+ 2 files changed, 3 insertions(+), 2 deletions(-)
+
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@ -922,7 +922,8 @@ static int __ip_append_data(struct sock
+ 		csummode = CHECKSUM_PARTIAL;
+ 
+ 	cork->length += length;
+-	if ((((length + fragheaderlen) > mtu) || (skb && skb_is_gso(skb))) &&
++	if ((((length + (skb ? skb->len : fragheaderlen)) > mtu) ||
++	     (skb && skb_is_gso(skb))) &&
+ 	    (sk->sk_protocol == IPPROTO_UDP) &&
+ 	    (rt->dst.dev->features & NETIF_F_UFO) && !rt->dst.header_len &&
+ 	    (sk->sk_type == SOCK_DGRAM) && !sk->sk_no_check_tx) {
+--- a/net/ipv6/ip6_output.c
++++ b/net/ipv6/ip6_output.c
+@@ -1357,7 +1357,7 @@ emsgsize:
+ 	 */
+ 
+ 	cork->length += length;
+-	if ((((length + fragheaderlen) > mtu) ||
++	if ((((length + (skb ? skb->len : headersize)) > mtu) ||
+ 	     (skb && skb_is_gso(skb))) &&
+ 	    (sk->sk_protocol == IPPROTO_UDP) &&
+ 	    (rt->dst.dev->features & NETIF_F_UFO) &&
