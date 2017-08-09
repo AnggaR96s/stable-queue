@@ -1,0 +1,133 @@
+From foo@baz Tue Aug  8 16:56:08 PDT 2017
+From: Rob Gardner <rob.gardner@oracle.com>
+Date: Mon, 17 Jul 2017 09:22:27 -0600
+Subject: sparc64: Prevent perf from running during super critical sections
+
+From: Rob Gardner <rob.gardner@oracle.com>
+
+
+[ Upstream commit fc290a114fc6034b0f6a5a46e2fb7d54976cf87a ]
+
+This fixes another cause of random segfaults and bus errors that may
+occur while running perf with the callgraph option.
+
+Critical sections beginning with spin_lock_irqsave() raise the interrupt
+level to PIL_NORMAL_MAX (14) and intentionally do not block performance
+counter interrupts, which arrive at PIL_NMI (15).
+
+But some sections of code are "super critical" with respect to perf
+because the perf_callchain_user() path accesses user space and may cause
+TLB activity as well as faults as it unwinds the user stack.
+
+One particular critical section occurs in switch_mm:
+
+        spin_lock_irqsave(&mm->context.lock, flags);
+        ...
+        load_secondary_context(mm);
+        tsb_context_switch(mm);
+        ...
+        spin_unlock_irqrestore(&mm->context.lock, flags);
+
+If a perf interrupt arrives in between load_secondary_context() and
+tsb_context_switch(), then perf_callchain_user() could execute with
+the context ID of one process, but with an active TSB for a different
+process. When the user stack is accessed, it is very likely to
+incur a TLB miss, since the h/w context ID has been changed. The TLB
+will then be reloaded with a translation from the TSB for one process,
+but using a context ID for another process. This exposes memory from
+one process to another, and since it is a mapping for stack memory,
+this usually causes the new process to crash quickly.
+
+This super critical section needs more protection than is provided
+by spin_lock_irqsave() since perf interrupts must not be allowed in.
+
+Since __tsb_context_switch already goes through the trouble of
+disabling interrupts completely, we fix this by moving the secondary
+context load down into this better protected region.
+
+Orabug: 25577560
+
+Signed-off-by: Dave Aldridge <david.j.aldridge@oracle.com>
+Signed-off-by: Rob Gardner <rob.gardner@oracle.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/sparc/include/asm/mmu_context_64.h |   12 +++++++-----
+ arch/sparc/kernel/tsb.S                 |   12 ++++++++++++
+ arch/sparc/power/hibernate.c            |    3 +--
+ 3 files changed, 20 insertions(+), 7 deletions(-)
+
+--- a/arch/sparc/include/asm/mmu_context_64.h
++++ b/arch/sparc/include/asm/mmu_context_64.h
+@@ -25,9 +25,11 @@ void destroy_context(struct mm_struct *m
+ void __tsb_context_switch(unsigned long pgd_pa,
+ 			  struct tsb_config *tsb_base,
+ 			  struct tsb_config *tsb_huge,
+-			  unsigned long tsb_descr_pa);
++			  unsigned long tsb_descr_pa,
++			  unsigned long secondary_ctx);
+ 
+-static inline void tsb_context_switch(struct mm_struct *mm)
++static inline void tsb_context_switch_ctx(struct mm_struct *mm,
++					  unsigned long ctx)
+ {
+ 	__tsb_context_switch(__pa(mm->pgd),
+ 			     &mm->context.tsb_block[0],
+@@ -38,7 +40,8 @@ static inline void tsb_context_switch(st
+ #else
+ 			     NULL
+ #endif
+-			     , __pa(&mm->context.tsb_descr[0]));
++			     , __pa(&mm->context.tsb_descr[0]),
++			     ctx);
+ }
+ 
+ void tsb_grow(struct mm_struct *mm,
+@@ -110,8 +113,7 @@ static inline void switch_mm(struct mm_s
+ 	 * cpu0 to update it's TSB because at that point the cpu_vm_mask
+ 	 * only had cpu1 set in it.
+ 	 */
+-	load_secondary_context(mm);
+-	tsb_context_switch(mm);
++	tsb_context_switch_ctx(mm, CTX_HWBITS(mm->context));
+ 
+ 	/* Any time a processor runs a context on an address space
+ 	 * for the first time, we must flush that context out of the
+--- a/arch/sparc/kernel/tsb.S
++++ b/arch/sparc/kernel/tsb.S
+@@ -375,6 +375,7 @@ tsb_flush:
+ 	 * %o1:	TSB base config pointer
+ 	 * %o2:	TSB huge config pointer, or NULL if none
+ 	 * %o3:	Hypervisor TSB descriptor physical address
++	 * %o4: Secondary context to load, if non-zero
+ 	 *
+ 	 * We have to run this whole thing with interrupts
+ 	 * disabled so that the current cpu doesn't change
+@@ -387,6 +388,17 @@ __tsb_context_switch:
+ 	rdpr	%pstate, %g1
+ 	wrpr	%g1, PSTATE_IE, %pstate
+ 
++	brz,pn	%o4, 1f
++	 mov	SECONDARY_CONTEXT, %o5
++
++661:	stxa	%o4, [%o5] ASI_DMMU
++	.section .sun4v_1insn_patch, "ax"
++	.word	661b
++	stxa	%o4, [%o5] ASI_MMU
++	.previous
++	flush	%g6
++
++1:
+ 	TRAP_LOAD_TRAP_BLOCK(%g2, %g3)
+ 
+ 	stx	%o0, [%g2 + TRAP_PER_CPU_PGD_PADDR]
+--- a/arch/sparc/power/hibernate.c
++++ b/arch/sparc/power/hibernate.c
+@@ -35,6 +35,5 @@ void restore_processor_state(void)
+ {
+ 	struct mm_struct *mm = current->active_mm;
+ 
+-	load_secondary_context(mm);
+-	tsb_context_switch(mm);
++	tsb_context_switch_ctx(mm, CTX_HWBITS(mm->context));
+ }
