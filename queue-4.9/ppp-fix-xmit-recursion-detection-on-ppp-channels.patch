@@ -1,0 +1,75 @@
+From foo@baz Fri Aug 11 09:10:20 PDT 2017
+From: Guillaume Nault <g.nault@alphalink.fr>
+Date: Tue, 8 Aug 2017 11:43:24 +0200
+Subject: ppp: fix xmit recursion detection on ppp channels
+
+From: Guillaume Nault <g.nault@alphalink.fr>
+
+
+[ Upstream commit 0a0e1a85c83775a648041be2b15de6d0a2f2b8eb ]
+
+Commit e5dadc65f9e0 ("ppp: Fix false xmit recursion detect with two ppp
+devices") dropped the xmit_recursion counter incrementation in
+ppp_channel_push() and relied on ppp_xmit_process() for this task.
+But __ppp_channel_push() can also send packets directly (using the
+.start_xmit() channel callback), in which case the xmit_recursion
+counter isn't incremented anymore. If such packets get routed back to
+the parent ppp unit, ppp_xmit_process() won't notice the recursion and
+will call ppp_channel_push() on the same channel, effectively creating
+the deadlock situation that the xmit_recursion mechanism was supposed
+to prevent.
+
+This patch re-introduces the xmit_recursion counter incrementation in
+ppp_channel_push(). Since the xmit_recursion variable is now part of
+the parent ppp unit, incrementation is skipped if the channel doesn't
+have any. This is fine because only packets routed through the parent
+unit may enter the channel recursively.
+
+Finally, we have to ensure that pch->ppp is not going to be modified
+while executing ppp_channel_push(). Instead of taking this lock only
+while calling ppp_xmit_process(), we now have to hold it for the full
+ppp_channel_push() execution. This respects the ppp locks ordering
+which requires locking ->upl before ->downl.
+
+Fixes: e5dadc65f9e0 ("ppp: Fix false xmit recursion detect with two ppp devices")
+Signed-off-by: Guillaume Nault <g.nault@alphalink.fr>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/ppp/ppp_generic.c |   18 ++++++++++--------
+ 1 file changed, 10 insertions(+), 8 deletions(-)
+
+--- a/drivers/net/ppp/ppp_generic.c
++++ b/drivers/net/ppp/ppp_generic.c
+@@ -1914,21 +1914,23 @@ static void __ppp_channel_push(struct ch
+ 	spin_unlock_bh(&pch->downl);
+ 	/* see if there is anything from the attached unit to be sent */
+ 	if (skb_queue_empty(&pch->file.xq)) {
+-		read_lock_bh(&pch->upl);
+ 		ppp = pch->ppp;
+ 		if (ppp)
+-			ppp_xmit_process(ppp);
+-		read_unlock_bh(&pch->upl);
++			__ppp_xmit_process(ppp);
+ 	}
+ }
+ 
+ static void ppp_channel_push(struct channel *pch)
+ {
+-	local_bh_disable();
+-
+-	__ppp_channel_push(pch);
+-
+-	local_bh_enable();
++	read_lock_bh(&pch->upl);
++	if (pch->ppp) {
++		(*this_cpu_ptr(pch->ppp->xmit_recursion))++;
++		__ppp_channel_push(pch);
++		(*this_cpu_ptr(pch->ppp->xmit_recursion))--;
++	} else {
++		__ppp_channel_push(pch);
++	}
++	read_unlock_bh(&pch->upl);
+ }
+ 
+ /*
