@@ -1,0 +1,163 @@
+From 89affbf5d9ebb15c6460596822e8857ea2f9e735 Mon Sep 17 00:00:00 2001
+From: Dima Zavin <dmitriyz@waymo.com>
+Date: Wed, 2 Aug 2017 13:32:18 -0700
+Subject: cpuset: fix a deadlock due to incomplete patching of cpusets_enabled()
+
+From: Dima Zavin <dmitriyz@waymo.com>
+
+commit 89affbf5d9ebb15c6460596822e8857ea2f9e735 upstream.
+
+In codepaths that use the begin/retry interface for reading
+mems_allowed_seq with irqs disabled, there exists a race condition that
+stalls the patch process after only modifying a subset of the
+static_branch call sites.
+
+This problem manifested itself as a deadlock in the slub allocator,
+inside get_any_partial.  The loop reads mems_allowed_seq value (via
+read_mems_allowed_begin), performs the defrag operation, and then
+verifies the consistency of mem_allowed via the read_mems_allowed_retry
+and the cookie returned by xxx_begin.
+
+The issue here is that both begin and retry first check if cpusets are
+enabled via cpusets_enabled() static branch.  This branch can be
+rewritted dynamically (via cpuset_inc) if a new cpuset is created.  The
+x86 jump label code fully synchronizes across all CPUs for every entry
+it rewrites.  If it rewrites only one of the callsites (specifically the
+one in read_mems_allowed_retry) and then waits for the
+smp_call_function(do_sync_core) to complete while a CPU is inside the
+begin/retry section with IRQs off and the mems_allowed value is changed,
+we can hang.
+
+This is because begin() will always return 0 (since it wasn't patched
+yet) while retry() will test the 0 against the actual value of the seq
+counter.
+
+The fix is to use two different static keys: one for begin
+(pre_enable_key) and one for retry (enable_key).  In cpuset_inc(), we
+first bump the pre_enable key to ensure that cpuset_mems_allowed_begin()
+always return a valid seqcount if are enabling cpusets.  Similarly, when
+disabling cpusets via cpuset_dec(), we first ensure that callers of
+cpuset_mems_allowed_retry() will start ignoring the seqcount value
+before we let cpuset_mems_allowed_begin() return 0.
+
+The relevant stack traces of the two stuck threads:
+
+  CPU: 1 PID: 1415 Comm: mkdir Tainted: G L  4.9.36-00104-g540c51286237 #4
+  Hardware name: Default string Default string/Hardware, BIOS 4.29.1-20170526215256 05/26/2017
+  task: ffff8817f9c28000 task.stack: ffffc9000ffa4000
+  RIP: smp_call_function_many+0x1f9/0x260
+  Call Trace:
+    smp_call_function+0x3b/0x70
+    on_each_cpu+0x2f/0x90
+    text_poke_bp+0x87/0xd0
+    arch_jump_label_transform+0x93/0x100
+    __jump_label_update+0x77/0x90
+    jump_label_update+0xaa/0xc0
+    static_key_slow_inc+0x9e/0xb0
+    cpuset_css_online+0x70/0x2e0
+    online_css+0x2c/0xa0
+    cgroup_apply_control_enable+0x27f/0x3d0
+    cgroup_mkdir+0x2b7/0x420
+    kernfs_iop_mkdir+0x5a/0x80
+    vfs_mkdir+0xf6/0x1a0
+    SyS_mkdir+0xb7/0xe0
+    entry_SYSCALL_64_fastpath+0x18/0xad
+
+  ...
+
+  CPU: 2 PID: 1 Comm: init Tainted: G L  4.9.36-00104-g540c51286237 #4
+  Hardware name: Default string Default string/Hardware, BIOS 4.29.1-20170526215256 05/26/2017
+  task: ffff8818087c0000 task.stack: ffffc90000030000
+  RIP: int3+0x39/0x70
+  Call Trace:
+    <#DB> ? ___slab_alloc+0x28b/0x5a0
+    <EOE> ? copy_process.part.40+0xf7/0x1de0
+    __slab_alloc.isra.80+0x54/0x90
+    copy_process.part.40+0xf7/0x1de0
+    copy_process.part.40+0xf7/0x1de0
+    kmem_cache_alloc_node+0x8a/0x280
+    copy_process.part.40+0xf7/0x1de0
+    _do_fork+0xe7/0x6c0
+    _raw_spin_unlock_irq+0x2d/0x60
+    trace_hardirqs_on_caller+0x136/0x1d0
+    entry_SYSCALL_64_fastpath+0x5/0xad
+    do_syscall_64+0x27/0x350
+    SyS_clone+0x19/0x20
+    do_syscall_64+0x60/0x350
+    entry_SYSCALL64_slow_path+0x25/0x25
+
+Link: http://lkml.kernel.org/r/20170731040113.14197-1-dmitriyz@waymo.com
+Fixes: 46e700abc44c ("mm, page_alloc: remove unnecessary taking of a seqlock when cpusets are disabled")
+Signed-off-by: Dima Zavin <dmitriyz@waymo.com>
+Reported-by: Cliff Spradlin <cspradlin@waymo.com>
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Christopher Lameter <cl@linux.com>
+Cc: Li Zefan <lizefan@huawei.com>
+Cc: Pekka Enberg <penberg@kernel.org>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+
+---
+ include/linux/cpuset.h |    7 +++++--
+ kernel/cpuset.c        |    1 +
+ 2 files changed, 6 insertions(+), 2 deletions(-)
+
+--- a/include/linux/cpuset.h
++++ b/include/linux/cpuset.h
+@@ -16,6 +16,7 @@
+ 
+ #ifdef CONFIG_CPUSETS
+ 
++extern struct static_key cpusets_pre_enable_key;
+ extern struct static_key cpusets_enabled_key;
+ static inline bool cpusets_enabled(void)
+ {
+@@ -30,12 +31,14 @@ static inline int nr_cpusets(void)
+ 
+ static inline void cpuset_inc(void)
+ {
++	static_key_slow_inc(&cpusets_pre_enable_key);
+ 	static_key_slow_inc(&cpusets_enabled_key);
+ }
+ 
+ static inline void cpuset_dec(void)
+ {
+ 	static_key_slow_dec(&cpusets_enabled_key);
++	static_key_slow_dec(&cpusets_pre_enable_key);
+ }
+ 
+ extern int cpuset_init(void);
+@@ -104,7 +107,7 @@ extern void cpuset_print_current_mems_al
+  */
+ static inline unsigned int read_mems_allowed_begin(void)
+ {
+-	if (!cpusets_enabled())
++	if (!static_key_false(&cpusets_pre_enable_key))
+ 		return 0;
+ 
+ 	return read_seqcount_begin(&current->mems_allowed_seq);
+@@ -118,7 +121,7 @@ static inline unsigned int read_mems_all
+  */
+ static inline bool read_mems_allowed_retry(unsigned int seq)
+ {
+-	if (!cpusets_enabled())
++	if (!static_key_false(&cpusets_enabled_key))
+ 		return false;
+ 
+ 	return read_seqcount_retry(&current->mems_allowed_seq, seq);
+--- a/kernel/cpuset.c
++++ b/kernel/cpuset.c
+@@ -60,6 +60,7 @@
+ #include <linux/cgroup.h>
+ #include <linux/wait.h>
+ 
++struct static_key cpusets_pre_enable_key __read_mostly = STATIC_KEY_INIT_FALSE;
+ struct static_key cpusets_enabled_key __read_mostly = STATIC_KEY_INIT_FALSE;
+ 
+ /* See "Frequency meter" comments, below. */
