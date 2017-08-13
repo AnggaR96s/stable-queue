@@ -1,0 +1,109 @@
+From d041353dc98a6339182cd6f628b4c8f111278cb3 Mon Sep 17 00:00:00 2001
+From: Cong Wang <xiyou.wangcong@gmail.com>
+Date: Thu, 10 Aug 2017 15:24:24 -0700
+Subject: mm: fix list corruptions on shmem shrinklist
+
+From: Cong Wang <xiyou.wangcong@gmail.com>
+
+commit d041353dc98a6339182cd6f628b4c8f111278cb3 upstream.
+
+We saw many list corruption warnings on shmem shrinklist:
+
+  WARNING: CPU: 18 PID: 177 at lib/list_debug.c:59 __list_del_entry+0x9e/0xc0
+  list_del corruption. prev->next should be ffff9ae5694b82d8, but was ffff9ae5699ba960
+  Modules linked in: intel_rapl sb_edac edac_core x86_pkg_temp_thermal coretemp iTCO_wdt iTCO_vendor_support crct10dif_pclmul crc32_pclmul ghash_clmulni_intel raid0 dcdbas shpchp wmi hed i2c_i801 ioatdma lpc_ich i2c_smbus acpi_cpufreq tcp_diag inet_diag sch_fq_codel ipmi_si ipmi_devintf ipmi_msghandler igb ptp crc32c_intel pps_core i2c_algo_bit i2c_core dca ipv6 crc_ccitt
+  CPU: 18 PID: 177 Comm: kswapd1 Not tainted 4.9.34-t3.el7.twitter.x86_64 #1
+  Hardware name: Dell Inc. PowerEdge C6220/0W6W6G, BIOS 2.2.3 11/07/2013
+  Call Trace:
+    dump_stack+0x4d/0x66
+    __warn+0xcb/0xf0
+    warn_slowpath_fmt+0x4f/0x60
+    __list_del_entry+0x9e/0xc0
+    shmem_unused_huge_shrink+0xfa/0x2e0
+    shmem_unused_huge_scan+0x20/0x30
+    super_cache_scan+0x193/0x1a0
+    shrink_slab.part.41+0x1e3/0x3f0
+    shrink_slab+0x29/0x30
+    shrink_node+0xf9/0x2f0
+    kswapd+0x2d8/0x6c0
+    kthread+0xd7/0xf0
+    ret_from_fork+0x22/0x30
+
+  WARNING: CPU: 23 PID: 639 at lib/list_debug.c:33 __list_add+0x89/0xb0
+  list_add corruption. prev->next should be next (ffff9ae5699ba960), but was ffff9ae5694b82d8. (prev=ffff9ae5694b82d8).
+  Modules linked in: intel_rapl sb_edac edac_core x86_pkg_temp_thermal coretemp iTCO_wdt iTCO_vendor_support crct10dif_pclmul crc32_pclmul ghash_clmulni_intel raid0 dcdbas shpchp wmi hed i2c_i801 ioatdma lpc_ich i2c_smbus acpi_cpufreq tcp_diag inet_diag sch_fq_codel ipmi_si ipmi_devintf ipmi_msghandler igb ptp crc32c_intel pps_core i2c_algo_bit i2c_core dca ipv6 crc_ccitt
+  CPU: 23 PID: 639 Comm: systemd-udevd Tainted: G        W       4.9.34-t3.el7.twitter.x86_64 #1
+  Hardware name: Dell Inc. PowerEdge C6220/0W6W6G, BIOS 2.2.3 11/07/2013
+  Call Trace:
+    dump_stack+0x4d/0x66
+    __warn+0xcb/0xf0
+    warn_slowpath_fmt+0x4f/0x60
+    __list_add+0x89/0xb0
+    shmem_setattr+0x204/0x230
+    notify_change+0x2ef/0x440
+    do_truncate+0x5d/0x90
+    path_openat+0x331/0x1190
+    do_filp_open+0x7e/0xe0
+    do_sys_open+0x123/0x200
+    SyS_open+0x1e/0x20
+    do_syscall_64+0x61/0x170
+    entry_SYSCALL64_slow_path+0x25/0x25
+
+The problem is that shmem_unused_huge_shrink() moves entries from the
+global sbinfo->shrinklist to its local lists and then releases the
+spinlock.  However, a parallel shmem_setattr() could access one of these
+entries directly and add it back to the global shrinklist if it is
+removed, with the spinlock held.
+
+The logic itself looks solid since an entry could be either in a local
+list or the global list, otherwise it is removed from one of them by
+list_del_init().  So probably the race condition is that, one CPU is in
+the middle of INIT_LIST_HEAD() but the other CPU calls list_empty()
+which returns true too early then the following list_add_tail() sees a
+corrupted entry.
+
+list_empty_careful() is designed to fix this situation.
+
+[akpm@linux-foundation.org: add comments]
+Link: http://lkml.kernel.org/r/20170803054630.18775-1-xiyou.wangcong@gmail.com
+Fixes: 779750d20b93 ("shmem: split huge pages beyond i_size under memory pressure")
+Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+Acked-by: Linus Torvalds <torvalds@linux-foundation.org>
+Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: Hugh Dickins <hughd@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ mm/shmem.c |   12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@ -1007,7 +1007,11 @@ static int shmem_setattr(struct dentry *
+ 			 */
+ 			if (IS_ENABLED(CONFIG_TRANSPARENT_HUGE_PAGECACHE)) {
+ 				spin_lock(&sbinfo->shrinklist_lock);
+-				if (list_empty(&info->shrinklist)) {
++				/*
++				 * _careful to defend against unlocked access to
++				 * ->shrink_list in shmem_unused_huge_shrink()
++				 */
++				if (list_empty_careful(&info->shrinklist)) {
+ 					list_add_tail(&info->shrinklist,
+ 							&sbinfo->shrinklist);
+ 					sbinfo->shrinklist_len++;
+@@ -1774,7 +1778,11 @@ alloc_nohuge:		page = shmem_alloc_and_ac
+ 			 * to shrink under memory pressure.
+ 			 */
+ 			spin_lock(&sbinfo->shrinklist_lock);
+-			if (list_empty(&info->shrinklist)) {
++			/*
++			 * _careful to defend against unlocked access to
++			 * ->shrink_list in shmem_unused_huge_shrink()
++			 */
++			if (list_empty_careful(&info->shrinklist)) {
+ 				list_add_tail(&info->shrinklist,
+ 						&sbinfo->shrinklist);
+ 				sbinfo->shrinklist_len++;
