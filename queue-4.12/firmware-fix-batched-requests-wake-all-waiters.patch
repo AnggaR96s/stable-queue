@@ -1,0 +1,198 @@
+From e44565f62a72064e686f7a852137595ec94d78f2 Mon Sep 17 00:00:00 2001
+From: "Luis R. Rodriguez" <mcgrof@kernel.org>
+Date: Thu, 20 Jul 2017 13:13:09 -0700
+Subject: firmware: fix batched requests - wake all waiters
+
+From: Luis R. Rodriguez <mcgrof@kernel.org>
+
+commit e44565f62a72064e686f7a852137595ec94d78f2 upstream.
+
+The firmware cache mechanism serves two purposes, the secondary purpose is
+not well documented nor understood. This fixes a regression with the
+secondary purpose of the firmware cache mechanism: batched requests on
+successful lookups. Without this fix *any* time a batched request is
+triggered, secondary requests for which the batched request mechanism
+was designed for will seem to last forver and seem to never return.
+This issue is present for all kernel builds possible, and a hard reset
+is required.
+
+The firmware cache is used for:
+
+1) Addressing races with file lookups during the suspend/resume cycle
+   by keeping firmware in memory during the suspend/resume cycle
+
+2) Batched requests for the same file rely only on work from the first file
+   lookup, which keeps the firmware in memory until the last
+   release_firmware() is called
+
+Batched requests *only* take effect if secondary requests come in prior to
+the first user calling release_firmware(). The devres name used for the
+internal firmware cache is used as a hint other pending requests are
+ongoing, the firmware buffer data is kept in memory until the last user of
+the buffer calls release_firmware(), therefore serializing requests and
+delaying the release until all requests are done.
+
+Batched requests wait for a wakup or signal so we can rely on the first file
+fetch to write to the pending secondary requests. Commit 5b029624948d
+("firmware: do not use fw_lock for fw_state protection") ported the firmware
+API to use swait, and in doing so failed to convert complete_all() to
+swake_up_all() -- it used swake_up(), loosing the ability for *some* batched
+requests to take effect.
+
+We *could* fix this by just using swake_up_all() *but* swait is now known
+to be very special use case, so its best to just move away from it. So we
+just go back to using completions as before commit 5b029624948d ("firmware:
+do not use fw_lock for fw_state protection") given this was using
+complete_all().
+
+Without this fix it has been reported plugging in two Intel 6260 Wifi cards
+on a system will end up enumerating the two devices only 50% of the time
+[0]. The ported swake_up() should have actually handled the case with two
+devices, however, *if more than two cards are used* the swake_up() would
+not have sufficed. This change is only part of the required fixes for
+batched requests. Another fix is provided in the next patch.
+
+This particular change should fix the cases where more than three requests
+with the same firmware name is used, otherwise batched requests will wait
+for MAX_SCHEDULE_TIMEOUT and just timeout eventually.
+
+Below is a summary of tests triggering batched requests on different
+kernel builds.
+
+Before this patch:
+============================================================================
+CONFIG_FW_LOADER_USER_HELPER_FALLBACK=n
+CONFIG_FW_LOADER_USER_HELPER=y
+
+Most common Linux distribution setup.
+
+API-type                               no-firmware-found   firmware-found
+----------------------------------------------------------------------
+request_firmware()                     FAIL                FAIL
+request_firmware_direct()              FAIL                FAIL
+request_firmware_nowait(uevent=true)   FAIL                FAIL
+request_firmware_nowait(uevent=false)  FAIL                FAIL
+============================================================================
+CONFIG_FW_LOADER_USER_HELPER_FALLBACK=n
+CONFIG_FW_LOADER_USER_HELPER=n
+
+Only possible if CONFIG_DELL_RBU=n and CONFIG_LEDS_LP55XX_COMMON=n, rare.
+
+API-type                               no-firmware-found   firmware-found
+----------------------------------------------------------------------
+request_firmware()                     FAIL                FAIL
+request_firmware_direct()              FAIL                FAIL
+request_firmware_nowait(uevent=true)   FAIL                FAIL
+request_firmware_nowait(uevent=false)  FAIL                FAIL
+============================================================================
+CONFIG_FW_LOADER_USER_HELPER_FALLBACK=y
+CONFIG_FW_LOADER_USER_HELPER=y
+
+Google Android setup.
+
+API-type                               no-firmware-found   firmware-found
+----------------------------------------------------------------------
+request_firmware()                     FAIL                FAIL
+request_firmware_direct()              FAIL                FAIL
+request_firmware_nowait(uevent=true)   FAIL                FAIL
+request_firmware_nowait(uevent=false)  FAIL                FAIL
+============================================================================
+
+After this patch:
+============================================================================
+CONFIG_FW_LOADER_USER_HELPER_FALLBACK=n
+CONFIG_FW_LOADER_USER_HELPER=y
+
+Most common Linux distribution setup.
+
+API-type                               no-firmware-found   firmware-found
+----------------------------------------------------------------------
+request_firmware()                     FAIL                OK
+request_firmware_direct()              FAIL                OK
+request_firmware_nowait(uevent=true)   FAIL                OK
+request_firmware_nowait(uevent=false)  FAIL                OK
+============================================================================
+CONFIG_FW_LOADER_USER_HELPER_FALLBACK=n
+CONFIG_FW_LOADER_USER_HELPER=n
+
+Only possible if CONFIG_DELL_RBU=n and CONFIG_LEDS_LP55XX_COMMON=n, rare.
+
+API-type                               no-firmware-found   firmware-found
+----------------------------------------------------------------------
+request_firmware()                     FAIL                OK
+request_firmware_direct()              FAIL                OK
+request_firmware_nowait(uevent=true)   FAIL                OK
+request_firmware_nowait(uevent=false)  FAIL                OK
+============================================================================
+CONFIG_FW_LOADER_USER_HELPER_FALLBACK=y
+CONFIG_FW_LOADER_USER_HELPER=y
+
+Google Android setup.
+
+API-type                               no-firmware-found   firmware-found
+----------------------------------------------------------------------
+request_firmware()                     OK                  OK
+request_firmware_direct()              FAIL                OK
+request_firmware_nowait(uevent=true)   OK                  OK
+request_firmware_nowait(uevent=false)  OK                  OK
+============================================================================
+
+[0] https://bugzilla.kernel.org/show_bug.cgi?id=195477
+
+Cc: Ming Lei <ming.lei@redhat.com>
+Fixes: 5b029624948d ("firmware: do not use fw_lock for fw_state protection")
+Reported-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+Signed-off-by: Luis R. Rodriguez <mcgrof@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/base/firmware_class.c |   12 +++++-------
+ 1 file changed, 5 insertions(+), 7 deletions(-)
+
+--- a/drivers/base/firmware_class.c
++++ b/drivers/base/firmware_class.c
+@@ -30,7 +30,6 @@
+ #include <linux/syscore_ops.h>
+ #include <linux/reboot.h>
+ #include <linux/security.h>
+-#include <linux/swait.h>
+ 
+ #include <generated/utsrelease.h>
+ 
+@@ -112,13 +111,13 @@ static inline long firmware_loading_time
+  * state of the firmware loading.
+  */
+ struct fw_state {
+-	struct swait_queue_head wq;
++	struct completion completion;
+ 	enum fw_status status;
+ };
+ 
+ static void fw_state_init(struct fw_state *fw_st)
+ {
+-	init_swait_queue_head(&fw_st->wq);
++	init_completion(&fw_st->completion);
+ 	fw_st->status = FW_STATUS_UNKNOWN;
+ }
+ 
+@@ -131,9 +130,8 @@ static int __fw_state_wait_common(struct
+ {
+ 	long ret;
+ 
+-	ret = swait_event_interruptible_timeout(fw_st->wq,
+-				__fw_state_is_done(READ_ONCE(fw_st->status)),
+-				timeout);
++	ret = wait_for_completion_interruptible_timeout(&fw_st->completion,
++							timeout);
+ 	if (ret != 0 && fw_st->status == FW_STATUS_ABORTED)
+ 		return -ENOENT;
+ 	if (!ret)
+@@ -148,7 +146,7 @@ static void __fw_state_set(struct fw_sta
+ 	WRITE_ONCE(fw_st->status, status);
+ 
+ 	if (status == FW_STATUS_DONE || status == FW_STATUS_ABORTED)
+-		swake_up(&fw_st->wq);
++		complete_all(&fw_st->completion);
+ }
+ 
+ #define fw_state_start(fw_st)					\
