@@ -1,0 +1,130 @@
+From bfe334924ccd9f4a53f30240c03cf2f43f5b2df1 Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Wed, 2 Aug 2017 19:39:30 +0200
+Subject: perf/x86: Fix RDPMC vs. mm_struct tracking
+
+From: Peter Zijlstra <peterz@infradead.org>
+
+commit bfe334924ccd9f4a53f30240c03cf2f43f5b2df1 upstream.
+
+Vince reported the following rdpmc() testcase failure:
+
+ > Failing test case:
+ >
+ >	fd=perf_event_open();
+ >	addr=mmap(fd);
+ >	exec()  // without closing or unmapping the event
+ >	fd=perf_event_open();
+ >	addr=mmap(fd);
+ >	rdpmc()	// GPFs due to rdpmc being disabled
+
+The problem is of course that exec() plays tricks with what is
+current->mm, only destroying the old mappings after having
+installed the new mm.
+
+Fix this confusion by passing along vma->vm_mm instead of relying on
+current->mm.
+
+Reported-by: Vince Weaver <vincent.weaver@maine.edu>
+Tested-by: Vince Weaver <vincent.weaver@maine.edu>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Reviewed-by: Andy Lutomirski <luto@kernel.org>
+Cc: Arnaldo Carvalho de Melo <acme@kernel.org>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Stephane Eranian <eranian@gmail.com>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Fixes: 1e0fb9ec679c ("perf: Add pmu callbacks to track event mapping and unmapping")
+Link: http://lkml.kernel.org/r/20170802173930.cstykcqefmqt7jau@hirez.programming.kicks-ass.net
+[ Minor cleanups. ]
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ arch/x86/events/core.c     |   16 +++++++---------
+ include/linux/perf_event.h |    4 ++--
+ kernel/events/core.c       |    6 +++---
+ 3 files changed, 12 insertions(+), 14 deletions(-)
+
+--- a/arch/x86/events/core.c
++++ b/arch/x86/events/core.c
+@@ -2105,7 +2105,7 @@ static void refresh_pce(void *ignored)
+ 		load_mm_cr4(current->active_mm);
+ }
+ 
+-static void x86_pmu_event_mapped(struct perf_event *event)
++static void x86_pmu_event_mapped(struct perf_event *event, struct mm_struct *mm)
+ {
+ 	if (!(event->hw.flags & PERF_X86_EVENT_RDPMC_ALLOWED))
+ 		return;
+@@ -2120,22 +2120,20 @@ static void x86_pmu_event_mapped(struct
+ 	 * For now, this can't happen because all callers hold mmap_sem
+ 	 * for write.  If this changes, we'll need a different solution.
+ 	 */
+-	lockdep_assert_held_exclusive(&current->mm->mmap_sem);
++	lockdep_assert_held_exclusive(&mm->mmap_sem);
+ 
+-	if (atomic_inc_return(&current->mm->context.perf_rdpmc_allowed) == 1)
+-		on_each_cpu_mask(mm_cpumask(current->mm), refresh_pce, NULL, 1);
++	if (atomic_inc_return(&mm->context.perf_rdpmc_allowed) == 1)
++		on_each_cpu_mask(mm_cpumask(mm), refresh_pce, NULL, 1);
+ }
+ 
+-static void x86_pmu_event_unmapped(struct perf_event *event)
++static void x86_pmu_event_unmapped(struct perf_event *event, struct mm_struct *mm)
+ {
+-	if (!current->mm)
+-		return;
+ 
+ 	if (!(event->hw.flags & PERF_X86_EVENT_RDPMC_ALLOWED))
+ 		return;
+ 
+-	if (atomic_dec_and_test(&current->mm->context.perf_rdpmc_allowed))
+-		on_each_cpu_mask(mm_cpumask(current->mm), refresh_pce, NULL, 1);
++	if (atomic_dec_and_test(&mm->context.perf_rdpmc_allowed))
++		on_each_cpu_mask(mm_cpumask(mm), refresh_pce, NULL, 1);
+ }
+ 
+ static int x86_pmu_event_idx(struct perf_event *event)
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@ -310,8 +310,8 @@ struct pmu {
+ 	 * Notification that the event was mapped or unmapped.  Called
+ 	 * in the context of the mapping task.
+ 	 */
+-	void (*event_mapped)		(struct perf_event *event); /*optional*/
+-	void (*event_unmapped)		(struct perf_event *event); /*optional*/
++	void (*event_mapped)		(struct perf_event *event, struct mm_struct *mm); /* optional */
++	void (*event_unmapped)		(struct perf_event *event, struct mm_struct *mm); /* optional */
+ 
+ 	/*
+ 	 * Flags for ->add()/->del()/ ->start()/->stop(). There are
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -5084,7 +5084,7 @@ static void perf_mmap_open(struct vm_are
+ 		atomic_inc(&event->rb->aux_mmap_count);
+ 
+ 	if (event->pmu->event_mapped)
+-		event->pmu->event_mapped(event);
++		event->pmu->event_mapped(event, vma->vm_mm);
+ }
+ 
+ static void perf_pmu_output_stop(struct perf_event *event);
+@@ -5107,7 +5107,7 @@ static void perf_mmap_close(struct vm_ar
+ 	unsigned long size = perf_data_size(rb);
+ 
+ 	if (event->pmu->event_unmapped)
+-		event->pmu->event_unmapped(event);
++		event->pmu->event_unmapped(event, vma->vm_mm);
+ 
+ 	/*
+ 	 * rb->aux_mmap_count will always drop before rb->mmap_count and
+@@ -5405,7 +5405,7 @@ aux_unlock:
+ 	vma->vm_ops = &perf_mmap_vmops;
+ 
+ 	if (event->pmu->event_mapped)
+-		event->pmu->event_mapped(event);
++		event->pmu->event_mapped(event, vma->vm_mm);
+ 
+ 	return ret;
+ }
