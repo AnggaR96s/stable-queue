@@ -1,0 +1,176 @@
+From 3010f876500f9ba921afaeccec30c45ca6584dc8 Mon Sep 17 00:00:00 2001
+From: Pavel Tatashin <pasha.tatashin@oracle.com>
+Date: Fri, 18 Aug 2017 15:16:05 -0700
+Subject: mm: discard memblock data later
+
+From: Pavel Tatashin <pasha.tatashin@oracle.com>
+
+commit 3010f876500f9ba921afaeccec30c45ca6584dc8 upstream.
+
+There is existing use after free bug when deferred struct pages are
+enabled:
+
+The memblock_add() allocates memory for the memory array if more than
+128 entries are needed.  See comment in e820__memblock_setup():
+
+  * The bootstrap memblock region count maximum is 128 entries
+  * (INIT_MEMBLOCK_REGIONS), but EFI might pass us more E820 entries
+  * than that - so allow memblock resizing.
+
+This memblock memory is freed here:
+        free_low_memory_core_early()
+
+We access the freed memblock.memory later in boot when deferred pages
+are initialized in this path:
+
+        deferred_init_memmap()
+                for_each_mem_pfn_range()
+                  __next_mem_pfn_range()
+                    type = &memblock.memory;
+
+One possible explanation for why this use-after-free hasn't been hit
+before is that the limit of INIT_MEMBLOCK_REGIONS has never been
+exceeded at least on systems where deferred struct pages were enabled.
+
+Tested by reducing INIT_MEMBLOCK_REGIONS down to 4 from the current 128,
+and verifying in qemu that this code is getting excuted and that the
+freed pages are sane.
+
+Link: http://lkml.kernel.org/r/1502485554-318703-2-git-send-email-pasha.tatashin@oracle.com
+Fixes: 7e18adb4f80b ("mm: meminit: initialise remaining struct pages in parallel with kswapd")
+Signed-off-by: Pavel Tatashin <pasha.tatashin@oracle.com>
+Reviewed-by: Steven Sistare <steven.sistare@oracle.com>
+Reviewed-by: Daniel Jordan <daniel.m.jordan@oracle.com>
+Reviewed-by: Bob Picco <bob.picco@oracle.com>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ include/linux/memblock.h |    6 ++++--
+ mm/memblock.c            |   40 ++++++++++++++++++----------------------
+ mm/nobootmem.c           |   16 ----------------
+ mm/page_alloc.c          |    4 ++++
+ 4 files changed, 26 insertions(+), 40 deletions(-)
+
+--- a/include/linux/memblock.h
++++ b/include/linux/memblock.h
+@@ -64,6 +64,7 @@ extern bool movable_node_enabled;
+ #ifdef CONFIG_ARCH_DISCARD_MEMBLOCK
+ #define __init_memblock __meminit
+ #define __initdata_memblock __meminitdata
++void memblock_discard(void);
+ #else
+ #define __init_memblock
+ #define __initdata_memblock
+@@ -77,8 +78,6 @@ phys_addr_t memblock_find_in_range_node(
+ 					int nid, ulong flags);
+ phys_addr_t memblock_find_in_range(phys_addr_t start, phys_addr_t end,
+ 				   phys_addr_t size, phys_addr_t align);
+-phys_addr_t get_allocated_memblock_reserved_regions_info(phys_addr_t *addr);
+-phys_addr_t get_allocated_memblock_memory_regions_info(phys_addr_t *addr);
+ void memblock_allow_resize(void);
+ int memblock_add_node(phys_addr_t base, phys_addr_t size, int nid);
+ int memblock_add(phys_addr_t base, phys_addr_t size);
+@@ -112,6 +111,9 @@ void __next_mem_range_rev(u64 *idx, int
+ void __next_reserved_mem_region(u64 *idx, phys_addr_t *out_start,
+ 				phys_addr_t *out_end);
+ 
++void __memblock_free_early(phys_addr_t base, phys_addr_t size);
++void __memblock_free_late(phys_addr_t base, phys_addr_t size);
++
+ /**
+  * for_each_mem_range - iterate through memblock areas from type_a and not
+  * included in type_b. Or just type_a if type_b is NULL.
+--- a/mm/memblock.c
++++ b/mm/memblock.c
+@@ -297,31 +297,27 @@ static void __init_memblock memblock_rem
+ }
+ 
+ #ifdef CONFIG_ARCH_DISCARD_MEMBLOCK
+-
+-phys_addr_t __init_memblock get_allocated_memblock_reserved_regions_info(
+-					phys_addr_t *addr)
+-{
+-	if (memblock.reserved.regions == memblock_reserved_init_regions)
+-		return 0;
+-
+-	*addr = __pa(memblock.reserved.regions);
+-
+-	return PAGE_ALIGN(sizeof(struct memblock_region) *
+-			  memblock.reserved.max);
+-}
+-
+-phys_addr_t __init_memblock get_allocated_memblock_memory_regions_info(
+-					phys_addr_t *addr)
++/**
++ * Discard memory and reserved arrays if they were allocated
++ */
++void __init memblock_discard(void)
+ {
+-	if (memblock.memory.regions == memblock_memory_init_regions)
+-		return 0;
++	phys_addr_t addr, size;
+ 
+-	*addr = __pa(memblock.memory.regions);
+-
+-	return PAGE_ALIGN(sizeof(struct memblock_region) *
+-			  memblock.memory.max);
++	if (memblock.reserved.regions != memblock_reserved_init_regions) {
++		addr = __pa(memblock.reserved.regions);
++		size = PAGE_ALIGN(sizeof(struct memblock_region) *
++				  memblock.reserved.max);
++		__memblock_free_late(addr, size);
++	}
++
++	if (memblock.memory.regions == memblock_memory_init_regions) {
++		addr = __pa(memblock.memory.regions);
++		size = PAGE_ALIGN(sizeof(struct memblock_region) *
++				  memblock.memory.max);
++		__memblock_free_late(addr, size);
++	}
+ }
+-
+ #endif
+ 
+ /**
+--- a/mm/nobootmem.c
++++ b/mm/nobootmem.c
+@@ -146,22 +146,6 @@ static unsigned long __init free_low_mem
+ 				NULL)
+ 		count += __free_memory_core(start, end);
+ 
+-#ifdef CONFIG_ARCH_DISCARD_MEMBLOCK
+-	{
+-		phys_addr_t size;
+-
+-		/* Free memblock.reserved array if it was allocated */
+-		size = get_allocated_memblock_reserved_regions_info(&start);
+-		if (size)
+-			count += __free_memory_core(start, start + size);
+-
+-		/* Free memblock.memory array if it was allocated */
+-		size = get_allocated_memblock_memory_regions_info(&start);
+-		if (size)
+-			count += __free_memory_core(start, start + size);
+-	}
+-#endif
+-
+ 	return count;
+ }
+ 
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -1587,6 +1587,10 @@ void __init page_alloc_init_late(void)
+ 	/* Reinit limits that are based on free pages after the kernel is up */
+ 	files_maxfiles_init();
+ #endif
++#ifdef CONFIG_ARCH_DISCARD_MEMBLOCK
++	/* Discard memblock private memory */
++	memblock_discard();
++#endif
+ 
+ 	for_each_populated_zone(zone)
+ 		set_zone_contiguous(zone);
