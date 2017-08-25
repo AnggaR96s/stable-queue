@@ -1,0 +1,125 @@
+From foo@baz Thu Aug 24 17:43:45 PDT 2017
+From: Liping Zhang <zlpnobody@gmail.com>
+Date: Wed, 16 Aug 2017 13:30:07 +0800
+Subject: openvswitch: fix skb_panic due to the incorrect actions attrlen
+
+From: Liping Zhang <zlpnobody@gmail.com>
+
+
+[ Upstream commit 494bea39f3201776cdfddc232705f54a0bd210c4 ]
+
+For sw_flow_actions, the actions_len only represents the kernel part's
+size, and when we dump the actions to the userspace, we will do the
+convertions, so it's true size may become bigger than the actions_len.
+
+But unfortunately, for OVS_PACKET_ATTR_ACTIONS, we use the actions_len
+to alloc the skbuff, so the user_skb's size may become insufficient and
+oops will happen like this:
+  skbuff: skb_over_panic: text:ffffffff8148fabf len:1749 put:157 head:
+  ffff881300f39000 data:ffff881300f39000 tail:0x6d5 end:0x6c0 dev:<NULL>
+  ------------[ cut here ]------------
+  kernel BUG at net/core/skbuff.c:129!
+  [...]
+  Call Trace:
+   <IRQ>
+   [<ffffffff8148be82>] skb_put+0x43/0x44
+   [<ffffffff8148fabf>] skb_zerocopy+0x6c/0x1f4
+   [<ffffffffa0290d36>] queue_userspace_packet+0x3a3/0x448 [openvswitch]
+   [<ffffffffa0292023>] ovs_dp_upcall+0x30/0x5c [openvswitch]
+   [<ffffffffa028d435>] output_userspace+0x132/0x158 [openvswitch]
+   [<ffffffffa01e6890>] ? ip6_rcv_finish+0x74/0x77 [ipv6]
+   [<ffffffffa028e277>] do_execute_actions+0xcc1/0xdc8 [openvswitch]
+   [<ffffffffa028e3f2>] ovs_execute_actions+0x74/0x106 [openvswitch]
+   [<ffffffffa0292130>] ovs_dp_process_packet+0xe1/0xfd [openvswitch]
+   [<ffffffffa0292b77>] ? key_extract+0x63c/0x8d5 [openvswitch]
+   [<ffffffffa029848b>] ovs_vport_receive+0xa1/0xc3 [openvswitch]
+  [...]
+
+Also we can find that the actions_len is much little than the orig_len:
+  crash> struct sw_flow_actions 0xffff8812f539d000
+  struct sw_flow_actions {
+    rcu = {
+      next = 0xffff8812f5398800,
+      func = 0xffffe3b00035db32
+    },
+    orig_len = 1384,
+    actions_len = 592,
+    actions = 0xffff8812f539d01c
+  }
+
+So as a quick fix, use the orig_len instead of the actions_len to alloc
+the user_skb.
+
+Last, this oops happened on our system running a relative old kernel, but
+the same risk still exists on the mainline, since we use the wrong
+actions_len from the beginning.
+
+Fixes: ccea74457bbd ("openvswitch: include datapath actions with sampled-packet upcall to userspace")
+Cc: Neil McKee <neil.mckee@inmon.com>
+Signed-off-by: Liping Zhang <zlpnobody@gmail.com>
+Acked-by: Pravin B Shelar <pshelar@ovn.org>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/openvswitch/actions.c  |    1 +
+ net/openvswitch/datapath.c |    7 ++++---
+ net/openvswitch/datapath.h |    2 ++
+ 3 files changed, 7 insertions(+), 3 deletions(-)
+
+--- a/net/openvswitch/actions.c
++++ b/net/openvswitch/actions.c
+@@ -1337,6 +1337,7 @@ int ovs_execute_actions(struct datapath
+ 		goto out;
+ 	}
+ 
++	OVS_CB(skb)->acts_origlen = acts->orig_len;
+ 	err = do_execute_actions(dp, skb, key,
+ 				 acts->actions, acts->actions_len);
+ 
+--- a/net/openvswitch/datapath.c
++++ b/net/openvswitch/datapath.c
+@@ -381,7 +381,7 @@ static int queue_gso_packets(struct data
+ }
+ 
+ static size_t upcall_msg_size(const struct dp_upcall_info *upcall_info,
+-			      unsigned int hdrlen)
++			      unsigned int hdrlen, int actions_attrlen)
+ {
+ 	size_t size = NLMSG_ALIGN(sizeof(struct ovs_header))
+ 		+ nla_total_size(hdrlen) /* OVS_PACKET_ATTR_PACKET */
+@@ -398,7 +398,7 @@ static size_t upcall_msg_size(const stru
+ 
+ 	/* OVS_PACKET_ATTR_ACTIONS */
+ 	if (upcall_info->actions_len)
+-		size += nla_total_size(upcall_info->actions_len);
++		size += nla_total_size(actions_attrlen);
+ 
+ 	/* OVS_PACKET_ATTR_MRU */
+ 	if (upcall_info->mru)
+@@ -465,7 +465,8 @@ static int queue_userspace_packet(struct
+ 	else
+ 		hlen = skb->len;
+ 
+-	len = upcall_msg_size(upcall_info, hlen - cutlen);
++	len = upcall_msg_size(upcall_info, hlen - cutlen,
++			      OVS_CB(skb)->acts_origlen);
+ 	user_skb = genlmsg_new(len, GFP_ATOMIC);
+ 	if (!user_skb) {
+ 		err = -ENOMEM;
+--- a/net/openvswitch/datapath.h
++++ b/net/openvswitch/datapath.h
+@@ -98,12 +98,14 @@ struct datapath {
+  * @input_vport: The original vport packet came in on. This value is cached
+  * when a packet is received by OVS.
+  * @mru: The maximum received fragement size; 0 if the packet is not
++ * @acts_origlen: The netlink size of the flow actions applied to this skb.
+  * @cutlen: The number of bytes from the packet end to be removed.
+  * fragmented.
+  */
+ struct ovs_skb_cb {
+ 	struct vport		*input_vport;
+ 	u16			mru;
++	u16			acts_origlen;
+ 	u32			cutlen;
+ };
+ #define OVS_CB(skb) ((struct ovs_skb_cb *)(skb)->cb)
