@@ -1,0 +1,155 @@
+From a7e52ad7ed82e21273eccff93d1477a7b313aabb Mon Sep 17 00:00:00 2001
+From: "Steven Rostedt (VMware)" <rostedt@goodmis.org>
+Date: Wed, 2 Aug 2017 14:20:54 -0400
+Subject: ring-buffer: Have ring_buffer_alloc_read_page() return error on offline CPU
+
+From: Steven Rostedt (VMware) <rostedt@goodmis.org>
+
+commit a7e52ad7ed82e21273eccff93d1477a7b313aabb upstream.
+
+Chunyu Hu reported:
+  "per_cpu trace directories and files are created for all possible cpus,
+   but only the cpus which have ever been on-lined have their own per cpu
+   ring buffer (allocated by cpuhp threads). While trace_buffers_open, the
+   open handler for trace file 'trace_pipe_raw' is always trying to access
+   field of ring_buffer_per_cpu, and would panic with the NULL pointer.
+
+   Align the behavior of trace_pipe_raw with trace_pipe, that returns -NODEV
+   when openning it if that cpu does not have trace ring buffer.
+
+   Reproduce:
+   cat /sys/kernel/debug/tracing/per_cpu/cpu31/trace_pipe_raw
+   (cpu31 is never on-lined, this is a 16 cores x86_64 box)
+
+   Tested with:
+   1) boot with maxcpus=14, read trace_pipe_raw of cpu15.
+      Got -NODEV.
+   2) oneline cpu15, read trace_pipe_raw of cpu15.
+      Get the raw trace data.
+
+   Call trace:
+   [ 5760.950995] RIP: 0010:ring_buffer_alloc_read_page+0x32/0xe0
+   [ 5760.961678]  tracing_buffers_read+0x1f6/0x230
+   [ 5760.962695]  __vfs_read+0x37/0x160
+   [ 5760.963498]  ? __vfs_read+0x5/0x160
+   [ 5760.964339]  ? security_file_permission+0x9d/0xc0
+   [ 5760.965451]  ? __vfs_read+0x5/0x160
+   [ 5760.966280]  vfs_read+0x8c/0x130
+   [ 5760.967070]  SyS_read+0x55/0xc0
+   [ 5760.967779]  do_syscall_64+0x67/0x150
+   [ 5760.968687]  entry_SYSCALL64_slow_path+0x25/0x25"
+
+This was introduced by the addition of the feature to reuse reader pages
+instead of re-allocating them. The problem is that the allocation of a
+reader page (which is per cpu) does not check if the cpu is online and set
+up for the ring buffer.
+
+Link: http://lkml.kernel.org/r/1500880866-1177-1-git-send-email-chuhu@redhat.com
+
+Fixes: 73a757e63114 ("ring-buffer: Return reader page back into existing ring buffer")
+Reported-by: Chunyu Hu <chuhu@redhat.com>
+Signed-off-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ kernel/trace/ring_buffer.c           |   14 +++++++++-----
+ kernel/trace/ring_buffer_benchmark.c |    2 +-
+ kernel/trace/trace.c                 |   16 +++++++++++-----
+ 3 files changed, 21 insertions(+), 11 deletions(-)
+
+--- a/kernel/trace/ring_buffer.c
++++ b/kernel/trace/ring_buffer.c
+@@ -4386,15 +4386,19 @@ EXPORT_SYMBOL_GPL(ring_buffer_swap_cpu);
+  * the page that was allocated, with the read page of the buffer.
+  *
+  * Returns:
+- *  The page allocated, or NULL on error.
++ *  The page allocated, or ERR_PTR
+  */
+ void *ring_buffer_alloc_read_page(struct ring_buffer *buffer, int cpu)
+ {
+-	struct ring_buffer_per_cpu *cpu_buffer = buffer->buffers[cpu];
++	struct ring_buffer_per_cpu *cpu_buffer;
+ 	struct buffer_data_page *bpage = NULL;
+ 	unsigned long flags;
+ 	struct page *page;
+ 
++	if (!cpumask_test_cpu(cpu, buffer->cpumask))
++		return ERR_PTR(-ENODEV);
++
++	cpu_buffer = buffer->buffers[cpu];
+ 	local_irq_save(flags);
+ 	arch_spin_lock(&cpu_buffer->lock);
+ 
+@@ -4412,7 +4416,7 @@ void *ring_buffer_alloc_read_page(struct
+ 	page = alloc_pages_node(cpu_to_node(cpu),
+ 				GFP_KERNEL | __GFP_NORETRY, 0);
+ 	if (!page)
+-		return NULL;
++		return ERR_PTR(-ENOMEM);
+ 
+ 	bpage = page_address(page);
+ 
+@@ -4467,8 +4471,8 @@ EXPORT_SYMBOL_GPL(ring_buffer_free_read_
+  *
+  * for example:
+  *	rpage = ring_buffer_alloc_read_page(buffer, cpu);
+- *	if (!rpage)
+- *		return error;
++ *	if (IS_ERR(rpage))
++ *		return PTR_ERR(rpage);
+  *	ret = ring_buffer_read_page(buffer, &rpage, len, cpu, 0);
+  *	if (ret >= 0)
+  *		process_page(rpage, ret);
+--- a/kernel/trace/ring_buffer_benchmark.c
++++ b/kernel/trace/ring_buffer_benchmark.c
+@@ -113,7 +113,7 @@ static enum event_status read_page(int c
+ 	int i;
+ 
+ 	bpage = ring_buffer_alloc_read_page(buffer, cpu);
+-	if (!bpage)
++	if (IS_ERR(bpage))
+ 		return EVENT_DROPPED;
+ 
+ 	ret = ring_buffer_read_page(buffer, &bpage, PAGE_SIZE, cpu, 1);
+--- a/kernel/trace/trace.c
++++ b/kernel/trace/trace.c
+@@ -6403,7 +6403,7 @@ tracing_buffers_read(struct file *filp,
+ {
+ 	struct ftrace_buffer_info *info = filp->private_data;
+ 	struct trace_iterator *iter = &info->iter;
+-	ssize_t ret;
++	ssize_t ret = 0;
+ 	ssize_t size;
+ 
+ 	if (!count)
+@@ -6417,10 +6417,15 @@ tracing_buffers_read(struct file *filp,
+ 	if (!info->spare) {
+ 		info->spare = ring_buffer_alloc_read_page(iter->trace_buffer->buffer,
+ 							  iter->cpu_file);
+-		info->spare_cpu = iter->cpu_file;
++		if (IS_ERR(info->spare)) {
++			ret = PTR_ERR(info->spare);
++			info->spare = NULL;
++		} else {
++			info->spare_cpu = iter->cpu_file;
++		}
+ 	}
+ 	if (!info->spare)
+-		return -ENOMEM;
++		return ret;
+ 
+ 	/* Do we have previous read data to read? */
+ 	if (info->read < PAGE_SIZE)
+@@ -6595,8 +6600,9 @@ tracing_buffers_splice_read(struct file
+ 		ref->ref = 1;
+ 		ref->buffer = iter->trace_buffer->buffer;
+ 		ref->page = ring_buffer_alloc_read_page(ref->buffer, iter->cpu_file);
+-		if (!ref->page) {
+-			ret = -ENOMEM;
++		if (IS_ERR(ref->page)) {
++			ret = PTR_ERR(ref->page);
++			ref->page = NULL;
+ 			kfree(ref);
+ 			break;
+ 		}
