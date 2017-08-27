@@ -1,0 +1,182 @@
+From 64aee2a965cf2954a038b5522f11d2cd2f0f8f3e Mon Sep 17 00:00:00 2001
+From: Mark Rutland <mark.rutland@arm.com>
+Date: Thu, 22 Jun 2017 15:41:38 +0100
+Subject: perf/core: Fix group {cpu,task} validation
+
+From: Mark Rutland <mark.rutland@arm.com>
+
+commit 64aee2a965cf2954a038b5522f11d2cd2f0f8f3e upstream.
+
+Regardless of which events form a group, it does not make sense for the
+events to target different tasks and/or CPUs, as this leaves the group
+inconsistent and impossible to schedule. The core perf code assumes that
+these are consistent across (successfully intialised) groups.
+
+Core perf code only verifies this when moving SW events into a HW
+context. Thus, we can violate this requirement for pure SW groups and
+pure HW groups, unless the relevant PMU driver happens to perform this
+verification itself. These mismatched groups subsequently wreak havoc
+elsewhere.
+
+For example, we handle watchpoints as SW events, and reserve watchpoint
+HW on a per-CPU basis at pmu::event_init() time to ensure that any event
+that is initialised is guaranteed to have a slot at pmu::add() time.
+However, the core code only checks the group leader's cpu filter (via
+event_filter_match()), and can thus install follower events onto CPUs
+violating thier (mismatched) CPU filters, potentially installing them
+into a CPU without sufficient reserved slots.
+
+This can be triggered with the below test case, resulting in warnings
+from arch backends.
+
+  #define _GNU_SOURCE
+  #include <linux/hw_breakpoint.h>
+  #include <linux/perf_event.h>
+  #include <sched.h>
+  #include <stdio.h>
+  #include <sys/prctl.h>
+  #include <sys/syscall.h>
+  #include <unistd.h>
+
+  static int perf_event_open(struct perf_event_attr *attr, pid_t pid, int cpu,
+			   int group_fd, unsigned long flags)
+  {
+	return syscall(__NR_perf_event_open, attr, pid, cpu, group_fd, flags);
+  }
+
+  char watched_char;
+
+  struct perf_event_attr wp_attr = {
+	.type = PERF_TYPE_BREAKPOINT,
+	.bp_type = HW_BREAKPOINT_RW,
+	.bp_addr = (unsigned long)&watched_char,
+	.bp_len = 1,
+	.size = sizeof(wp_attr),
+  };
+
+  int main(int argc, char *argv[])
+  {
+	int leader, ret;
+	cpu_set_t cpus;
+
+	/*
+	 * Force use of CPU0 to ensure our CPU0-bound events get scheduled.
+	 */
+	CPU_ZERO(&cpus);
+	CPU_SET(0, &cpus);
+	ret = sched_setaffinity(0, sizeof(cpus), &cpus);
+	if (ret) {
+		printf("Unable to set cpu affinity\n");
+		return 1;
+	}
+
+	/* open leader event, bound to this task, CPU0 only */
+	leader = perf_event_open(&wp_attr, 0, 0, -1, 0);
+	if (leader < 0) {
+		printf("Couldn't open leader: %d\n", leader);
+		return 1;
+	}
+
+	/*
+	 * Open a follower event that is bound to the same task, but a
+	 * different CPU. This means that the group should never be possible to
+	 * schedule.
+	 */
+	ret = perf_event_open(&wp_attr, 0, 1, leader, 0);
+	if (ret < 0) {
+		printf("Couldn't open mismatched follower: %d\n", ret);
+		return 1;
+	} else {
+		printf("Opened leader/follower with mismastched CPUs\n");
+	}
+
+	/*
+	 * Open as many independent events as we can, all bound to the same
+	 * task, CPU0 only.
+	 */
+	do {
+		ret = perf_event_open(&wp_attr, 0, 0, -1, 0);
+	} while (ret >= 0);
+
+	/*
+	 * Force enable/disble all events to trigger the erronoeous
+	 * installation of the follower event.
+	 */
+	printf("Opened all events. Toggling..\n");
+	for (;;) {
+		prctl(PR_TASK_PERF_EVENTS_DISABLE, 0, 0, 0, 0);
+		prctl(PR_TASK_PERF_EVENTS_ENABLE, 0, 0, 0, 0);
+	}
+
+	return 0;
+  }
+
+Fix this by validating this requirement regardless of whether we're
+moving events.
+
+Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Cc: Arnaldo Carvalho de Melo <acme@kernel.org>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Zhou Chengming <zhouchengming1@huawei.com>
+Link: http://lkml.kernel.org/r/1498142498-15758-1-git-send-email-mark.rutland@arm.com
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ kernel/events/core.c |   39 +++++++++++++++++++--------------------
+ 1 file changed, 19 insertions(+), 20 deletions(-)
+
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -9786,28 +9786,27 @@ SYSCALL_DEFINE5(perf_event_open,
+ 			goto err_context;
+ 
+ 		/*
+-		 * Do not allow to attach to a group in a different
+-		 * task or CPU context:
++		 * Make sure we're both events for the same CPU;
++		 * grouping events for different CPUs is broken; since
++		 * you can never concurrently schedule them anyhow.
+ 		 */
+-		if (move_group) {
+-			/*
+-			 * Make sure we're both on the same task, or both
+-			 * per-cpu events.
+-			 */
+-			if (group_leader->ctx->task != ctx->task)
+-				goto err_context;
++		if (group_leader->cpu != event->cpu)
++			goto err_context;
++
++		/*
++		 * Make sure we're both on the same task, or both
++		 * per-CPU events.
++		 */
++		if (group_leader->ctx->task != ctx->task)
++			goto err_context;
+ 
+-			/*
+-			 * Make sure we're both events for the same CPU;
+-			 * grouping events for different CPUs is broken; since
+-			 * you can never concurrently schedule them anyhow.
+-			 */
+-			if (group_leader->cpu != event->cpu)
+-				goto err_context;
+-		} else {
+-			if (group_leader->ctx != ctx)
+-				goto err_context;
+-		}
++		/*
++		 * Do not allow to attach to a group in a different task
++		 * or CPU context. If we're moving SW events, we'll fix
++		 * this up later, so allow that.
++		 */
++		if (!move_group && group_leader->ctx != ctx)
++			goto err_context;
+ 
+ 		/*
+ 		 * Only a group leader can be exclusive or pinned

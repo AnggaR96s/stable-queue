@@ -1,0 +1,206 @@
+From 2fe59f507a65dbd734b990a11ebc7488f6f87a24 Mon Sep 17 00:00:00 2001
+From: Nicholas Piggin <npiggin@gmail.com>
+Date: Tue, 22 Aug 2017 18:43:48 +1000
+Subject: timers: Fix excessive granularity of new timers after a nohz idle
+
+From: Nicholas Piggin <npiggin@gmail.com>
+
+commit 2fe59f507a65dbd734b990a11ebc7488f6f87a24 upstream.
+
+When a timer base is idle, it is forwarded when a new timer is added
+to ensure that granularity does not become excessive. When not idle,
+the timer tick is expected to increment the base.
+
+However there are several problems:
+
+- If an existing timer is modified, the base is forwarded only after
+  the index is calculated.
+
+- The base is not forwarded by add_timer_on.
+
+- There is a window after a timer is restarted from a nohz idle, after
+  it is marked not-idle and before the timer tick on this CPU, where a
+  timer may be added but the ancient base does not get forwarded.
+
+These result in excessive granularity (a 1 jiffy timeout can blow out
+to 100s of jiffies), which cause the rcu lockup detector to trigger,
+among other things.
+
+Fix this by keeping track of whether the timer base has been idle
+since it was last run or forwarded, and if so then forward it before
+adding a new timer.
+
+There is still a case where mod_timer optimises the case of a pending
+timer mod with the same expiry time, where the timer can see excessive
+granularity relative to the new, shorter interval. A comment is added,
+but it's not changed because it is an important fastpath for
+networking.
+
+This has been tested and found to fix the RCU softlockup messages.
+
+Testing was also done with tracing to measure requested versus
+achieved wakeup latencies for all non-deferrable timers in an idle
+system (with no lockup watchdogs running). Wakeup latency relative to
+absolute latency is calculated (note this suffers from round-up skew
+at low absolute times) and analysed:
+
+             max     avg      std
+upstream   506.0    1.20     4.68
+patched      2.0    1.08     0.15
+
+The bug was noticed due to the lockup detector Kconfig changes
+dropping it out of people's .configs and resulting in larger base
+clk skew When the lockup detectors are enabled, no CPU can go idle for
+longer than 4 seconds, which limits the granularity errors.
+Sub-optimal timer behaviour is observable on a smaller scale in that
+case:
+
+	     max     avg      std
+upstream     9.0    1.05     0.19
+patched      2.0    1.04     0.11
+
+Fixes: Fixes: a683f390b93f ("timers: Forward the wheel clock whenever possible")
+Signed-off-by: Nicholas Piggin <npiggin@gmail.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Tested-by: Jonathan Cameron <Jonathan.Cameron@huawei.com>
+Tested-by: David Miller <davem@davemloft.net>
+Cc: dzickus@redhat.com
+Cc: sfr@canb.auug.org.au
+Cc: mpe@ellerman.id.au
+Cc: Stephen Boyd <sboyd@codeaurora.org>
+Cc: linuxarm@huawei.com
+Cc: abdhalee@linux.vnet.ibm.com
+Cc: John Stultz <john.stultz@linaro.org>
+Cc: akpm@linux-foundation.org
+Cc: paulmck@linux.vnet.ibm.com
+Cc: torvalds@linux-foundation.org
+Link: http://lkml.kernel.org/r/20170822084348.21436-1-npiggin@gmail.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ kernel/time/timer.c |   50 +++++++++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 41 insertions(+), 9 deletions(-)
+
+--- a/kernel/time/timer.c
++++ b/kernel/time/timer.c
+@@ -201,6 +201,7 @@ struct timer_base {
+ 	bool			migration_enabled;
+ 	bool			nohz_active;
+ 	bool			is_idle;
++	bool			must_forward_clk;
+ 	DECLARE_BITMAP(pending_map, WHEEL_SIZE);
+ 	struct hlist_head	vectors[WHEEL_SIZE];
+ } ____cacheline_aligned;
+@@ -891,13 +892,19 @@ get_target_base(struct timer_base *base,
+ 
+ static inline void forward_timer_base(struct timer_base *base)
+ {
+-	unsigned long jnow = READ_ONCE(jiffies);
++	unsigned long jnow;
+ 
+ 	/*
+-	 * We only forward the base when it's idle and we have a delta between
+-	 * base clock and jiffies.
++	 * We only forward the base when we are idle or have just come out of
++	 * idle (must_forward_clk logic), and have a delta between base clock
++	 * and jiffies. In the common case, run_timers will take care of it.
+ 	 */
+-	if (!base->is_idle || (long) (jnow - base->clk) < 2)
++	if (likely(!base->must_forward_clk))
++		return;
++
++	jnow = READ_ONCE(jiffies);
++	base->must_forward_clk = base->is_idle;
++	if ((long)(jnow - base->clk) < 2)
+ 		return;
+ 
+ 	/*
+@@ -973,6 +980,11 @@ __mod_timer(struct timer_list *timer, un
+ 	 * same array bucket then just return:
+ 	 */
+ 	if (timer_pending(timer)) {
++		/*
++		 * The downside of this optimization is that it can result in
++		 * larger granularity than you would get from adding a new
++		 * timer with this expiry.
++		 */
+ 		if (timer->expires == expires)
+ 			return 1;
+ 
+@@ -983,6 +995,7 @@ __mod_timer(struct timer_list *timer, un
+ 		 * dequeue/enqueue dance.
+ 		 */
+ 		base = lock_timer_base(timer, &flags);
++		forward_timer_base(base);
+ 
+ 		clk = base->clk;
+ 		idx = calc_wheel_index(expires, clk);
+@@ -999,6 +1012,7 @@ __mod_timer(struct timer_list *timer, un
+ 		}
+ 	} else {
+ 		base = lock_timer_base(timer, &flags);
++		forward_timer_base(base);
+ 	}
+ 
+ 	timer_stats_timer_set_start_info(timer);
+@@ -1028,12 +1042,10 @@ __mod_timer(struct timer_list *timer, un
+ 			spin_lock(&base->lock);
+ 			WRITE_ONCE(timer->flags,
+ 				   (timer->flags & ~TIMER_BASEMASK) | base->cpu);
++			forward_timer_base(base);
+ 		}
+ 	}
+ 
+-	/* Try to forward a stale timer base clock */
+-	forward_timer_base(base);
+-
+ 	timer->expires = expires;
+ 	/*
+ 	 * If 'idx' was calculated above and the base time did not advance
+@@ -1150,6 +1162,7 @@ void add_timer_on(struct timer_list *tim
+ 		WRITE_ONCE(timer->flags,
+ 			   (timer->flags & ~TIMER_BASEMASK) | cpu);
+ 	}
++	forward_timer_base(base);
+ 
+ 	debug_activate(timer, timer->expires);
+ 	internal_add_timer(base, timer);
+@@ -1538,10 +1551,16 @@ u64 get_next_timer_interrupt(unsigned lo
+ 		if (!is_max_delta)
+ 			expires = basem + (u64)(nextevt - basej) * TICK_NSEC;
+ 		/*
+-		 * If we expect to sleep more than a tick, mark the base idle:
++		 * If we expect to sleep more than a tick, mark the base idle.
++		 * Also the tick is stopped so any added timer must forward
++		 * the base clk itself to keep granularity small. This idle
++		 * logic is only maintained for the BASE_STD base, deferrable
++		 * timers may still see large granularity skew (by design).
+ 		 */
+-		if ((expires - basem) > TICK_NSEC)
++		if ((expires - basem) > TICK_NSEC) {
++			base->must_forward_clk = true;
+ 			base->is_idle = true;
++		}
+ 	}
+ 	spin_unlock(&base->lock);
+ 
+@@ -1651,6 +1670,19 @@ static __latent_entropy void run_timer_s
+ {
+ 	struct timer_base *base = this_cpu_ptr(&timer_bases[BASE_STD]);
+ 
++	/*
++	 * must_forward_clk must be cleared before running timers so that any
++	 * timer functions that call mod_timer will not try to forward the
++	 * base. idle trcking / clock forwarding logic is only used with
++	 * BASE_STD timers.
++	 *
++	 * The deferrable base does not do idle tracking at all, so we do
++	 * not forward it. This can result in very large variations in
++	 * granularity for deferrable timers, but they can be deferred for
++	 * long periods due to idle.
++	 */
++	base->must_forward_clk = false;
++
+ 	__run_timers(base);
+ 	if (IS_ENABLED(CONFIG_NO_HZ_COMMON) && base->nohz_active)
+ 		__run_timers(this_cpu_ptr(&timer_bases[BASE_DEF]));
