@@ -1,0 +1,152 @@
+From b9dd21e104bcd45e124acfe978a79df71259e59b Mon Sep 17 00:00:00 2001
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Wed, 23 Aug 2017 23:14:38 +0200
+Subject: KVM: x86: simplify handling of PKRU
+
+From: Paolo Bonzini <pbonzini@redhat.com>
+
+commit b9dd21e104bcd45e124acfe978a79df71259e59b upstream.
+
+Move it to struct kvm_arch_vcpu, replacing guest_pkru_valid with a
+simple comparison against the host value of the register.  The write of
+PKRU in addition can be skipped if the guest has not enabled the feature.
+Once we do this, we need not test OSPKE in the host anymore, because
+guest_CR4.PKE=1 implies host_CR4.PKE=1.
+
+The static PKU test is kept to elide the code on older CPUs.
+
+Suggested-by: Yang Zhang <zy107165@alibaba-inc.com>
+Fixes: 1be0e61c1f255faaeab04a390e00c8b9b9042870
+Reviewed-by: David Hildenbrand <david@redhat.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ arch/x86/include/asm/kvm_host.h |    1 +
+ arch/x86/kvm/kvm_cache_regs.h   |    5 -----
+ arch/x86/kvm/mmu.h              |    2 +-
+ arch/x86/kvm/svm.c              |    7 -------
+ arch/x86/kvm/vmx.c              |   25 ++++++++-----------------
+ 5 files changed, 10 insertions(+), 30 deletions(-)
+
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -486,6 +486,7 @@ struct kvm_vcpu_arch {
+ 	unsigned long cr4;
+ 	unsigned long cr4_guest_owned_bits;
+ 	unsigned long cr8;
++	u32 pkru;
+ 	u32 hflags;
+ 	u64 efer;
+ 	u64 apic_base;
+--- a/arch/x86/kvm/kvm_cache_regs.h
++++ b/arch/x86/kvm/kvm_cache_regs.h
+@@ -84,11 +84,6 @@ static inline u64 kvm_read_edx_eax(struc
+ 		| ((u64)(kvm_register_read(vcpu, VCPU_REGS_RDX) & -1u) << 32);
+ }
+ 
+-static inline u32 kvm_read_pkru(struct kvm_vcpu *vcpu)
+-{
+-	return kvm_x86_ops->get_pkru(vcpu);
+-}
+-
+ static inline void enter_guest_mode(struct kvm_vcpu *vcpu)
+ {
+ 	vcpu->arch.hflags |= HF_GUEST_MASK;
+--- a/arch/x86/kvm/mmu.h
++++ b/arch/x86/kvm/mmu.h
+@@ -182,7 +182,7 @@ static inline u8 permission_fault(struct
+ 		* index of the protection domain, so pte_pkey * 2 is
+ 		* is the index of the first bit for the domain.
+ 		*/
+-		pkru_bits = (kvm_read_pkru(vcpu) >> (pte_pkey * 2)) & 3;
++		pkru_bits = (vcpu->arch.pkru >> (pte_pkey * 2)) & 3;
+ 
+ 		/* clear present bit, replace PFEC.RSVD with ACC_USER_MASK. */
+ 		offset = (pfec & ~1) +
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -1725,11 +1725,6 @@ static void svm_set_rflags(struct kvm_vc
+ 	to_svm(vcpu)->vmcb->save.rflags = rflags;
+ }
+ 
+-static u32 svm_get_pkru(struct kvm_vcpu *vcpu)
+-{
+-	return 0;
+-}
+-
+ static void svm_cache_reg(struct kvm_vcpu *vcpu, enum kvm_reg reg)
+ {
+ 	switch (reg) {
+@@ -5313,8 +5308,6 @@ static struct kvm_x86_ops svm_x86_ops __
+ 	.get_rflags = svm_get_rflags,
+ 	.set_rflags = svm_set_rflags,
+ 
+-	.get_pkru = svm_get_pkru,
+-
+ 	.tlb_flush = svm_flush_tlb,
+ 
+ 	.run = svm_vcpu_run,
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -636,8 +636,6 @@ struct vcpu_vmx {
+ 
+ 	u64 current_tsc_ratio;
+ 
+-	bool guest_pkru_valid;
+-	u32 guest_pkru;
+ 	u32 host_pkru;
+ 
+ 	/*
+@@ -2368,11 +2366,6 @@ static void vmx_set_rflags(struct kvm_vc
+ 	vmcs_writel(GUEST_RFLAGS, rflags);
+ }
+ 
+-static u32 vmx_get_pkru(struct kvm_vcpu *vcpu)
+-{
+-	return to_vmx(vcpu)->guest_pkru;
+-}
+-
+ static u32 vmx_get_interrupt_shadow(struct kvm_vcpu *vcpu)
+ {
+ 	u32 interruptibility = vmcs_read32(GUEST_INTERRUPTIBILITY_INFO);
+@@ -8860,8 +8853,10 @@ static void __noclone vmx_vcpu_run(struc
+ 	if (vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP)
+ 		vmx_set_interrupt_shadow(vcpu, 0);
+ 
+-	if (vmx->guest_pkru_valid)
+-		__write_pkru(vmx->guest_pkru);
++	if (static_cpu_has(X86_FEATURE_PKU) &&
++	    kvm_read_cr4_bits(vcpu, X86_CR4_PKE) &&
++	    vcpu->arch.pkru != vmx->host_pkru)
++		__write_pkru(vcpu->arch.pkru);
+ 
+ 	atomic_switch_perf_msrs(vmx);
+ 	debugctlmsr = get_debugctlmsr();
+@@ -9009,13 +9004,11 @@ static void __noclone vmx_vcpu_run(struc
+ 	 * back on host, so it is safe to read guest PKRU from current
+ 	 * XSAVE.
+ 	 */
+-	if (boot_cpu_has(X86_FEATURE_OSPKE)) {
+-		vmx->guest_pkru = __read_pkru();
+-		if (vmx->guest_pkru != vmx->host_pkru) {
+-			vmx->guest_pkru_valid = true;
++	if (static_cpu_has(X86_FEATURE_PKU) &&
++	    kvm_read_cr4_bits(vcpu, X86_CR4_PKE)) {
++		vcpu->arch.pkru = __read_pkru();
++		if (vcpu->arch.pkru != vmx->host_pkru)
+ 			__write_pkru(vmx->host_pkru);
+-		} else
+-			vmx->guest_pkru_valid = false;
+ 	}
+ 
+ 	/*
+@@ -11507,8 +11500,6 @@ static struct kvm_x86_ops vmx_x86_ops __
+ 	.get_rflags = vmx_get_rflags,
+ 	.set_rflags = vmx_set_rflags,
+ 
+-	.get_pkru = vmx_get_pkru,
+-
+ 	.tlb_flush = vmx_flush_tlb,
+ 
+ 	.run = vmx_vcpu_run,
