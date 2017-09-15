@@ -1,0 +1,163 @@
+From foo@baz Fri Sep 15 10:03:45 PDT 2017
+From: Wei Wang <weiwan@google.com>
+Date: Mon, 21 Aug 2017 09:47:10 -0700
+Subject: ipv6: add rcu grace period before freeing fib6_node
+
+From: Wei Wang <weiwan@google.com>
+
+
+[ Upstream commit c5cff8561d2d0006e972bd114afd51f082fee77c ]
+
+We currently keep rt->rt6i_node pointing to the fib6_node for the route.
+And some functions make use of this pointer to dereference the fib6_node
+from rt structure, e.g. rt6_check(). However, as there is neither
+refcount nor rcu taken when dereferencing rt->rt6i_node, it could
+potentially cause crashes as rt->rt6i_node could be set to NULL by other
+CPUs when doing a route deletion.
+This patch introduces an rcu grace period before freeing fib6_node and
+makes sure the functions that dereference it takes rcu_read_lock().
+
+Note: there is no "Fixes" tag because this bug was there in a very
+early stage.
+
+Signed-off-by: Wei Wang <weiwan@google.com>
+Acked-by: Eric Dumazet <edumazet@google.com>
+Acked-by: Martin KaFai Lau <kafai@fb.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/net/ip6_fib.h |   30 +++++++++++++++++++++++++++++-
+ net/ipv6/ip6_fib.c    |   20 ++++++++++++++++----
+ net/ipv6/route.c      |   14 +++++++++++---
+ 3 files changed, 56 insertions(+), 8 deletions(-)
+
+--- a/include/net/ip6_fib.h
++++ b/include/net/ip6_fib.h
+@@ -68,6 +68,7 @@ struct fib6_node {
+ 	__u16			fn_flags;
+ 	int			fn_sernum;
+ 	struct rt6_info		*rr_ptr;
++	struct rcu_head		rcu;
+ };
+ 
+ #ifndef CONFIG_IPV6_SUBTREES
+@@ -165,13 +166,40 @@ static inline void rt6_update_expires(st
+ 	rt0->rt6i_flags |= RTF_EXPIRES;
+ }
+ 
++/* Function to safely get fn->sernum for passed in rt
++ * and store result in passed in cookie.
++ * Return true if we can get cookie safely
++ * Return false if not
++ */
++static inline bool rt6_get_cookie_safe(const struct rt6_info *rt,
++				       u32 *cookie)
++{
++	struct fib6_node *fn;
++	bool status = false;
++
++	rcu_read_lock();
++	fn = rcu_dereference(rt->rt6i_node);
++
++	if (fn) {
++		*cookie = fn->fn_sernum;
++		status = true;
++	}
++
++	rcu_read_unlock();
++	return status;
++}
++
+ static inline u32 rt6_get_cookie(const struct rt6_info *rt)
+ {
++	u32 cookie = 0;
++
+ 	if (rt->rt6i_flags & RTF_PCPU ||
+ 	    (unlikely(rt->dst.flags & DST_NOCACHE) && rt->dst.from))
+ 		rt = (struct rt6_info *)(rt->dst.from);
+ 
+-	return rt->rt6i_node ? rt->rt6i_node->fn_sernum : 0;
++	rt6_get_cookie_safe(rt, &cookie);
++
++	return cookie;
+ }
+ 
+ static inline void ip6_rt_put(struct rt6_info *rt)
+--- a/net/ipv6/ip6_fib.c
++++ b/net/ipv6/ip6_fib.c
+@@ -150,11 +150,23 @@ static struct fib6_node *node_alloc(void
+ 	return fn;
+ }
+ 
+-static void node_free(struct fib6_node *fn)
++static void node_free_immediate(struct fib6_node *fn)
++{
++	kmem_cache_free(fib6_node_kmem, fn);
++}
++
++static void node_free_rcu(struct rcu_head *head)
+ {
++	struct fib6_node *fn = container_of(head, struct fib6_node, rcu);
++
+ 	kmem_cache_free(fib6_node_kmem, fn);
+ }
+ 
++static void node_free(struct fib6_node *fn)
++{
++	call_rcu(&fn->rcu, node_free_rcu);
++}
++
+ static void rt6_rcu_free(struct rt6_info *rt)
+ {
+ 	call_rcu(&rt->dst.rcu_head, dst_rcu_free);
+@@ -588,9 +600,9 @@ insert_above:
+ 
+ 		if (!in || !ln) {
+ 			if (in)
+-				node_free(in);
++				node_free_immediate(in);
+ 			if (ln)
+-				node_free(ln);
++				node_free_immediate(ln);
+ 			return ERR_PTR(-ENOMEM);
+ 		}
+ 
+@@ -1015,7 +1027,7 @@ int fib6_add(struct fib6_node *root, str
+ 				   root, and then (in failure) stale node
+ 				   in main tree.
+ 				 */
+-				node_free(sfn);
++				node_free_immediate(sfn);
+ 				err = PTR_ERR(sn);
+ 				goto failure;
+ 			}
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@ -1248,7 +1248,9 @@ static void rt6_dst_from_metrics_check(s
+ 
+ static struct dst_entry *rt6_check(struct rt6_info *rt, u32 cookie)
+ {
+-	if (!rt->rt6i_node || (rt->rt6i_node->fn_sernum != cookie))
++	u32 rt_cookie;
++
++	if (!rt6_get_cookie_safe(rt, &rt_cookie) || rt_cookie != cookie)
+ 		return NULL;
+ 
+ 	if (rt6_check_expired(rt))
+@@ -1316,8 +1318,14 @@ static void ip6_link_failure(struct sk_b
+ 		if (rt->rt6i_flags & RTF_CACHE) {
+ 			dst_hold(&rt->dst);
+ 			ip6_del_rt(rt);
+-		} else if (rt->rt6i_node && (rt->rt6i_flags & RTF_DEFAULT)) {
+-			rt->rt6i_node->fn_sernum = -1;
++		} else {
++			struct fib6_node *fn;
++
++			rcu_read_lock();
++			fn = rcu_dereference(rt->rt6i_node);
++			if (fn && (rt->rt6i_flags & RTF_DEFAULT))
++				fn->fn_sernum = -1;
++			rcu_read_unlock();
+ 		}
+ 	}
+ }
