@@ -1,0 +1,72 @@
+From paulus@ozlabs.org  Mon Oct  2 11:15:17 2017
+From: Paul Mackerras <paulus@ozlabs.org>
+Date: Tue, 12 Sep 2017 15:42:38 +1000
+Subject: KVM: PPC: Book3S HV: Protect updates to spapr_tce_tables list
+To: stable@vger.kernel.org
+Message-ID: <20170912054238.ori4majx46kxpz5m@oak.ozlabs.ibm.com>
+Content-Disposition: inline
+
+From: Paul Mackerras <paulus@ozlabs.org>
+
+commit edd03602d97236e8fea13cd76886c576186aa307 upstream.
+
+Al Viro pointed out that while one thread of a process is executing
+in kvm_vm_ioctl_create_spapr_tce(), another thread could guess the
+file descriptor returned by anon_inode_getfd() and close() it before
+the first thread has added it to the kvm->arch.spapr_tce_tables list.
+That highlights a more general problem: there is no mutual exclusion
+between writers to the spapr_tce_tables list, leading to the
+possibility of the list becoming corrupted, which could cause a
+host kernel crash.
+
+To fix the mutual exclusion problem, we add a mutex_lock/unlock
+pair around the list_del_rce in kvm_spapr_tce_release().
+
+If another thread does guess the file descriptor returned by the
+anon_inode_getfd() call in kvm_vm_ioctl_create_spapr_tce() and closes
+it, its call to kvm_spapr_tce_release() will not do any harm because
+it will have to wait until the first thread has released kvm->lock.
+
+The other things that the second thread could do with the guessed
+file descriptor are to mmap it or to pass it as a parameter to a
+KVM_DEV_VFIO_GROUP_SET_SPAPR_TCE ioctl on a KVM device fd.  An mmap
+call won't cause any harm because kvm_spapr_tce_mmap() and
+kvm_spapr_tce_fault() don't access the spapr_tce_tables list or
+the kvmppc_spapr_tce_table.list field, and the fields that they do use
+have been properly initialized by the time of the anon_inode_getfd()
+call.
+
+The KVM_DEV_VFIO_GROUP_SET_SPAPR_TCE ioctl calls
+kvm_spapr_tce_attach_iommu_group(), which scans the spapr_tce_tables
+list looking for the kvmppc_spapr_tce_table struct corresponding to
+the fd given as the parameter.  Either it will find the new entry
+or it won't; if it doesn't, it just returns an error, and if it
+does, it will function normally.  So, in each case there is no
+harmful effect.
+
+[paulus@ozlabs.org - moved parts of the upstream patch into the backport
+ of 47c5310a8dbe, adjusted this commit message accordingly.]
+
+Fixes: 366baf28ee3f ("KVM: PPC: Use RCU for arch.spapr_tce_tables")
+Reviewed-by: David Gibson <david@gibson.dropbear.id.au>
+Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ arch/powerpc/kvm/book3s_64_vio.c |    3 +++
+ 1 file changed, 3 insertions(+)
+
+--- a/arch/powerpc/kvm/book3s_64_vio.c
++++ b/arch/powerpc/kvm/book3s_64_vio.c
+@@ -129,8 +129,11 @@ static int kvm_spapr_tce_mmap(struct fil
+ static int kvm_spapr_tce_release(struct inode *inode, struct file *filp)
+ {
+ 	struct kvmppc_spapr_tce_table *stt = filp->private_data;
++	struct kvm *kvm = stt->kvm;
+ 
++	mutex_lock(&kvm->lock);
+ 	list_del_rcu(&stt->list);
++	mutex_unlock(&kvm->lock);
+ 
+ 	kvm_put_kvm(stt->kvm);
+ 
