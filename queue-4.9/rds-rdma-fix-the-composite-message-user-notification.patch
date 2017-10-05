@@ -1,0 +1,123 @@
+From foo@baz Thu Oct  5 10:28:31 CEST 2017
+From: Santosh Shilimkar <santosh.shilimkar@oracle.com>
+Date: Thu, 18 Feb 2016 20:06:47 -0800
+Subject: RDS: RDMA: Fix the composite message user notification
+
+From: Santosh Shilimkar <santosh.shilimkar@oracle.com>
+
+
+[ Upstream commit 941f8d55f6d613a460a5e080d25a38509f45eb75 ]
+
+When application sends an RDS RDMA composite message consist of
+RDMA transfer to be followed up by non RDMA payload, it expect to
+be notified *only* when the full message gets delivered. RDS RDMA
+notification doesn't behave this way though.
+
+Thanks to Venkat for debug and root casuing the issue
+where only first part of the message(RDMA) was
+successfully delivered but remainder payload delivery failed.
+In that case, application should not be notified with
+a false positive of message delivery success.
+
+Fix this case by making sure the user gets notified only after
+the full message delivery.
+
+Reviewed-by: Venkat Venkatsubra <venkat.x.venkatsubra@oracle.com>
+Signed-off-by: Santosh Shilimkar <santosh.shilimkar@oracle.com>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/rds/ib_send.c |   25 +++++++++++++++----------
+ net/rds/rdma.c    |   10 ++++++++++
+ net/rds/rds.h     |    1 +
+ net/rds/send.c    |    4 +++-
+ 4 files changed, 29 insertions(+), 11 deletions(-)
+
+--- a/net/rds/ib_send.c
++++ b/net/rds/ib_send.c
+@@ -69,16 +69,6 @@ static void rds_ib_send_complete(struct
+ 	complete(rm, notify_status);
+ }
+ 
+-static void rds_ib_send_unmap_data(struct rds_ib_connection *ic,
+-				   struct rm_data_op *op,
+-				   int wc_status)
+-{
+-	if (op->op_nents)
+-		ib_dma_unmap_sg(ic->i_cm_id->device,
+-				op->op_sg, op->op_nents,
+-				DMA_TO_DEVICE);
+-}
+-
+ static void rds_ib_send_unmap_rdma(struct rds_ib_connection *ic,
+ 				   struct rm_rdma_op *op,
+ 				   int wc_status)
+@@ -139,6 +129,21 @@ static void rds_ib_send_unmap_atomic(str
+ 		rds_ib_stats_inc(s_ib_atomic_fadd);
+ }
+ 
++static void rds_ib_send_unmap_data(struct rds_ib_connection *ic,
++				   struct rm_data_op *op,
++				   int wc_status)
++{
++	struct rds_message *rm = container_of(op, struct rds_message, data);
++
++	if (op->op_nents)
++		ib_dma_unmap_sg(ic->i_cm_id->device,
++				op->op_sg, op->op_nents,
++				DMA_TO_DEVICE);
++
++	if (rm->rdma.op_active && rm->data.op_notify)
++		rds_ib_send_unmap_rdma(ic, &rm->rdma, wc_status);
++}
++
+ /*
+  * Unmap the resources associated with a struct send_work.
+  *
+--- a/net/rds/rdma.c
++++ b/net/rds/rdma.c
+@@ -626,6 +626,16 @@ int rds_cmsg_rdma_args(struct rds_sock *
+ 		}
+ 		op->op_notifier->n_user_token = args->user_token;
+ 		op->op_notifier->n_status = RDS_RDMA_SUCCESS;
++
++		/* Enable rmda notification on data operation for composite
++		 * rds messages and make sure notification is enabled only
++		 * for the data operation which follows it so that application
++		 * gets notified only after full message gets delivered.
++		 */
++		if (rm->data.op_sg) {
++			rm->rdma.op_notify = 0;
++			rm->data.op_notify = !!(args->flags & RDS_RDMA_NOTIFY_ME);
++		}
+ 	}
+ 
+ 	/* The cookie contains the R_Key of the remote memory region, and
+--- a/net/rds/rds.h
++++ b/net/rds/rds.h
+@@ -414,6 +414,7 @@ struct rds_message {
+ 		} rdma;
+ 		struct rm_data_op {
+ 			unsigned int		op_active:1;
++			unsigned int		op_notify:1;
+ 			unsigned int		op_nents;
+ 			unsigned int		op_count;
+ 			unsigned int		op_dmasg;
+--- a/net/rds/send.c
++++ b/net/rds/send.c
+@@ -475,12 +475,14 @@ void rds_rdma_send_complete(struct rds_m
+ 	struct rm_rdma_op *ro;
+ 	struct rds_notifier *notifier;
+ 	unsigned long flags;
++	unsigned int notify = 0;
+ 
+ 	spin_lock_irqsave(&rm->m_rs_lock, flags);
+ 
++	notify =  rm->rdma.op_notify | rm->data.op_notify;
+ 	ro = &rm->rdma;
+ 	if (test_bit(RDS_MSG_ON_SOCK, &rm->m_flags) &&
+-	    ro->op_active && ro->op_notify && ro->op_notifier) {
++	    ro->op_active && notify && ro->op_notifier) {
+ 		notifier = ro->op_notifier;
+ 		rs = rm->m_rs;
+ 		sock_hold(rds_rs_to_sk(rs));
