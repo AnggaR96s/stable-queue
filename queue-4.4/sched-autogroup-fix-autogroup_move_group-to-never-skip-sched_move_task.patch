@@ -1,0 +1,111 @@
+From 18f649ef344127ef6de23a5a4272dbe2fdb73dde Mon Sep 17 00:00:00 2001
+From: Oleg Nesterov <oleg@redhat.com>
+Date: Mon, 14 Nov 2016 19:46:09 +0100
+Subject: sched/autogroup: Fix autogroup_move_group() to never skip sched_move_task()
+
+From: Oleg Nesterov <oleg@redhat.com>
+
+commit 18f649ef344127ef6de23a5a4272dbe2fdb73dde upstream.
+
+The PF_EXITING check in task_wants_autogroup() is no longer needed. Remove
+it, but see the next patch.
+
+However the comment is correct in that autogroup_move_group() must always
+change task_group() for every thread so the sysctl_ check is very wrong;
+we can race with cgroups and even sys_setsid() is not safe because a task
+running with task_group() == ag->tg must participate in refcounting:
+
+	int main(void)
+	{
+		int sctl = open("/proc/sys/kernel/sched_autogroup_enabled", O_WRONLY);
+
+		assert(sctl > 0);
+		if (fork()) {
+			wait(NULL); // destroy the child's ag/tg
+			pause();
+		}
+
+		assert(pwrite(sctl, "1\n", 2, 0) == 2);
+		assert(setsid() > 0);
+		if (fork())
+			pause();
+
+		kill(getppid(), SIGKILL);
+		sleep(1);
+
+		// The child has gone, the grandchild runs with kref == 1
+		assert(pwrite(sctl, "0\n", 2, 0) == 2);
+		assert(setsid() > 0);
+
+		// runs with the freed ag/tg
+		for (;;)
+			sleep(1);
+
+		return 0;
+	}
+
+crashes the kernel. It doesn't really need sleep(1), it doesn't matter if
+autogroup_move_group() actually frees the task_group or this happens later.
+
+Reported-by: Vern Lovejoy <vlovejoy@redhat.com>
+Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Mike Galbraith <efault@gmx.de>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: hartsjc@redhat.com
+Cc: vbendel@redhat.com
+Link: http://lkml.kernel.org/r/20161114184609.GA15965@redhat.com
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Sumit Semwal <sumit.semwal@linaro.org>
+ [sumits: submit to 4.4 LTS, post testing on Hikey]
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ kernel/sched/auto_group.c |   23 ++++++++++++-----------
+ 1 file changed, 12 insertions(+), 11 deletions(-)
+
+--- a/kernel/sched/auto_group.c
++++ b/kernel/sched/auto_group.c
+@@ -111,14 +111,11 @@ bool task_wants_autogroup(struct task_st
+ {
+ 	if (tg != &root_task_group)
+ 		return false;
+-
+ 	/*
+-	 * We can only assume the task group can't go away on us if
+-	 * autogroup_move_group() can see us on ->thread_group list.
++	 * If we race with autogroup_move_group() the caller can use the old
++	 * value of signal->autogroup but in this case sched_move_task() will
++	 * be called again before autogroup_kref_put().
+ 	 */
+-	if (p->flags & PF_EXITING)
+-		return false;
+-
+ 	return true;
+ }
+ 
+@@ -138,13 +135,17 @@ autogroup_move_group(struct task_struct
+ 	}
+ 
+ 	p->signal->autogroup = autogroup_kref_get(ag);
+-
+-	if (!READ_ONCE(sysctl_sched_autogroup_enabled))
+-		goto out;
+-
++	/*
++	 * We can't avoid sched_move_task() after we changed signal->autogroup,
++	 * this process can already run with task_group() == prev->tg or we can
++	 * race with cgroup code which can read autogroup = prev under rq->lock.
++	 * In the latter case for_each_thread() can not miss a migrating thread,
++	 * cpu_cgroup_attach() must not be possible after cgroup_exit() and it
++	 * can't be removed from thread list, we hold ->siglock.
++	 */
+ 	for_each_thread(p, t)
+ 		sched_move_task(t);
+-out:
++
+ 	unlock_task_sighand(p, &flags);
+ 	autogroup_kref_put(prev);
+ }
