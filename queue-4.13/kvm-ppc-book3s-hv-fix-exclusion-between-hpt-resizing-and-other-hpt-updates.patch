@@ -1,0 +1,192 @@
+From 38c53af853069adf87181684370d7b8866d6387b Mon Sep 17 00:00:00 2001
+From: Paul Mackerras <paulus@ozlabs.org>
+Date: Wed, 8 Nov 2017 14:44:04 +1100
+Subject: KVM: PPC: Book3S HV: Fix exclusion between HPT resizing and other HPT updates
+
+From: Paul Mackerras <paulus@ozlabs.org>
+
+commit 38c53af853069adf87181684370d7b8866d6387b upstream.
+
+Commit 5e9859699aba ("KVM: PPC: Book3S HV: Outline of KVM-HV HPT resizing
+implementation", 2016-12-20) added code that tries to exclude any use
+or update of the hashed page table (HPT) while the HPT resizing code
+is iterating through all the entries in the HPT.  It does this by
+taking the kvm->lock mutex, clearing the kvm->arch.hpte_setup_done
+flag and then sending an IPI to all CPUs in the host.  The idea is
+that any VCPU task that tries to enter the guest will see that the
+hpte_setup_done flag is clear and therefore call kvmppc_hv_setup_htab_rma,
+which also takes the kvm->lock mutex and will therefore block until
+we release kvm->lock.
+
+However, any VCPU that is already in the guest, or is handling a
+hypervisor page fault or hypercall, can re-enter the guest without
+rechecking the hpte_setup_done flag.  The IPI will cause a guest exit
+of any VCPUs that are currently in the guest, but does not prevent
+those VCPU tasks from immediately re-entering the guest.
+
+The result is that after resize_hpt_rehash_hpte() has made a HPTE
+absent, a hypervisor page fault can occur and make that HPTE present
+again.  This includes updating the rmap array for the guest real page,
+meaning that we now have a pointer in the rmap array which connects
+with pointers in the old rev array but not the new rev array.  In
+fact, if the HPT is being reduced in size, the pointer in the rmap
+array could point outside the bounds of the new rev array.  If that
+happens, we can get a host crash later on such as this one:
+
+[91652.628516] Unable to handle kernel paging request for data at address 0xd0000000157fb10c
+[91652.628668] Faulting instruction address: 0xc0000000000e2640
+[91652.628736] Oops: Kernel access of bad area, sig: 11 [#1]
+[91652.628789] LE SMP NR_CPUS=1024 NUMA PowerNV
+[91652.628847] Modules linked in: binfmt_misc vhost_net vhost tap xt_CHECKSUM ipt_MASQUERADE nf_nat_masquerade_ipv4 ip6t_rpfilter ip6t_REJECT nf_reject_ipv6 nf_conntrack_ipv6 nf_defrag_ipv6 xt_conntrack ip_set nfnetlink ebtable_nat ebtable_broute bridge stp llc ip6table_mangle ip6table_security ip6table_raw iptable_nat nf_conntrack_ipv4 nf_defrag_ipv4 nf_nat_ipv4 nf_nat nf_conntrack libcrc32c iptable_mangle iptable_security iptable_raw ebtable_filter ebtables ip6table_filter ip6_tables ses enclosure scsi_transport_sas i2c_opal ipmi_powernv ipmi_devintf i2c_core ipmi_msghandler powernv_op_panel nfsd auth_rpcgss oid_registry nfs_acl lockd grace sunrpc kvm_hv kvm_pr kvm scsi_dh_alua dm_service_time dm_multipath tg3 ptp pps_core [last unloaded: stap_552b612747aec2da355051e464fa72a1_14259]
+[91652.629566] CPU: 136 PID: 41315 Comm: CPU 21/KVM Tainted: G           O    4.14.0-1.rc4.dev.gitb27fc5c.el7.centos.ppc64le #1
+[91652.629684] task: c0000007a419e400 task.stack: c0000000028d8000
+[91652.629750] NIP:  c0000000000e2640 LR: d00000000c36e498 CTR: c0000000000e25f0
+[91652.629829] REGS: c0000000028db5d0 TRAP: 0300   Tainted: G           O     (4.14.0-1.rc4.dev.gitb27fc5c.el7.centos.ppc64le)
+[91652.629932] MSR:  900000010280b033 <SF,HV,VEC,VSX,EE,FP,ME,IR,DR,RI,LE,TM[E]>  CR: 44022422  XER: 00000000
+[91652.630034] CFAR: d00000000c373f84 DAR: d0000000157fb10c DSISR: 40000000 SOFTE: 1
+[91652.630034] GPR00: d00000000c36e498 c0000000028db850 c000000001403900 c0000007b7960000
+[91652.630034] GPR04: d0000000117fb100 d000000007ab00d8 000000000033bb10 0000000000000000
+[91652.630034] GPR08: fffffffffffffe7f 801001810073bb10 d00000000e440000 d00000000c373f70
+[91652.630034] GPR12: c0000000000e25f0 c00000000fdb9400 f000000003b24680 0000000000000000
+[91652.630034] GPR16: 00000000000004fb 00007ff7081a0000 00000000000ec91a 000000000033bb10
+[91652.630034] GPR20: 0000000000010000 00000000001b1190 0000000000000001 0000000000010000
+[91652.630034] GPR24: c0000007b7ab8038 d0000000117fb100 0000000ec91a1190 c000001e6a000000
+[91652.630034] GPR28: 00000000033bb100 000000000073bb10 c0000007b7960000 d0000000157fb100
+[91652.630735] NIP [c0000000000e2640] kvmppc_add_revmap_chain+0x50/0x120
+[91652.630806] LR [d00000000c36e498] kvmppc_book3s_hv_page_fault+0xbb8/0xc40 [kvm_hv]
+[91652.630884] Call Trace:
+[91652.630913] [c0000000028db850] [c0000000028db8b0] 0xc0000000028db8b0 (unreliable)
+[91652.630996] [c0000000028db8b0] [d00000000c36e498] kvmppc_book3s_hv_page_fault+0xbb8/0xc40 [kvm_hv]
+[91652.631091] [c0000000028db9e0] [d00000000c36a078] kvmppc_vcpu_run_hv+0xdf8/0x1300 [kvm_hv]
+[91652.631179] [c0000000028dbb30] [d00000000c2248c4] kvmppc_vcpu_run+0x34/0x50 [kvm]
+[91652.631266] [c0000000028dbb50] [d00000000c220d54] kvm_arch_vcpu_ioctl_run+0x114/0x2a0 [kvm]
+[91652.631351] [c0000000028dbbd0] [d00000000c2139d8] kvm_vcpu_ioctl+0x598/0x7a0 [kvm]
+[91652.631433] [c0000000028dbd40] [c0000000003832e0] do_vfs_ioctl+0xd0/0x8c0
+[91652.631501] [c0000000028dbde0] [c000000000383ba4] SyS_ioctl+0xd4/0x130
+[91652.631569] [c0000000028dbe30] [c00000000000b8e0] system_call+0x58/0x6c
+[91652.631635] Instruction dump:
+[91652.631676] fba1ffe8 fbc1fff0 fbe1fff8 f8010010 f821ffa1 2fa70000 793d0020 e9432110
+[91652.631814] 7bbf26e4 7c7e1b78 7feafa14 409e0094 <807f000c> 786326e4 7c6a1a14 93a40008
+[91652.631959] ---[ end trace ac85ba6db72e5b2e ]---
+
+To fix this, we tighten up the way that the hpte_setup_done flag is
+checked to ensure that it does provide the guarantee that the resizing
+code needs.  In kvmppc_run_core(), we check the hpte_setup_done flag
+after disabling interrupts and refuse to enter the guest if it is
+clear (for a HPT guest).  The code that checks hpte_setup_done and
+calls kvmppc_hv_setup_htab_rma() is moved from kvmppc_vcpu_run_hv()
+to a point inside the main loop in kvmppc_run_vcpu(), ensuring that
+we don't just spin endlessly calling kvmppc_run_core() while
+hpte_setup_done is clear, but instead have a chance to block on the
+kvm->lock mutex.
+
+Finally we also check hpte_setup_done inside the region in
+kvmppc_book3s_hv_page_fault() where the HPTE is locked and we are about
+to update the HPTE, and bail out if it is clear.  If another CPU is
+inside kvm_vm_ioctl_resize_hpt_commit) and has cleared hpte_setup_done,
+then we know that either we are looking at a HPTE
+that resize_hpt_rehash_hpte() has not yet processed, which is OK,
+or else we will see hpte_setup_done clear and refuse to update it,
+because of the full barrier formed by the unlock of the HPTE in
+resize_hpt_rehash_hpte() combined with the locking of the HPTE
+in kvmppc_book3s_hv_page_fault().
+
+Fixes: 5e9859699aba ("KVM: PPC: Book3S HV: Outline of KVM-HV HPT resizing implementation")
+Reported-by: Satheesh Rajendran <satheera@in.ibm.com>
+Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ arch/powerpc/kvm/book3s_64_mmu_hv.c |   10 ++++++++++
+ arch/powerpc/kvm/book3s_hv.c        |   29 +++++++++++++++++++----------
+ 2 files changed, 29 insertions(+), 10 deletions(-)
+
+--- a/arch/powerpc/kvm/book3s_64_mmu_hv.c
++++ b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+@@ -645,6 +645,16 @@ int kvmppc_book3s_hv_page_fault(struct k
+ 		hnow_v = hpte_new_to_old_v(hnow_v, hnow_r);
+ 		hnow_r = hpte_new_to_old_r(hnow_r);
+ 	}
++
++	/*
++	 * If the HPT is being resized, don't update the HPTE,
++	 * instead let the guest retry after the resize operation is complete.
++	 * The synchronization for hpte_setup_done test vs. set is provided
++	 * by the HPTE lock.
++	 */
++	if (!kvm->arch.hpte_setup_done)
++		goto out_unlock;
++
+ 	if ((hnow_v & ~HPTE_V_HVLOCK) != hpte[0] || hnow_r != hpte[1] ||
+ 	    rev->guest_rpte != hpte[2])
+ 		/* HPTE has been changed under us; let the guest retry */
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@ -2688,11 +2688,14 @@ static noinline void kvmppc_run_core(str
+ 	 * Hard-disable interrupts, and check resched flag and signals.
+ 	 * If we need to reschedule or deliver a signal, clean up
+ 	 * and return without going into the guest(s).
++	 * If the hpte_setup_done flag has been cleared, don't go into the
++	 * guest because that means a HPT resize operation is in progress.
+ 	 */
+ 	local_irq_disable();
+ 	hard_irq_disable();
+ 	if (lazy_irq_pending() || need_resched() ||
+-	    recheck_signals(&core_info)) {
++	    recheck_signals(&core_info) ||
++	    (!kvm_is_radix(vc->kvm) && !vc->kvm->arch.hpte_setup_done)) {
+ 		local_irq_enable();
+ 		vc->vcore_state = VCORE_INACTIVE;
+ 		/* Unlock all except the primary vcore */
+@@ -3061,7 +3064,7 @@ out:
+ 
+ static int kvmppc_run_vcpu(struct kvm_run *kvm_run, struct kvm_vcpu *vcpu)
+ {
+-	int n_ceded, i;
++	int n_ceded, i, r;
+ 	struct kvmppc_vcore *vc;
+ 	struct kvm_vcpu *v;
+ 
+@@ -3115,6 +3118,20 @@ static int kvmppc_run_vcpu(struct kvm_ru
+ 
+ 	while (vcpu->arch.state == KVMPPC_VCPU_RUNNABLE &&
+ 	       !signal_pending(current)) {
++		/* See if the HPT and VRMA are ready to go */
++		if (!kvm_is_radix(vcpu->kvm) &&
++		    !vcpu->kvm->arch.hpte_setup_done) {
++			spin_unlock(&vc->lock);
++			r = kvmppc_hv_setup_htab_rma(vcpu);
++			spin_lock(&vc->lock);
++			if (r) {
++				kvm_run->exit_reason = KVM_EXIT_FAIL_ENTRY;
++				kvm_run->fail_entry.hardware_entry_failure_reason = 0;
++				vcpu->arch.ret = r;
++				break;
++			}
++		}
++
+ 		if (vc->vcore_state == VCORE_PREEMPT && vc->runner == NULL)
+ 			kvmppc_vcore_end_preempt(vc);
+ 
+@@ -3232,13 +3249,6 @@ static int kvmppc_vcpu_run_hv(struct kvm
+ 	/* Order vcpus_running vs. hpte_setup_done, see kvmppc_alloc_reset_hpt */
+ 	smp_mb();
+ 
+-	/* On the first time here, set up HTAB and VRMA */
+-	if (!kvm_is_radix(vcpu->kvm) && !vcpu->kvm->arch.hpte_setup_done) {
+-		r = kvmppc_hv_setup_htab_rma(vcpu);
+-		if (r)
+-			goto out;
+-	}
+-
+ 	flush_all_to_thread(current);
+ 
+ 	/* Save userspace EBB and other register values */
+@@ -3286,7 +3296,6 @@ static int kvmppc_vcpu_run_hv(struct kvm
+ 	}
+ 	mtspr(SPRN_VRSAVE, user_vrsave);
+ 
+- out:
+ 	vcpu->arch.state = KVMPPC_VCPU_NOTREADY;
+ 	atomic_dec(&vcpu->kvm->arch.vcpus_running);
+ 	return r;
