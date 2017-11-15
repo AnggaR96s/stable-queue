@@ -1,0 +1,91 @@
+From foo@baz Wed Nov 15 17:25:34 CET 2017
+From: Craig Gallek <kraig@google.com>
+Date: Thu, 19 Oct 2017 15:00:29 -0400
+Subject: soreuseport: fix initialization race
+
+From: Craig Gallek <kraig@google.com>
+
+
+[ Upstream commit 1b5f962e71bfad6284574655c406597535c3ea7a ]
+
+Syzkaller stumbled upon a way to trigger
+WARNING: CPU: 1 PID: 13881 at net/core/sock_reuseport.c:41
+reuseport_alloc+0x306/0x3b0 net/core/sock_reuseport.c:39
+
+There are two initialization paths for the sock_reuseport structure in a
+socket: Through the udp/tcp bind paths of SO_REUSEPORT sockets or through
+SO_ATTACH_REUSEPORT_[CE]BPF before bind.  The existing implementation
+assumedthat the socket lock protected both of these paths when it actually
+only protects the SO_ATTACH_REUSEPORT path.  Syzkaller triggered this
+double allocation by running these paths concurrently.
+
+This patch moves the check for double allocation into the reuseport_alloc
+function which is protected by a global spin lock.
+
+Fixes: e32ea7e74727 ("soreuseport: fast reuseport UDP socket selection")
+Fixes: c125e80b8868 ("soreuseport: fast reuseport TCP socket selection")
+Signed-off-by: Craig Gallek <kraig@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/core/sock_reuseport.c  |   12 +++++++++---
+ net/ipv4/inet_hashtables.c |    5 +----
+ net/ipv4/udp.c             |    5 +----
+ 3 files changed, 11 insertions(+), 11 deletions(-)
+
+--- a/net/core/sock_reuseport.c
++++ b/net/core/sock_reuseport.c
+@@ -36,9 +36,14 @@ int reuseport_alloc(struct sock *sk)
+ 	 * soft irq of receive path or setsockopt from process context
+ 	 */
+ 	spin_lock_bh(&reuseport_lock);
+-	WARN_ONCE(rcu_dereference_protected(sk->sk_reuseport_cb,
+-					    lockdep_is_held(&reuseport_lock)),
+-		  "multiple allocations for the same socket");
++
++	/* Allocation attempts can occur concurrently via the setsockopt path
++	 * and the bind/hash path.  Nothing to do when we lose the race.
++	 */
++	if (rcu_dereference_protected(sk->sk_reuseport_cb,
++				      lockdep_is_held(&reuseport_lock)))
++		goto out;
++
+ 	reuse = __reuseport_alloc(INIT_SOCKS);
+ 	if (!reuse) {
+ 		spin_unlock_bh(&reuseport_lock);
+@@ -49,6 +54,7 @@ int reuseport_alloc(struct sock *sk)
+ 	reuse->num_socks = 1;
+ 	rcu_assign_pointer(sk->sk_reuseport_cb, reuse);
+ 
++out:
+ 	spin_unlock_bh(&reuseport_lock);
+ 
+ 	return 0;
+--- a/net/ipv4/inet_hashtables.c
++++ b/net/ipv4/inet_hashtables.c
+@@ -449,10 +449,7 @@ static int inet_reuseport_add_sock(struc
+ 			return reuseport_add_sock(sk, sk2);
+ 	}
+ 
+-	/* Initial allocation may have already happened via setsockopt */
+-	if (!rcu_access_pointer(sk->sk_reuseport_cb))
+-		return reuseport_alloc(sk);
+-	return 0;
++	return reuseport_alloc(sk);
+ }
+ 
+ int __inet_hash(struct sock *sk, struct sock *osk)
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@ -231,10 +231,7 @@ static int udp_reuseport_add_sock(struct
+ 		}
+ 	}
+ 
+-	/* Initial allocation may have already happened via setsockopt */
+-	if (!rcu_access_pointer(sk->sk_reuseport_cb))
+-		return reuseport_alloc(sk);
+-	return 0;
++	return reuseport_alloc(sk);
+ }
+ 
+ /**
