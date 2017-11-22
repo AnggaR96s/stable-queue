@@ -1,0 +1,70 @@
+From keith.busch@intel.com  Tue Nov 21 17:57:03 2017
+From: Keith Busch <keith.busch@intel.com>
+Date: Thu, 16 Nov 2017 16:57:10 -0700
+Subject: [PATCH-stable] nvme: Fix memory order on async queue deletion
+To: linux-nvme@lists.infradead.org, stable@vger.kernel.org
+Cc: Greg KH <gregkh@linuxfoundation.org>, Keith Busch <keith.busch@intel.com>
+Message-ID: <20171116235710.20224-1-keith.busch@intel.com>
+
+From: Keith Busch <keith.busch@intel.com>
+
+This patch is a fix specific to the 3.19 - 4.4 kernels. The 4.5 kernel
+inadvertently fixed this bug differently (db3cbfff5bcc0), but is not
+a stable candidate due it being a complicated re-write of the entire
+feature.
+
+This patch fixes a potential timing bug with nvme's asynchronous queue
+deletion, which causes an allocated request to be accidentally released
+due to the ordering of the shared completion context among the sq/cq
+pair. The completion context saves the request that issued the queue
+deletion. If the submission side deletion happens to reset the active
+request, the completion side will release the wrong request tag back into
+the pool of available tags. This means the driver will create multiple
+commands with the same tag, corrupting the queue context.
+
+The error is observable in the kernel logs like:
+
+  "nvme XX:YY:ZZ completed id XX twice on qid:0"
+
+In this particular case, this message occurs because the queue is
+corrupted.
+
+The following timing sequence demonstrates the error:
+
+  CPU A                                 CPU B
+  -----------------------               -----------------------------
+  nvme_irq
+   nvme_process_cq
+    async_completion
+     queue_kthread_work  ----------->   nvme_del_sq_work_handler
+                                         nvme_delete_cq
+                                          adapter_async_del_queue
+                                           nvme_submit_admin_async_cmd
+                                            cmdinfo->req = req;
+
+     blk_mq_free_request(cmdinfo->req); <-- wrong request!!!
+
+This patch fixes the bug by releasing the request in the completion side
+prior to waking the submission thread, such that that thread can't muck
+with the shared completion context.
+
+Fixes: a4aea5623d4a5 ("NVMe: Convert to blk-mq")
+
+Signed-off-by: Keith Busch <keith.busch@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/nvme/host/pci.c |    2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -350,8 +350,8 @@ static void async_completion(struct nvme
+ 	struct async_cmd_info *cmdinfo = ctx;
+ 	cmdinfo->result = le32_to_cpup(&cqe->result);
+ 	cmdinfo->status = le16_to_cpup(&cqe->status) >> 1;
+-	queue_kthread_work(cmdinfo->worker, &cmdinfo->work);
+ 	blk_mq_free_request(cmdinfo->req);
++	queue_kthread_work(cmdinfo->worker, &cmdinfo->work);
+ }
+ 
+ static inline struct nvme_cmd_info *get_cmd_from_tag(struct nvme_queue *nvmeq,
