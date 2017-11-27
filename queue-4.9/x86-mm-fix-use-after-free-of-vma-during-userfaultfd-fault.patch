@@ -1,0 +1,80 @@
+From cb0631fd3cf9e989cd48293fe631cbc402aec9a9 Mon Sep 17 00:00:00 2001
+From: Vlastimil Babka <vbabka@suse.cz>
+Date: Wed, 1 Nov 2017 08:21:25 +0100
+Subject: x86/mm: fix use-after-free of vma during userfaultfd fault
+
+From: Vlastimil Babka <vbabka@suse.cz>
+
+commit cb0631fd3cf9e989cd48293fe631cbc402aec9a9 upstream.
+
+Syzkaller with KASAN has reported a use-after-free of vma->vm_flags in
+__do_page_fault() with the following reproducer:
+
+  mmap(&(0x7f0000000000/0xfff000)=nil, 0xfff000, 0x3, 0x32, 0xffffffffffffffff, 0x0)
+  mmap(&(0x7f0000011000/0x3000)=nil, 0x3000, 0x1, 0x32, 0xffffffffffffffff, 0x0)
+  r0 = userfaultfd(0x0)
+  ioctl$UFFDIO_API(r0, 0xc018aa3f, &(0x7f0000002000-0x18)={0xaa, 0x0, 0x0})
+  ioctl$UFFDIO_REGISTER(r0, 0xc020aa00, &(0x7f0000019000)={{&(0x7f0000012000/0x2000)=nil, 0x2000}, 0x1, 0x0})
+  r1 = gettid()
+  syz_open_dev$evdev(&(0x7f0000013000-0x12)="2f6465762f696e7075742f6576656e742300", 0x0, 0x0)
+  tkill(r1, 0x7)
+
+The vma should be pinned by mmap_sem, but handle_userfault() might (in a
+return to userspace scenario) release it and then acquire again, so when
+we return to __do_page_fault() (with other result than VM_FAULT_RETRY),
+the vma might be gone.
+
+Specifically, per Andrea the scenario is
+ "A return to userland to repeat the page fault later with a
+  VM_FAULT_NOPAGE retval (potentially after handling any pending signal
+  during the return to userland). The return to userland is identified
+  whenever FAULT_FLAG_USER|FAULT_FLAG_KILLABLE are both set in
+  vmf->flags"
+
+However, since commit a3c4fb7c9c2e ("x86/mm: Fix fault error path using
+unsafe vma pointer") there is a vma_pkey() read of vma->vm_flags after
+that point, which can thus become use-after-free.  Fix this by moving
+the read before calling handle_mm_fault().
+
+Reported-by: syzbot <bot+6a5269ce759a7bb12754ed9622076dc93f65a1f6@syzkaller.appspotmail.com>
+Reported-by: Dmitry Vyukov <dvyukov@google.com>
+Suggested-by: Kirill A. Shutemov <kirill@shutemov.name>
+Fixes: 3c4fb7c9c2e ("x86/mm: Fix fault error path using unsafe vma pointer")
+Reviewed-by: Andrea Arcangeli <aarcange@redhat.com>
+Signed-off-by: Vlastimil Babka <vbabka@suse.cz>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Eric Biggers <ebiggers3@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ arch/x86/mm/fault.c |   11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+--- a/arch/x86/mm/fault.c
++++ b/arch/x86/mm/fault.c
+@@ -1393,7 +1393,17 @@ good_area:
+ 	 * make sure we exit gracefully rather than endlessly redo
+ 	 * the fault.  Since we never set FAULT_FLAG_RETRY_NOWAIT, if
+ 	 * we get VM_FAULT_RETRY back, the mmap_sem has been unlocked.
++	 *
++	 * Note that handle_userfault() may also release and reacquire mmap_sem
++	 * (and not return with VM_FAULT_RETRY), when returning to userland to
++	 * repeat the page fault later with a VM_FAULT_NOPAGE retval
++	 * (potentially after handling any pending signal during the return to
++	 * userland). The return to userland is identified whenever
++	 * FAULT_FLAG_USER|FAULT_FLAG_KILLABLE are both set in flags.
++	 * Thus we have to be careful about not touching vma after handling the
++	 * fault, so we read the pkey beforehand.
+ 	 */
++	pkey = vma_pkey(vma);
+ 	fault = handle_mm_fault(vma, address, flags);
+ 	major |= fault & VM_FAULT_MAJOR;
+ 
+@@ -1420,7 +1430,6 @@ good_area:
+ 		return;
+ 	}
+ 
+-	pkey = vma_pkey(vma);
+ 	up_read(&mm->mmap_sem);
+ 	if (unlikely(fault & VM_FAULT_ERROR)) {
+ 		mm_fault_error(regs, error_code, address, &pkey, fault);
