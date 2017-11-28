@@ -1,0 +1,128 @@
+From foo@baz Tue Nov 28 10:49:28 CET 2017
+From: Romain Perier <romain.perier@free-electrons.com>
+Date: Wed, 14 Dec 2016 15:15:07 +0100
+Subject: crypto: marvell - Copy IVDIG before launching partial DMA ahash requests
+
+From: Romain Perier <romain.perier@free-electrons.com>
+
+
+[ Upstream commit 8759fec4af222f338d08f8f1a7ad6a77ca6cb301 ]
+
+Currently, inner IV/DIGEST data are only copied once into the hash
+engines and not set explicitly before launching a request that is not a
+first frag. This is an issue especially when multiple ahash reqs are
+computed in parallel or chained with cipher request, as the state of the
+request being computed is not updated into the hash engine. It leads to
+non-deterministic corrupted digest results.
+
+Fixes: commit 2786cee8e50b ("crypto: marvell - Move SRAM I/O operations to step functions")
+Signed-off-by: Romain Perier <romain.perier@free-electrons.com>
+Acked-by: Boris Brezillon <boris.brezillon@free-electrons.com>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/crypto/marvell/cesa.h |    3 ++-
+ drivers/crypto/marvell/hash.c |   34 +++++++++++++++++++++++++++++++++-
+ drivers/crypto/marvell/tdma.c |    9 ++++++++-
+ 3 files changed, 43 insertions(+), 3 deletions(-)
+
+--- a/drivers/crypto/marvell/cesa.h
++++ b/drivers/crypto/marvell/cesa.h
+@@ -273,7 +273,8 @@ struct mv_cesa_op_ctx {
+ #define CESA_TDMA_SRC_IN_SRAM			BIT(30)
+ #define CESA_TDMA_END_OF_REQ			BIT(29)
+ #define CESA_TDMA_BREAK_CHAIN			BIT(28)
+-#define CESA_TDMA_TYPE_MSK			GENMASK(27, 0)
++#define CESA_TDMA_SET_STATE			BIT(27)
++#define CESA_TDMA_TYPE_MSK			GENMASK(26, 0)
+ #define CESA_TDMA_DUMMY				0
+ #define CESA_TDMA_DATA				1
+ #define CESA_TDMA_OP				2
+--- a/drivers/crypto/marvell/hash.c
++++ b/drivers/crypto/marvell/hash.c
+@@ -280,13 +280,32 @@ static void mv_cesa_ahash_std_prepare(st
+ 	sreq->offset = 0;
+ }
+ 
++static void mv_cesa_ahash_dma_step(struct ahash_request *req)
++{
++	struct mv_cesa_ahash_req *creq = ahash_request_ctx(req);
++	struct mv_cesa_req *base = &creq->base;
++
++	/* We must explicitly set the digest state. */
++	if (base->chain.first->flags & CESA_TDMA_SET_STATE) {
++		struct mv_cesa_engine *engine = base->engine;
++		int i;
++
++		/* Set the hash state in the IVDIG regs. */
++		for (i = 0; i < ARRAY_SIZE(creq->state); i++)
++			writel_relaxed(creq->state[i], engine->regs +
++				       CESA_IVDIG(i));
++	}
++
++	mv_cesa_dma_step(base);
++}
++
+ static void mv_cesa_ahash_step(struct crypto_async_request *req)
+ {
+ 	struct ahash_request *ahashreq = ahash_request_cast(req);
+ 	struct mv_cesa_ahash_req *creq = ahash_request_ctx(ahashreq);
+ 
+ 	if (mv_cesa_req_get_type(&creq->base) == CESA_DMA_REQ)
+-		mv_cesa_dma_step(&creq->base);
++		mv_cesa_ahash_dma_step(ahashreq);
+ 	else
+ 		mv_cesa_ahash_std_step(ahashreq);
+ }
+@@ -562,11 +581,15 @@ static int mv_cesa_ahash_dma_req_init(st
+ 	struct mv_cesa_ahash_dma_iter iter;
+ 	struct mv_cesa_op_ctx *op = NULL;
+ 	unsigned int frag_len;
++	bool set_state = false;
+ 	int ret;
+ 
+ 	basereq->chain.first = NULL;
+ 	basereq->chain.last = NULL;
+ 
++	if (!mv_cesa_mac_op_is_first_frag(&creq->op_tmpl))
++		set_state = true;
++
+ 	if (creq->src_nents) {
+ 		ret = dma_map_sg(cesa_dev->dev, req->src, creq->src_nents,
+ 				 DMA_TO_DEVICE);
+@@ -650,6 +673,15 @@ static int mv_cesa_ahash_dma_req_init(st
+ 	basereq->chain.last->flags |= (CESA_TDMA_END_OF_REQ |
+ 				       CESA_TDMA_BREAK_CHAIN);
+ 
++	if (set_state) {
++		/*
++		 * Put the CESA_TDMA_SET_STATE flag on the first tdma desc to
++		 * let the step logic know that the IVDIG registers should be
++		 * explicitly set before launching a TDMA chain.
++		 */
++		basereq->chain.first->flags |= CESA_TDMA_SET_STATE;
++	}
++
+ 	return 0;
+ 
+ err_free_tdma:
+--- a/drivers/crypto/marvell/tdma.c
++++ b/drivers/crypto/marvell/tdma.c
+@@ -112,7 +112,14 @@ void mv_cesa_tdma_chain(struct mv_cesa_e
+ 		last->next = dreq->chain.first;
+ 		engine->chain.last = dreq->chain.last;
+ 
+-		if (!(last->flags & CESA_TDMA_BREAK_CHAIN))
++		/*
++		 * Break the DMA chain if the CESA_TDMA_BREAK_CHAIN is set on
++		 * the last element of the current chain, or if the request
++		 * being queued needs the IV regs to be set before lauching
++		 * the request.
++		 */
++		if (!(last->flags & CESA_TDMA_BREAK_CHAIN) &&
++		    !(dreq->chain.first->flags & CESA_TDMA_SET_STATE))
+ 			last->next_dma = dreq->chain.first->cur_dma;
+ 	}
+ }
