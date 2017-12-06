@@ -1,0 +1,159 @@
+From foo@baz Wed Dec  6 17:39:55 CET 2017
+From: Jiri Olsa <jolsa@kernel.org>
+Date: Wed, 28 Dec 2016 14:31:03 +0100
+Subject: perf/x86/intel: Account interrupts for PEBS errors
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+
+[ Upstream commit 475113d937adfd150eb82b5e2c5507125a68e7af ]
+
+It's possible to set up PEBS events to get only errors and not
+any data, like on SNB-X (model 45) and IVB-EP (model 62)
+via 2 perf commands running simultaneously:
+
+    taskset -c 1 ./perf record -c 4 -e branches:pp -j any -C 10
+
+This leads to a soft lock up, because the error path of the
+intel_pmu_drain_pebs_nhm() does not account event->hw.interrupt
+for error PEBS interrupts, so in case you're getting ONLY
+errors you don't have a way to stop the event when it's over
+the max_samples_per_tick limit:
+
+  NMI watchdog: BUG: soft lockup - CPU#22 stuck for 22s! [perf_fuzzer:5816]
+  ...
+  RIP: 0010:[<ffffffff81159232>]  [<ffffffff81159232>] smp_call_function_single+0xe2/0x140
+  ...
+  Call Trace:
+   ? trace_hardirqs_on_caller+0xf5/0x1b0
+   ? perf_cgroup_attach+0x70/0x70
+   perf_install_in_context+0x199/0x1b0
+   ? ctx_resched+0x90/0x90
+   SYSC_perf_event_open+0x641/0xf90
+   SyS_perf_event_open+0x9/0x10
+   do_syscall_64+0x6c/0x1f0
+   entry_SYSCALL64_slow_path+0x25/0x25
+
+Add perf_event_account_interrupt() which does the interrupt
+and frequency checks and call it from intel_pmu_drain_pebs_nhm()'s
+error path.
+
+We keep the pending_kill and pending_wakeup logic only in the
+__perf_event_overflow() path, because they make sense only if
+there's any data to deliver.
+
+Signed-off-by: Jiri Olsa <jolsa@kernel.org>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Cc: Arnaldo Carvalho de Melo <acme@kernel.org>
+Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+Cc: Jiri Olsa <jolsa@redhat.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Stephane Eranian <eranian@google.com>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Vince Weaver <vince@deater.net>
+Cc: Vince Weaver <vincent.weaver@maine.edu>
+Link: http://lkml.kernel.org/r/1482931866-6018-2-git-send-email-jolsa@kernel.org
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/x86/events/intel/ds.c |    6 ++++-
+ include/linux/perf_event.h |    1 
+ kernel/events/core.c       |   47 +++++++++++++++++++++++++++++----------------
+ 3 files changed, 37 insertions(+), 17 deletions(-)
+
+--- a/arch/x86/events/intel/ds.c
++++ b/arch/x86/events/intel/ds.c
+@@ -1389,9 +1389,13 @@ static void intel_pmu_drain_pebs_nhm(str
+ 			continue;
+ 
+ 		/* log dropped samples number */
+-		if (error[bit])
++		if (error[bit]) {
+ 			perf_log_lost_samples(event, error[bit]);
+ 
++			if (perf_event_account_interrupt(event))
++				x86_pmu_stop(event, 0);
++		}
++
+ 		if (counts[bit]) {
+ 			__intel_pmu_pebs_event(event, iregs, base,
+ 					       top, bit, counts[bit]);
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@ -1259,6 +1259,7 @@ extern void perf_event_disable(struct pe
+ extern void perf_event_disable_local(struct perf_event *event);
+ extern void perf_event_disable_inatomic(struct perf_event *event);
+ extern void perf_event_task_tick(void);
++extern int perf_event_account_interrupt(struct perf_event *event);
+ #else /* !CONFIG_PERF_EVENTS: */
+ static inline void *
+ perf_aux_output_begin(struct perf_output_handle *handle,
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -7088,25 +7088,12 @@ static void perf_log_itrace_start(struct
+ 	perf_output_end(&handle);
+ }
+ 
+-/*
+- * Generic event overflow handling, sampling.
+- */
+-
+-static int __perf_event_overflow(struct perf_event *event,
+-				   int throttle, struct perf_sample_data *data,
+-				   struct pt_regs *regs)
++static int
++__perf_event_account_interrupt(struct perf_event *event, int throttle)
+ {
+-	int events = atomic_read(&event->event_limit);
+ 	struct hw_perf_event *hwc = &event->hw;
+-	u64 seq;
+ 	int ret = 0;
+-
+-	/*
+-	 * Non-sampling counters might still use the PMI to fold short
+-	 * hardware counters, ignore those.
+-	 */
+-	if (unlikely(!is_sampling_event(event)))
+-		return 0;
++	u64 seq;
+ 
+ 	seq = __this_cpu_read(perf_throttled_seq);
+ 	if (seq != hwc->interrupts_seq) {
+@@ -7134,6 +7121,34 @@ static int __perf_event_overflow(struct
+ 			perf_adjust_period(event, delta, hwc->last_period, true);
+ 	}
+ 
++	return ret;
++}
++
++int perf_event_account_interrupt(struct perf_event *event)
++{
++	return __perf_event_account_interrupt(event, 1);
++}
++
++/*
++ * Generic event overflow handling, sampling.
++ */
++
++static int __perf_event_overflow(struct perf_event *event,
++				   int throttle, struct perf_sample_data *data,
++				   struct pt_regs *regs)
++{
++	int events = atomic_read(&event->event_limit);
++	int ret = 0;
++
++	/*
++	 * Non-sampling counters might still use the PMI to fold short
++	 * hardware counters, ignore those.
++	 */
++	if (unlikely(!is_sampling_event(event)))
++		return 0;
++
++	ret = __perf_event_account_interrupt(event, throttle);
++
+ 	/*
+ 	 * XXX event_limit might not quite work as expected on inherited
+ 	 * events
