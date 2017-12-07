@@ -1,0 +1,204 @@
+From d3862e44daa7a0c94d2f6193502a8c49379acfce Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Thu, 29 Jun 2017 22:05:32 +0100
+Subject: dma-buf/sw-sync: Fix locking around sync_timeline lists
+
+From: Chris Wilson <chris@chris-wilson.co.uk>
+
+commit d3862e44daa7a0c94d2f6193502a8c49379acfce upstream.
+
+The sync_pt were not adding themselves atomically to the timeline lists,
+corruption imminent.  Only a single list is required to track the
+unsignaled sync_pt, so reduce it and rename the lock more appropriately
+along with using idiomatic names to distinguish a list from links along
+it.
+
+v2: Prevent spinlock recursion on free during create (next patch) and
+fixup crossref in kerneldoc
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Sumit Semwal <sumit.semwal@linaro.org>
+Cc: Sean Paul <seanpaul@chromium.org>
+Cc: Gustavo Padovan <gustavo@padovan.org>
+Reviewed-by: Sean Paul <seanpaul@chromium.org>
+Signed-off-by: Gustavo Padovan <gustavo.padovan@collabora.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/20170629210532.5617-1-chris@chris-wilson.co.uk
+[s/dma_fence/fence/g - gregkh]
+Cc: Jisheng Zhang <Jisheng.Zhang@synaptics.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/dma-buf/sw_sync.c    |   48 +++++++++++++++++--------------------------
+ drivers/dma-buf/sync_debug.c |    9 +++-----
+ drivers/dma-buf/sync_debug.h |   22 +++++++------------
+ 3 files changed, 31 insertions(+), 48 deletions(-)
+
+--- a/drivers/dma-buf/sw_sync.c
++++ b/drivers/dma-buf/sw_sync.c
+@@ -96,9 +96,8 @@ struct sync_timeline *sync_timeline_crea
+ 	obj->context = fence_context_alloc(1);
+ 	strlcpy(obj->name, name, sizeof(obj->name));
+ 
+-	INIT_LIST_HEAD(&obj->child_list_head);
+-	INIT_LIST_HEAD(&obj->active_list_head);
+-	spin_lock_init(&obj->child_list_lock);
++	INIT_LIST_HEAD(&obj->pt_list);
++	spin_lock_init(&obj->lock);
+ 
+ 	sync_timeline_debug_add(obj);
+ 
+@@ -139,17 +138,15 @@ static void sync_timeline_signal(struct
+ 
+ 	trace_sync_timeline(obj);
+ 
+-	spin_lock_irq(&obj->child_list_lock);
++	spin_lock_irq(&obj->lock);
+ 
+ 	obj->value += inc;
+ 
+-	list_for_each_entry_safe(pt, next, &obj->active_list_head,
+-				 active_list) {
++	list_for_each_entry_safe(pt, next, &obj->pt_list, link)
+ 		if (fence_is_signaled_locked(&pt->base))
+-			list_del_init(&pt->active_list);
+-	}
++			list_del_init(&pt->link);
+ 
+-	spin_unlock_irq(&obj->child_list_lock);
++	spin_unlock_irq(&obj->lock);
+ }
+ 
+ /**
+@@ -171,15 +168,15 @@ static struct sync_pt *sync_pt_create(st
+ 	if (!pt)
+ 		return NULL;
+ 
+-	spin_lock_irq(&obj->child_list_lock);
+-
+ 	sync_timeline_get(obj);
+-	fence_init(&pt->base, &timeline_fence_ops, &obj->child_list_lock,
++	fence_init(&pt->base, &timeline_fence_ops, &obj->lock,
+ 		   obj->context, value);
+-	list_add_tail(&pt->child_list, &obj->child_list_head);
+-	INIT_LIST_HEAD(&pt->active_list);
++	INIT_LIST_HEAD(&pt->link);
+ 
+-	spin_unlock_irq(&obj->child_list_lock);
++	spin_lock_irq(&obj->lock);
++	if (!fence_is_signaled_locked(&pt->base))
++		list_add_tail(&pt->link, &obj->pt_list);
++	spin_unlock_irq(&obj->lock);
+ 
+ 	return pt;
+ }
+@@ -200,15 +197,15 @@ static void timeline_fence_release(struc
+ {
+ 	struct sync_pt *pt = fence_to_sync_pt(fence);
+ 	struct sync_timeline *parent = fence_parent(fence);
+-	unsigned long flags;
+ 
+-	spin_lock_irqsave(fence->lock, flags);
++	if (!list_empty(&pt->link)) {
++		unsigned long flags;
+ 
+-	list_del(&pt->child_list);
+-	if (!list_empty(&pt->active_list))
+-		list_del(&pt->active_list);
+-
+-	spin_unlock_irqrestore(fence->lock, flags);
++		spin_lock_irqsave(fence->lock, flags);
++		if (!list_empty(&pt->link))
++			list_del(&pt->link);
++		spin_unlock_irqrestore(fence->lock, flags);
++	}
+ 
+ 	sync_timeline_put(parent);
+ 	fence_free(fence);
+@@ -223,13 +220,6 @@ static bool timeline_fence_signaled(stru
+ 
+ static bool timeline_fence_enable_signaling(struct fence *fence)
+ {
+-	struct sync_pt *pt = fence_to_sync_pt(fence);
+-	struct sync_timeline *parent = fence_parent(fence);
+-
+-	if (timeline_fence_signaled(fence))
+-		return false;
+-
+-	list_add_tail(&pt->active_list, &parent->active_list_head);
+ 	return true;
+ }
+ 
+--- a/drivers/dma-buf/sync_debug.c
++++ b/drivers/dma-buf/sync_debug.c
+@@ -119,13 +119,12 @@ static void sync_print_obj(struct seq_fi
+ 
+ 	seq_printf(s, "%s: %d\n", obj->name, obj->value);
+ 
+-	spin_lock_irq(&obj->child_list_lock);
+-	list_for_each(pos, &obj->child_list_head) {
+-		struct sync_pt *pt =
+-			container_of(pos, struct sync_pt, child_list);
++	spin_lock_irq(&obj->lock);
++	list_for_each(pos, &obj->pt_list) {
++		struct sync_pt *pt = container_of(pos, struct sync_pt, link);
+ 		sync_print_fence(s, &pt->base, false);
+ 	}
+-	spin_unlock_irq(&obj->child_list_lock);
++	spin_unlock_irq(&obj->lock);
+ }
+ 
+ static void sync_print_sync_file(struct seq_file *s,
+--- a/drivers/dma-buf/sync_debug.h
++++ b/drivers/dma-buf/sync_debug.h
+@@ -24,43 +24,37 @@
+  * struct sync_timeline - sync object
+  * @kref:		reference count on fence.
+  * @name:		name of the sync_timeline. Useful for debugging
+- * @child_list_head:	list of children sync_pts for this sync_timeline
+- * @child_list_lock:	lock protecting @child_list_head and fence.status
+- * @active_list_head:	list of active (unsignaled/errored) sync_pts
++ * @lock:		lock protecting @pt_list and @value
++ * @pt_list:		list of active (unsignaled/errored) sync_pts
+  * @sync_timeline_list:	membership in global sync_timeline_list
+  */
+ struct sync_timeline {
+ 	struct kref		kref;
+ 	char			name[32];
+ 
+-	/* protected by child_list_lock */
++	/* protected by lock */
+ 	u64			context;
+ 	int			value;
+ 
+-	struct list_head	child_list_head;
+-	spinlock_t		child_list_lock;
+-
+-	struct list_head	active_list_head;
++	struct list_head	pt_list;
++	spinlock_t		lock;
+ 
+ 	struct list_head	sync_timeline_list;
+ };
+ 
+ static inline struct sync_timeline *fence_parent(struct fence *fence)
+ {
+-	return container_of(fence->lock, struct sync_timeline,
+-			    child_list_lock);
++	return container_of(fence->lock, struct sync_timeline, lock);
+ }
+ 
+ /**
+  * struct sync_pt - sync_pt object
+  * @base: base fence object
+- * @child_list: sync timeline child's list
+- * @active_list: sync timeline active child's list
++ * @link: link on the sync timeline's list
+  */
+ struct sync_pt {
+ 	struct fence base;
+-	struct list_head child_list;
+-	struct list_head active_list;
++	struct list_head link;
+ };
+ 
+ #ifdef CONFIG_SW_SYNC

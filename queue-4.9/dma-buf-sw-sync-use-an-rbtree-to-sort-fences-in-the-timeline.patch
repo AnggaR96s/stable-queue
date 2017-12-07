@@ -1,0 +1,150 @@
+From f1e8c67123cf171e2b0357e885e426328b241d7d Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Thu, 29 Jun 2017 22:12:53 +0100
+Subject: dma-buf/sw-sync: Use an rbtree to sort fences in the timeline
+
+From: Chris Wilson <chris@chris-wilson.co.uk>
+
+commit f1e8c67123cf171e2b0357e885e426328b241d7d upstream.
+
+Reduce the list iteration when incrementing the timeline by storing the
+fences in increasing order.
+
+v2: Prevent spinlock recursion on free during create
+v3: Fixup rebase conflict inside comments that escaped the compiler.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Sumit Semwal <sumit.semwal@linaro.org>
+Cc: Sean Paul <seanpaul@chromium.org>
+Cc: Gustavo Padovan <gustavo@padovan.org>
+Reviewed-by: Sean Paul <seanpaul@chromium.org>
+Signed-off-by: Gustavo Padovan <gustavo.padovan@collabora.com>
+Link: http://patchwork.freedesktop.org/patch/msgid/20170629211253.22766-1-chris@chris-wilson.co.uk
+[s/dma_fence/fence/g - gregkh]
+Cc: Jisheng Zhang <Jisheng.Zhang@synaptics.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/dma-buf/sw_sync.c    |   49 +++++++++++++++++++++++++++++++++++++------
+ drivers/dma-buf/sync_debug.h |    5 ++++
+ 2 files changed, 48 insertions(+), 6 deletions(-)
+
+--- a/drivers/dma-buf/sw_sync.c
++++ b/drivers/dma-buf/sw_sync.c
+@@ -96,6 +96,7 @@ struct sync_timeline *sync_timeline_crea
+ 	obj->context = fence_context_alloc(1);
+ 	strlcpy(obj->name, name, sizeof(obj->name));
+ 
++	obj->pt_tree = RB_ROOT;
+ 	INIT_LIST_HEAD(&obj->pt_list);
+ 	spin_lock_init(&obj->lock);
+ 
+@@ -142,9 +143,13 @@ static void sync_timeline_signal(struct
+ 
+ 	obj->value += inc;
+ 
+-	list_for_each_entry_safe(pt, next, &obj->pt_list, link)
+-		if (fence_is_signaled_locked(&pt->base))
+-			list_del_init(&pt->link);
++	list_for_each_entry_safe(pt, next, &obj->pt_list, link) {
++		if (!fence_is_signaled_locked(&pt->base))
++			break;
++
++		list_del_init(&pt->link);
++		rb_erase(&pt->node, &obj->pt_tree);
++	}
+ 
+ 	spin_unlock_irq(&obj->lock);
+ }
+@@ -174,8 +179,38 @@ static struct sync_pt *sync_pt_create(st
+ 	INIT_LIST_HEAD(&pt->link);
+ 
+ 	spin_lock_irq(&obj->lock);
+-	if (!fence_is_signaled_locked(&pt->base))
+-		list_add_tail(&pt->link, &obj->pt_list);
++	if (!fence_is_signaled_locked(&pt->base)) {
++		struct rb_node **p = &obj->pt_tree.rb_node;
++		struct rb_node *parent = NULL;
++
++		while (*p) {
++			struct sync_pt *other;
++			int cmp;
++
++			parent = *p;
++			other = rb_entry(parent, typeof(*pt), node);
++			cmp = value - other->base.seqno;
++			if (cmp > 0) {
++				p = &parent->rb_right;
++			} else if (cmp < 0) {
++				p = &parent->rb_left;
++			} else {
++				if (fence_get_rcu(&other->base)) {
++					fence_put(&pt->base);
++					pt = other;
++					goto unlock;
++				}
++				p = &parent->rb_left;
++			}
++		}
++		rb_link_node(&pt->node, parent, p);
++		rb_insert_color(&pt->node, &obj->pt_tree);
++
++		parent = rb_next(&pt->node);
++		list_add_tail(&pt->link,
++			      parent ? &rb_entry(parent, typeof(*pt), node)->link : &obj->pt_list);
++	}
++unlock:
+ 	spin_unlock_irq(&obj->lock);
+ 
+ 	return pt;
+@@ -202,8 +237,10 @@ static void timeline_fence_release(struc
+ 		unsigned long flags;
+ 
+ 		spin_lock_irqsave(fence->lock, flags);
+-		if (!list_empty(&pt->link))
++		if (!list_empty(&pt->link)) {
+ 			list_del(&pt->link);
++			rb_erase(&pt->node, &parent->pt_tree);
++		}
+ 		spin_unlock_irqrestore(fence->lock, flags);
+ 	}
+ 
+--- a/drivers/dma-buf/sync_debug.h
++++ b/drivers/dma-buf/sync_debug.h
+@@ -14,6 +14,7 @@
+ #define _LINUX_SYNC_H
+ 
+ #include <linux/list.h>
++#include <linux/rbtree.h>
+ #include <linux/spinlock.h>
+ #include <linux/fence.h>
+ 
+@@ -25,6 +26,7 @@
+  * @kref:		reference count on fence.
+  * @name:		name of the sync_timeline. Useful for debugging
+  * @lock:		lock protecting @pt_list and @value
++ * @pt_tree:		rbtree of active (unsignaled/errored) sync_pts
+  * @pt_list:		list of active (unsignaled/errored) sync_pts
+  * @sync_timeline_list:	membership in global sync_timeline_list
+  */
+@@ -36,6 +38,7 @@ struct sync_timeline {
+ 	u64			context;
+ 	int			value;
+ 
++	struct rb_root		pt_tree;
+ 	struct list_head	pt_list;
+ 	spinlock_t		lock;
+ 
+@@ -51,10 +54,12 @@ static inline struct sync_timeline *fenc
+  * struct sync_pt - sync_pt object
+  * @base: base fence object
+  * @link: link on the sync timeline's list
++ * @node: node in the sync timeline's tree
+  */
+ struct sync_pt {
+ 	struct fence base;
+ 	struct list_head link;
++	struct rb_node node;
+ };
+ 
+ #ifdef CONFIG_SW_SYNC

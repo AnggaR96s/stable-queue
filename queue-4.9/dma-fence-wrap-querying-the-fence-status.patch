@@ -1,0 +1,163 @@
+From d6c99f4bf093a58d3ab47caaec74b81f18bc4e3f Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Wed, 4 Jan 2017 14:12:21 +0000
+Subject: dma-fence: Wrap querying the fence->status
+
+From: Chris Wilson <chris@chris-wilson.co.uk>
+
+commit d6c99f4bf093a58d3ab47caaec74b81f18bc4e3f upstream.
+
+The fence->status is an optional field that is only valid once the fence
+has been signaled. (Driver may fill the fence->status with an error code
+prior to calling dma_fence_signal().) Given the restriction upon its
+validity, wrap querying of the fence->status into a helper
+dma_fence_get_status().
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Reviewed-by: Sumit Semwal <sumit.semwal@linaro.org>
+Signed-off-by: Sumit Semwal <sumit.semwal@linaro.org>
+Link: http://patchwork.freedesktop.org/patch/msgid/20170104141222.6992-2-chris@chris-wilson.co.uk
+[s/dma_fence/fence/g - gregkh]
+Cc: Jisheng Zhang <Jisheng.Zhang@synaptics.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/dma-buf/fence.c      |   25 +++++++++++++++++++++++++
+ drivers/dma-buf/sync_debug.c |   20 ++++++++++----------
+ drivers/dma-buf/sync_file.c  |    6 ++----
+ include/linux/fence.h        |   24 ++++++++++++++++++++++++
+ 4 files changed, 61 insertions(+), 14 deletions(-)
+
+--- a/drivers/dma-buf/fence.c
++++ b/drivers/dma-buf/fence.c
+@@ -281,6 +281,31 @@ int fence_add_callback(struct fence *fen
+ EXPORT_SYMBOL(fence_add_callback);
+ 
+ /**
++ * fence_get_status - returns the status upon completion
++ * @fence: [in]	the fence to query
++ *
++ * This wraps fence_get_status_locked() to return the error status
++ * condition on a signaled fence. See fence_get_status_locked() for more
++ * details.
++ *
++ * Returns 0 if the fence has not yet been signaled, 1 if the fence has
++ * been signaled without an error condition, or a negative error code
++ * if the fence has been completed in err.
++ */
++int fence_get_status(struct fence *fence)
++{
++	unsigned long flags;
++	int status;
++
++	spin_lock_irqsave(fence->lock, flags);
++	status = fence_get_status_locked(fence);
++	spin_unlock_irqrestore(fence->lock, flags);
++
++	return status;
++}
++EXPORT_SYMBOL(fence_get_status);
++
++/**
+  * fence_remove_callback - remove a callback from the signaling list
+  * @fence:	[in]	the fence to wait on
+  * @cb:		[in]	the callback to remove
+--- a/drivers/dma-buf/sync_debug.c
++++ b/drivers/dma-buf/sync_debug.c
+@@ -62,29 +62,29 @@ void sync_file_debug_remove(struct sync_
+ 
+ static const char *sync_status_str(int status)
+ {
+-	if (status == 0)
+-		return "signaled";
++	if (status < 0)
++		return "error";
+ 
+ 	if (status > 0)
+-		return "active";
++		return "signaled";
+ 
+-	return "error";
++	return "active";
+ }
+ 
+-static void sync_print_fence(struct seq_file *s, struct fence *fence, bool show)
++static void sync_print_fence(struct seq_file *s,
++			     struct fence *fence, bool show)
+ {
+-	int status = 1;
+ 	struct sync_timeline *parent = fence_parent(fence);
++	int status;
+ 
+-	if (fence_is_signaled_locked(fence))
+-		status = fence->status;
++	status = fence_get_status_locked(fence);
+ 
+ 	seq_printf(s, "  %s%sfence %s",
+ 		   show ? parent->name : "",
+ 		   show ? "_" : "",
+ 		   sync_status_str(status));
+ 
+-	if (status <= 0) {
++	if (status) {
+ 		struct timespec64 ts64 =
+ 			ktime_to_timespec64(fence->timestamp);
+ 
+@@ -133,7 +133,7 @@ static void sync_print_sync_file(struct
+ 	int i;
+ 
+ 	seq_printf(s, "[%p] %s: %s\n", sync_file, sync_file->name,
+-		   sync_status_str(!fence_is_signaled(sync_file->fence)));
++		   sync_status_str(fence_get_status(sync_file->fence)));
+ 
+ 	if (fence_is_array(sync_file->fence)) {
+ 		struct fence_array *array = to_fence_array(sync_file->fence);
+--- a/drivers/dma-buf/sync_file.c
++++ b/drivers/dma-buf/sync_file.c
+@@ -377,10 +377,8 @@ static void sync_fill_fence_info(struct
+ 		sizeof(info->obj_name));
+ 	strlcpy(info->driver_name, fence->ops->get_driver_name(fence),
+ 		sizeof(info->driver_name));
+-	if (fence_is_signaled(fence))
+-		info->status = fence->status >= 0 ? 1 : fence->status;
+-	else
+-		info->status = 0;
++
++	info->status = fence_get_status(fence);
+ 	info->timestamp_ns = ktime_to_ns(fence->timestamp);
+ }
+ 
+--- a/include/linux/fence.h
++++ b/include/linux/fence.h
+@@ -334,6 +334,30 @@ static inline struct fence *fence_later(
+ 		return fence_is_signaled(f2) ? NULL : f2;
+ }
+ 
++/**
++ * fence_get_status_locked - returns the status upon completion
++ * @fence: [in]	the fence to query
++ *
++ * Drivers can supply an optional error status condition before they signal
++ * the fence (to indicate whether the fence was completed due to an error
++ * rather than success). The value of the status condition is only valid
++ * if the fence has been signaled, fence_get_status_locked() first checks
++ * the signal state before reporting the error status.
++ *
++ * Returns 0 if the fence has not yet been signaled, 1 if the fence has
++ * been signaled without an error condition, or a negative error code
++ * if the fence has been completed in err.
++ */
++static inline int fence_get_status_locked(struct fence *fence)
++{
++	if (fence_is_signaled_locked(fence))
++		return fence->status < 0 ? fence->status : 1;
++	else
++		return 0;
++}
++
++int fence_get_status(struct fence *fence);
++
+ signed long fence_wait_timeout(struct fence *, bool intr, signed long timeout);
+ signed long fence_wait_any_timeout(struct fence **fences, uint32_t count,
+ 				   bool intr, signed long timeout);
