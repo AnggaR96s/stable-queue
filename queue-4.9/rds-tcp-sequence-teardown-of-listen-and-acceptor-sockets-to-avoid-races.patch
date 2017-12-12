@@ -1,0 +1,140 @@
+From foo@baz Tue Dec 12 13:26:17 CET 2017
+From: Sowmini Varadhan <sowmini.varadhan@oracle.com>
+Date: Sat, 4 Mar 2017 08:57:35 -0800
+Subject: rds: tcp: Sequence teardown of listen and acceptor sockets to avoid races
+
+From: Sowmini Varadhan <sowmini.varadhan@oracle.com>
+
+
+[ Upstream commit b21dd4506b71bdb9c5a20e759255cd2513ea7ebe ]
+
+Commit a93d01f5777e ("RDS: TCP: avoid bad page reference in
+rds_tcp_listen_data_ready") added the function
+rds_tcp_listen_sock_def_readable()  to handle the case when a
+partially set-up acceptor socket drops into rds_tcp_listen_data_ready().
+However, if the listen socket (rtn->rds_tcp_listen_sock) is itself going
+through a tear-down via rds_tcp_listen_stop(), the (*ready)() will be
+null and we would hit a panic  of the form
+  BUG: unable to handle kernel NULL pointer dereference at   (null)
+  IP:           (null)
+   :
+  ? rds_tcp_listen_data_ready+0x59/0xb0 [rds_tcp]
+  tcp_data_queue+0x39d/0x5b0
+  tcp_rcv_established+0x2e5/0x660
+  tcp_v4_do_rcv+0x122/0x220
+  tcp_v4_rcv+0x8b7/0x980
+    :
+In the above case, it is not fatal to encounter a NULL value for
+ready- we should just drop the packet and let the flush of the
+acceptor thread finish gracefully.
+
+In general, the tear-down sequence for listen() and accept() socket
+that is ensured by this commit is:
+     rtn->rds_tcp_listen_sock = NULL; /* prevent any new accepts */
+     In rds_tcp_listen_stop():
+         serialize with, and prevent, further callbacks using lock_sock()
+         flush rds_wq
+         flush acceptor workq
+         sock_release(listen socket)
+
+Signed-off-by: Sowmini Varadhan <sowmini.varadhan@oracle.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/rds/tcp.c        |   15 ++++++++++-----
+ net/rds/tcp.h        |    2 +-
+ net/rds/tcp_listen.c |    9 +++++++--
+ 3 files changed, 18 insertions(+), 8 deletions(-)
+
+--- a/net/rds/tcp.c
++++ b/net/rds/tcp.c
+@@ -478,9 +478,10 @@ static void __net_exit rds_tcp_exit_net(
+ 	 * we do need to clean up the listen socket here.
+ 	 */
+ 	if (rtn->rds_tcp_listen_sock) {
+-		rds_tcp_listen_stop(rtn->rds_tcp_listen_sock);
++		struct socket *lsock = rtn->rds_tcp_listen_sock;
++
+ 		rtn->rds_tcp_listen_sock = NULL;
+-		flush_work(&rtn->rds_tcp_accept_w);
++		rds_tcp_listen_stop(lsock, &rtn->rds_tcp_accept_w);
+ 	}
+ }
+ 
+@@ -517,10 +518,10 @@ static void rds_tcp_kill_sock(struct net
+ 	struct rds_tcp_connection *tc, *_tc;
+ 	LIST_HEAD(tmp_list);
+ 	struct rds_tcp_net *rtn = net_generic(net, rds_tcp_netid);
++	struct socket *lsock = rtn->rds_tcp_listen_sock;
+ 
+-	rds_tcp_listen_stop(rtn->rds_tcp_listen_sock);
+ 	rtn->rds_tcp_listen_sock = NULL;
+-	flush_work(&rtn->rds_tcp_accept_w);
++	rds_tcp_listen_stop(lsock, &rtn->rds_tcp_accept_w);
+ 	spin_lock_irq(&rds_tcp_conn_lock);
+ 	list_for_each_entry_safe(tc, _tc, &rds_tcp_conn_list, t_tcp_node) {
+ 		struct net *c_net = read_pnet(&tc->t_cpath->cp_conn->c_net);
+@@ -540,8 +541,12 @@ static void rds_tcp_kill_sock(struct net
+ void *rds_tcp_listen_sock_def_readable(struct net *net)
+ {
+ 	struct rds_tcp_net *rtn = net_generic(net, rds_tcp_netid);
++	struct socket *lsock = rtn->rds_tcp_listen_sock;
++
++	if (!lsock)
++		return NULL;
+ 
+-	return rtn->rds_tcp_listen_sock->sk->sk_user_data;
++	return lsock->sk->sk_user_data;
+ }
+ 
+ static int rds_tcp_dev_event(struct notifier_block *this,
+--- a/net/rds/tcp.h
++++ b/net/rds/tcp.h
+@@ -66,7 +66,7 @@ void rds_tcp_state_change(struct sock *s
+ 
+ /* tcp_listen.c */
+ struct socket *rds_tcp_listen_init(struct net *);
+-void rds_tcp_listen_stop(struct socket *);
++void rds_tcp_listen_stop(struct socket *sock, struct work_struct *acceptor);
+ void rds_tcp_listen_data_ready(struct sock *sk);
+ int rds_tcp_accept_one(struct socket *sock);
+ int rds_tcp_keepalive(struct socket *sock);
+--- a/net/rds/tcp_listen.c
++++ b/net/rds/tcp_listen.c
+@@ -227,6 +227,9 @@ void rds_tcp_listen_data_ready(struct so
+ 	 * before it has been accepted and the accepter has set up their
+ 	 * data_ready.. we only want to queue listen work for our listening
+ 	 * socket
++	 *
++	 * (*ready)() may be null if we are racing with netns delete, and
++	 * the listen socket is being torn down.
+ 	 */
+ 	if (sk->sk_state == TCP_LISTEN)
+ 		rds_tcp_accept_work(sk);
+@@ -235,7 +238,8 @@ void rds_tcp_listen_data_ready(struct so
+ 
+ out:
+ 	read_unlock_bh(&sk->sk_callback_lock);
+-	ready(sk);
++	if (ready)
++		ready(sk);
+ }
+ 
+ struct socket *rds_tcp_listen_init(struct net *net)
+@@ -275,7 +279,7 @@ out:
+ 	return NULL;
+ }
+ 
+-void rds_tcp_listen_stop(struct socket *sock)
++void rds_tcp_listen_stop(struct socket *sock, struct work_struct *acceptor)
+ {
+ 	struct sock *sk;
+ 
+@@ -296,5 +300,6 @@ void rds_tcp_listen_stop(struct socket *
+ 
+ 	/* wait for accepts to stop and close the socket */
+ 	flush_workqueue(rds_wq);
++	flush_work(acceptor);
+ 	sock_release(sock);
+ }

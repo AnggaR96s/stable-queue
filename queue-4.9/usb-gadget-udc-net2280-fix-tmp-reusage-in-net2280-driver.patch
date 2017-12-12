@@ -1,0 +1,145 @@
+From foo@baz Tue Dec 12 13:26:17 CET 2017
+From: Raz Manor <Raz.Manor@valens.com>
+Date: Thu, 9 Feb 2017 09:41:08 +0200
+Subject: usb: gadget: udc: net2280: Fix tmp reusage in net2280 driver
+
+From: Raz Manor <Raz.Manor@valens.com>
+
+
+[ Upstream commit ef5e2fa9f65befa12f1113c734602d2c1964d2a5 ]
+
+In the function scan_dma_completions() there is a reusage of tmp
+variable. That coused a wrong value being used in some case when
+reading a short packet terminated transaction from an endpoint,
+in 2 concecutive reads.
+
+This was my logic for the patch:
+
+The req->td->dmadesc equals to 0 iff:
+-- There was a transaction ending with a short packet, and
+-- The read() to read it was shorter than the transaction length, and
+-- The read() to complete it is longer than the residue.
+I believe this is true from the printouts of various cases,
+but I can't be positive it is correct.
+
+Entering this if, there should be no more data in the endpoint
+(a short packet terminated the transaction).
+If there is, the transaction wasn't really done and we should exit and
+wait for it to finish entirely. That is the inner if.
+That inner if should never happen, but it is there to be on the safe
+side. That is why it is marked with the comment /* paranoia */.
+The size of the data available in the endpoint is ep->dma->dmacount
+and it is read to tmp.
+This entire clause is based on my own educated guesses.
+
+If we passed that inner if without breaking in the original code,
+than tmp & DMA_BYTE_MASK_COUNT== 0.
+That means we will always pass dma bytes count of 0 to dma_done(),
+meaning all the requested bytes were read.
+
+dma_done() reports back to the upper layer that the request (read())
+was done and how many bytes were read.
+In the original code that would always be the request size,
+regardless of the actual size of the data.
+That did not make sense to me at all.
+
+However, the original value of tmp is req->td->dmacount,
+which is the dmacount value when the request's dma transaction was
+finished. And that is a much more reasonable value to report back to
+the caller.
+
+To recreate the problem:
+Read from a bulk out endpoint in a loop, 1024 * n bytes in each
+iteration.
+Connect the PLX to a host you can control.
+Send to that endpoint 1024 * n + x bytes,
+such that 0 < x < 1024 * n and (x % 1024) != 0
+You would expect the first read() to return 1024 * n
+and the second read() to return x.
+But you will get the first read to return 1024 * n
+and the second one to return 1024 * n.
+That is true for every positive integer n.
+
+Cc: Felipe Balbi <balbi@kernel.org>
+Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: linux-usb@vger.kernel.org
+Signed-off-by: Raz Manor <Raz.Manor@valens.com>
+Signed-off-by: Felipe Balbi <felipe.balbi@linux.intel.com>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/gadget/udc/net2280.c |   25 +++++++++++++------------
+ 1 file changed, 13 insertions(+), 12 deletions(-)
+
+--- a/drivers/usb/gadget/udc/net2280.c
++++ b/drivers/usb/gadget/udc/net2280.c
+@@ -1146,15 +1146,15 @@ static int scan_dma_completions(struct n
+ 	 */
+ 	while (!list_empty(&ep->queue)) {
+ 		struct net2280_request	*req;
+-		u32			tmp;
++		u32 req_dma_count;
+ 
+ 		req = list_entry(ep->queue.next,
+ 				struct net2280_request, queue);
+ 		if (!req->valid)
+ 			break;
+ 		rmb();
+-		tmp = le32_to_cpup(&req->td->dmacount);
+-		if ((tmp & BIT(VALID_BIT)) != 0)
++		req_dma_count = le32_to_cpup(&req->td->dmacount);
++		if ((req_dma_count & BIT(VALID_BIT)) != 0)
+ 			break;
+ 
+ 		/* SHORT_PACKET_TRANSFERRED_INTERRUPT handles "usb-short"
+@@ -1163,40 +1163,41 @@ static int scan_dma_completions(struct n
+ 		 */
+ 		if (unlikely(req->td->dmadesc == 0)) {
+ 			/* paranoia */
+-			tmp = readl(&ep->dma->dmacount);
+-			if (tmp & DMA_BYTE_COUNT_MASK)
++			u32 const ep_dmacount = readl(&ep->dma->dmacount);
++
++			if (ep_dmacount & DMA_BYTE_COUNT_MASK)
+ 				break;
+ 			/* single transfer mode */
+-			dma_done(ep, req, tmp, 0);
++			dma_done(ep, req, req_dma_count, 0);
+ 			num_completed++;
+ 			break;
+ 		} else if (!ep->is_in &&
+ 			   (req->req.length % ep->ep.maxpacket) &&
+ 			   !(ep->dev->quirks & PLX_PCIE)) {
+ 
+-			tmp = readl(&ep->regs->ep_stat);
++			u32 const ep_stat = readl(&ep->regs->ep_stat);
+ 			/* AVOID TROUBLE HERE by not issuing short reads from
+ 			 * your gadget driver.  That helps avoids errata 0121,
+ 			 * 0122, and 0124; not all cases trigger the warning.
+ 			 */
+-			if ((tmp & BIT(NAK_OUT_PACKETS)) == 0) {
++			if ((ep_stat & BIT(NAK_OUT_PACKETS)) == 0) {
+ 				ep_warn(ep->dev, "%s lost packet sync!\n",
+ 						ep->ep.name);
+ 				req->req.status = -EOVERFLOW;
+ 			} else {
+-				tmp = readl(&ep->regs->ep_avail);
+-				if (tmp) {
++				u32 const ep_avail = readl(&ep->regs->ep_avail);
++				if (ep_avail) {
+ 					/* fifo gets flushed later */
+ 					ep->out_overflow = 1;
+ 					ep_dbg(ep->dev,
+ 						"%s dma, discard %d len %d\n",
+-						ep->ep.name, tmp,
++						ep->ep.name, ep_avail,
+ 						req->req.length);
+ 					req->req.status = -EOVERFLOW;
+ 				}
+ 			}
+ 		}
+-		dma_done(ep, req, tmp, 0);
++		dma_done(ep, req, req_dma_count, 0);
+ 		num_completed++;
+ 	}
+ 
