@@ -1,0 +1,161 @@
+From foo@baz Mon Dec 18 14:47:43 CET 2017
+From: Daniel Bristot de Oliveira <bristot@redhat.com>
+Date: Thu, 2 Mar 2017 15:10:58 +0100
+Subject: sched/deadline: Throttle a constrained deadline task activated after the deadline
+
+From: Daniel Bristot de Oliveira <bristot@redhat.com>
+
+
+[ Upstream commit df8eac8cafce7d086be3bd5cf5a838fa37594dfb ]
+
+During the activation, CBS checks if it can reuse the current task's
+runtime and period. If the deadline of the task is in the past, CBS
+cannot use the runtime, and so it replenishes the task. This rule
+works fine for implicit deadline tasks (deadline == period), and the
+CBS was designed for implicit deadline tasks. However, a task with
+constrained deadline (deadine < period) might be awakened after the
+deadline, but before the next period. In this case, replenishing the
+task would allow it to run for runtime / deadline. As in this case
+deadline < period, CBS enables a task to run for more than the
+runtime / period. In a very loaded system, this can cause a domino
+effect, making other tasks miss their deadlines.
+
+To avoid this problem, in the activation of a constrained deadline
+task after the deadline but before the next period, throttle the
+task and set the replenishing timer to the begin of the next period,
+unless it is boosted.
+
+Reproducer:
+
+ --------------- %< ---------------
+  int main (int argc, char **argv)
+  {
+	int ret;
+	int flags = 0;
+	unsigned long l = 0;
+	struct timespec ts;
+	struct sched_attr attr;
+
+	memset(&attr, 0, sizeof(attr));
+	attr.size = sizeof(attr);
+
+	attr.sched_policy   = SCHED_DEADLINE;
+	attr.sched_runtime  = 2 * 1000 * 1000;		/* 2 ms */
+	attr.sched_deadline = 2 * 1000 * 1000;		/* 2 ms */
+	attr.sched_period   = 2 * 1000 * 1000 * 1000;	/* 2 s */
+
+	ts.tv_sec = 0;
+	ts.tv_nsec = 2000 * 1000;			/* 2 ms */
+
+	ret = sched_setattr(0, &attr, flags);
+
+	if (ret < 0) {
+		perror("sched_setattr");
+		exit(-1);
+	}
+
+	for(;;) {
+		/* XXX: you may need to adjust the loop */
+		for (l = 0; l < 150000; l++);
+		/*
+		 * The ideia is to go to sleep right before the deadline
+		 * and then wake up before the next period to receive
+		 * a new replenishment.
+		 */
+		nanosleep(&ts, NULL);
+	}
+
+	exit(0);
+  }
+  --------------- >% ---------------
+
+On my box, this reproducer uses almost 50% of the CPU time, which is
+obviously wrong for a task with 2/2000 reservation.
+
+Signed-off-by: Daniel Bristot de Oliveira <bristot@redhat.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Juri Lelli <juri.lelli@arm.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Luca Abeni <luca.abeni@santannapisa.it>
+Cc: Mike Galbraith <efault@gmx.de>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Romulo Silva de Oliveira <romulo.deoliveira@ufsc.br>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Tommaso Cucinotta <tommaso.cucinotta@sssup.it>
+Link: http://lkml.kernel.org/r/edf58354e01db46bf42df8d2dd32418833f68c89.1488392936.git.bristot@redhat.com
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ kernel/sched/deadline.c |   45 +++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 45 insertions(+)
+
+--- a/kernel/sched/deadline.c
++++ b/kernel/sched/deadline.c
+@@ -704,6 +704,37 @@ void init_dl_task_timer(struct sched_dl_
+ 	timer->function = dl_task_timer;
+ }
+ 
++/*
++ * During the activation, CBS checks if it can reuse the current task's
++ * runtime and period. If the deadline of the task is in the past, CBS
++ * cannot use the runtime, and so it replenishes the task. This rule
++ * works fine for implicit deadline tasks (deadline == period), and the
++ * CBS was designed for implicit deadline tasks. However, a task with
++ * constrained deadline (deadine < period) might be awakened after the
++ * deadline, but before the next period. In this case, replenishing the
++ * task would allow it to run for runtime / deadline. As in this case
++ * deadline < period, CBS enables a task to run for more than the
++ * runtime / period. In a very loaded system, this can cause a domino
++ * effect, making other tasks miss their deadlines.
++ *
++ * To avoid this problem, in the activation of a constrained deadline
++ * task after the deadline but before the next period, throttle the
++ * task and set the replenishing timer to the begin of the next period,
++ * unless it is boosted.
++ */
++static inline void dl_check_constrained_dl(struct sched_dl_entity *dl_se)
++{
++	struct task_struct *p = dl_task_of(dl_se);
++	struct rq *rq = rq_of_dl_rq(dl_rq_of_se(dl_se));
++
++	if (dl_time_before(dl_se->deadline, rq_clock(rq)) &&
++	    dl_time_before(rq_clock(rq), dl_next_period(dl_se))) {
++		if (unlikely(dl_se->dl_boosted || !start_dl_timer(p)))
++			return;
++		dl_se->dl_throttled = 1;
++	}
++}
++
+ static
+ int dl_runtime_exceeded(struct sched_dl_entity *dl_se)
+ {
+@@ -958,6 +989,11 @@ static void dequeue_dl_entity(struct sch
+ 	__dequeue_dl_entity(dl_se);
+ }
+ 
++static inline bool dl_is_constrained(struct sched_dl_entity *dl_se)
++{
++	return dl_se->dl_deadline < dl_se->dl_period;
++}
++
+ static void enqueue_task_dl(struct rq *rq, struct task_struct *p, int flags)
+ {
+ 	struct task_struct *pi_task = rt_mutex_get_top_task(p);
+@@ -984,6 +1020,15 @@ static void enqueue_task_dl(struct rq *r
+ 	}
+ 
+ 	/*
++	 * Check if a constrained deadline task was activated
++	 * after the deadline but before the next period.
++	 * If that is the case, the task will be throttled and
++	 * the replenishment timer will be set to the next period.
++	 */
++	if (!p->dl.dl_throttled && dl_is_constrained(&p->dl))
++		dl_check_constrained_dl(&p->dl);
++
++	/*
+ 	 * If p is throttled, we do nothing. In fact, if it exhausted
+ 	 * its budget it needs a replenishment and, since it now is on
+ 	 * its rq, the bandwidth timer callback (which clearly has not
