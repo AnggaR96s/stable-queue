@@ -1,0 +1,430 @@
+From 946c191161cef10c667b5ee3179db1714fa5b7c0 Mon Sep 17 00:00:00 2001
+From: Josh Poimboeuf <jpoimboe@redhat.com>
+Date: Thu, 20 Oct 2016 11:34:40 -0500
+Subject: x86/entry/unwind: Create stack frames for saved interrupt registers
+
+From: Josh Poimboeuf <jpoimboe@redhat.com>
+
+commit 946c191161cef10c667b5ee3179db1714fa5b7c0 upstream.
+
+With frame pointers, when a task is interrupted, its stack is no longer
+completely reliable because the function could have been interrupted
+before it had a chance to save the previous frame pointer on the stack.
+So the caller of the interrupted function could get skipped by a stack
+trace.
+
+This is problematic for live patching, which needs to know whether a
+stack trace of a sleeping task can be relied upon.  There's currently no
+way to detect if a sleeping task was interrupted by a page fault
+exception or preemption before it went to sleep.
+
+Another issue is that when dumping the stack of an interrupted task, the
+unwinder has no way of knowing where the saved pt_regs registers are, so
+it can't print them.
+
+This solves those issues by encoding the pt_regs pointer in the frame
+pointer on entry from an interrupt or an exception.
+
+This patch also updates the unwinder to be able to decode it, because
+otherwise the unwinder would be broken by this change.
+
+Note that this causes a change in the behavior of the unwinder: each
+instance of a pt_regs on the stack is now considered a "frame".  So
+callers of unwind_get_return_address() will now get an occasional
+'regs->ip' address that would have previously been skipped over.
+
+Suggested-by: Andy Lutomirski <luto@amacapital.net>
+Signed-off-by: Josh Poimboeuf <jpoimboe@redhat.com>
+Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Borislav Petkov <bp@alien8.de>
+Cc: Brian Gerst <brgerst@gmail.com>
+Cc: Denys Vlasenko <dvlasenk@redhat.com>
+Cc: H. Peter Anvin <hpa@zytor.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/8b9f84a21e39d249049e0547b559ff8da0df0988.1476973742.git.jpoimboe@redhat.com
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Eduardo Valentin <eduval@amazon.com>
+Signed-off-by: Eduardo Valentin <edubezval@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/x86/entry/calling.h       |   20 ++++++++++
+ arch/x86/entry/entry_32.S      |   33 +++++++++++++++--
+ arch/x86/entry/entry_64.S      |   10 +++--
+ arch/x86/include/asm/unwind.h  |   16 ++++++++
+ arch/x86/kernel/unwind_frame.c |   76 ++++++++++++++++++++++++++++++++++++-----
+ 5 files changed, 139 insertions(+), 16 deletions(-)
+
+--- a/arch/x86/entry/calling.h
++++ b/arch/x86/entry/calling.h
+@@ -201,6 +201,26 @@ For 32-bit we have the following convent
+ 	.byte 0xf1
+ 	.endm
+ 
++/*
++ * This is a sneaky trick to help the unwinder find pt_regs on the stack.  The
++ * frame pointer is replaced with an encoded pointer to pt_regs.  The encoding
++ * is just setting the LSB, which makes it an invalid stack address and is also
++ * a signal to the unwinder that it's a pt_regs pointer in disguise.
++ *
++ * NOTE: This macro must be used *after* SAVE_EXTRA_REGS because it corrupts
++ * the original rbp.
++ */
++.macro ENCODE_FRAME_POINTER ptregs_offset=0
++#ifdef CONFIG_FRAME_POINTER
++	.if \ptregs_offset
++		leaq \ptregs_offset(%rsp), %rbp
++	.else
++		mov %rsp, %rbp
++	.endif
++	orq	$0x1, %rbp
++#endif
++.endm
++
+ #endif /* CONFIG_X86_64 */
+ 
+ /*
+--- a/arch/x86/entry/entry_32.S
++++ b/arch/x86/entry/entry_32.S
+@@ -175,6 +175,22 @@
+ 	SET_KERNEL_GS %edx
+ .endm
+ 
++/*
++ * This is a sneaky trick to help the unwinder find pt_regs on the stack.  The
++ * frame pointer is replaced with an encoded pointer to pt_regs.  The encoding
++ * is just setting the LSB, which makes it an invalid stack address and is also
++ * a signal to the unwinder that it's a pt_regs pointer in disguise.
++ *
++ * NOTE: This macro must be used *after* SAVE_ALL because it corrupts the
++ * original rbp.
++ */
++.macro ENCODE_FRAME_POINTER
++#ifdef CONFIG_FRAME_POINTER
++	mov %esp, %ebp
++	orl $0x1, %ebp
++#endif
++.endm
++
+ .macro RESTORE_INT_REGS
+ 	popl	%ebx
+ 	popl	%ecx
+@@ -624,6 +640,7 @@ common_interrupt:
+ 	ASM_CLAC
+ 	addl	$-0x80, (%esp)			/* Adjust vector into the [-256, -1] range */
+ 	SAVE_ALL
++	ENCODE_FRAME_POINTER
+ 	TRACE_IRQS_OFF
+ 	movl	%esp, %eax
+ 	call	do_IRQ
+@@ -635,6 +652,7 @@ ENTRY(name)				\
+ 	ASM_CLAC;			\
+ 	pushl	$~(nr);			\
+ 	SAVE_ALL;			\
++	ENCODE_FRAME_POINTER;		\
+ 	TRACE_IRQS_OFF			\
+ 	movl	%esp, %eax;		\
+ 	call	fn;			\
+@@ -769,6 +787,7 @@ END(spurious_interrupt_bug)
+ ENTRY(xen_hypervisor_callback)
+ 	pushl	$-1				/* orig_ax = -1 => not a system call */
+ 	SAVE_ALL
++	ENCODE_FRAME_POINTER
+ 	TRACE_IRQS_OFF
+ 
+ 	/*
+@@ -823,6 +842,7 @@ ENTRY(xen_failsafe_callback)
+ 	jmp	iret_exc
+ 5:	pushl	$-1				/* orig_ax = -1 => not a system call */
+ 	SAVE_ALL
++	ENCODE_FRAME_POINTER
+ 	jmp	ret_from_exception
+ 
+ .section .fixup, "ax"
+@@ -1047,6 +1067,7 @@ error_code:
+ 	pushl	%edx
+ 	pushl	%ecx
+ 	pushl	%ebx
++	ENCODE_FRAME_POINTER
+ 	cld
+ 	movl	$(__KERNEL_PERCPU), %ecx
+ 	movl	%ecx, %fs
+@@ -1079,6 +1100,7 @@ ENTRY(debug)
+ 	ASM_CLAC
+ 	pushl	$-1				# mark this as an int
+ 	SAVE_ALL
++	ENCODE_FRAME_POINTER
+ 	xorl	%edx, %edx			# error code 0
+ 	movl	%esp, %eax			# pt_regs pointer
+ 
+@@ -1094,11 +1116,11 @@ ENTRY(debug)
+ 
+ .Ldebug_from_sysenter_stack:
+ 	/* We're on the SYSENTER stack.  Switch off. */
+-	movl	%esp, %ebp
++	movl	%esp, %ebx
+ 	movl	PER_CPU_VAR(cpu_current_top_of_stack), %esp
+ 	TRACE_IRQS_OFF
+ 	call	do_debug
+-	movl	%ebp, %esp
++	movl	%ebx, %esp
+ 	jmp	ret_from_exception
+ END(debug)
+ 
+@@ -1121,6 +1143,7 @@ ENTRY(nmi)
+ 
+ 	pushl	%eax				# pt_regs->orig_ax
+ 	SAVE_ALL
++	ENCODE_FRAME_POINTER
+ 	xorl	%edx, %edx			# zero error code
+ 	movl	%esp, %eax			# pt_regs pointer
+ 
+@@ -1139,10 +1162,10 @@ ENTRY(nmi)
+ 	 * We're on the SYSENTER stack.  Switch off.  No one (not even debug)
+ 	 * is using the thread stack right now, so it's safe for us to use it.
+ 	 */
+-	movl	%esp, %ebp
++	movl	%esp, %ebx
+ 	movl	PER_CPU_VAR(cpu_current_top_of_stack), %esp
+ 	call	do_nmi
+-	movl	%ebp, %esp
++	movl	%ebx, %esp
+ 	jmp	restore_all_notrace
+ 
+ #ifdef CONFIG_X86_ESPFIX32
+@@ -1159,6 +1182,7 @@ nmi_espfix_stack:
+ 	.endr
+ 	pushl	%eax
+ 	SAVE_ALL
++	ENCODE_FRAME_POINTER
+ 	FIXUP_ESPFIX_STACK			# %eax == %esp
+ 	xorl	%edx, %edx			# zero error code
+ 	call	do_nmi
+@@ -1172,6 +1196,7 @@ ENTRY(int3)
+ 	ASM_CLAC
+ 	pushl	$-1				# mark this as an int
+ 	SAVE_ALL
++	ENCODE_FRAME_POINTER
+ 	TRACE_IRQS_OFF
+ 	xorl	%edx, %edx			# zero error code
+ 	movl	%esp, %eax			# pt_regs pointer
+--- a/arch/x86/entry/entry_64.S
++++ b/arch/x86/entry/entry_64.S
+@@ -469,6 +469,7 @@ END(irq_entries_start)
+ 	ALLOC_PT_GPREGS_ON_STACK
+ 	SAVE_C_REGS
+ 	SAVE_EXTRA_REGS
++	ENCODE_FRAME_POINTER
+ 
+ 	testb	$3, CS(%rsp)
+ 	jz	1f
+@@ -985,6 +986,7 @@ ENTRY(xen_failsafe_callback)
+ 	ALLOC_PT_GPREGS_ON_STACK
+ 	SAVE_C_REGS
+ 	SAVE_EXTRA_REGS
++	ENCODE_FRAME_POINTER
+ 	jmp	error_exit
+ END(xen_failsafe_callback)
+ 
+@@ -1028,6 +1030,7 @@ ENTRY(paranoid_entry)
+ 	cld
+ 	SAVE_C_REGS 8
+ 	SAVE_EXTRA_REGS 8
++	ENCODE_FRAME_POINTER 8
+ 	movl	$1, %ebx
+ 	movl	$MSR_GS_BASE, %ecx
+ 	rdmsr
+@@ -1075,6 +1078,7 @@ ENTRY(error_entry)
+ 	cld
+ 	SAVE_C_REGS 8
+ 	SAVE_EXTRA_REGS 8
++	ENCODE_FRAME_POINTER 8
+ 	xorl	%ebx, %ebx
+ 	testb	$3, CS+8(%rsp)
+ 	jz	.Lerror_kernelspace
+@@ -1259,6 +1263,7 @@ ENTRY(nmi)
+ 	pushq	%r13		/* pt_regs->r13 */
+ 	pushq	%r14		/* pt_regs->r14 */
+ 	pushq	%r15		/* pt_regs->r15 */
++	ENCODE_FRAME_POINTER
+ 
+ 	/*
+ 	 * At this point we no longer need to worry about stack damage
+@@ -1272,11 +1277,10 @@ ENTRY(nmi)
+ 
+ 	/*
+ 	 * Return back to user mode.  We must *not* do the normal exit
+-	 * work, because we don't want to enable interrupts.  Fortunately,
+-	 * do_nmi doesn't modify pt_regs.
++	 * work, because we don't want to enable interrupts.
+ 	 */
+ 	SWAPGS
+-	jmp	restore_c_regs_and_iret
++	jmp	restore_regs_and_iret
+ 
+ .Lnmi_from_kernel:
+ 	/*
+--- a/arch/x86/include/asm/unwind.h
++++ b/arch/x86/include/asm/unwind.h
+@@ -13,6 +13,7 @@ struct unwind_state {
+ 	int graph_idx;
+ #ifdef CONFIG_FRAME_POINTER
+ 	unsigned long *bp;
++	struct pt_regs *regs;
+ #else
+ 	unsigned long *sp;
+ #endif
+@@ -47,7 +48,15 @@ unsigned long *unwind_get_return_address
+ 	if (unwind_done(state))
+ 		return NULL;
+ 
+-	return state->bp + 1;
++	return state->regs ? &state->regs->ip : state->bp + 1;
++}
++
++static inline struct pt_regs *unwind_get_entry_regs(struct unwind_state *state)
++{
++	if (unwind_done(state))
++		return NULL;
++
++	return state->regs;
+ }
+ 
+ #else /* !CONFIG_FRAME_POINTER */
+@@ -57,6 +66,11 @@ unsigned long *unwind_get_return_address
+ {
+ 	return NULL;
+ }
++
++static inline struct pt_regs *unwind_get_entry_regs(struct unwind_state *state)
++{
++	return NULL;
++}
+ 
+ #endif /* CONFIG_FRAME_POINTER */
+ 
+--- a/arch/x86/kernel/unwind_frame.c
++++ b/arch/x86/kernel/unwind_frame.c
+@@ -14,6 +14,9 @@ unsigned long unwind_get_return_address(
+ 	if (unwind_done(state))
+ 		return 0;
+ 
++	if (state->regs && user_mode(state->regs))
++		return 0;
++
+ 	addr = ftrace_graph_ret_addr(state->task, &state->graph_idx, *addr_p,
+ 				     addr_p);
+ 
+@@ -21,6 +24,20 @@ unsigned long unwind_get_return_address(
+ }
+ EXPORT_SYMBOL_GPL(unwind_get_return_address);
+ 
++/*
++ * This determines if the frame pointer actually contains an encoded pointer to
++ * pt_regs on the stack.  See ENCODE_FRAME_POINTER.
++ */
++static struct pt_regs *decode_frame_pointer(unsigned long *bp)
++{
++	unsigned long regs = (unsigned long)bp;
++
++	if (!(regs & 0x1))
++		return NULL;
++
++	return (struct pt_regs *)(regs & ~0x1);
++}
++
+ static bool update_stack_state(struct unwind_state *state, void *addr,
+ 			       size_t len)
+ {
+@@ -43,26 +60,59 @@ static bool update_stack_state(struct un
+ 
+ bool unwind_next_frame(struct unwind_state *state)
+ {
+-	unsigned long *next_bp;
++	struct pt_regs *regs;
++	unsigned long *next_bp, *next_frame;
++	size_t next_len;
+ 
+ 	if (unwind_done(state))
+ 		return false;
+ 
+-	next_bp = (unsigned long *)*state->bp;
++	/* have we reached the end? */
++	if (state->regs && user_mode(state->regs))
++		goto the_end;
++
++	/* get the next frame pointer */
++	if (state->regs)
++		next_bp = (unsigned long *)state->regs->bp;
++	else
++		next_bp = (unsigned long *)*state->bp;
++
++	/* is the next frame pointer an encoded pointer to pt_regs? */
++	regs = decode_frame_pointer(next_bp);
++	if (regs) {
++		next_frame = (unsigned long *)regs;
++		next_len = sizeof(*regs);
++	} else {
++		next_frame = next_bp;
++		next_len = FRAME_HEADER_SIZE;
++	}
+ 
+ 	/* make sure the next frame's data is accessible */
+-	if (!update_stack_state(state, next_bp, FRAME_HEADER_SIZE))
++	if (!update_stack_state(state, next_frame, next_len))
+ 		return false;
+-
+ 	/* move to the next frame */
+-	state->bp = next_bp;
++	if (regs) {
++		state->regs = regs;
++		state->bp = NULL;
++	} else {
++		state->bp = next_bp;
++		state->regs = NULL;
++	}
++
+ 	return true;
++
++the_end:
++	state->stack_info.type = STACK_TYPE_UNKNOWN;
++	return false;
+ }
+ EXPORT_SYMBOL_GPL(unwind_next_frame);
+ 
+ void __unwind_start(struct unwind_state *state, struct task_struct *task,
+ 		    struct pt_regs *regs, unsigned long *first_frame)
+ {
++	unsigned long *bp, *frame;
++	size_t len;
++
+ 	memset(state, 0, sizeof(*state));
+ 	state->task = task;
+ 
+@@ -73,12 +123,22 @@ void __unwind_start(struct unwind_state
+ 	}
+ 
+ 	/* set up the starting stack frame */
+-	state->bp = get_frame_pointer(task, regs);
++	bp = get_frame_pointer(task, regs);
++	regs = decode_frame_pointer(bp);
++	if (regs) {
++		state->regs = regs;
++		frame = (unsigned long *)regs;
++		len = sizeof(*regs);
++	} else {
++		state->bp = bp;
++		frame = bp;
++		len = FRAME_HEADER_SIZE;
++	}
+ 
+ 	/* initialize stack info and make sure the frame data is accessible */
+-	get_stack_info(state->bp, state->task, &state->stack_info,
++	get_stack_info(frame, state->task, &state->stack_info,
+ 		       &state->stack_mask);
+-	update_stack_state(state, state->bp, FRAME_HEADER_SIZE);
++	update_stack_state(state, frame, len);
+ 
+ 	/*
+ 	 * The caller can provide the address of the first frame directly

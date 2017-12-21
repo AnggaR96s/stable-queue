@@ -1,0 +1,118 @@
+From foo@baz Thu Dec 21 09:02:40 CET 2017
+From: Julian Wiedmann <jwi@linux.vnet.ibm.com>
+Date: Thu, 23 Mar 2017 14:55:08 +0100
+Subject: s390/qeth: size calculation outbound buffers
+
+From: Julian Wiedmann <jwi@linux.vnet.ibm.com>
+
+
+[ Upstream commit 7d969d2e8890f546c8cec634b3aa5f57d4eef883 ]
+
+Depending on the device type, hard_start_xmit() builds different output
+buffer formats. For instance with HiperSockets, on both L2 and L3 we
+strip the ETH header from the skb - L3 doesn't need it, and L2 carries
+it in the buffer's header element.
+For this, we pass data_offset = ETH_HLEN all the way down to
+__qeth_fill_buffer(), where skb->data is then adjusted accordingly.
+But the initial size calculation still considers the *full* skb length
+(including the ETH header). So qeth_get_elements_no() can erroneously
+reject a skb as too big, even though it would actually fit into an
+output buffer once the ETH header has been trimmed off later.
+
+Fix this by passing an additional offset to qeth_get_elements_no(),
+that indicates where in the skb the on-wire data actually begins.
+Since the current code uses data_offset=-1 for some special handling
+on OSA, we need to clamp data_offset to 0...
+
+On HiperSockets this helps when sending ~MTU-size skbs with weird page
+alignment. No change for OSA or AF_IUCV.
+
+Signed-off-by: Julian Wiedmann <jwi@linux.vnet.ibm.com>
+Signed-off-by: Ursula Braun <ubraun@linux.vnet.ibm.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/s390/net/qeth_core.h      |    3 ++-
+ drivers/s390/net/qeth_core_main.c |    5 +++--
+ drivers/s390/net/qeth_l2_main.c   |    5 +++--
+ drivers/s390/net/qeth_l3_main.c   |    5 +++--
+ 4 files changed, 11 insertions(+), 7 deletions(-)
+
+--- a/drivers/s390/net/qeth_core.h
++++ b/drivers/s390/net/qeth_core.h
+@@ -969,7 +969,8 @@ int qeth_bridgeport_query_ports(struct q
+ int qeth_bridgeport_setrole(struct qeth_card *card, enum qeth_sbp_roles role);
+ int qeth_bridgeport_an_set(struct qeth_card *card, int enable);
+ int qeth_get_priority_queue(struct qeth_card *, struct sk_buff *, int, int);
+-int qeth_get_elements_no(struct qeth_card *, struct sk_buff *, int);
++int qeth_get_elements_no(struct qeth_card *card, struct sk_buff *skb,
++			 int extra_elems, int data_offset);
+ int qeth_get_elements_for_frags(struct sk_buff *);
+ int qeth_do_send_packet_fast(struct qeth_card *, struct qeth_qdio_out_q *,
+ 			struct sk_buff *, struct qeth_hdr *, int, int, int);
+--- a/drivers/s390/net/qeth_core_main.c
++++ b/drivers/s390/net/qeth_core_main.c
+@@ -3842,6 +3842,7 @@ EXPORT_SYMBOL_GPL(qeth_get_elements_for_
+  * @card:			qeth card structure, to check max. elems.
+  * @skb:			SKB address
+  * @extra_elems:		extra elems needed, to check against max.
++ * @data_offset:		range starts at skb->data + data_offset
+  *
+  * Returns the number of pages, and thus QDIO buffer elements, needed to cover
+  * skb data, including linear part and fragments. Checks if the result plus
+@@ -3849,10 +3850,10 @@ EXPORT_SYMBOL_GPL(qeth_get_elements_for_
+  * Note: extra_elems is not included in the returned result.
+  */
+ int qeth_get_elements_no(struct qeth_card *card,
+-		     struct sk_buff *skb, int extra_elems)
++		     struct sk_buff *skb, int extra_elems, int data_offset)
+ {
+ 	int elements = qeth_get_elements_for_range(
+-				(addr_t)skb->data,
++				(addr_t)skb->data + data_offset,
+ 				(addr_t)skb->data + skb_headlen(skb)) +
+ 			qeth_get_elements_for_frags(skb);
+ 
+--- a/drivers/s390/net/qeth_l2_main.c
++++ b/drivers/s390/net/qeth_l2_main.c
+@@ -865,7 +865,7 @@ static int qeth_l2_hard_start_xmit(struc
+ 	 * chaining we can not send long frag lists
+ 	 */
+ 	if ((card->info.type != QETH_CARD_TYPE_IQD) &&
+-	    !qeth_get_elements_no(card, new_skb, 0)) {
++	    !qeth_get_elements_no(card, new_skb, 0, 0)) {
+ 		int lin_rc = skb_linearize(new_skb);
+ 
+ 		if (card->options.performance_stats) {
+@@ -910,7 +910,8 @@ static int qeth_l2_hard_start_xmit(struc
+ 		}
+ 	}
+ 
+-	elements = qeth_get_elements_no(card, new_skb, elements_needed);
++	elements = qeth_get_elements_no(card, new_skb, elements_needed,
++					(data_offset > 0) ? data_offset : 0);
+ 	if (!elements) {
+ 		if (data_offset >= 0)
+ 			kmem_cache_free(qeth_core_header_cache, hdr);
+--- a/drivers/s390/net/qeth_l3_main.c
++++ b/drivers/s390/net/qeth_l3_main.c
+@@ -2870,7 +2870,7 @@ static int qeth_l3_hard_start_xmit(struc
+ 	 */
+ 	if ((card->info.type != QETH_CARD_TYPE_IQD) &&
+ 	    ((use_tso && !qeth_l3_get_elements_no_tso(card, new_skb, 1)) ||
+-	     (!use_tso && !qeth_get_elements_no(card, new_skb, 0)))) {
++	     (!use_tso && !qeth_get_elements_no(card, new_skb, 0, 0)))) {
+ 		int lin_rc = skb_linearize(new_skb);
+ 
+ 		if (card->options.performance_stats) {
+@@ -2912,7 +2912,8 @@ static int qeth_l3_hard_start_xmit(struc
+ 
+ 	elements = use_tso ?
+ 		   qeth_l3_get_elements_no_tso(card, new_skb, hdr_elements) :
+-		   qeth_get_elements_no(card, new_skb, hdr_elements);
++		   qeth_get_elements_no(card, new_skb, hdr_elements,
++					(data_offset > 0) ? data_offset : 0);
+ 	if (!elements) {
+ 		if (data_offset >= 0)
+ 			kmem_cache_free(qeth_core_header_cache, hdr);

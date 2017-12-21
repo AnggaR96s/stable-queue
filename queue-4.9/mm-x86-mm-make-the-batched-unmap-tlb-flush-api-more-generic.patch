@@ -1,0 +1,183 @@
+From e73ad5ff2f76da25390e9607cb549691639330c3 Mon Sep 17 00:00:00 2001
+From: Andy Lutomirski <luto@kernel.org>
+Date: Mon, 22 May 2017 15:30:03 -0700
+Subject: mm, x86/mm: Make the batched unmap TLB flush API more generic
+
+From: Andy Lutomirski <luto@kernel.org>
+
+commit e73ad5ff2f76da25390e9607cb549691639330c3 upstream.
+
+try_to_unmap_flush() used to open-code a rather x86-centric flush
+sequence: local_flush_tlb() + flush_tlb_others().  Rearrange the
+code so that the arch (only x86 for now) provides
+arch_tlbbatch_add_mm() and arch_tlbbatch_flush() and the core code
+calls those functions instead.
+
+I'll want this for x86 because, to enable address space ids, I can't
+support the flush_tlb_others() mode used by exising
+try_to_unmap_flush() implementation with good performance.  I can
+support the new API fairly easily, though.
+
+I imagine that other architectures may be in a similar position.
+Architectures with strong remote flush primitives (arm64?) may have
+even worse performance problems with flush_tlb_others() the way that
+try_to_unmap_flush() uses it.
+
+Signed-off-by: Andy Lutomirski <luto@kernel.org>
+Acked-by: Kees Cook <keescook@chromium.org>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: Borislav Petkov <bpetkov@suse.de>
+Cc: Dave Hansen <dave.hansen@intel.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Nadav Amit <nadav.amit@gmail.com>
+Cc: Nadav Amit <namit@vmware.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Rik van Riel <riel@redhat.com>
+Cc: Sasha Levin <sasha.levin@oracle.com>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: linux-mm@kvack.org
+Link: http://lkml.kernel.org/r/19f25a8581f9fb77876b7ff3b001f89835e34ea3.1495492063.git.luto@kernel.org
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Eduardo Valentin <eduval@amazon.com>
+Signed-off-by: Eduardo Valentin <edubezval@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/x86/include/asm/tlbbatch.h |   16 ++++++++++++++++
+ arch/x86/include/asm/tlbflush.h |    8 ++++++++
+ arch/x86/mm/tlb.c               |   17 +++++++++++++++++
+ include/linux/sched.h           |   15 +++++++++++----
+ mm/rmap.c                       |   16 ++--------------
+ 5 files changed, 54 insertions(+), 18 deletions(-)
+ create mode 100644 arch/x86/include/asm/tlbbatch.h
+
+--- /dev/null
++++ b/arch/x86/include/asm/tlbbatch.h
+@@ -0,0 +1,16 @@
++#ifndef _ARCH_X86_TLBBATCH_H
++#define _ARCH_X86_TLBBATCH_H
++
++#include <linux/cpumask.h>
++
++#ifdef CONFIG_SMP
++struct arch_tlbflush_unmap_batch {
++	/*
++	 * Each bit set is a CPU that potentially has a TLB entry for one of
++	 * the PFNs being flushed..
++	 */
++	struct cpumask cpumask;
++};
++#endif
++
++#endif /* _ARCH_X86_TLBBATCH_H */
+--- a/arch/x86/include/asm/tlbflush.h
++++ b/arch/x86/include/asm/tlbflush.h
+@@ -327,6 +327,14 @@ static inline void reset_lazy_tlbstate(v
+ 	this_cpu_write(cpu_tlbstate.active_mm, &init_mm);
+ }
+ 
++static inline void arch_tlbbatch_add_mm(struct arch_tlbflush_unmap_batch *batch,
++					struct mm_struct *mm)
++{
++	cpumask_or(&batch->cpumask, &batch->cpumask, mm_cpumask(mm));
++}
++
++extern void arch_tlbbatch_flush(struct arch_tlbflush_unmap_batch *batch);
++
+ #endif	/* SMP */
+ 
+ #ifndef CONFIG_PARAVIRT
+--- a/arch/x86/mm/tlb.c
++++ b/arch/x86/mm/tlb.c
+@@ -410,6 +410,23 @@ void flush_tlb_kernel_range(unsigned lon
+ 	}
+ }
+ 
++void arch_tlbbatch_flush(struct arch_tlbflush_unmap_batch *batch)
++{
++	int cpu = get_cpu();
++
++	if (cpumask_test_cpu(cpu, &batch->cpumask)) {
++		count_vm_tlb_event(NR_TLB_LOCAL_FLUSH_ALL);
++		local_flush_tlb();
++		trace_tlb_flush(TLB_LOCAL_SHOOTDOWN, TLB_FLUSH_ALL);
++	}
++
++	if (cpumask_any_but(&batch->cpumask, cpu) < nr_cpu_ids)
++		flush_tlb_others(&batch->cpumask, NULL, 0, TLB_FLUSH_ALL);
++	cpumask_clear(&batch->cpumask);
++
++	put_cpu();
++}
++
+ static ssize_t tlbflush_read_file(struct file *file, char __user *user_buf,
+ 			     size_t count, loff_t *ppos)
+ {
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1463,15 +1463,22 @@ enum perf_event_task_context {
+ 	perf_nr_task_contexts,
+ };
+ 
++#ifdef CONFIG_ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH
++#include <asm/tlbbatch.h>
++#endif
++
+ /* Track pages that require TLB flushes */
+ struct tlbflush_unmap_batch {
+ 	/*
+-	 * Each bit set is a CPU that potentially has a TLB entry for one of
+-	 * the PFNs being flushed. See set_tlb_ubc_flush_pending().
++	 * The arch code makes the following promise: generic code can modify a
++	 * PTE, then call arch_tlbbatch_add_mm() (which internally provides all
++	 * needed barriers), then call arch_tlbbatch_flush(), and the entries
++	 * will be flushed on all CPUs by the time that arch_tlbbatch_flush()
++	 * returns.
+ 	 */
+-	struct cpumask cpumask;
++	struct arch_tlbflush_unmap_batch arch;
+ 
+-	/* True if any bit in cpumask is set */
++	/* True if a flush is needed. */
+ 	bool flush_required;
+ 
+ 	/*
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -578,25 +578,13 @@ void page_unlock_anon_vma_read(struct an
+ void try_to_unmap_flush(void)
+ {
+ 	struct tlbflush_unmap_batch *tlb_ubc = &current->tlb_ubc;
+-	int cpu;
+ 
+ 	if (!tlb_ubc->flush_required)
+ 		return;
+ 
+-	cpu = get_cpu();
+-
+-	if (cpumask_test_cpu(cpu, &tlb_ubc->cpumask)) {
+-		count_vm_tlb_event(NR_TLB_LOCAL_FLUSH_ALL);
+-		local_flush_tlb();
+-		trace_tlb_flush(TLB_LOCAL_SHOOTDOWN, TLB_FLUSH_ALL);
+-	}
+-
+-	if (cpumask_any_but(&tlb_ubc->cpumask, cpu) < nr_cpu_ids)
+-		flush_tlb_others(&tlb_ubc->cpumask, NULL, 0, TLB_FLUSH_ALL);
+-	cpumask_clear(&tlb_ubc->cpumask);
++	arch_tlbbatch_flush(&tlb_ubc->arch);
+ 	tlb_ubc->flush_required = false;
+ 	tlb_ubc->writable = false;
+-	put_cpu();
+ }
+ 
+ /* Flush iff there are potentially writable TLB entries that can race with IO */
+@@ -613,7 +601,7 @@ static void set_tlb_ubc_flush_pending(st
+ {
+ 	struct tlbflush_unmap_batch *tlb_ubc = &current->tlb_ubc;
+ 
+-	cpumask_or(&tlb_ubc->cpumask, &tlb_ubc->cpumask, mm_cpumask(mm));
++	arch_tlbbatch_add_mm(&tlb_ubc->arch, mm);
+ 	tlb_ubc->flush_required = true;
+ 
+ 	/*
