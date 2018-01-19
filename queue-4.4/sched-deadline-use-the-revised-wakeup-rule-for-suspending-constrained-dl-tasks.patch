@@ -1,0 +1,270 @@
+From 3effcb4247e74a51f5d8b775a1ee4abf87cc089a Mon Sep 17 00:00:00 2001
+From: Daniel Bristot de Oliveira <bristot@redhat.com>
+Date: Mon, 29 May 2017 16:24:03 +0200
+Subject: sched/deadline: Use the revised wakeup rule for suspending constrained dl tasks
+
+From: Daniel Bristot de Oliveira <bristot@redhat.com>
+
+commit 3effcb4247e74a51f5d8b775a1ee4abf87cc089a upstream.
+
+We have been facing some problems with self-suspending constrained
+deadline tasks. The main reason is that the original CBS was not
+designed for such sort of tasks.
+
+One problem reported by Xunlei Pang takes place when a task
+suspends, and then is awakened before the deadline, but so close
+to the deadline that its remaining runtime can cause the task
+to have an absolute density higher than allowed. In such situation,
+the original CBS assumes that the task is facing an early activation,
+and so it replenishes the task and set another deadline, one deadline
+in the future. This rule works fine for implicit deadline tasks.
+Moreover, it allows the system to adapt the period of a task in which
+the external event source suffered from a clock drift.
+
+However, this opens the window for bandwidth leakage for constrained
+deadline tasks. For instance, a task with the following parameters:
+
+  runtime   = 5 ms
+  deadline  = 7 ms
+  [density] = 5 / 7 = 0.71
+  period    = 1000 ms
+
+If the task runs for 1 ms, and then suspends for another 1ms,
+it will be awakened with the following parameters:
+
+  remaining runtime = 4
+  laxity = 5
+
+presenting a absolute density of 4 / 5 = 0.80.
+
+In this case, the original CBS would assume the task had an early
+wakeup. Then, CBS will reset the runtime, and the absolute deadline will
+be postponed by one relative deadline, allowing the task to run.
+
+The problem is that, if the task runs this pattern forever, it will keep
+receiving bandwidth, being able to run 1ms every 2ms. Following this
+behavior, the task would be able to run 500 ms in 1 sec. Thus running
+more than the 5 ms / 1 sec the admission control allowed it to run.
+
+Trying to address the self-suspending case, Luca Abeni, Giuseppe
+Lipari, and Juri Lelli [1] revisited the CBS in order to deal with
+self-suspending tasks. In the new approach, rather than
+replenishing/postponing the absolute deadline, the revised wakeup rule
+adjusts the remaining runtime, reducing it to fit into the allowed
+density.
+
+A revised version of the idea is:
+
+At a given time t, the maximum absolute density of a task cannot be
+higher than its relative density, that is:
+
+  runtime / (deadline - t) <= dl_runtime / dl_deadline
+
+Knowing the laxity of a task (deadline - t), it is possible to move
+it to the other side of the equality, thus enabling to define max
+remaining runtime a task can use within the absolute deadline, without
+over-running the allowed density:
+
+  runtime = (dl_runtime / dl_deadline) * (deadline - t)
+
+For instance, in our previous example, the task could still run:
+
+  runtime = ( 5 / 7 ) * 5
+  runtime = 3.57 ms
+
+Without causing damage for other deadline tasks. It is note worthy
+that the laxity cannot be negative because that would cause a negative
+runtime. Thus, this patch depends on the patch:
+
+  df8eac8cafce ("sched/deadline: Throttle a constrained deadline task activated after the deadline")
+
+Which throttles a constrained deadline task activated after the
+deadline.
+
+Finally, it is also possible to use the revised wakeup rule for
+all other tasks, but that would require some more discussions
+about pros and cons.
+
+Reported-by: Xunlei Pang <xpang@redhat.com>
+Signed-off-by: Daniel Bristot de Oliveira <bristot@redhat.com>
+[peterz: replaced dl_is_constrained with dl_is_implicit]
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Juri Lelli <juri.lelli@arm.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Luca Abeni <luca.abeni@santannapisa.it>
+Cc: Mike Galbraith <efault@gmx.de>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Romulo Silva de Oliveira <romulo.deoliveira@ufsc.br>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Tommaso Cucinotta <tommaso.cucinotta@sssup.it>
+Link: http://lkml.kernel.org/r/5c800ab3a74a168a84ee5f3f84d12a02e11383be.1495803804.git.bristot@redhat.com
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Cc: Ben Hutchings <ben.hutchings@codethink.co.uk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ include/linux/sched.h   |    3 -
+ kernel/sched/core.c     |    2 
+ kernel/sched/deadline.c |   98 ++++++++++++++++++++++++++++++++++++++++++------
+ 3 files changed, 90 insertions(+), 13 deletions(-)
+
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1312,7 +1312,8 @@ struct sched_dl_entity {
+ 	u64 dl_runtime;		/* maximum runtime for each instance	*/
+ 	u64 dl_deadline;	/* relative deadline of each instance	*/
+ 	u64 dl_period;		/* separation of two instances (period) */
+-	u64 dl_bw;		/* dl_runtime / dl_deadline		*/
++	u64 dl_bw;		/* dl_runtime / dl_period		*/
++	u64 dl_density;		/* dl_runtime / dl_deadline		*/
+ 
+ 	/*
+ 	 * Actual scheduling parameters. Initialized with the values above,
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -2109,6 +2109,7 @@ void __dl_clear_params(struct task_struc
+ 	dl_se->dl_period = 0;
+ 	dl_se->flags = 0;
+ 	dl_se->dl_bw = 0;
++	dl_se->dl_density = 0;
+ 
+ 	dl_se->dl_throttled = 0;
+ 	dl_se->dl_new = 1;
+@@ -3647,6 +3648,7 @@ __setparam_dl(struct task_struct *p, con
+ 	dl_se->dl_period = attr->sched_period ?: dl_se->dl_deadline;
+ 	dl_se->flags = attr->sched_flags;
+ 	dl_se->dl_bw = to_ratio(dl_se->dl_period, dl_se->dl_runtime);
++	dl_se->dl_density = to_ratio(dl_se->dl_deadline, dl_se->dl_runtime);
+ 
+ 	/*
+ 	 * Changing the parameters of a task is 'tricky' and we're not doing
+--- a/kernel/sched/deadline.c
++++ b/kernel/sched/deadline.c
+@@ -480,13 +480,84 @@ static bool dl_entity_overflow(struct sc
+ }
+ 
+ /*
+- * When a -deadline entity is queued back on the runqueue, its runtime and
+- * deadline might need updating.
++ * Revised wakeup rule [1]: For self-suspending tasks, rather then
++ * re-initializing task's runtime and deadline, the revised wakeup
++ * rule adjusts the task's runtime to avoid the task to overrun its
++ * density.
+  *
+- * The policy here is that we update the deadline of the entity only if:
+- *  - the current deadline is in the past,
+- *  - using the remaining runtime with the current deadline would make
+- *    the entity exceed its bandwidth.
++ * Reasoning: a task may overrun the density if:
++ *    runtime / (deadline - t) > dl_runtime / dl_deadline
++ *
++ * Therefore, runtime can be adjusted to:
++ *     runtime = (dl_runtime / dl_deadline) * (deadline - t)
++ *
++ * In such way that runtime will be equal to the maximum density
++ * the task can use without breaking any rule.
++ *
++ * [1] Luca Abeni, Giuseppe Lipari, and Juri Lelli. 2015. Constant
++ * bandwidth server revisited. SIGBED Rev. 11, 4 (January 2015), 19-24.
++ */
++static void
++update_dl_revised_wakeup(struct sched_dl_entity *dl_se, struct rq *rq)
++{
++	u64 laxity = dl_se->deadline - rq_clock(rq);
++
++	/*
++	 * If the task has deadline < period, and the deadline is in the past,
++	 * it should already be throttled before this check.
++	 *
++	 * See update_dl_entity() comments for further details.
++	 */
++	WARN_ON(dl_time_before(dl_se->deadline, rq_clock(rq)));
++
++	dl_se->runtime = (dl_se->dl_density * laxity) >> BW_SHIFT;
++}
++
++/*
++ * Regarding the deadline, a task with implicit deadline has a relative
++ * deadline == relative period. A task with constrained deadline has a
++ * relative deadline <= relative period.
++ *
++ * We support constrained deadline tasks. However, there are some restrictions
++ * applied only for tasks which do not have an implicit deadline. See
++ * update_dl_entity() to know more about such restrictions.
++ *
++ * The dl_is_implicit() returns true if the task has an implicit deadline.
++ */
++static inline bool dl_is_implicit(struct sched_dl_entity *dl_se)
++{
++	return dl_se->dl_deadline == dl_se->dl_period;
++}
++
++/*
++ * When a deadline entity is placed in the runqueue, its runtime and deadline
++ * might need to be updated. This is done by a CBS wake up rule. There are two
++ * different rules: 1) the original CBS; and 2) the Revisited CBS.
++ *
++ * When the task is starting a new period, the Original CBS is used. In this
++ * case, the runtime is replenished and a new absolute deadline is set.
++ *
++ * When a task is queued before the begin of the next period, using the
++ * remaining runtime and deadline could make the entity to overflow, see
++ * dl_entity_overflow() to find more about runtime overflow. When such case
++ * is detected, the runtime and deadline need to be updated.
++ *
++ * If the task has an implicit deadline, i.e., deadline == period, the Original
++ * CBS is applied. the runtime is replenished and a new absolute deadline is
++ * set, as in the previous cases.
++ *
++ * However, the Original CBS does not work properly for tasks with
++ * deadline < period, which are said to have a constrained deadline. By
++ * applying the Original CBS, a constrained deadline task would be able to run
++ * runtime/deadline in a period. With deadline < period, the task would
++ * overrun the runtime/period allowed bandwidth, breaking the admission test.
++ *
++ * In order to prevent this misbehave, the Revisited CBS is used for
++ * constrained deadline tasks when a runtime overflow is detected. In the
++ * Revisited CBS, rather than replenishing & setting a new absolute deadline,
++ * the remaining runtime of the task is reduced to avoid runtime overflow.
++ * Please refer to the comments update_dl_revised_wakeup() function to find
++ * more about the Revised CBS rule.
+  */
+ static void update_dl_entity(struct sched_dl_entity *dl_se,
+ 			     struct sched_dl_entity *pi_se)
+@@ -505,6 +576,14 @@ static void update_dl_entity(struct sche
+ 
+ 	if (dl_time_before(dl_se->deadline, rq_clock(rq)) ||
+ 	    dl_entity_overflow(dl_se, pi_se, rq_clock(rq))) {
++
++		if (unlikely(!dl_is_implicit(dl_se) &&
++			     !dl_time_before(dl_se->deadline, rq_clock(rq)) &&
++			     !dl_se->dl_boosted)){
++			update_dl_revised_wakeup(dl_se, rq);
++			return;
++		}
++
+ 		dl_se->deadline = rq_clock(rq) + pi_se->dl_deadline;
+ 		dl_se->runtime = pi_se->dl_runtime;
+ 	}
+@@ -991,11 +1070,6 @@ static void dequeue_dl_entity(struct sch
+ 	__dequeue_dl_entity(dl_se);
+ }
+ 
+-static inline bool dl_is_constrained(struct sched_dl_entity *dl_se)
+-{
+-	return dl_se->dl_deadline < dl_se->dl_period;
+-}
+-
+ static void enqueue_task_dl(struct rq *rq, struct task_struct *p, int flags)
+ {
+ 	struct task_struct *pi_task = rt_mutex_get_top_task(p);
+@@ -1027,7 +1101,7 @@ static void enqueue_task_dl(struct rq *r
+ 	 * If that is the case, the task will be throttled and
+ 	 * the replenishment timer will be set to the next period.
+ 	 */
+-	if (!p->dl.dl_throttled && dl_is_constrained(&p->dl))
++	if (!p->dl.dl_throttled && !dl_is_implicit(&p->dl))
+ 		dl_check_constrained_dl(&p->dl);
+ 
+ 	/*
