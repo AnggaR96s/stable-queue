@@ -1,0 +1,126 @@
+From foo@baz Sun Jan 28 17:35:08 CET 2018
+From: Guillaume Nault <g.nault@alphalink.fr>
+Date: Mon, 22 Jan 2018 18:06:37 +0100
+Subject: pppoe: take ->needed_headroom of lower device into account on xmit
+
+From: Guillaume Nault <g.nault@alphalink.fr>
+
+
+[ Upstream commit 02612bb05e51df8489db5e94d0cf8d1c81f87b0c ]
+
+In pppoe_sendmsg(), reserving dev->hard_header_len bytes of headroom
+was probably fine before the introduction of ->needed_headroom in
+commit f5184d267c1a ("net: Allow netdevices to specify needed head/tailroom").
+
+But now, virtual devices typically advertise the size of their overhead
+in dev->needed_headroom, so we must also take it into account in
+skb_reserve().
+Allocation size of skb is also updated to take dev->needed_tailroom
+into account and replace the arbitrary 32 bytes with the real size of
+a PPPoE header.
+
+This issue was discovered by syzbot, who connected a pppoe socket to a
+gre device which had dev->header_ops->create == ipgre_header and
+dev->hard_header_len == 0. Therefore, PPPoE didn't reserve any
+headroom, and dev_hard_header() crashed when ipgre_header() tried to
+prepend its header to skb->data.
+
+skbuff: skb_under_panic: text:000000001d390b3a len:31 put:24
+head:00000000d8ed776f data:000000008150e823 tail:0x7 end:0xc0 dev:gre0
+------------[ cut here ]------------
+kernel BUG at net/core/skbuff.c:104!
+invalid opcode: 0000 [#1] SMP KASAN
+Dumping ftrace buffer:
+    (ftrace buffer empty)
+Modules linked in:
+CPU: 1 PID: 3670 Comm: syzkaller801466 Not tainted
+4.15.0-rc7-next-20180115+ #97
+Hardware name: Google Google Compute Engine/Google Compute Engine, BIOS
+Google 01/01/2011
+RIP: 0010:skb_panic+0x162/0x1f0 net/core/skbuff.c:100
+RSP: 0018:ffff8801d9bd7840 EFLAGS: 00010282
+RAX: 0000000000000083 RBX: ffff8801d4f083c0 RCX: 0000000000000000
+RDX: 0000000000000083 RSI: 1ffff1003b37ae92 RDI: ffffed003b37aefc
+RBP: ffff8801d9bd78a8 R08: 1ffff1003b37ae8a R09: 0000000000000000
+R10: 0000000000000001 R11: 0000000000000000 R12: ffffffff86200de0
+R13: ffffffff84a981ad R14: 0000000000000018 R15: ffff8801d2d34180
+FS:  00000000019c4880(0000) GS:ffff8801db300000(0000) knlGS:0000000000000000
+CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+CR2: 00000000208bc000 CR3: 00000001d9111001 CR4: 00000000001606e0
+DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7: 0000000000000400
+Call Trace:
+  skb_under_panic net/core/skbuff.c:114 [inline]
+  skb_push+0xce/0xf0 net/core/skbuff.c:1714
+  ipgre_header+0x6d/0x4e0 net/ipv4/ip_gre.c:879
+  dev_hard_header include/linux/netdevice.h:2723 [inline]
+  pppoe_sendmsg+0x58e/0x8b0 drivers/net/ppp/pppoe.c:890
+  sock_sendmsg_nosec net/socket.c:630 [inline]
+  sock_sendmsg+0xca/0x110 net/socket.c:640
+  sock_write_iter+0x31a/0x5d0 net/socket.c:909
+  call_write_iter include/linux/fs.h:1775 [inline]
+  do_iter_readv_writev+0x525/0x7f0 fs/read_write.c:653
+  do_iter_write+0x154/0x540 fs/read_write.c:932
+  vfs_writev+0x18a/0x340 fs/read_write.c:977
+  do_writev+0xfc/0x2a0 fs/read_write.c:1012
+  SYSC_writev fs/read_write.c:1085 [inline]
+  SyS_writev+0x27/0x30 fs/read_write.c:1082
+  entry_SYSCALL_64_fastpath+0x29/0xa0
+
+Admittedly PPPoE shouldn't be allowed to run on non Ethernet-like
+interfaces, but reserving space for ->needed_headroom is a more
+fundamental issue that needs to be addressed first.
+
+Same problem exists for __pppoe_xmit(), which also needs to take
+dev->needed_headroom into account in skb_cow_head().
+
+Fixes: f5184d267c1a ("net: Allow netdevices to specify needed head/tailroom")
+Reported-by: syzbot+ed0838d0fa4c4f2b528e20286e6dc63effc7c14d@syzkaller.appspotmail.com
+Signed-off-by: Guillaume Nault <g.nault@alphalink.fr>
+Reviewed-by: Xin Long <lucien.xin@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/ppp/pppoe.c |   11 ++++++-----
+ 1 file changed, 6 insertions(+), 5 deletions(-)
+
+--- a/drivers/net/ppp/pppoe.c
++++ b/drivers/net/ppp/pppoe.c
+@@ -842,6 +842,7 @@ static int pppoe_sendmsg(struct socket *
+ 	struct pppoe_hdr *ph;
+ 	struct net_device *dev;
+ 	char *start;
++	int hlen;
+ 
+ 	lock_sock(sk);
+ 	if (sock_flag(sk, SOCK_DEAD) || !(sk->sk_state & PPPOX_CONNECTED)) {
+@@ -860,16 +861,16 @@ static int pppoe_sendmsg(struct socket *
+ 	if (total_len > (dev->mtu + dev->hard_header_len))
+ 		goto end;
+ 
+-
+-	skb = sock_wmalloc(sk, total_len + dev->hard_header_len + 32,
+-			   0, GFP_KERNEL);
++	hlen = LL_RESERVED_SPACE(dev);
++	skb = sock_wmalloc(sk, hlen + sizeof(*ph) + total_len +
++			   dev->needed_tailroom, 0, GFP_KERNEL);
+ 	if (!skb) {
+ 		error = -ENOMEM;
+ 		goto end;
+ 	}
+ 
+ 	/* Reserve space for headers. */
+-	skb_reserve(skb, dev->hard_header_len);
++	skb_reserve(skb, hlen);
+ 	skb_reset_network_header(skb);
+ 
+ 	skb->dev = dev;
+@@ -930,7 +931,7 @@ static int __pppoe_xmit(struct sock *sk,
+ 	/* Copy the data if there is no space for the header or if it's
+ 	 * read-only.
+ 	 */
+-	if (skb_cow_head(skb, sizeof(*ph) + dev->hard_header_len))
++	if (skb_cow_head(skb, LL_RESERVED_SPACE(dev) + sizeof(*ph)))
+ 		goto abort;
+ 
+ 	__skb_push(skb, sizeof(*ph));

@@ -1,0 +1,192 @@
+From foo@baz Sun Jan 28 17:35:08 CET 2018
+From: Eran Ben Elisha <eranbe@mellanox.com>
+Date: Tue, 9 Jan 2018 11:41:10 +0200
+Subject: {net,ib}/mlx5: Don't disable local loopback multicast traffic when needed
+
+From: Eran Ben Elisha <eranbe@mellanox.com>
+
+
+[ Upstream commit 8978cc921fc7fad3f4d6f91f1da01352aeeeff25 ]
+
+There are systems platform information management interfaces (such as
+HOST2BMC) for which we cannot disable local loopback multicast traffic.
+
+Separate disable_local_lb_mc and disable_local_lb_uc capability bits so
+driver will not disable multicast loopback traffic if not supported.
+(It is expected that Firmware will not set disable_local_lb_mc if
+HOST2BMC is running for example.)
+
+Function mlx5_nic_vport_update_local_lb will do best effort to
+disable/enable UC/MC loopback traffic and return success only in case it
+succeeded to changed all allowed by Firmware.
+
+Adapt mlx5_ib and mlx5e to support the new cap bits.
+
+Fixes: 2c43c5a036be ("net/mlx5e: Enable local loopback in loopback selftest")
+Fixes: c85023e153e3 ("IB/mlx5: Add raw ethernet local loopback support")
+Fixes: bded747bb432 ("net/mlx5: Add raw ethernet local loopback firmware command")
+Signed-off-by: Eran Ben Elisha <eranbe@mellanox.com>
+Cc: kernel-team@fb.com
+Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/infiniband/hw/mlx5/main.c                     |    9 ++++--
+ drivers/net/ethernet/mellanox/mlx5/core/en_selftest.c |   27 ++++++++++++------
+ drivers/net/ethernet/mellanox/mlx5/core/main.c        |    3 --
+ drivers/net/ethernet/mellanox/mlx5/core/vport.c       |   22 ++++++++++----
+ include/linux/mlx5/mlx5_ifc.h                         |    5 ++-
+ 5 files changed, 44 insertions(+), 22 deletions(-)
+
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@ -1276,7 +1276,8 @@ static int mlx5_ib_alloc_transport_domai
+ 		return err;
+ 
+ 	if ((MLX5_CAP_GEN(dev->mdev, port_type) != MLX5_CAP_PORT_TYPE_ETH) ||
+-	    !MLX5_CAP_GEN(dev->mdev, disable_local_lb))
++	    (!MLX5_CAP_GEN(dev->mdev, disable_local_lb_uc) &&
++	     !MLX5_CAP_GEN(dev->mdev, disable_local_lb_mc)))
+ 		return err;
+ 
+ 	mutex_lock(&dev->lb_mutex);
+@@ -1294,7 +1295,8 @@ static void mlx5_ib_dealloc_transport_do
+ 	mlx5_core_dealloc_transport_domain(dev->mdev, tdn);
+ 
+ 	if ((MLX5_CAP_GEN(dev->mdev, port_type) != MLX5_CAP_PORT_TYPE_ETH) ||
+-	    !MLX5_CAP_GEN(dev->mdev, disable_local_lb))
++	    (!MLX5_CAP_GEN(dev->mdev, disable_local_lb_uc) &&
++	     !MLX5_CAP_GEN(dev->mdev, disable_local_lb_mc)))
+ 		return;
+ 
+ 	mutex_lock(&dev->lb_mutex);
+@@ -4161,7 +4163,8 @@ static void *mlx5_ib_add(struct mlx5_cor
+ 	}
+ 
+ 	if ((MLX5_CAP_GEN(mdev, port_type) == MLX5_CAP_PORT_TYPE_ETH) &&
+-	    MLX5_CAP_GEN(mdev, disable_local_lb))
++	    (MLX5_CAP_GEN(mdev, disable_local_lb_uc) ||
++	     MLX5_CAP_GEN(mdev, disable_local_lb_mc)))
+ 		mutex_init(&dev->lb_mutex);
+ 
+ 	dev->ib_active = true;
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_selftest.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_selftest.c
+@@ -238,15 +238,19 @@ static int mlx5e_test_loopback_setup(str
+ 	int err = 0;
+ 
+ 	/* Temporarily enable local_lb */
+-	if (MLX5_CAP_GEN(priv->mdev, disable_local_lb)) {
+-		mlx5_nic_vport_query_local_lb(priv->mdev, &lbtp->local_lb);
+-		if (!lbtp->local_lb)
+-			mlx5_nic_vport_update_local_lb(priv->mdev, true);
++	err = mlx5_nic_vport_query_local_lb(priv->mdev, &lbtp->local_lb);
++	if (err)
++		return err;
++
++	if (!lbtp->local_lb) {
++		err = mlx5_nic_vport_update_local_lb(priv->mdev, true);
++		if (err)
++			return err;
+ 	}
+ 
+ 	err = mlx5e_refresh_tirs(priv, true);
+ 	if (err)
+-		return err;
++		goto out;
+ 
+ 	lbtp->loopback_ok = false;
+ 	init_completion(&lbtp->comp);
+@@ -256,16 +260,21 @@ static int mlx5e_test_loopback_setup(str
+ 	lbtp->pt.dev = priv->netdev;
+ 	lbtp->pt.af_packet_priv = lbtp;
+ 	dev_add_pack(&lbtp->pt);
++
++	return 0;
++
++out:
++	if (!lbtp->local_lb)
++		mlx5_nic_vport_update_local_lb(priv->mdev, false);
++
+ 	return err;
+ }
+ 
+ static void mlx5e_test_loopback_cleanup(struct mlx5e_priv *priv,
+ 					struct mlx5e_lbt_priv *lbtp)
+ {
+-	if (MLX5_CAP_GEN(priv->mdev, disable_local_lb)) {
+-		if (!lbtp->local_lb)
+-			mlx5_nic_vport_update_local_lb(priv->mdev, false);
+-	}
++	if (!lbtp->local_lb)
++		mlx5_nic_vport_update_local_lb(priv->mdev, false);
+ 
+ 	dev_remove_pack(&lbtp->pt);
+ 	mlx5e_refresh_tirs(priv, false);
+--- a/drivers/net/ethernet/mellanox/mlx5/core/main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/main.c
+@@ -577,8 +577,7 @@ static int mlx5_core_set_hca_defaults(st
+ 	int ret = 0;
+ 
+ 	/* Disable local_lb by default */
+-	if ((MLX5_CAP_GEN(dev, port_type) == MLX5_CAP_PORT_TYPE_ETH) &&
+-	    MLX5_CAP_GEN(dev, disable_local_lb))
++	if (MLX5_CAP_GEN(dev, port_type) == MLX5_CAP_PORT_TYPE_ETH)
+ 		ret = mlx5_nic_vport_update_local_lb(dev, false);
+ 
+ 	return ret;
+--- a/drivers/net/ethernet/mellanox/mlx5/core/vport.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/vport.c
+@@ -908,23 +908,33 @@ int mlx5_nic_vport_update_local_lb(struc
+ 	void *in;
+ 	int err;
+ 
+-	mlx5_core_dbg(mdev, "%s local_lb\n", enable ? "enable" : "disable");
++	if (!MLX5_CAP_GEN(mdev, disable_local_lb_mc) &&
++	    !MLX5_CAP_GEN(mdev, disable_local_lb_uc))
++		return 0;
++
+ 	in = kvzalloc(inlen, GFP_KERNEL);
+ 	if (!in)
+ 		return -ENOMEM;
+ 
+ 	MLX5_SET(modify_nic_vport_context_in, in,
+-		 field_select.disable_mc_local_lb, 1);
+-	MLX5_SET(modify_nic_vport_context_in, in,
+ 		 nic_vport_context.disable_mc_local_lb, !enable);
+-
+-	MLX5_SET(modify_nic_vport_context_in, in,
+-		 field_select.disable_uc_local_lb, 1);
+ 	MLX5_SET(modify_nic_vport_context_in, in,
+ 		 nic_vport_context.disable_uc_local_lb, !enable);
+ 
++	if (MLX5_CAP_GEN(mdev, disable_local_lb_mc))
++		MLX5_SET(modify_nic_vport_context_in, in,
++			 field_select.disable_mc_local_lb, 1);
++
++	if (MLX5_CAP_GEN(mdev, disable_local_lb_uc))
++		MLX5_SET(modify_nic_vport_context_in, in,
++			 field_select.disable_uc_local_lb, 1);
++
+ 	err = mlx5_modify_nic_vport_context(mdev, in, inlen);
+ 
++	if (!err)
++		mlx5_core_dbg(mdev, "%s local_lb\n",
++			      enable ? "enable" : "disable");
++
+ 	kvfree(in);
+ 	return err;
+ }
+--- a/include/linux/mlx5/mlx5_ifc.h
++++ b/include/linux/mlx5/mlx5_ifc.h
+@@ -1023,8 +1023,9 @@ struct mlx5_ifc_cmd_hca_cap_bits {
+ 	u8         log_max_wq_sz[0x5];
+ 
+ 	u8         nic_vport_change_event[0x1];
+-	u8         disable_local_lb[0x1];
+-	u8         reserved_at_3e2[0x9];
++	u8         disable_local_lb_uc[0x1];
++	u8         disable_local_lb_mc[0x1];
++	u8         reserved_at_3e3[0x8];
+ 	u8         log_max_vlan_list[0x5];
+ 	u8         reserved_at_3f0[0x3];
+ 	u8         log_max_current_mc_list[0x5];
