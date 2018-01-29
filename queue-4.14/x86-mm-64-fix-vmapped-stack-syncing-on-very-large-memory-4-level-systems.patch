@@ -1,0 +1,92 @@
+From 5beda7d54eafece4c974cfa9fbb9f60fb18fd20a Mon Sep 17 00:00:00 2001
+From: Andy Lutomirski <luto@kernel.org>
+Date: Thu, 25 Jan 2018 13:12:14 -0800
+Subject: x86/mm/64: Fix vmapped stack syncing on very-large-memory 4-level systems
+
+From: Andy Lutomirski <luto@kernel.org>
+
+commit 5beda7d54eafece4c974cfa9fbb9f60fb18fd20a upstream.
+
+Neil Berrington reported a double-fault on a VM with 768GB of RAM that uses
+large amounts of vmalloc space with PTI enabled.
+
+The cause is that load_new_mm_cr3() was never fixed to take the 5-level pgd
+folding code into account, so, on a 4-level kernel, the pgd synchronization
+logic compiles away to exactly nothing.
+
+Interestingly, the problem doesn't trigger with nopti.  I assume this is
+because the kernel is mapped with global pages if we boot with nopti.  The
+sequence of operations when we create a new task is that we first load its
+mm while still running on the old stack (which crashes if the old stack is
+unmapped in the new mm unless the TLB saves us), then we call
+prepare_switch_to(), and then we switch to the new stack.
+prepare_switch_to() pokes the new stack directly, which will populate the
+mapping through vmalloc_fault().  I assume that we're getting lucky on
+non-PTI systems -- the old stack's TLB entry stays alive long enough to
+make it all the way through prepare_switch_to() and switch_to() so that we
+make it to a valid stack.
+
+Fixes: b50858ce3e2a ("x86/mm/vmalloc: Add 5-level paging support")
+Reported-and-tested-by: Neil Berrington <neil.berrington@datacore.com>
+Signed-off-by: Andy Lutomirski <luto@kernel.org>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Cc: Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+Cc: Dave Hansen <dave.hansen@intel.com>
+Cc: Borislav Petkov <bp@alien8.de>
+Link: https://lkml.kernel.org/r/346541c56caed61abbe693d7d2742b4a380c5001.1516914529.git.luto@kernel.org
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ arch/x86/mm/tlb.c |   34 +++++++++++++++++++++++++++++-----
+ 1 file changed, 29 insertions(+), 5 deletions(-)
+
+--- a/arch/x86/mm/tlb.c
++++ b/arch/x86/mm/tlb.c
+@@ -151,6 +151,34 @@ void switch_mm(struct mm_struct *prev, s
+ 	local_irq_restore(flags);
+ }
+ 
++static void sync_current_stack_to_mm(struct mm_struct *mm)
++{
++	unsigned long sp = current_stack_pointer;
++	pgd_t *pgd = pgd_offset(mm, sp);
++
++	if (CONFIG_PGTABLE_LEVELS > 4) {
++		if (unlikely(pgd_none(*pgd))) {
++			pgd_t *pgd_ref = pgd_offset_k(sp);
++
++			set_pgd(pgd, *pgd_ref);
++		}
++	} else {
++		/*
++		 * "pgd" is faked.  The top level entries are "p4d"s, so sync
++		 * the p4d.  This compiles to approximately the same code as
++		 * the 5-level case.
++		 */
++		p4d_t *p4d = p4d_offset(pgd, sp);
++
++		if (unlikely(p4d_none(*p4d))) {
++			pgd_t *pgd_ref = pgd_offset_k(sp);
++			p4d_t *p4d_ref = p4d_offset(pgd_ref, sp);
++
++			set_p4d(p4d, *p4d_ref);
++		}
++	}
++}
++
+ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
+ 			struct task_struct *tsk)
+ {
+@@ -226,11 +254,7 @@ void switch_mm_irqs_off(struct mm_struct
+ 			 * mapped in the new pgd, we'll double-fault.  Forcibly
+ 			 * map it.
+ 			 */
+-			unsigned int index = pgd_index(current_stack_pointer);
+-			pgd_t *pgd = next->pgd + index;
+-
+-			if (unlikely(pgd_none(*pgd)))
+-				set_pgd(pgd, init_mm.pgd[index]);
++			sync_current_stack_to_mm(next);
+ 		}
+ 
+ 		/* Stop remote flushes for the previous mm */
