@@ -1,0 +1,254 @@
+From foo@baz Thu Feb  1 09:05:44 CET 2018
+From: Daniel Borkmann <daniel@iogearbox.net>
+Date: Tue, 30 Jan 2018 03:37:41 +0100
+Subject: bpf: introduce BPF_JIT_ALWAYS_ON config
+To: gregkh@linuxfoundation.org
+Cc: ast@kernel.org, daniel@iogearbox.net, stable@vger.kernel.org
+Message-ID: <8fa0284c9e3811cc7ae467dd3490da45ff76b46b.1517279268.git.daniel@iogearbox.net>
+
+From: Alexei Starovoitov <ast@kernel.org>
+
+[ upstream commit 290af86629b25ffd1ed6232c4e9107da031705cb ]
+
+The BPF interpreter has been used as part of the spectre 2 attack CVE-2017-5715.
+
+A quote from goolge project zero blog:
+"At this point, it would normally be necessary to locate gadgets in
+the host kernel code that can be used to actually leak data by reading
+from an attacker-controlled location, shifting and masking the result
+appropriately and then using the result of that as offset to an
+attacker-controlled address for a load. But piecing gadgets together
+and figuring out which ones work in a speculation context seems annoying.
+So instead, we decided to use the eBPF interpreter, which is built into
+the host kernel - while there is no legitimate way to invoke it from inside
+a VM, the presence of the code in the host kernel's text section is sufficient
+to make it usable for the attack, just like with ordinary ROP gadgets."
+
+To make attacker job harder introduce BPF_JIT_ALWAYS_ON config
+option that removes interpreter from the kernel in favor of JIT-only mode.
+So far eBPF JIT is supported by:
+x64, arm64, arm32, sparc64, s390, powerpc64, mips64
+
+The start of JITed program is randomized and code page is marked as read-only.
+In addition "constant blinding" can be turned on with net.core.bpf_jit_harden
+
+v2->v3:
+- move __bpf_prog_ret0 under ifdef (Daniel)
+
+v1->v2:
+- fix init order, test_bpf and cBPF (Daniel's feedback)
+- fix offloaded bpf (Jakub's feedback)
+- add 'return 0' dummy in case something can invoke prog->bpf_func
+- retarget bpf tree. For bpf-next the patch would need one extra hunk.
+  It will be sent when the trees are merged back to net-next
+
+Considered doing:
+  int bpf_jit_enable __read_mostly = BPF_EBPF_JIT_DEFAULT;
+but it seems better to land the patch as-is and in bpf-next remove
+bpf_jit_enable global variable from all JITs, consolidate in one place
+and remove this jit_init() function.
+
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/arm64/Kconfig         |    1 +
+ arch/s390/Kconfig          |    1 +
+ arch/x86/Kconfig           |    1 +
+ init/Kconfig               |    7 +++++++
+ kernel/bpf/core.c          |   24 +++++++++++++++++++++++-
+ lib/test_bpf.c             |   13 ++++++++-----
+ net/Kconfig                |    3 +++
+ net/core/filter.c          |    4 +++-
+ net/core/sysctl_net_core.c |    6 ++++++
+ net/socket.c               |    9 +++++++++
+ 10 files changed, 62 insertions(+), 7 deletions(-)
+
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@ -54,6 +54,7 @@ config ARM64
+ 	select HAVE_ARCH_SECCOMP_FILTER
+ 	select HAVE_ARCH_TRACEHOOK
+ 	select HAVE_BPF_JIT
++	select HAVE_EBPF_JIT
+ 	select HAVE_C_RECORDMCOUNT
+ 	select HAVE_CC_STACKPROTECTOR
+ 	select HAVE_CMPXCHG_DOUBLE
+--- a/arch/s390/Kconfig
++++ b/arch/s390/Kconfig
+@@ -123,6 +123,7 @@ config S390
+ 	select HAVE_ARCH_TRACEHOOK
+ 	select HAVE_ARCH_TRANSPARENT_HUGEPAGE
+ 	select HAVE_BPF_JIT if PACK_STACK && HAVE_MARCH_Z196_FEATURES
++	select HAVE_EBPF_JIT if PACK_STACK && HAVE_MARCH_Z196_FEATURES
+ 	select HAVE_CMPXCHG_DOUBLE
+ 	select HAVE_CMPXCHG_LOCAL
+ 	select HAVE_DEBUG_KMEMLEAK
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -88,6 +88,7 @@ config X86
+ 	select HAVE_ARCH_TRACEHOOK
+ 	select HAVE_ARCH_TRANSPARENT_HUGEPAGE
+ 	select HAVE_BPF_JIT			if X86_64
++	select HAVE_EBPF_JIT			if X86_64
+ 	select HAVE_CC_STACKPROTECTOR
+ 	select HAVE_CMPXCHG_DOUBLE
+ 	select HAVE_CMPXCHG_LOCAL
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -1556,6 +1556,13 @@ config BPF_SYSCALL
+ 	  Enable the bpf() system call that allows to manipulate eBPF
+ 	  programs and maps via file descriptors.
+ 
++config BPF_JIT_ALWAYS_ON
++	bool "Permanently enable BPF JIT and remove BPF interpreter"
++	depends on BPF_SYSCALL && HAVE_EBPF_JIT && BPF_JIT
++	help
++	  Enables BPF JIT and removes BPF interpreter to avoid
++	  speculative execution of BPF instructions by the interpreter
++
+ config SHMEM
+ 	bool "Use full shmem filesystem" if EXPERT
+ 	default y
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@ -256,6 +256,7 @@ noinline u64 __bpf_call_base(u64 r1, u64
+ }
+ EXPORT_SYMBOL_GPL(__bpf_call_base);
+ 
++#ifndef CONFIG_BPF_JIT_ALWAYS_ON
+ /**
+  *	__bpf_prog_run - run eBPF program on a given context
+  *	@ctx: is the data we are operating on
+@@ -725,6 +726,13 @@ load_byte:
+ 		return 0;
+ }
+ 
++#else
++static unsigned int __bpf_prog_ret0(void *ctx, const struct bpf_insn *insn)
++{
++	return 0;
++}
++#endif
++
+ bool bpf_prog_array_compatible(struct bpf_array *array,
+ 			       const struct bpf_prog *fp)
+ {
+@@ -771,9 +779,23 @@ static int bpf_check_tail_call(const str
+  */
+ int bpf_prog_select_runtime(struct bpf_prog *fp)
+ {
++#ifndef CONFIG_BPF_JIT_ALWAYS_ON
+ 	fp->bpf_func = (void *) __bpf_prog_run;
+-
++#else
++	fp->bpf_func = (void *) __bpf_prog_ret0;
++#endif
++
++	/* eBPF JITs can rewrite the program in case constant
++	 * blinding is active. However, in case of error during
++	 * blinding, bpf_int_jit_compile() must always return a
++	 * valid program, which in this case would simply not
++	 * be JITed, but falls back to the interpreter.
++	 */
+ 	bpf_int_jit_compile(fp);
++#ifdef CONFIG_BPF_JIT_ALWAYS_ON
++	if (!fp->jited)
++		return -ENOTSUPP;
++#endif
+ 	bpf_prog_lock_ro(fp);
+ 
+ 	/* The tail call compatibility check can only be done at
+--- a/lib/test_bpf.c
++++ b/lib/test_bpf.c
+@@ -5304,9 +5304,8 @@ static struct bpf_prog *generate_filter(
+ 				return NULL;
+ 			}
+ 		}
+-		/* We don't expect to fail. */
+ 		if (*err) {
+-			pr_cont("FAIL to attach err=%d len=%d\n",
++			pr_cont("FAIL to prog_create err=%d len=%d\n",
+ 				*err, fprog.len);
+ 			return NULL;
+ 		}
+@@ -5325,7 +5324,11 @@ static struct bpf_prog *generate_filter(
+ 		fp->type = BPF_PROG_TYPE_SOCKET_FILTER;
+ 		memcpy(fp->insnsi, fptr, fp->len * sizeof(struct bpf_insn));
+ 
+-		bpf_prog_select_runtime(fp);
++		*err = bpf_prog_select_runtime(fp);
++		if (*err) {
++			pr_cont("FAIL to select_runtime err=%d\n", *err);
++			return NULL;
++		}
+ 		break;
+ 	}
+ 
+@@ -5511,8 +5514,8 @@ static __init int test_bpf(void)
+ 				pass_cnt++;
+ 				continue;
+ 			}
+-
+-			return err;
++			err_cnt++;
++			continue;
+ 		}
+ 
+ 		pr_cont("jited:%u ", fp->jited);
+--- a/net/Kconfig
++++ b/net/Kconfig
+@@ -388,3 +388,6 @@ endif   # if NET
+ # Used by archs to tell that they support BPF_JIT
+ config HAVE_BPF_JIT
+ 	bool
++
++config HAVE_EBPF_JIT
++	bool
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -984,7 +984,9 @@ static struct bpf_prog *bpf_migrate_filt
+ 		 */
+ 		goto out_err_free;
+ 
+-	bpf_prog_select_runtime(fp);
++	err = bpf_prog_select_runtime(fp);
++	if (err)
++		goto out_err_free;
+ 
+ 	kfree(old_prog);
+ 	return fp;
+--- a/net/core/sysctl_net_core.c
++++ b/net/core/sysctl_net_core.c
+@@ -292,7 +292,13 @@ static struct ctl_table net_core_table[]
+ 		.data		= &bpf_jit_enable,
+ 		.maxlen		= sizeof(int),
+ 		.mode		= 0644,
++#ifndef CONFIG_BPF_JIT_ALWAYS_ON
+ 		.proc_handler	= proc_dointvec
++#else
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= &one,
++		.extra2		= &one,
++#endif
+ 	},
+ #endif
+ 	{
+--- a/net/socket.c
++++ b/net/socket.c
+@@ -2534,6 +2534,15 @@ out_fs:
+ 
+ core_initcall(sock_init);	/* early initcall */
+ 
++static int __init jit_init(void)
++{
++#ifdef CONFIG_BPF_JIT_ALWAYS_ON
++	bpf_jit_enable = 1;
++#endif
++	return 0;
++}
++pure_initcall(jit_init);
++
+ #ifdef CONFIG_PROC_FS
+ void socket_seq_show(struct seq_file *seq)
+ {
