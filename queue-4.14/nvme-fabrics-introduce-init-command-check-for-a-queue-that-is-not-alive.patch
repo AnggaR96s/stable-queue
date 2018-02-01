@@ -1,0 +1,111 @@
+From foo@baz Thu Feb  1 13:45:42 CET 2018
+From: Sagi Grimberg <sagi@grimberg.me>
+Date: Tue, 24 Oct 2017 15:25:20 +0300
+Subject: nvme-fabrics: introduce init command check for a queue that is not alive
+
+From: Sagi Grimberg <sagi@grimberg.me>
+
+
+[ Upstream commit 48832f8d58cfedb2f9bee11bbfbb657efb42e7e7 ]
+
+When the fabrics queue is not alive and fully functional, no commands
+should be allowed to pass but connect (which moves the queue to a fully
+functional state). Any other command should be failed, with either
+temporary status BLK_STS_RESOUCE or permanent status BLK_STS_IOERR.
+
+This is shared across all fabrics, hence move the check to fabrics
+library.
+
+Signed-off-by: Sagi Grimberg <sagi@grimberg.me>
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/nvme/host/fabrics.h |   30 ++++++++++++++++++++++++++++++
+ drivers/nvme/host/rdma.c    |   30 +++++-------------------------
+ 2 files changed, 35 insertions(+), 25 deletions(-)
+
+--- a/drivers/nvme/host/fabrics.h
++++ b/drivers/nvme/host/fabrics.h
+@@ -142,4 +142,34 @@ void nvmf_free_options(struct nvmf_ctrl_
+ int nvmf_get_address(struct nvme_ctrl *ctrl, char *buf, int size);
+ bool nvmf_should_reconnect(struct nvme_ctrl *ctrl);
+ 
++static inline blk_status_t nvmf_check_init_req(struct nvme_ctrl *ctrl,
++		struct request *rq)
++{
++	struct nvme_command *cmd = nvme_req(rq)->cmd;
++
++	/*
++	 * We cannot accept any other command until the connect command has
++	 * completed, so only allow connect to pass.
++	 */
++	if (!blk_rq_is_passthrough(rq) ||
++	    cmd->common.opcode != nvme_fabrics_command ||
++	    cmd->fabrics.fctype != nvme_fabrics_type_connect) {
++		/*
++		 * Reconnecting state means transport disruption, which can take
++		 * a long time and even might fail permanently, fail fast to
++		 * give upper layers a chance to failover.
++		 * Deleting state means that the ctrl will never accept commands
++		 * again, fail it permanently.
++		 */
++		if (ctrl->state == NVME_CTRL_RECONNECTING ||
++		    ctrl->state == NVME_CTRL_DELETING) {
++			nvme_req(rq)->status = NVME_SC_ABORT_REQ;
++			return BLK_STS_IOERR;
++		}
++		return BLK_STS_RESOURCE; /* try again later */
++	}
++
++	return BLK_STS_OK;
++}
++
+ #endif /* _NVME_FABRICS_H */
+--- a/drivers/nvme/host/rdma.c
++++ b/drivers/nvme/host/rdma.c
+@@ -1603,31 +1603,11 @@ nvme_rdma_timeout(struct request *rq, bo
+  * We cannot accept any other command until the Connect command has completed.
+  */
+ static inline blk_status_t
+-nvme_rdma_queue_is_ready(struct nvme_rdma_queue *queue, struct request *rq)
++nvme_rdma_is_ready(struct nvme_rdma_queue *queue, struct request *rq)
+ {
+-	if (unlikely(!test_bit(NVME_RDMA_Q_LIVE, &queue->flags))) {
+-		struct nvme_command *cmd = nvme_req(rq)->cmd;
+-
+-		if (!blk_rq_is_passthrough(rq) ||
+-		    cmd->common.opcode != nvme_fabrics_command ||
+-		    cmd->fabrics.fctype != nvme_fabrics_type_connect) {
+-			/*
+-			 * reconnecting state means transport disruption, which
+-			 * can take a long time and even might fail permanently,
+-			 * fail fast to give upper layers a chance to failover.
+-			 * deleting state means that the ctrl will never accept
+-			 * commands again, fail it permanently.
+-			 */
+-			if (queue->ctrl->ctrl.state == NVME_CTRL_RECONNECTING ||
+-			    queue->ctrl->ctrl.state == NVME_CTRL_DELETING) {
+-				nvme_req(rq)->status = NVME_SC_ABORT_REQ;
+-				return BLK_STS_IOERR;
+-			}
+-			return BLK_STS_RESOURCE; /* try again later */
+-		}
+-	}
+-
+-	return 0;
++	if (unlikely(!test_bit(NVME_RDMA_Q_LIVE, &queue->flags)))
++		return nvmf_check_init_req(&queue->ctrl->ctrl, rq);
++	return BLK_STS_OK;
+ }
+ 
+ static blk_status_t nvme_rdma_queue_rq(struct blk_mq_hw_ctx *hctx,
+@@ -1646,7 +1626,7 @@ static blk_status_t nvme_rdma_queue_rq(s
+ 
+ 	WARN_ON_ONCE(rq->tag < 0);
+ 
+-	ret = nvme_rdma_queue_is_ready(queue, rq);
++	ret = nvme_rdma_is_ready(queue, rq);
+ 	if (unlikely(ret))
+ 		return ret;
+ 
