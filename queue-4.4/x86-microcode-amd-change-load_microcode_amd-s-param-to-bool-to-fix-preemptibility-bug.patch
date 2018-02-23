@@ -1,0 +1,130 @@
+From foo@baz Fri Feb 23 17:12:49 CET 2018
+From: Arnd Bergmann <arnd@arndb.de>
+Date: Tue, 20 Feb 2018 12:55:05 +0100
+Subject: x86/microcode/AMD: Change load_microcode_amd()'s param to bool to fix preemptibility bug
+To: stable@vger.kernel.org
+Cc: Greg KH <gregkh@linuxfoundation.org>, linux-kernel@vger.kernel.org, Borislav Petkov <bp@suse.de>, Linus Torvalds <torvalds@linux-foundation.org>, Peter Zijlstra <peterz@infradead.org>, Thomas Gleixner <tglx@linutronix.de>, Ingo Molnar <mingo@kernel.org>, Arnd Bergmann <arnd@arndb.de>, Ingo Molnar <mingo@redhat.com>, "H. Peter Anvin" <hpa@zytor.com>, x86@kernel.org, Borislav Petkov <bp@alien8.de>, Tom Lendacky <thomas.lendacky@amd.com>
+Message-ID: <20180220115527.1806578-19-arnd@arndb.de>
+
+From: Borislav Petkov <bp@suse.de>
+
+commit dac6ca243c4c49a9ca7507d3d66140ebfac8b04b upstream.
+
+With CONFIG_DEBUG_PREEMPT enabled, I get:
+
+  BUG: using smp_processor_id() in preemptible [00000000] code: swapper/0/1
+  caller is debug_smp_processor_id
+  CPU: 0 PID: 1 Comm: swapper/0 Not tainted 4.12.0-rc2+ #2
+  Call Trace:
+   dump_stack
+   check_preemption_disabled
+   debug_smp_processor_id
+   save_microcode_in_initrd_amd
+   ? microcode_init
+   save_microcode_in_initrd
+   ...
+
+because, well, it says it above, we're using smp_processor_id() in
+preemptible code.
+
+But passing the CPU number is not really needed. It is only used to
+determine whether we're on the BSP, and, if so, to save the microcode
+patch for early loading.
+
+ [ We don't absolutely need to do it on the BSP but we do that
+   customarily there. ]
+
+Instead, convert that function parameter to a boolean which denotes
+whether the patch should be saved or not, thereby avoiding the use of
+smp_processor_id() in preemptible code.
+
+Signed-off-by: Borislav Petkov <bp@suse.de>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/20170528200414.31305-1-bp@alien8.de
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+[arnd: rebased to 4.9, after running into warning:
+ arch/x86/kernel/cpu/microcode/amd.c:881:30: self-comparison always evaluates to true]
+Signed-off-by: Arnd Bergmann <arnd@arndb.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/x86/include/asm/microcode_amd.h |    1 -
+ arch/x86/kernel/cpu/microcode/amd.c  |   17 +++++++++++------
+ 2 files changed, 11 insertions(+), 7 deletions(-)
+
+--- a/arch/x86/include/asm/microcode_amd.h
++++ b/arch/x86/include/asm/microcode_amd.h
+@@ -59,7 +59,6 @@ static inline u16 find_equiv_id(struct e
+ 
+ extern int __apply_microcode_amd(struct microcode_amd *mc_amd);
+ extern int apply_microcode_amd(int cpu);
+-extern enum ucode_state load_microcode_amd(int cpu, u8 family, const u8 *data, size_t size);
+ 
+ #define PATCH_MAX_SIZE PAGE_SIZE
+ extern u8 amd_ucode_patch[PATCH_MAX_SIZE];
+--- a/arch/x86/kernel/cpu/microcode/amd.c
++++ b/arch/x86/kernel/cpu/microcode/amd.c
+@@ -131,6 +131,9 @@ static size_t compute_container_size(u8
+ 	return size;
+ }
+ 
++static enum ucode_state
++load_microcode_amd(bool save, u8 family, const u8 *data, size_t size);
++
+ /*
+  * Early load occurs before we can vmalloc(). So we look for the microcode
+  * patch container file in initrd, traverse equivalent cpu table, look for a
+@@ -438,7 +441,7 @@ int __init save_microcode_in_initrd_amd(
+ 	eax   = cpuid_eax(0x00000001);
+ 	eax   = ((eax >> 8) & 0xf) + ((eax >> 20) & 0xff);
+ 
+-	ret = load_microcode_amd(smp_processor_id(), eax, container, container_size);
++	ret = load_microcode_amd(true, eax, container, container_size);
+ 	if (ret != UCODE_OK)
+ 		retval = -EINVAL;
+ 
+@@ -854,7 +857,8 @@ static enum ucode_state __load_microcode
+ 	return UCODE_OK;
+ }
+ 
+-enum ucode_state load_microcode_amd(int cpu, u8 family, const u8 *data, size_t size)
++static enum ucode_state
++load_microcode_amd(bool save, u8 family, const u8 *data, size_t size)
+ {
+ 	enum ucode_state ret;
+ 
+@@ -868,8 +872,8 @@ enum ucode_state load_microcode_amd(int
+ 
+ #ifdef CONFIG_X86_32
+ 	/* save BSP's matching patch for early load */
+-	if (cpu_data(cpu).cpu_index == boot_cpu_data.cpu_index) {
+-		struct ucode_patch *p = find_patch(cpu);
++	if (save) {
++		struct ucode_patch *p = find_patch(0);
+ 		if (p) {
+ 			memset(amd_ucode_patch, 0, PATCH_MAX_SIZE);
+ 			memcpy(amd_ucode_patch, p->data, min_t(u32, ksize(p->data),
+@@ -901,11 +905,12 @@ static enum ucode_state request_microcod
+ {
+ 	char fw_name[36] = "amd-ucode/microcode_amd.bin";
+ 	struct cpuinfo_x86 *c = &cpu_data(cpu);
++	bool bsp = c->cpu_index == boot_cpu_data.cpu_index;
+ 	enum ucode_state ret = UCODE_NFOUND;
+ 	const struct firmware *fw;
+ 
+ 	/* reload ucode container only on the boot cpu */
+-	if (!refresh_fw || c->cpu_index != boot_cpu_data.cpu_index)
++	if (!refresh_fw || !bsp)
+ 		return UCODE_OK;
+ 
+ 	if (c->x86 >= 0x15)
+@@ -922,7 +927,7 @@ static enum ucode_state request_microcod
+ 		goto fw_release;
+ 	}
+ 
+-	ret = load_microcode_amd(cpu, c->x86, fw->data, fw->size);
++	ret = load_microcode_amd(bsp, c->x86, fw->data, fw->size);
+ 
+  fw_release:
+ 	release_firmware(fw);
