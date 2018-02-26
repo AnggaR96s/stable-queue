@@ -1,0 +1,288 @@
+From e09acddf873bf775b208b452a4c3a3fd26fa9427 Mon Sep 17 00:00:00 2001
+From: Paolo Abeni <pabeni@redhat.com>
+Date: Fri, 12 Feb 2016 15:43:55 +0100
+Subject: ip_tunnel: replace dst_cache with generic implementation
+
+From: Paolo Abeni <pabeni@redhat.com>
+
+commit e09acddf873bf775b208b452a4c3a3fd26fa9427 upstream.
+
+The current ip_tunnel cache implementation is prone to a race
+that will cause the wrong dst to be cached on cuncurrent dst cache
+miss and ip tunnel update via netlink.
+
+Replacing with the generic implementation fix the issue.
+
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Suggested-and-acked-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Cc: Nathan Chancellor <natechancellor@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ include/net/ip_tunnels.h |    9 +----
+ net/ipv4/Kconfig         |    1 
+ net/ipv4/ip_tunnel.c     |   78 +++++++----------------------------------------
+ net/ipv6/sit.c           |   17 +++++-----
+ 4 files changed, 25 insertions(+), 80 deletions(-)
+
+--- a/include/net/ip_tunnels.h
++++ b/include/net/ip_tunnels.h
+@@ -13,6 +13,7 @@
+ #include <net/netns/generic.h>
+ #include <net/rtnetlink.h>
+ #include <net/lwtunnel.h>
++#include <net/dst_cache.h>
+ 
+ #if IS_ENABLED(CONFIG_IPV6)
+ #include <net/ipv6.h>
+@@ -85,11 +86,6 @@ struct ip_tunnel_prl_entry {
+ 	struct rcu_head			rcu_head;
+ };
+ 
+-struct ip_tunnel_dst {
+-	struct dst_entry __rcu 		*dst;
+-	__be32				 saddr;
+-};
+-
+ struct metadata_dst;
+ 
+ struct ip_tunnel {
+@@ -108,7 +104,7 @@ struct ip_tunnel {
+ 	int		tun_hlen;	/* Precalculated header length */
+ 	int		mlink;
+ 
+-	struct ip_tunnel_dst __percpu *dst_cache;
++	struct dst_cache dst_cache;
+ 
+ 	struct ip_tunnel_parm parms;
+ 
+@@ -248,7 +244,6 @@ int ip_tunnel_changelink(struct net_devi
+ int ip_tunnel_newlink(struct net_device *dev, struct nlattr *tb[],
+ 		      struct ip_tunnel_parm *p);
+ void ip_tunnel_setup(struct net_device *dev, int net_id);
+-void ip_tunnel_dst_reset_all(struct ip_tunnel *t);
+ int ip_tunnel_encap_setup(struct ip_tunnel *t,
+ 			  struct ip_tunnel_encap *ipencap);
+ 
+--- a/net/ipv4/Kconfig
++++ b/net/ipv4/Kconfig
+@@ -186,6 +186,7 @@ config NET_IPGRE_DEMUX
+ 
+ config NET_IP_TUNNEL
+ 	tristate
++	select DST_CACHE
+ 	default n
+ 
+ config NET_IPGRE
+--- a/net/ipv4/ip_tunnel.c
++++ b/net/ipv4/ip_tunnel.c
+@@ -69,61 +69,6 @@ static unsigned int ip_tunnel_hash(__be3
+ 			 IP_TNL_HASH_BITS);
+ }
+ 
+-static void __tunnel_dst_set(struct ip_tunnel_dst *idst,
+-			     struct dst_entry *dst, __be32 saddr)
+-{
+-	struct dst_entry *old_dst;
+-
+-	dst_clone(dst);
+-	old_dst = xchg((__force struct dst_entry **)&idst->dst, dst);
+-	dst_release(old_dst);
+-	idst->saddr = saddr;
+-}
+-
+-static noinline void tunnel_dst_set(struct ip_tunnel *t,
+-			   struct dst_entry *dst, __be32 saddr)
+-{
+-	__tunnel_dst_set(raw_cpu_ptr(t->dst_cache), dst, saddr);
+-}
+-
+-static void tunnel_dst_reset(struct ip_tunnel *t)
+-{
+-	tunnel_dst_set(t, NULL, 0);
+-}
+-
+-void ip_tunnel_dst_reset_all(struct ip_tunnel *t)
+-{
+-	int i;
+-
+-	for_each_possible_cpu(i)
+-		__tunnel_dst_set(per_cpu_ptr(t->dst_cache, i), NULL, 0);
+-}
+-EXPORT_SYMBOL(ip_tunnel_dst_reset_all);
+-
+-static struct rtable *tunnel_rtable_get(struct ip_tunnel *t,
+-					u32 cookie, __be32 *saddr)
+-{
+-	struct ip_tunnel_dst *idst;
+-	struct dst_entry *dst;
+-
+-	rcu_read_lock();
+-	idst = raw_cpu_ptr(t->dst_cache);
+-	dst = rcu_dereference(idst->dst);
+-	if (dst && !atomic_inc_not_zero(&dst->__refcnt))
+-		dst = NULL;
+-	if (dst) {
+-		if (!dst->obsolete || dst->ops->check(dst, cookie)) {
+-			*saddr = idst->saddr;
+-		} else {
+-			tunnel_dst_reset(t);
+-			dst_release(dst);
+-			dst = NULL;
+-		}
+-	}
+-	rcu_read_unlock();
+-	return (struct rtable *)dst;
+-}
+-
+ static bool ip_tunnel_key_match(const struct ip_tunnel_parm *p,
+ 				__be16 flags, __be32 key)
+ {
+@@ -382,7 +327,8 @@ static int ip_tunnel_bind_dev(struct net
+ 
+ 		if (!IS_ERR(rt)) {
+ 			tdev = rt->dst.dev;
+-			tunnel_dst_set(tunnel, &rt->dst, fl4.saddr);
++			dst_cache_set_ip4(&tunnel->dst_cache, &rt->dst,
++					  fl4.saddr);
+ 			ip_rt_put(rt);
+ 		}
+ 		if (dev->type != ARPHRD_ETHER)
+@@ -733,7 +679,8 @@ void ip_tunnel_xmit(struct sk_buff *skb,
+ 	if (ip_tunnel_encap(skb, tunnel, &protocol, &fl4) < 0)
+ 		goto tx_error;
+ 
+-	rt = connected ? tunnel_rtable_get(tunnel, 0, &fl4.saddr) : NULL;
++	rt = connected ? dst_cache_get_ip4(&tunnel->dst_cache, &fl4.saddr) :
++			 NULL;
+ 
+ 	if (!rt) {
+ 		rt = ip_route_output_key(tunnel->net, &fl4);
+@@ -743,7 +690,8 @@ void ip_tunnel_xmit(struct sk_buff *skb,
+ 			goto tx_error;
+ 		}
+ 		if (connected)
+-			tunnel_dst_set(tunnel, &rt->dst, fl4.saddr);
++			dst_cache_set_ip4(&tunnel->dst_cache, &rt->dst,
++					  fl4.saddr);
+ 	}
+ 
+ 	if (rt->dst.dev == dev) {
+@@ -841,7 +789,7 @@ static void ip_tunnel_update(struct ip_t
+ 		if (set_mtu)
+ 			dev->mtu = mtu;
+ 	}
+-	ip_tunnel_dst_reset_all(t);
++	dst_cache_reset(&t->dst_cache);
+ 	netdev_state_change(dev);
+ }
+ 
+@@ -980,7 +928,7 @@ static void ip_tunnel_dev_free(struct ne
+ 	struct ip_tunnel *tunnel = netdev_priv(dev);
+ 
+ 	gro_cells_destroy(&tunnel->gro_cells);
+-	free_percpu(tunnel->dst_cache);
++	dst_cache_destroy(&tunnel->dst_cache);
+ 	free_percpu(dev->tstats);
+ 	free_netdev(dev);
+ }
+@@ -1174,15 +1122,15 @@ int ip_tunnel_init(struct net_device *de
+ 	if (!dev->tstats)
+ 		return -ENOMEM;
+ 
+-	tunnel->dst_cache = alloc_percpu(struct ip_tunnel_dst);
+-	if (!tunnel->dst_cache) {
++	err = dst_cache_init(&tunnel->dst_cache, GFP_KERNEL);
++	if (err) {
+ 		free_percpu(dev->tstats);
+-		return -ENOMEM;
++		return err;
+ 	}
+ 
+ 	err = gro_cells_init(&tunnel->gro_cells, dev);
+ 	if (err) {
+-		free_percpu(tunnel->dst_cache);
++		dst_cache_destroy(&tunnel->dst_cache);
+ 		free_percpu(dev->tstats);
+ 		return err;
+ 	}
+@@ -1212,7 +1160,7 @@ void ip_tunnel_uninit(struct net_device
+ 	if (itn->fb_tunnel_dev != dev)
+ 		ip_tunnel_del(itn, netdev_priv(dev));
+ 
+-	ip_tunnel_dst_reset_all(tunnel);
++	dst_cache_reset(&tunnel->dst_cache);
+ }
+ EXPORT_SYMBOL_GPL(ip_tunnel_uninit);
+ 
+--- a/net/ipv6/sit.c
++++ b/net/ipv6/sit.c
+@@ -475,7 +475,7 @@ static void ipip6_tunnel_uninit(struct n
+ 		ipip6_tunnel_unlink(sitn, tunnel);
+ 		ipip6_tunnel_del_prl(tunnel, NULL);
+ 	}
+-	ip_tunnel_dst_reset_all(tunnel);
++	dst_cache_reset(&tunnel->dst_cache);
+ 	dev_put(dev);
+ }
+ 
+@@ -1098,7 +1098,7 @@ static void ipip6_tunnel_update(struct i
+ 		t->parms.link = p->link;
+ 		ipip6_tunnel_bind_dev(t->dev);
+ 	}
+-	ip_tunnel_dst_reset_all(t);
++	dst_cache_reset(&t->dst_cache);
+ 	netdev_state_change(t->dev);
+ }
+ 
+@@ -1129,7 +1129,7 @@ static int ipip6_tunnel_update_6rd(struc
+ 	t->ip6rd.relay_prefix = relay_prefix;
+ 	t->ip6rd.prefixlen = ip6rd->prefixlen;
+ 	t->ip6rd.relay_prefixlen = ip6rd->relay_prefixlen;
+-	ip_tunnel_dst_reset_all(t);
++	dst_cache_reset(&t->dst_cache);
+ 	netdev_state_change(t->dev);
+ 	return 0;
+ }
+@@ -1283,7 +1283,7 @@ ipip6_tunnel_ioctl(struct net_device *de
+ 			err = ipip6_tunnel_add_prl(t, &prl, cmd == SIOCCHGPRL);
+ 			break;
+ 		}
+-		ip_tunnel_dst_reset_all(t);
++		dst_cache_reset(&t->dst_cache);
+ 		netdev_state_change(dev);
+ 		break;
+ 
+@@ -1344,7 +1344,7 @@ static void ipip6_dev_free(struct net_de
+ {
+ 	struct ip_tunnel *tunnel = netdev_priv(dev);
+ 
+-	free_percpu(tunnel->dst_cache);
++	dst_cache_destroy(&tunnel->dst_cache);
+ 	free_percpu(dev->tstats);
+ 	free_netdev(dev);
+ }
+@@ -1377,6 +1377,7 @@ static void ipip6_tunnel_setup(struct ne
+ static int ipip6_tunnel_init(struct net_device *dev)
+ {
+ 	struct ip_tunnel *tunnel = netdev_priv(dev);
++	int err;
+ 
+ 	tunnel->dev = dev;
+ 	tunnel->net = dev_net(dev);
+@@ -1387,11 +1388,11 @@ static int ipip6_tunnel_init(struct net_
+ 	if (!dev->tstats)
+ 		return -ENOMEM;
+ 
+-	tunnel->dst_cache = alloc_percpu(struct ip_tunnel_dst);
+-	if (!tunnel->dst_cache) {
++	err = dst_cache_init(&tunnel->dst_cache, GFP_KERNEL);
++	if (err) {
+ 		free_percpu(dev->tstats);
+ 		dev->tstats = NULL;
+-		return -ENOMEM;
++		return err;
+ 	}
+ 
+ 	return 0;
