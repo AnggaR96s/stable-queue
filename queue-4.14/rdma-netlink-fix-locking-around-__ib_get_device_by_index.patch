@@ -1,0 +1,192 @@
+From foo@baz Wed Feb 28 16:23:28 CET 2018
+From: Leon Romanovsky <leonro@mellanox.com>
+Date: Mon, 1 Jan 2018 13:07:15 +0200
+Subject: RDMA/netlink: Fix locking around __ib_get_device_by_index
+
+From: Leon Romanovsky <leonro@mellanox.com>
+
+
+[ Upstream commit f8978bd95cf92f869f3d9b34c1b699f49253b8c6 ]
+
+Holding locks is mandatory when calling __ib_device_get_by_index,
+otherwise there are races during the list iteration with device removal.
+
+Since the locks are static to device.c, __ib_device_get_by_index can
+never be called correctly by any user out side the file.
+
+Make the function static and provide a safe function that gets the
+correct locks and returns a kref'd pointer. Fix all callers.
+
+Fixes: e5c9469efcb1 ("RDMA/netlink: Add nldev device doit implementation")
+Fixes: c3f66f7b0052 ("RDMA/netlink: Implement nldev port doit callback")
+Fixes: 7d02f605f0dc ("RDMA/netlink: Add nldev port dumpit implementation")
+Reviewed-by: Mark Bloch <markb@mellanox.com>
+Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/infiniband/core/core_priv.h |    2 -
+ drivers/infiniband/core/device.c    |   18 +++++++++++-
+ drivers/infiniband/core/nldev.c     |   54 ++++++++++++++++++++++++------------
+ 3 files changed, 54 insertions(+), 20 deletions(-)
+
+--- a/drivers/infiniband/core/core_priv.h
++++ b/drivers/infiniband/core/core_priv.h
+@@ -314,7 +314,7 @@ static inline int ib_mad_enforce_securit
+ }
+ #endif
+ 
+-struct ib_device *__ib_device_get_by_index(u32 ifindex);
++struct ib_device *ib_device_get_by_index(u32 ifindex);
+ /* RDMA device netlink */
+ void nldev_init(void);
+ void nldev_exit(void);
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@ -134,7 +134,7 @@ static int ib_device_check_mandatory(str
+ 	return 0;
+ }
+ 
+-struct ib_device *__ib_device_get_by_index(u32 index)
++static struct ib_device *__ib_device_get_by_index(u32 index)
+ {
+ 	struct ib_device *device;
+ 
+@@ -145,6 +145,22 @@ struct ib_device *__ib_device_get_by_ind
+ 	return NULL;
+ }
+ 
++/*
++ * Caller is responsible to return refrerence count by calling put_device()
++ */
++struct ib_device *ib_device_get_by_index(u32 index)
++{
++	struct ib_device *device;
++
++	down_read(&lists_rwsem);
++	device = __ib_device_get_by_index(index);
++	if (device)
++		get_device(&device->dev);
++
++	up_read(&lists_rwsem);
++	return device;
++}
++
+ static struct ib_device *__ib_device_get_by_name(const char *name)
+ {
+ 	struct ib_device *device;
+--- a/drivers/infiniband/core/nldev.c
++++ b/drivers/infiniband/core/nldev.c
+@@ -142,27 +142,34 @@ static int nldev_get_doit(struct sk_buff
+ 
+ 	index = nla_get_u32(tb[RDMA_NLDEV_ATTR_DEV_INDEX]);
+ 
+-	device = __ib_device_get_by_index(index);
++	device = ib_device_get_by_index(index);
+ 	if (!device)
+ 		return -EINVAL;
+ 
+ 	msg = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
+-	if (!msg)
+-		return -ENOMEM;
++	if (!msg) {
++		err = -ENOMEM;
++		goto err;
++	}
+ 
+ 	nlh = nlmsg_put(msg, NETLINK_CB(skb).portid, nlh->nlmsg_seq,
+ 			RDMA_NL_GET_TYPE(RDMA_NL_NLDEV, RDMA_NLDEV_CMD_GET),
+ 			0, 0);
+ 
+ 	err = fill_dev_info(msg, device);
+-	if (err) {
+-		nlmsg_free(msg);
+-		return err;
+-	}
++	if (err)
++		goto err_free;
+ 
+ 	nlmsg_end(msg, nlh);
+ 
++	put_device(&device->dev);
+ 	return rdma_nl_unicast(msg, NETLINK_CB(skb).portid);
++
++err_free:
++	nlmsg_free(msg);
++err:
++	put_device(&device->dev);
++	return err;
+ }
+ 
+ static int _nldev_get_dumpit(struct ib_device *device,
+@@ -220,31 +227,40 @@ static int nldev_port_get_doit(struct sk
+ 		return -EINVAL;
+ 
+ 	index = nla_get_u32(tb[RDMA_NLDEV_ATTR_DEV_INDEX]);
+-	device = __ib_device_get_by_index(index);
++	device = ib_device_get_by_index(index);
+ 	if (!device)
+ 		return -EINVAL;
+ 
+ 	port = nla_get_u32(tb[RDMA_NLDEV_ATTR_PORT_INDEX]);
+-	if (!rdma_is_port_valid(device, port))
+-		return -EINVAL;
++	if (!rdma_is_port_valid(device, port)) {
++		err = -EINVAL;
++		goto err;
++	}
+ 
+ 	msg = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
+-	if (!msg)
+-		return -ENOMEM;
++	if (!msg) {
++		err = -ENOMEM;
++		goto err;
++	}
+ 
+ 	nlh = nlmsg_put(msg, NETLINK_CB(skb).portid, nlh->nlmsg_seq,
+ 			RDMA_NL_GET_TYPE(RDMA_NL_NLDEV, RDMA_NLDEV_CMD_GET),
+ 			0, 0);
+ 
+ 	err = fill_port_info(msg, device, port);
+-	if (err) {
+-		nlmsg_free(msg);
+-		return err;
+-	}
++	if (err)
++		goto err_free;
+ 
+ 	nlmsg_end(msg, nlh);
++	put_device(&device->dev);
+ 
+ 	return rdma_nl_unicast(msg, NETLINK_CB(skb).portid);
++
++err_free:
++	nlmsg_free(msg);
++err:
++	put_device(&device->dev);
++	return err;
+ }
+ 
+ static int nldev_port_get_dumpit(struct sk_buff *skb,
+@@ -265,7 +281,7 @@ static int nldev_port_get_dumpit(struct
+ 		return -EINVAL;
+ 
+ 	ifindex = nla_get_u32(tb[RDMA_NLDEV_ATTR_DEV_INDEX]);
+-	device = __ib_device_get_by_index(ifindex);
++	device = ib_device_get_by_index(ifindex);
+ 	if (!device)
+ 		return -EINVAL;
+ 
+@@ -299,7 +315,9 @@ static int nldev_port_get_dumpit(struct
+ 		nlmsg_end(skb, nlh);
+ 	}
+ 
+-out:	cb->args[0] = idx;
++out:
++	put_device(&device->dev);
++	cb->args[0] = idx;
+ 	return skb->len;
+ }
+ 
