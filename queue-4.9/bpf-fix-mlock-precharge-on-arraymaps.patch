@@ -1,0 +1,94 @@
+From foo@baz Fri Mar  9 14:20:51 PST 2018
+From: Daniel Borkmann <daniel@iogearbox.net>
+Date: Thu,  8 Mar 2018 16:17:33 +0100
+Subject: bpf: fix mlock precharge on arraymaps
+To: gregkh@linuxfoundation.org
+Cc: ast@kernel.org, daniel@iogearbox.net, stable@vger.kernel.org, Dennis Zhou <dennisszhou@gmail.com>
+Message-ID: <56632230ccbd31f06f33af4c6ac9fcbc88506825.1520521792.git.daniel@iogearbox.net>
+
+From: Daniel Borkmann <daniel@iogearbox.net>
+
+[ upstream commit 9c2d63b843a5c8a8d0559cc067b5398aa5ec3ffc ]
+
+syzkaller recently triggered OOM during percpu map allocation;
+while there is work in progress by Dennis Zhou to add __GFP_NORETRY
+semantics for percpu allocator under pressure, there seems also a
+missing bpf_map_precharge_memlock() check in array map allocation.
+
+Given today the actual bpf_map_charge_memlock() happens after the
+find_and_alloc_map() in syscall path, the bpf_map_precharge_memlock()
+is there to bail out early before we go and do the map setup work
+when we find that we hit the limits anyway. Therefore add this for
+array map as well.
+
+Fixes: 6c9059817432 ("bpf: pre-allocate hash map elements")
+Fixes: a10423b87a7e ("bpf: introduce BPF_MAP_TYPE_PERCPU_ARRAY map")
+Reported-by: syzbot+adb03f3f0bb57ce3acda@syzkaller.appspotmail.com
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Cc: Dennis Zhou <dennisszhou@gmail.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ kernel/bpf/arraymap.c |   29 ++++++++++++++++++-----------
+ 1 file changed, 18 insertions(+), 11 deletions(-)
+
+--- a/kernel/bpf/arraymap.c
++++ b/kernel/bpf/arraymap.c
+@@ -48,8 +48,9 @@ static struct bpf_map *array_map_alloc(u
+ 	bool percpu = attr->map_type == BPF_MAP_TYPE_PERCPU_ARRAY;
+ 	u32 elem_size, index_mask, max_entries;
+ 	bool unpriv = !capable(CAP_SYS_ADMIN);
++	u64 cost, array_size, mask64;
+ 	struct bpf_array *array;
+-	u64 array_size, mask64;
++	int ret;
+ 
+ 	/* check sanity of attributes */
+ 	if (attr->max_entries == 0 || attr->key_size != 4 ||
+@@ -92,8 +93,19 @@ static struct bpf_map *array_map_alloc(u
+ 		array_size += (u64) max_entries * elem_size;
+ 
+ 	/* make sure there is no u32 overflow later in round_up() */
+-	if (array_size >= U32_MAX - PAGE_SIZE)
++	cost = array_size;
++	if (cost >= U32_MAX - PAGE_SIZE)
+ 		return ERR_PTR(-ENOMEM);
++	if (percpu) {
++		cost += (u64)attr->max_entries * elem_size * num_possible_cpus();
++		if (cost >= U32_MAX - PAGE_SIZE)
++			return ERR_PTR(-ENOMEM);
++	}
++	cost = round_up(cost, PAGE_SIZE) >> PAGE_SHIFT;
++
++	ret = bpf_map_precharge_memlock(cost);
++	if (ret < 0)
++		return ERR_PTR(ret);
+ 
+ 	/* allocate all map elements and zero-initialize them */
+ 	array = bpf_map_area_alloc(array_size);
+@@ -108,20 +120,15 @@ static struct bpf_map *array_map_alloc(u
+ 	array->map.value_size = attr->value_size;
+ 	array->map.max_entries = attr->max_entries;
+ 	array->map.map_flags = attr->map_flags;
++	array->map.pages = cost;
+ 	array->elem_size = elem_size;
+ 
+-	if (!percpu)
+-		goto out;
+-
+-	array_size += (u64) attr->max_entries * elem_size * num_possible_cpus();
+-
+-	if (array_size >= U32_MAX - PAGE_SIZE ||
+-	    elem_size > PCPU_MIN_UNIT_SIZE || bpf_array_alloc_percpu(array)) {
++	if (percpu &&
++	    (elem_size > PCPU_MIN_UNIT_SIZE ||
++	     bpf_array_alloc_percpu(array))) {
+ 		bpf_map_area_free(array);
+ 		return ERR_PTR(-ENOMEM);
+ 	}
+-out:
+-	array->map.pages = round_up(array_size, PAGE_SIZE) >> PAGE_SHIFT;
+ 
+ 	return &array->map;
+ }
