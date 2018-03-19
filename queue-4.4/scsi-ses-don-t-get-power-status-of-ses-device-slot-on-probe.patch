@@ -1,0 +1,117 @@
+From foo@baz Mon Mar 19 09:58:12 CET 2018
+From: Mauricio Faria de Oliveira <mauricfo@linux.vnet.ibm.com>
+Date: Wed, 5 Apr 2017 12:18:19 -0300
+Subject: scsi: ses: don't get power status of SES device slot on probe
+
+From: Mauricio Faria de Oliveira <mauricfo@linux.vnet.ibm.com>
+
+
+[ Upstream commit 75106523f39751390b5789b36ee1d213b3af1945 ]
+
+The commit 08024885a2a3 ("ses: Add power_status to SES device slot")
+introduced the 'power_status' attribute to enclosure components and
+the associated callbacks.
+
+There are 2 callbacks available to get the power status of a device:
+1) ses_get_power_status() for 'struct enclosure_component_callbacks'
+2) get_component_power_status() for the sysfs device attribute
+(these are available for kernel-space and user-space, respectively.)
+
+However, despite both methods being available to get power status
+on demand, that commit also introduced a call to get power status
+in ses_enclosure_data_process().
+
+This dramatically increased the total probe time for SCSI devices
+on larger configurations, because ses_enclosure_data_process() is
+called several times during the SCSI devices probe and loops over
+the component devices (but that is another problem, another patch).
+
+That results in a tremendous continuous hammering of SCSI Receive
+Diagnostics commands to the enclosure-services device, which does
+delay the total probe time for the SCSI devices __significantly__:
+
+  Originally, ~34 minutes on a system attached to ~170 disks:
+
+    [ 9214.490703] mpt3sas version 13.100.00.00 loaded
+    ...
+    [11256.580231] scsi 17:0:177:0: qdepth(16), tagged(1), simple(0),
+                   ordered(0), scsi_level(6), cmd_que(1)
+
+  With this patch, it decreased to ~2.5 minutes -- a 13.6x faster
+
+    [ 1002.992533] mpt3sas version 13.100.00.00 loaded
+    ...
+    [ 1151.978831] scsi 11:0:177:0: qdepth(16), tagged(1), simple(0),
+                   ordered(0), scsi_level(6), cmd_que(1)
+
+Back to the commit discussion.. on the ses_get_power_status() call
+introduced in ses_enclosure_data_process(): impact of removing it.
+
+That may possibly be in place to initialize the power status value
+on device probe.  However, those 2 functions available to retrieve
+that value _do_ automatically refresh/update it.  So the potential
+benefit would be a direct access of the 'power_status' field which
+does not use the callbacks...
+
+But the only reader of 'struct enclosure_component::power_status'
+is the get_component_power_status() callback for sysfs attribute,
+and it _does_ check for and call the .get_power_status callback,
+(which indeed is defined and implemented by that commit), so the
+power status value is, again, automatically updated.
+
+So, the remaining potential for a direct/non-callback access to
+the power_status attribute would be out-of-tree modules -- well,
+for those, if they are for whatever reason interested in values
+that are set during device probe and not up-to-date by the time
+they need it.. well, that would be curious.
+
+Well, to handle that more properly, set the initial power state
+value to '-1' (i.e., uninitialized) instead of '1' (power 'on'),
+and check for it in that callback which may do an direct access
+to the field value _if_ a callback function is not defined.
+
+Signed-off-by: Mauricio Faria de Oliveira <mauricfo@linux.vnet.ibm.com>
+Fixes: 08024885a2a3 ("ses: Add power_status to SES device slot")
+Reviewed-by: Dan Williams <dan.j.williams@intel.com>
+Reviewed-by: Song Liu <songliubraving@fb.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Sasha Levin <alexander.levin@microsoft.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/misc/enclosure.c |    7 ++++++-
+ drivers/scsi/ses.c       |    1 -
+ 2 files changed, 6 insertions(+), 2 deletions(-)
+
+--- a/drivers/misc/enclosure.c
++++ b/drivers/misc/enclosure.c
+@@ -148,7 +148,7 @@ enclosure_register(struct device *dev, c
+ 	for (i = 0; i < components; i++) {
+ 		edev->component[i].number = -1;
+ 		edev->component[i].slot = -1;
+-		edev->component[i].power_status = 1;
++		edev->component[i].power_status = -1;
+ 	}
+ 
+ 	mutex_lock(&container_list_lock);
+@@ -600,6 +600,11 @@ static ssize_t get_component_power_statu
+ 
+ 	if (edev->cb->get_power_status)
+ 		edev->cb->get_power_status(edev, ecomp);
++
++	/* If still uninitialized, the callback failed or does not exist. */
++	if (ecomp->power_status == -1)
++		return (edev->cb->get_power_status) ? -EIO : -ENOTTY;
++
+ 	return snprintf(buf, 40, "%s\n", ecomp->power_status ? "on" : "off");
+ }
+ 
+--- a/drivers/scsi/ses.c
++++ b/drivers/scsi/ses.c
+@@ -546,7 +546,6 @@ static void ses_enclosure_data_process(s
+ 					ecomp = &edev->component[components++];
+ 
+ 				if (!IS_ERR(ecomp)) {
+-					ses_get_power_status(edev, ecomp);
+ 					if (addl_desc_ptr)
+ 						ses_process_descriptor(
+ 							ecomp,
