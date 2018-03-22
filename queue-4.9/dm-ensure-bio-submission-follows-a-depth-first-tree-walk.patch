@@ -1,0 +1,137 @@
+From foo@baz Thu Mar 22 14:40:24 CET 2018
+From: NeilBrown <neilb@suse.com>
+Date: Wed, 6 Sep 2017 09:43:28 +1000
+Subject: dm: ensure bio submission follows a depth-first tree walk
+
+From: NeilBrown <neilb@suse.com>
+
+
+[ Upstream commit 18a25da84354c6bb655320de6072c00eda6eb602 ]
+
+A dm device can, in general, represent a tree of targets, each of which
+handles a sub-range of the range of blocks handled by the parent.
+
+The bio sequencing managed by generic_make_request() requires that bios
+are generated and handled in a depth-first manner.  Each call to a
+make_request_fn() may submit bios to a single member device, and may
+submit bios for a reduced region of the same device as the
+make_request_fn.
+
+In particular, any bios submitted to member devices must be expected to
+be processed in order, so a later one must never wait for an earlier
+one.
+
+This ordering is usually achieved by using bio_split() to reduce a bio
+to a size that can be completely handled by one target, and resubmitting
+the remainder to the originating device. bio_queue_split() shows the
+canonical approach.
+
+dm doesn't follow this approach, largely because it has needed to split
+bios since long before bio_split() was available.  It currently can
+submit bios to separate targets within the one dm_make_request() call.
+Dependencies between these targets, as can happen with dm-snap, can
+cause deadlocks if either bios gets stuck behind the other in the queues
+managed by generic_make_request().  This requires the 'rescue'
+functionality provided by dm_offload_{start,end}.
+
+Some of this requirement can be removed by changing the order of bio
+submission to follow the canonical approach.  That is, if dm finds that
+it needs to split a bio, the remainder should be sent to
+generic_make_request() rather than being handled immediately.  This
+delays the handling until the first part is completely processed, so the
+deadlock problems do not occur.
+
+__split_and_process_bio() can be called both from dm_make_request() and
+from dm_wq_work().  When called from dm_wq_work() the current approach
+is perfectly satisfactory as each bio will be processed immediately.
+When called from dm_make_request(), current->bio_list will be non-NULL,
+and in this case it is best to create a separate "clone" bio for the
+remainder.
+
+When we use bio_clone_bioset() to split off the front part of a bio
+and chain the two together and submit the remainder to
+generic_make_request(), it is important that the newly allocated
+bio is used as the head to be processed immediately, and the original
+bio gets "bio_advance()"d and sent to generic_make_request() as the
+remainder.  Otherwise, if the newly allocated bio is used as the
+remainder, and if it then needs to be split again, then the next
+bio_clone_bioset() call will be made while holding a reference a bio
+(result of the first clone) from the same bioset.  This can potentially
+exhaust the bioset mempool and result in a memory allocation deadlock.
+
+Note that there is no race caused by reassigning cio.io->bio after already
+calling __map_bio().  This bio will only be dereferenced again after
+dec_pending() has found io->io_count to be zero, and this cannot happen
+before the dec_pending() call at the end of __split_and_process_bio().
+
+To provide the clone bio when splitting, we use q->bio_split.  This
+was previously being freed by bio-based dm to avoid having excess
+rescuer threads.  As bio_split bio sets no longer create rescuer
+threads, there is little cost and much gain from restoring the
+q->bio_split bio set.
+
+Signed-off-by: NeilBrown <neilb@suse.com>
+Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+Signed-off-by: Sasha Levin <alexander.levin@microsoft.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/md/dm.c |   33 ++++++++++++++++++++++++---------
+ 1 file changed, 24 insertions(+), 9 deletions(-)
+
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@ -1320,8 +1320,29 @@ static void __split_and_process_bio(stru
+ 	} else {
+ 		ci.bio = bio;
+ 		ci.sector_count = bio_sectors(bio);
+-		while (ci.sector_count && !error)
++		while (ci.sector_count && !error) {
+ 			error = __split_and_process_non_flush(&ci);
++			if (current->bio_list && ci.sector_count && !error) {
++				/*
++				 * Remainder must be passed to generic_make_request()
++				 * so that it gets handled *after* bios already submitted
++				 * have been completely processed.
++				 * We take a clone of the original to store in
++				 * ci.io->bio to be used by end_io_acct() and
++				 * for dec_pending to use for completion handling.
++				 * As this path is not used for REQ_OP_ZONE_REPORT,
++				 * the usage of io->bio in dm_remap_zone_report()
++				 * won't be affected by this reassignment.
++				 */
++				struct bio *b = bio_clone_bioset(bio, GFP_NOIO,
++								 md->queue->bio_split);
++				ci.io->bio = b;
++				bio_advance(bio, (bio_sectors(bio) - ci.sector_count) << 9);
++				bio_chain(b, bio);
++				generic_make_request(bio);
++				break;
++			}
++		}
+ 	}
+ 
+ 	/* drop the extra reference count */
+@@ -1332,8 +1353,8 @@ static void __split_and_process_bio(stru
+  *---------------------------------------------------------------*/
+ 
+ /*
+- * The request function that just remaps the bio built up by
+- * dm_merge_bvec.
++ * The request function that remaps the bio to one target and
++ * splits off any remainder.
+  */
+ static blk_qc_t dm_make_request(struct request_queue *q, struct bio *bio)
+ {
+@@ -1854,12 +1875,6 @@ int dm_setup_md_queue(struct mapped_devi
+ 	case DM_TYPE_DAX_BIO_BASED:
+ 		dm_init_normal_md_queue(md);
+ 		blk_queue_make_request(md->queue, dm_make_request);
+-		/*
+-		 * DM handles splitting bios as needed.  Free the bio_split bioset
+-		 * since it won't be used (saves 1 process per bio-based DM device).
+-		 */
+-		bioset_free(md->queue->bio_split);
+-		md->queue->bio_split = NULL;
+ 
+ 		if (type == DM_TYPE_DAX_BIO_BASED)
+ 			queue_flag_set_unlocked(QUEUE_FLAG_DAX, md->queue);
