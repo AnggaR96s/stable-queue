@@ -1,0 +1,111 @@
+From foo@baz Thu Mar 22 14:57:32 CET 2018
+From: Feras Daoud <ferasda@mellanox.com>
+Date: Sun, 19 Mar 2017 11:18:55 +0200
+Subject: IB/ipoib: Fix deadlock between ipoib_stop and mcast join flow
+
+From: Feras Daoud <ferasda@mellanox.com>
+
+
+[ Upstream commit 3e31a490e01a6e67cbe9f6e1df2f3ff0fbf48972 ]
+
+Before calling ipoib_stop, rtnl_lock should be taken, then
+the flow clears the IPOIB_FLAG_ADMIN_UP and IPOIB_FLAG_OPER_UP
+flags, and waits for mcast completion if IPOIB_MCAST_FLAG_BUSY
+is set.
+
+On the other hand, the flow of multicast join task initializes
+a mcast completion, sets the IPOIB_MCAST_FLAG_BUSY and calls
+ipoib_mcast_join. If IPOIB_FLAG_OPER_UP flag is not set, this
+call returns EINVAL without setting the mcast completion and
+leads to a deadlock.
+
+    ipoib_stop                          |
+        |                               |
+    clear_bit(IPOIB_FLAG_ADMIN_UP)      |
+        |                               |
+    Context Switch                      |
+        |                       ipoib_mcast_join_task
+        |                               |
+        |                       spin_lock_irq(lock)
+        |                               |
+        |                       init_completion(mcast)
+        |                               |
+        |                       set_bit(IPOIB_MCAST_FLAG_BUSY)
+        |                               |
+        |                       Context Switch
+        |                               |
+    clear_bit(IPOIB_FLAG_OPER_UP)       |
+        |                               |
+    spin_lock_irqsave(lock)             |
+        |                               |
+    Context Switch                      |
+        |                       ipoib_mcast_join
+        |                       return (-EINVAL)
+        |                               |
+        |                       spin_unlock_irq(lock)
+        |                               |
+        |                       Context Switch
+        |                               |
+    ipoib_mcast_dev_flush               |
+    wait_for_completion(mcast)          |
+
+ipoib_stop will wait for mcast completion for ever, and will
+not release the rtnl_lock. As a result panic occurs with the
+following trace:
+
+    [13441.639268] Call Trace:
+    [13441.640150]  [<ffffffff8168b579>] schedule+0x29/0x70
+    [13441.641038]  [<ffffffff81688fc9>] schedule_timeout+0x239/0x2d0
+    [13441.641914]  [<ffffffff810bc017>] ? complete+0x47/0x50
+    [13441.642765]  [<ffffffff810a690d>] ? flush_workqueue_prep_pwqs+0x16d/0x200
+    [13441.643580]  [<ffffffff8168b956>] wait_for_completion+0x116/0x170
+    [13441.644434]  [<ffffffff810c4ec0>] ? wake_up_state+0x20/0x20
+    [13441.645293]  [<ffffffffa05af170>] ipoib_mcast_dev_flush+0x150/0x190 [ib_ipoib]
+    [13441.646159]  [<ffffffffa05ac967>] ipoib_ib_dev_down+0x37/0x60 [ib_ipoib]
+    [13441.647013]  [<ffffffffa05a4805>] ipoib_stop+0x75/0x150 [ib_ipoib]
+
+Fixes: 08bc327629cb ("IB/ipoib: fix for rare multicast join race condition")
+Signed-off-by: Feras Daoud <ferasda@mellanox.com>
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Signed-off-by: Doug Ledford <dledford@redhat.com>
+Signed-off-by: Sasha Levin <alexander.levin@microsoft.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/infiniband/ulp/ipoib/ipoib_multicast.c |   11 +++++------
+ 1 file changed, 5 insertions(+), 6 deletions(-)
+
+--- a/drivers/infiniband/ulp/ipoib/ipoib_multicast.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_multicast.c
+@@ -473,6 +473,9 @@ static int ipoib_mcast_join(struct net_d
+ 	    !test_bit(IPOIB_FLAG_OPER_UP, &priv->flags))
+ 		return -EINVAL;
+ 
++	init_completion(&mcast->done);
++	set_bit(IPOIB_MCAST_FLAG_BUSY, &mcast->flags);
++
+ 	ipoib_dbg_mcast(priv, "joining MGID %pI6\n", mcast->mcmember.mgid.raw);
+ 
+ 	rec.mgid     = mcast->mcmember.mgid;
+@@ -631,8 +634,6 @@ void ipoib_mcast_join_task(struct work_s
+ 			if (mcast->backoff == 1 ||
+ 			    time_after_eq(jiffies, mcast->delay_until)) {
+ 				/* Found the next unjoined group */
+-				init_completion(&mcast->done);
+-				set_bit(IPOIB_MCAST_FLAG_BUSY, &mcast->flags);
+ 				if (ipoib_mcast_join(dev, mcast)) {
+ 					spin_unlock_irq(&priv->lock);
+ 					return;
+@@ -652,11 +653,9 @@ out:
+ 		queue_delayed_work(priv->wq, &priv->mcast_task,
+ 				   delay_until - jiffies);
+ 	}
+-	if (mcast) {
+-		init_completion(&mcast->done);
+-		set_bit(IPOIB_MCAST_FLAG_BUSY, &mcast->flags);
++	if (mcast)
+ 		ipoib_mcast_join(dev, mcast);
+-	}
++
+ 	spin_unlock_irq(&priv->lock);
+ }
+ 
