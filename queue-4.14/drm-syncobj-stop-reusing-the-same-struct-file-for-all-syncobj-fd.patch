@@ -1,0 +1,174 @@
+From e7cdf5c82f1773c3386b93bbcf13b9bfff29fa31 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Tue, 19 Dec 2017 12:07:00 +0000
+Subject: drm/syncobj: Stop reusing the same struct file for all syncobj -> fd
+
+From: Chris Wilson <chris@chris-wilson.co.uk>
+
+commit e7cdf5c82f1773c3386b93bbcf13b9bfff29fa31 upstream.
+
+The vk cts test:
+dEQP-VK.api.external.semaphore.opaque_fd.export_multiple_times_temporary
+
+triggers a lot of
+VFS: Close: file count is 0
+
+Dave pointed out that clearing the syncobj->file from
+drm_syncobj_file_release() was sufficient to silence the test, but that
+opens a can of worm since we assumed that the syncobj->file was never
+unset. Stop trying to reuse the same struct file for every fd pointing
+to the drm_syncobj, and allocate one file for each fd instead.
+
+v2: Fixup return handling of drm_syncobj_fd_to_handle
+v2.1: [airlied: fix possible syncobj ref race]
+v2.2: [jekstrand: back-port to 4.14]
+
+Reported-by: Dave Airlie <airlied@redhat.com>
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Tested-by: Dave Airlie <airlied@redhat.com>
+Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Signed-off-by: Jason Ekstrand <jason@jlekstrand.net>
+Tested-by: Clayton Craft <clayton.a.craft@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/gpu/drm/drm_syncobj.c |   81 +++++++++++++++---------------------------
+ include/drm/drm_syncobj.h     |    5 --
+ 2 files changed, 30 insertions(+), 56 deletions(-)
+
+--- a/drivers/gpu/drm/drm_syncobj.c
++++ b/drivers/gpu/drm/drm_syncobj.c
+@@ -328,28 +328,11 @@ static const struct file_operations drm_
+ 	.release = drm_syncobj_file_release,
+ };
+ 
+-static int drm_syncobj_alloc_file(struct drm_syncobj *syncobj)
+-{
+-	struct file *file = anon_inode_getfile("syncobj_file",
+-					       &drm_syncobj_file_fops,
+-					       syncobj, 0);
+-	if (IS_ERR(file))
+-		return PTR_ERR(file);
+-
+-	drm_syncobj_get(syncobj);
+-	if (cmpxchg(&syncobj->file, NULL, file)) {
+-		/* lost the race */
+-		fput(file);
+-	}
+-
+-	return 0;
+-}
+-
+ static int drm_syncobj_handle_to_fd(struct drm_file *file_private,
+ 				    u32 handle, int *p_fd)
+ {
+ 	struct drm_syncobj *syncobj = drm_syncobj_find(file_private, handle);
+-	int ret;
++	struct file *file;
+ 	int fd;
+ 
+ 	if (!syncobj)
+@@ -361,46 +344,40 @@ static int drm_syncobj_handle_to_fd(stru
+ 		return fd;
+ 	}
+ 
+-	if (!syncobj->file) {
+-		ret = drm_syncobj_alloc_file(syncobj);
+-		if (ret)
+-			goto out_put_fd;
++	file = anon_inode_getfile("syncobj_file",
++				  &drm_syncobj_file_fops,
++				  syncobj, 0);
++	if (IS_ERR(file)) {
++		put_unused_fd(fd);
++		drm_syncobj_put(syncobj);
++		return PTR_ERR(file);
+ 	}
+-	fd_install(fd, syncobj->file);
+-	drm_syncobj_put(syncobj);
++
++	drm_syncobj_get(syncobj);
++	fd_install(fd, file);
++
+ 	*p_fd = fd;
+ 	return 0;
+-out_put_fd:
+-	put_unused_fd(fd);
+-	drm_syncobj_put(syncobj);
+-	return ret;
+ }
+ 
+-static struct drm_syncobj *drm_syncobj_fdget(int fd)
+-{
+-	struct file *file = fget(fd);
+-
+-	if (!file)
+-		return NULL;
+-	if (file->f_op != &drm_syncobj_file_fops)
+-		goto err;
+-
+-	return file->private_data;
+-err:
+-	fput(file);
+-	return NULL;
+-};
+-
+ static int drm_syncobj_fd_to_handle(struct drm_file *file_private,
+ 				    int fd, u32 *handle)
+ {
+-	struct drm_syncobj *syncobj = drm_syncobj_fdget(fd);
++	struct drm_syncobj *syncobj;
++	struct file *file;
+ 	int ret;
+ 
+-	if (!syncobj)
++	file = fget(fd);
++	if (!file)
++		return -EINVAL;
++
++	if (file->f_op != &drm_syncobj_file_fops) {
++		fput(file);
+ 		return -EINVAL;
++	}
+ 
+ 	/* take a reference to put in the idr */
++	syncobj = file->private_data;
+ 	drm_syncobj_get(syncobj);
+ 
+ 	idr_preload(GFP_KERNEL);
+@@ -409,12 +386,14 @@ static int drm_syncobj_fd_to_handle(stru
+ 	spin_unlock(&file_private->syncobj_table_lock);
+ 	idr_preload_end();
+ 
+-	if (ret < 0) {
+-		fput(syncobj->file);
+-		return ret;
+-	}
+-	*handle = ret;
+-	return 0;
++	if (ret > 0) {
++		*handle = ret;
++		ret = 0;
++	} else
++		drm_syncobj_put(syncobj);
++
++	fput(file);
++	return ret;
+ }
+ 
+ int drm_syncobj_import_sync_file_fence(struct drm_file *file_private,
+--- a/include/drm/drm_syncobj.h
++++ b/include/drm/drm_syncobj.h
+@@ -60,11 +60,6 @@ struct drm_syncobj {
+ 	 * locks cb_list and write-locks fence.
+ 	 */
+ 	spinlock_t lock;
+-	/**
+-	 * @file:
+-	 * a file backing for this syncobj.
+-	 */
+-	struct file *file;
+ };
+ 
+ typedef void (*drm_syncobj_func_t)(struct drm_syncobj *syncobj,
