@@ -1,0 +1,118 @@
+From 80a4ae202f2d319eced8bbf612a4e8b0f11c21f5 Mon Sep 17 00:00:00 2001
+From: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Date: Fri, 23 Mar 2018 09:29:06 +1100
+Subject: powerpc/mm: Workaround Nest MMU bug with TLB invalidations
+
+From: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+
+commit 80a4ae202f2d319eced8bbf612a4e8b0f11c21f5 upstream.
+
+On POWER9 the Nest MMU may fail to invalidate some translations when
+doing a tlbie "by PID" or "by LPID" that is targeted at the TLB only
+and not the page walk cache.
+
+This works around it by forcing such invalidations to escalate to
+RIC=2 (full invalidation of TLB *and* PWC) when a coprocessor is in
+use for the context.
+
+Fixes: 03b8abedf4f4 ("cxl: Enable global TLBIs for cxl contexts")
+Cc: stable@vger.kernel.org # v4.15+
+Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Signed-off-by: Balbir Singh <bsingharora@gmail.com>
+[balbirs: fixed spelling and coding style to quiesce checkpatch.pl]
+Tested-by: Balbir Singh <bsingharora@gmail.com>
+Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ arch/powerpc/mm/tlb-radix.c |   50 +++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 43 insertions(+), 7 deletions(-)
+
+--- a/arch/powerpc/mm/tlb-radix.c
++++ b/arch/powerpc/mm/tlb-radix.c
+@@ -85,7 +85,23 @@ static inline void _tlbiel_pid(unsigned
+ static inline void _tlbie_pid(unsigned long pid, unsigned long ric)
+ {
+ 	asm volatile("ptesync": : :"memory");
+-	__tlbie_pid(pid, ric);
++
++	/*
++	 * Workaround the fact that the "ric" argument to __tlbie_pid
++	 * must be a compile-time contraint to match the "i" constraint
++	 * in the asm statement.
++	 */
++	switch (ric) {
++	case RIC_FLUSH_TLB:
++		__tlbie_pid(pid, RIC_FLUSH_TLB);
++		break;
++	case RIC_FLUSH_PWC:
++		__tlbie_pid(pid, RIC_FLUSH_PWC);
++		break;
++	case RIC_FLUSH_ALL:
++	default:
++		__tlbie_pid(pid, RIC_FLUSH_ALL);
++	}
+ 	asm volatile("eieio; tlbsync; ptesync": : :"memory");
+ }
+ 
+@@ -245,6 +261,16 @@ void radix__local_flush_tlb_page(struct
+ }
+ EXPORT_SYMBOL(radix__local_flush_tlb_page);
+ 
++static bool mm_needs_flush_escalation(struct mm_struct *mm)
++{
++	/*
++	 * P9 nest MMU has issues with the page walk cache
++	 * caching PTEs and not flushing them properly when
++	 * RIC = 0 for a PID/LPID invalidate
++	 */
++	return atomic_read(&mm->context.copros) != 0;
++}
++
+ #ifdef CONFIG_SMP
+ void radix__flush_tlb_mm(struct mm_struct *mm)
+ {
+@@ -255,9 +281,12 @@ void radix__flush_tlb_mm(struct mm_struc
+ 		return;
+ 
+ 	preempt_disable();
+-	if (!mm_is_thread_local(mm))
+-		_tlbie_pid(pid, RIC_FLUSH_TLB);
+-	else
++	if (!mm_is_thread_local(mm)) {
++		if (mm_needs_flush_escalation(mm))
++			_tlbie_pid(pid, RIC_FLUSH_ALL);
++		else
++			_tlbie_pid(pid, RIC_FLUSH_TLB);
++	} else
+ 		_tlbiel_pid(pid, RIC_FLUSH_TLB);
+ 	preempt_enable();
+ }
+@@ -369,10 +398,14 @@ void radix__flush_tlb_range(struct vm_ar
+ 	}
+ 
+ 	if (full) {
+-		if (local)
++		if (local) {
+ 			_tlbiel_pid(pid, RIC_FLUSH_TLB);
+-		else
+-			_tlbie_pid(pid, RIC_FLUSH_TLB);
++		} else {
++			if (mm_needs_flush_escalation(mm))
++				_tlbie_pid(pid, RIC_FLUSH_ALL);
++			else
++				_tlbie_pid(pid, RIC_FLUSH_TLB);
++		}
+ 	} else {
+ 		bool hflush = false;
+ 		unsigned long hstart, hend;
+@@ -482,6 +515,9 @@ static inline void __radix__flush_tlb_ra
+ 	}
+ 
+ 	if (full) {
++		if (!local && mm_needs_flush_escalation(mm))
++			also_pwc = true;
++
+ 		if (local)
+ 			_tlbiel_pid(pid, also_pwc ? RIC_FLUSH_ALL : RIC_FLUSH_TLB);
+ 		else
