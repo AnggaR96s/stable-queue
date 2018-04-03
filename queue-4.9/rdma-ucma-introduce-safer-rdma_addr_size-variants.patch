@@ -1,0 +1,186 @@
+From 84652aefb347297aa08e91e283adf7b18f77c2d5 Mon Sep 17 00:00:00 2001
+From: Roland Dreier <roland@purestorage.com>
+Date: Wed, 28 Mar 2018 11:27:22 -0700
+Subject: RDMA/ucma: Introduce safer rdma_addr_size() variants
+
+From: Roland Dreier <roland@purestorage.com>
+
+commit 84652aefb347297aa08e91e283adf7b18f77c2d5 upstream.
+
+There are several places in the ucma ABI where userspace can pass in a
+sockaddr but set the address family to AF_IB.  When that happens,
+rdma_addr_size() will return a size bigger than sizeof struct sockaddr_in6,
+and the ucma kernel code might end up copying past the end of a buffer
+not sized for a struct sockaddr_ib.
+
+Fix this by introducing new variants
+
+    int rdma_addr_size_in6(struct sockaddr_in6 *addr);
+    int rdma_addr_size_kss(struct __kernel_sockaddr_storage *addr);
+
+that are type-safe for the types used in the ucma ABI and return 0 if the
+size computed is bigger than the size of the type passed in.  We can use
+these new variants to check what size userspace has passed in before
+copying any addresses.
+
+Reported-by: <syzbot+6800425d54ed3ed8135d@syzkaller.appspotmail.com>
+Signed-off-by: Roland Dreier <roland@purestorage.com>
+Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/infiniband/core/addr.c |   16 ++++++++++++++++
+ drivers/infiniband/core/ucma.c |   34 +++++++++++++++++-----------------
+ include/rdma/ib_addr.h         |    2 ++
+ 3 files changed, 35 insertions(+), 17 deletions(-)
+
+--- a/drivers/infiniband/core/addr.c
++++ b/drivers/infiniband/core/addr.c
+@@ -209,6 +209,22 @@ int rdma_addr_size(struct sockaddr *addr
+ }
+ EXPORT_SYMBOL(rdma_addr_size);
+ 
++int rdma_addr_size_in6(struct sockaddr_in6 *addr)
++{
++	int ret = rdma_addr_size((struct sockaddr *) addr);
++
++	return ret <= sizeof(*addr) ? ret : 0;
++}
++EXPORT_SYMBOL(rdma_addr_size_in6);
++
++int rdma_addr_size_kss(struct __kernel_sockaddr_storage *addr)
++{
++	int ret = rdma_addr_size((struct sockaddr *) addr);
++
++	return ret <= sizeof(*addr) ? ret : 0;
++}
++EXPORT_SYMBOL(rdma_addr_size_kss);
++
+ static struct rdma_addr_client self;
+ 
+ void rdma_addr_register_client(struct rdma_addr_client *client)
+--- a/drivers/infiniband/core/ucma.c
++++ b/drivers/infiniband/core/ucma.c
+@@ -630,6 +630,9 @@ static ssize_t ucma_bind_ip(struct ucma_
+ 	if (copy_from_user(&cmd, inbuf, sizeof(cmd)))
+ 		return -EFAULT;
+ 
++	if (!rdma_addr_size_in6(&cmd.addr))
++		return -EINVAL;
++
+ 	ctx = ucma_get_ctx(file, cmd.id);
+ 	if (IS_ERR(ctx))
+ 		return PTR_ERR(ctx);
+@@ -643,22 +646,21 @@ static ssize_t ucma_bind(struct ucma_fil
+ 			 int in_len, int out_len)
+ {
+ 	struct rdma_ucm_bind cmd;
+-	struct sockaddr *addr;
+ 	struct ucma_context *ctx;
+ 	int ret;
+ 
+ 	if (copy_from_user(&cmd, inbuf, sizeof(cmd)))
+ 		return -EFAULT;
+ 
+-	addr = (struct sockaddr *) &cmd.addr;
+-	if (cmd.reserved || !cmd.addr_size || (cmd.addr_size != rdma_addr_size(addr)))
++	if (cmd.reserved || !cmd.addr_size ||
++	    cmd.addr_size != rdma_addr_size_kss(&cmd.addr))
+ 		return -EINVAL;
+ 
+ 	ctx = ucma_get_ctx(file, cmd.id);
+ 	if (IS_ERR(ctx))
+ 		return PTR_ERR(ctx);
+ 
+-	ret = rdma_bind_addr(ctx->cm_id, addr);
++	ret = rdma_bind_addr(ctx->cm_id, (struct sockaddr *) &cmd.addr);
+ 	ucma_put_ctx(ctx);
+ 	return ret;
+ }
+@@ -668,23 +670,22 @@ static ssize_t ucma_resolve_ip(struct uc
+ 			       int in_len, int out_len)
+ {
+ 	struct rdma_ucm_resolve_ip cmd;
+-	struct sockaddr *src, *dst;
+ 	struct ucma_context *ctx;
+ 	int ret;
+ 
+ 	if (copy_from_user(&cmd, inbuf, sizeof(cmd)))
+ 		return -EFAULT;
+ 
+-	src = (struct sockaddr *) &cmd.src_addr;
+-	dst = (struct sockaddr *) &cmd.dst_addr;
+-	if (!rdma_addr_size(src) || !rdma_addr_size(dst))
++	if (!rdma_addr_size_in6(&cmd.src_addr) ||
++	    !rdma_addr_size_in6(&cmd.dst_addr))
+ 		return -EINVAL;
+ 
+ 	ctx = ucma_get_ctx(file, cmd.id);
+ 	if (IS_ERR(ctx))
+ 		return PTR_ERR(ctx);
+ 
+-	ret = rdma_resolve_addr(ctx->cm_id, src, dst, cmd.timeout_ms);
++	ret = rdma_resolve_addr(ctx->cm_id, (struct sockaddr *) &cmd.src_addr,
++				(struct sockaddr *) &cmd.dst_addr, cmd.timeout_ms);
+ 	ucma_put_ctx(ctx);
+ 	return ret;
+ }
+@@ -694,24 +695,23 @@ static ssize_t ucma_resolve_addr(struct
+ 				 int in_len, int out_len)
+ {
+ 	struct rdma_ucm_resolve_addr cmd;
+-	struct sockaddr *src, *dst;
+ 	struct ucma_context *ctx;
+ 	int ret;
+ 
+ 	if (copy_from_user(&cmd, inbuf, sizeof(cmd)))
+ 		return -EFAULT;
+ 
+-	src = (struct sockaddr *) &cmd.src_addr;
+-	dst = (struct sockaddr *) &cmd.dst_addr;
+-	if (cmd.reserved || (cmd.src_size && (cmd.src_size != rdma_addr_size(src))) ||
+-	    !cmd.dst_size || (cmd.dst_size != rdma_addr_size(dst)))
++	if (cmd.reserved ||
++	    (cmd.src_size && (cmd.src_size != rdma_addr_size_kss(&cmd.src_addr))) ||
++	    !cmd.dst_size || (cmd.dst_size != rdma_addr_size_kss(&cmd.dst_addr)))
+ 		return -EINVAL;
+ 
+ 	ctx = ucma_get_ctx(file, cmd.id);
+ 	if (IS_ERR(ctx))
+ 		return PTR_ERR(ctx);
+ 
+-	ret = rdma_resolve_addr(ctx->cm_id, src, dst, cmd.timeout_ms);
++	ret = rdma_resolve_addr(ctx->cm_id, (struct sockaddr *) &cmd.src_addr,
++				(struct sockaddr *) &cmd.dst_addr, cmd.timeout_ms);
+ 	ucma_put_ctx(ctx);
+ 	return ret;
+ }
+@@ -1414,7 +1414,7 @@ static ssize_t ucma_join_ip_multicast(st
+ 	join_cmd.response = cmd.response;
+ 	join_cmd.uid = cmd.uid;
+ 	join_cmd.id = cmd.id;
+-	join_cmd.addr_size = rdma_addr_size((struct sockaddr *) &cmd.addr);
++	join_cmd.addr_size = rdma_addr_size_in6(&cmd.addr);
+ 	if (!join_cmd.addr_size)
+ 		return -EINVAL;
+ 
+@@ -1433,7 +1433,7 @@ static ssize_t ucma_join_multicast(struc
+ 	if (copy_from_user(&cmd, inbuf, sizeof(cmd)))
+ 		return -EFAULT;
+ 
+-	if (!rdma_addr_size((struct sockaddr *)&cmd.addr))
++	if (!rdma_addr_size_kss(&cmd.addr))
+ 		return -EINVAL;
+ 
+ 	return ucma_process_join(file, &cmd, out_len);
+--- a/include/rdma/ib_addr.h
++++ b/include/rdma/ib_addr.h
+@@ -129,6 +129,8 @@ int rdma_copy_addr(struct rdma_dev_addr
+ 	      const unsigned char *dst_dev_addr);
+ 
+ int rdma_addr_size(struct sockaddr *addr);
++int rdma_addr_size_in6(struct sockaddr_in6 *addr);
++int rdma_addr_size_kss(struct __kernel_sockaddr_storage *addr);
+ 
+ int rdma_addr_find_smac_by_sgid(union ib_gid *sgid, u8 *smac, u16 *vlan_id);
+ int rdma_addr_find_l2_eth_by_grh(const union ib_gid *sgid,
