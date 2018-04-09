@@ -1,0 +1,107 @@
+From foo@baz Mon Apr  9 17:09:24 CEST 2018
+From: Florian Westphal <fw@strlen.de>
+Date: Sun, 21 May 2017 12:52:56 +0200
+Subject: netfilter: conntrack: don't call iter for non-confirmed conntracks
+
+From: Florian Westphal <fw@strlen.de>
+
+
+[ Upstream commit b0feacaad13a0aa9657c37ed80991575981e2e3b ]
+
+nf_ct_iterate_cleanup_net currently calls iter() callback also for
+conntracks on the unconfirmed list, but this is unsafe.
+
+Acesses to nf_conn are fine, but some users access the extension area
+in the iter() callback, but that does only work reliably for confirmed
+conntracks (ct->ext can be reallocated at any time for unconfirmed
+conntrack).
+
+The seond issue is that there is a short window where a conntrack entry
+is neither on the list nor in the table: To confirm an entry, it is first
+removed from the unconfirmed list, then insert into the table.
+
+Fix this by iterating the unconfirmed list first and marking all entries
+as dying, then wait for rcu grace period.
+
+This makes sure all entries that were about to be confirmed either are
+in the main table, or will be dropped soon.
+
+Signed-off-by: Florian Westphal <fw@strlen.de>
+Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+Signed-off-by: Sasha Levin <alexander.levin@microsoft.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/netfilter/nf_conntrack_core.c |   39 ++++++++++++++++++++++++++++----------
+ 1 file changed, 29 insertions(+), 10 deletions(-)
+
+--- a/net/netfilter/nf_conntrack_core.c
++++ b/net/netfilter/nf_conntrack_core.c
+@@ -1542,7 +1542,6 @@ get_next_corpse(struct net *net, int (*i
+ 	struct nf_conntrack_tuple_hash *h;
+ 	struct nf_conn *ct;
+ 	struct hlist_nulls_node *n;
+-	int cpu;
+ 	spinlock_t *lockp;
+ 
+ 	for (; *bucket < nf_conntrack_htable_size; (*bucket)++) {
+@@ -1564,24 +1563,40 @@ get_next_corpse(struct net *net, int (*i
+ 		cond_resched();
+ 	}
+ 
++	return NULL;
++found:
++	atomic_inc(&ct->ct_general.use);
++	spin_unlock(lockp);
++	local_bh_enable();
++	return ct;
++}
++
++static void
++__nf_ct_unconfirmed_destroy(struct net *net)
++{
++	int cpu;
++
+ 	for_each_possible_cpu(cpu) {
+-		struct ct_pcpu *pcpu = per_cpu_ptr(net->ct.pcpu_lists, cpu);
++		struct nf_conntrack_tuple_hash *h;
++		struct hlist_nulls_node *n;
++		struct ct_pcpu *pcpu;
++
++		pcpu = per_cpu_ptr(net->ct.pcpu_lists, cpu);
+ 
+ 		spin_lock_bh(&pcpu->lock);
+ 		hlist_nulls_for_each_entry(h, n, &pcpu->unconfirmed, hnnode) {
++			struct nf_conn *ct;
++
+ 			ct = nf_ct_tuplehash_to_ctrack(h);
+-			if (iter(ct, data))
+-				set_bit(IPS_DYING_BIT, &ct->status);
++
++			/* we cannot call iter() on unconfirmed list, the
++			 * owning cpu can reallocate ct->ext at any time.
++			 */
++			set_bit(IPS_DYING_BIT, &ct->status);
+ 		}
+ 		spin_unlock_bh(&pcpu->lock);
+ 		cond_resched();
+ 	}
+-	return NULL;
+-found:
+-	atomic_inc(&ct->ct_general.use);
+-	spin_unlock(lockp);
+-	local_bh_enable();
+-	return ct;
+ }
+ 
+ void nf_ct_iterate_cleanup(struct net *net,
+@@ -1596,6 +1611,10 @@ void nf_ct_iterate_cleanup(struct net *n
+ 	if (atomic_read(&net->ct.count) == 0)
+ 		return;
+ 
++	__nf_ct_unconfirmed_destroy(net);
++
++	synchronize_net();
++
+ 	while ((ct = get_next_corpse(net, iter, data, &bucket)) != NULL) {
+ 		/* Time to push up daises... */
+ 
