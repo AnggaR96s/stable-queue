@@ -1,0 +1,145 @@
+From foo@baz Tue Apr 24 15:29:20 CEST 2018
+From: "Michael J. Ruhl" <michael.j.ruhl@intel.com>
+Date: Thu, 1 Feb 2018 10:43:42 -0800
+Subject: IB/hfi1: Re-order IRQ cleanup to address driver cleanup race
+
+From: "Michael J. Ruhl" <michael.j.ruhl@intel.com>
+
+
+[ Upstream commit 82a979265638c505e12fbe7ba40980dc0901436d ]
+
+The pci_request_irq() interfaces always adds the IRQF_SHARED bit to
+all IRQ requests.
+
+When the kernel is built with CONFIG_DEBUG_SHIRQ config flag, if the
+IRQF_SHARED bit is set, a call to the IRQ handler is made from the
+__free_irq() function. This is testing a race condition between the
+IRQ cleanup and an IRQ racing the cleanup.  The HFI driver should be
+able to handle this race, but does not.
+
+This race can cause traces that start with this footprint:
+
+BUG: unable to handle kernel NULL pointer dereference at   (null)
+Call Trace:
+ <hfi1 irq handler>
+ ...
+ __free_irq+0x1b3/0x2d0
+ free_irq+0x35/0x70
+ pci_free_irq+0x1c/0x30
+ clean_up_interrupts+0x53/0xf0 [hfi1]
+ hfi1_start_cleanup+0x122/0x190 [hfi1]
+ postinit_cleanup+0x1d/0x280 [hfi1]
+ remove_one+0x233/0x250 [hfi1]
+ pci_device_remove+0x39/0xc0
+
+Export IRQ cleanup function so it can be called from other modules.
+
+Using the exported cleanup function:
+
+  Re-order the driver cleanup code to clean up IRQ resources before
+  other resources, eliminating the race.
+
+  Re-order error path for init so that the race does not occur.
+
+Reduce severity on spurious error message for SDMA IRQs to info.
+
+Reviewed-by: Alex Estrin <alex.estrin@intel.com>
+Reviewed-by: Patel Jay P <jay.p.patel@intel.com>
+Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+Signed-off-by: Michael J. Ruhl <michael.j.ruhl@intel.com>
+Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+Signed-off-by: Sasha Levin <alexander.levin@microsoft.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/infiniband/hw/hfi1/chip.c |   18 ++++++++++++------
+ drivers/infiniband/hw/hfi1/hfi.h  |    1 +
+ drivers/infiniband/hw/hfi1/init.c |    4 +++-
+ 3 files changed, 16 insertions(+), 7 deletions(-)
+
+--- a/drivers/infiniband/hw/hfi1/chip.c
++++ b/drivers/infiniband/hw/hfi1/chip.c
+@@ -8294,8 +8294,8 @@ static irqreturn_t sdma_interrupt(int ir
+ 		/* handle the interrupt(s) */
+ 		sdma_engine_interrupt(sde, status);
+ 	} else {
+-		dd_dev_err_ratelimited(dd, "SDMA engine %u interrupt, but no status bits set\n",
+-				       sde->this_idx);
++		dd_dev_info_ratelimited(dd, "SDMA engine %u interrupt, but no status bits set\n",
++					sde->this_idx);
+ 	}
+ 	return IRQ_HANDLED;
+ }
+@@ -12967,7 +12967,14 @@ static void disable_intx(struct pci_dev
+ 	pci_intx(pdev, 0);
+ }
+ 
+-static void clean_up_interrupts(struct hfi1_devdata *dd)
++/**
++ * hfi1_clean_up_interrupts() - Free all IRQ resources
++ * @dd: valid device data data structure
++ *
++ * Free the MSI or INTx IRQs and assoicated PCI resources,
++ * if they have been allocated.
++ */
++void hfi1_clean_up_interrupts(struct hfi1_devdata *dd)
+ {
+ 	int i;
+ 
+@@ -13344,7 +13351,7 @@ static int set_up_interrupts(struct hfi1
+ 	return 0;
+ 
+ fail:
+-	clean_up_interrupts(dd);
++	hfi1_clean_up_interrupts(dd);
+ 	return ret;
+ }
+ 
+@@ -14770,7 +14777,6 @@ void hfi1_start_cleanup(struct hfi1_devd
+ 	aspm_exit(dd);
+ 	free_cntrs(dd);
+ 	free_rcverr(dd);
+-	clean_up_interrupts(dd);
+ 	finish_chip_resources(dd);
+ }
+ 
+@@ -15229,7 +15235,7 @@ bail_free_rcverr:
+ bail_free_cntrs:
+ 	free_cntrs(dd);
+ bail_clear_intr:
+-	clean_up_interrupts(dd);
++	hfi1_clean_up_interrupts(dd);
+ bail_cleanup:
+ 	hfi1_pcie_ddcleanup(dd);
+ bail_free:
+--- a/drivers/infiniband/hw/hfi1/hfi.h
++++ b/drivers/infiniband/hw/hfi1/hfi.h
+@@ -1954,6 +1954,7 @@ void hfi1_verbs_unregister_sysfs(struct
+ int qsfp_dump(struct hfi1_pportdata *ppd, char *buf, int len);
+ 
+ int hfi1_pcie_init(struct pci_dev *pdev, const struct pci_device_id *ent);
++void hfi1_clean_up_interrupts(struct hfi1_devdata *dd);
+ void hfi1_pcie_cleanup(struct pci_dev *pdev);
+ int hfi1_pcie_ddinit(struct hfi1_devdata *dd, struct pci_dev *pdev);
+ void hfi1_pcie_ddcleanup(struct hfi1_devdata *);
+--- a/drivers/infiniband/hw/hfi1/init.c
++++ b/drivers/infiniband/hw/hfi1/init.c
+@@ -1039,8 +1039,9 @@ static void shutdown_device(struct hfi1_
+ 	}
+ 	dd->flags &= ~HFI1_INITTED;
+ 
+-	/* mask interrupts, but not errors */
++	/* mask and clean up interrupts, but not errors */
+ 	set_intr_state(dd, 0);
++	hfi1_clean_up_interrupts(dd);
+ 
+ 	for (pidx = 0; pidx < dd->num_pports; ++pidx) {
+ 		ppd = dd->pport + pidx;
+@@ -1696,6 +1697,7 @@ static int init_one(struct pci_dev *pdev
+ 		dd_dev_err(dd, "Failed to create /dev devices: %d\n", -j);
+ 
+ 	if (initfail || ret) {
++		hfi1_clean_up_interrupts(dd);
+ 		stop_timers(dd);
+ 		flush_workqueue(ib_wq);
+ 		for (pidx = 0; pidx < dd->num_pports; ++pidx) {

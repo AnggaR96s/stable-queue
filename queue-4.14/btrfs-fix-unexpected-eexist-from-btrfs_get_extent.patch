@@ -1,0 +1,150 @@
+From foo@baz Tue Apr 24 15:29:20 CEST 2018
+From: Liu Bo <bo.li.liu@oracle.com>
+Date: Fri, 5 Jan 2018 12:51:09 -0700
+Subject: Btrfs: fix unexpected EEXIST from btrfs_get_extent
+
+From: Liu Bo <bo.li.liu@oracle.com>
+
+
+[ Upstream commit 18e83ac75bfe67009c4ddcdd581bba8eb16f4030 ]
+
+This fixes a corner case that is caused by a race of dio write vs dio
+read/write.
+
+Here is how the race could happen.
+
+Suppose that no extent map has been loaded into memory yet.
+There is a file extent [0, 32K), two jobs are running concurrently
+against it, t1 is doing dio write to [8K, 32K) and t2 is doing dio
+read from [0, 4K) or [4K, 8K).
+
+t1 goes ahead of t2 and splits em [0, 32K) to em [0K, 8K) and [8K 32K).
+
+------------------------------------------------------
+             t1                                t2
+      btrfs_get_blocks_direct()         btrfs_get_blocks_direct()
+       -> btrfs_get_extent()              -> btrfs_get_extent()
+           -> lookup_extent_mapping()
+           -> add_extent_mapping()            -> lookup_extent_mapping()
+              # load [0, 32K)
+       -> btrfs_new_extent_direct()
+           -> btrfs_drop_extent_cache()
+              # split [0, 32K) and
+	      # drop [8K, 32K)
+           -> add_extent_mapping()
+              # add [8K, 32K)
+                                              -> add_extent_mapping()
+                                                 # handle -EEXIST when adding
+                                                 # [0, 32K)
+------------------------------------------------------
+About how t2(dio read/write) runs into -EEXIST:
+
+a) add_extent_mapping() gets -EEXIST for adding em [0, 32k),
+
+b) search_extent_mapping() then returns [0, 8k) as the existing em,
+   even though start == existing->start, em is [0, 32k) so that
+   extent_map_end(em) > extent_map_end(existing), i.e. 32k > 8k,
+
+c) then it goes thru merge_extent_mapping() which tries to add a [8k, 8k)
+   (with a length 0) and returns -EEXIST as [8k, 32k) is already in tree,
+
+d) so btrfs_get_extent() ends up returning -EEXIST to dio read/write,
+   which is confusing applications.
+
+Here I conclude all the possible situations,
+1) start < existing->start
+
+            +-----------+em+-----------+
++--prev---+ |     +-------------+      |
+|         | |     |             |      |
++---------+ +     +---+existing++      ++
+                +
+                |
+                +
+             start
+
+2) start == existing->start
+
+      +------------em------------+
+      |     +-------------+      |
+      |     |             |      |
+      +     +----existing-+      +
+            |
+            |
+            +
+         start
+
+3) start > existing->start && start < (existing->start + existing->len)
+
+      +------------em------------+
+      |     +-------------+      |
+      |     |             |      |
+      +     +----existing-+      +
+               |
+               |
+               +
+             start
+
+4) start >= (existing->start + existing->len)
+
++-----------+em+-----------+
+|     +-------------+      | +--next---+
+|     |             |      | |         |
++     +---+existing++      + +---------+
+                      +
+                      |
+                      +
+                   start
+
+As we can see, it turns out that if start is within existing em (front
+inclusive), then the existing em should be returned as is, otherwise,
+we try our best to merge candidate em with sibling ems to form a
+larger em (in order to reduce the total number of em).
+
+Reported-by: David Vallender <david.vallender@landmark.co.uk>
+Signed-off-by: Liu Bo <bo.li.liu@oracle.com>
+Reviewed-by: Josef Bacik <jbacik@fb.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+
+Signed-off-by: Sasha Levin <alexander.levin@microsoft.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/btrfs/inode.c |   17 +++--------------
+ 1 file changed, 3 insertions(+), 14 deletions(-)
+
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -7265,19 +7265,12 @@ insert:
+ 		 * existing will always be non-NULL, since there must be
+ 		 * extent causing the -EEXIST.
+ 		 */
+-		if (existing->start == em->start &&
+-		    extent_map_end(existing) >= extent_map_end(em) &&
+-		    em->block_start == existing->block_start) {
+-			/*
+-			 * The existing extent map already encompasses the
+-			 * entire extent map we tried to add.
+-			 */
++		if (start >= existing->start &&
++		    start < extent_map_end(existing)) {
+ 			free_extent_map(em);
+ 			em = existing;
+ 			err = 0;
+-
+-		} else if (start >= extent_map_end(existing) ||
+-		    start <= existing->start) {
++		} else {
+ 			/*
+ 			 * The existing extent map is the one nearest to
+ 			 * the [start, start + len) range which overlaps
+@@ -7289,10 +7282,6 @@ insert:
+ 				free_extent_map(em);
+ 				em = NULL;
+ 			}
+-		} else {
+-			free_extent_map(em);
+-			em = existing;
+-			err = 0;
+ 		}
+ 	}
+ 	write_unlock(&em_tree->lock);
