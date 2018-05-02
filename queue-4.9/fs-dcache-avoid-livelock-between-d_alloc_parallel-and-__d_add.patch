@@ -1,0 +1,83 @@
+From foo@baz Wed May  2 10:53:11 PDT 2018
+From: Will Deacon <will.deacon@arm.com>
+Date: Mon, 19 Feb 2018 14:55:54 +0000
+Subject: fs: dcache: Avoid livelock between d_alloc_parallel and __d_add
+
+From: Will Deacon <will.deacon@arm.com>
+
+[ Upstream commit 015555fd4d2930bc0c86952c46ad88b3392f66e4 ]
+
+If d_alloc_parallel runs concurrently with __d_add, it is possible for
+d_alloc_parallel to continuously retry whilst i_dir_seq has been
+incremented to an odd value by __d_add:
+
+CPU0:
+__d_add
+	n = start_dir_add(dir);
+		cmpxchg(&dir->i_dir_seq, n, n + 1) == n
+
+CPU1:
+d_alloc_parallel
+retry:
+	seq = smp_load_acquire(&parent->d_inode->i_dir_seq) & ~1;
+	hlist_bl_lock(b);
+		bit_spin_lock(0, (unsigned long *)b); // Always succeeds
+
+CPU0:
+	__d_lookup_done(dentry)
+		hlist_bl_lock
+			bit_spin_lock(0, (unsigned long *)b); // Never succeeds
+
+CPU1:
+	if (unlikely(parent->d_inode->i_dir_seq != seq)) {
+		hlist_bl_unlock(b);
+		goto retry;
+	}
+
+Since the simple bit_spin_lock used to implement hlist_bl_lock does not
+provide any fairness guarantees, then CPU1 can starve CPU0 of the lock
+and prevent it from reaching end_dir_add(dir), therefore CPU1 cannot
+exit its retry loop because the sequence number always has the bottom
+bit set.
+
+This patch resolves the livelock by not taking hlist_bl_lock in
+d_alloc_parallel if the sequence counter is odd, since any subsequent
+masked comparison with i_dir_seq will fail anyway.
+
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Reported-by: Naresh Madhusudana <naresh.madhusudana@arm.com>
+Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Reviewed-by: Matthew Wilcox <mawilcox@microsoft.com>
+Signed-off-by: Will Deacon <will.deacon@arm.com>
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+Signed-off-by: Sasha Levin <alexander.levin@microsoft.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/dcache.c |    8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@ -2452,7 +2452,7 @@ struct dentry *d_alloc_parallel(struct d
+ 
+ retry:
+ 	rcu_read_lock();
+-	seq = smp_load_acquire(&parent->d_inode->i_dir_seq) & ~1;
++	seq = smp_load_acquire(&parent->d_inode->i_dir_seq);
+ 	r_seq = read_seqbegin(&rename_lock);
+ 	dentry = __d_lookup_rcu(parent, name, &d_seq);
+ 	if (unlikely(dentry)) {
+@@ -2473,6 +2473,12 @@ retry:
+ 		rcu_read_unlock();
+ 		goto retry;
+ 	}
++
++	if (unlikely(seq & 1)) {
++		rcu_read_unlock();
++		goto retry;
++	}
++
+ 	hlist_bl_lock(b);
+ 	if (unlikely(parent->d_inode->i_dir_seq != seq)) {
+ 		hlist_bl_unlock(b);
