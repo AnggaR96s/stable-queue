@@ -1,0 +1,155 @@
+From 26bff1bd74a4f7417509a83295614e9dab995b2a Mon Sep 17 00:00:00 2001
+From: Raju Rangoju <rajur@chelsio.com>
+Date: Mon, 23 Apr 2018 21:42:37 +0530
+Subject: RDMA/cxgb4: release hw resources on device removal
+
+From: Raju Rangoju <rajur@chelsio.com>
+
+commit 26bff1bd74a4f7417509a83295614e9dab995b2a upstream.
+
+The c4iw_rdev_close() logic was not releasing all the hw
+resources (PBL and RQT memory) during the device removal
+event (driver unload / system reboot). This can cause panic
+in gen_pool_destroy().
+
+The module remove function will wait for all the hw
+resources to be released during the device removal event.
+
+Fixes c12a67fe(iw_cxgb4: free EQ queue memory on last deref)
+Signed-off-by: Raju Rangoju <rajur@chelsio.com>
+Reviewed-by: Steve Wise <swise@opengridcomputing.com>
+Cc: stable@vger.kernel.org
+Signed-off-by: Doug Ledford <dledford@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/infiniband/hw/cxgb4/device.c   |    9 ++++++++-
+ drivers/infiniband/hw/cxgb4/iw_cxgb4.h |    4 ++++
+ drivers/infiniband/hw/cxgb4/resource.c |   26 ++++++++++++++++++++++++--
+ 3 files changed, 36 insertions(+), 3 deletions(-)
+
+--- a/drivers/infiniband/hw/cxgb4/device.c
++++ b/drivers/infiniband/hw/cxgb4/device.c
+@@ -856,6 +856,11 @@ static int c4iw_rdev_open(struct c4iw_rd
+ 
+ 	rdev->status_page->db_off = 0;
+ 
++	init_completion(&rdev->rqt_compl);
++	init_completion(&rdev->pbl_compl);
++	kref_init(&rdev->rqt_kref);
++	kref_init(&rdev->pbl_kref);
++
+ 	return 0;
+ err_free_status_page:
+ 	free_page((unsigned long)rdev->status_page);
+@@ -872,12 +877,14 @@ destroy_resource:
+ 
+ static void c4iw_rdev_close(struct c4iw_rdev *rdev)
+ {
+-	destroy_workqueue(rdev->free_workq);
+ 	kfree(rdev->wr_log);
+ 	free_page((unsigned long)rdev->status_page);
+ 	c4iw_pblpool_destroy(rdev);
+ 	c4iw_rqtpool_destroy(rdev);
++	wait_for_completion(&rdev->pbl_compl);
++	wait_for_completion(&rdev->rqt_compl);
+ 	c4iw_destroy_resource(&rdev->resource);
++	destroy_workqueue(rdev->free_workq);
+ }
+ 
+ static void c4iw_dealloc(struct uld_ctx *ctx)
+--- a/drivers/infiniband/hw/cxgb4/iw_cxgb4.h
++++ b/drivers/infiniband/hw/cxgb4/iw_cxgb4.h
+@@ -186,6 +186,10 @@ struct c4iw_rdev {
+ 	struct wr_log_entry *wr_log;
+ 	int wr_log_size;
+ 	struct workqueue_struct *free_workq;
++	struct completion rqt_compl;
++	struct completion pbl_compl;
++	struct kref rqt_kref;
++	struct kref pbl_kref;
+ };
+ 
+ static inline int c4iw_fatal_error(struct c4iw_rdev *rdev)
+--- a/drivers/infiniband/hw/cxgb4/resource.c
++++ b/drivers/infiniband/hw/cxgb4/resource.c
+@@ -260,12 +260,22 @@ u32 c4iw_pblpool_alloc(struct c4iw_rdev
+ 		rdev->stats.pbl.cur += roundup(size, 1 << MIN_PBL_SHIFT);
+ 		if (rdev->stats.pbl.cur > rdev->stats.pbl.max)
+ 			rdev->stats.pbl.max = rdev->stats.pbl.cur;
++		kref_get(&rdev->pbl_kref);
+ 	} else
+ 		rdev->stats.pbl.fail++;
+ 	mutex_unlock(&rdev->stats.lock);
+ 	return (u32)addr;
+ }
+ 
++static void destroy_pblpool(struct kref *kref)
++{
++	struct c4iw_rdev *rdev;
++
++	rdev = container_of(kref, struct c4iw_rdev, pbl_kref);
++	gen_pool_destroy(rdev->pbl_pool);
++	complete(&rdev->pbl_compl);
++}
++
+ void c4iw_pblpool_free(struct c4iw_rdev *rdev, u32 addr, int size)
+ {
+ 	PDBG("%s addr 0x%x size %d\n", __func__, addr, size);
+@@ -273,6 +283,7 @@ void c4iw_pblpool_free(struct c4iw_rdev
+ 	rdev->stats.pbl.cur -= roundup(size, 1 << MIN_PBL_SHIFT);
+ 	mutex_unlock(&rdev->stats.lock);
+ 	gen_pool_free(rdev->pbl_pool, (unsigned long)addr, size);
++	kref_put(&rdev->pbl_kref, destroy_pblpool);
+ }
+ 
+ int c4iw_pblpool_create(struct c4iw_rdev *rdev)
+@@ -312,7 +323,7 @@ int c4iw_pblpool_create(struct c4iw_rdev
+ 
+ void c4iw_pblpool_destroy(struct c4iw_rdev *rdev)
+ {
+-	gen_pool_destroy(rdev->pbl_pool);
++	kref_put(&rdev->pbl_kref, destroy_pblpool);
+ }
+ 
+ /*
+@@ -333,12 +344,22 @@ u32 c4iw_rqtpool_alloc(struct c4iw_rdev
+ 		rdev->stats.rqt.cur += roundup(size << 6, 1 << MIN_RQT_SHIFT);
+ 		if (rdev->stats.rqt.cur > rdev->stats.rqt.max)
+ 			rdev->stats.rqt.max = rdev->stats.rqt.cur;
++		kref_get(&rdev->rqt_kref);
+ 	} else
+ 		rdev->stats.rqt.fail++;
+ 	mutex_unlock(&rdev->stats.lock);
+ 	return (u32)addr;
+ }
+ 
++static void destroy_rqtpool(struct kref *kref)
++{
++	struct c4iw_rdev *rdev;
++
++	rdev = container_of(kref, struct c4iw_rdev, rqt_kref);
++	gen_pool_destroy(rdev->rqt_pool);
++	complete(&rdev->rqt_compl);
++}
++
+ void c4iw_rqtpool_free(struct c4iw_rdev *rdev, u32 addr, int size)
+ {
+ 	PDBG("%s addr 0x%x size %d\n", __func__, addr, size << 6);
+@@ -346,6 +367,7 @@ void c4iw_rqtpool_free(struct c4iw_rdev
+ 	rdev->stats.rqt.cur -= roundup(size << 6, 1 << MIN_RQT_SHIFT);
+ 	mutex_unlock(&rdev->stats.lock);
+ 	gen_pool_free(rdev->rqt_pool, (unsigned long)addr, size << 6);
++	kref_put(&rdev->rqt_kref, destroy_rqtpool);
+ }
+ 
+ int c4iw_rqtpool_create(struct c4iw_rdev *rdev)
+@@ -383,7 +405,7 @@ int c4iw_rqtpool_create(struct c4iw_rdev
+ 
+ void c4iw_rqtpool_destroy(struct c4iw_rdev *rdev)
+ {
+-	gen_pool_destroy(rdev->rqt_pool);
++	kref_put(&rdev->rqt_kref, destroy_rqtpool);
+ }
+ 
+ /*
