@@ -1,0 +1,102 @@
+From c7be96af89d4b53211862d8599b2430e8900ed92 Mon Sep 17 00:00:00 2001
+From: Waiman Long <Waiman.Long@hpe.com>
+Date: Wed, 14 Dec 2016 15:04:10 -0800
+Subject: signals: avoid unnecessary taking of sighand->siglock
+
+From: Waiman Long <Waiman.Long@hpe.com>
+
+commit c7be96af89d4b53211862d8599b2430e8900ed92 upstream.
+
+When running certain database workload on a high-end system with many
+CPUs, it was found that spinlock contention in the sigprocmask syscalls
+became a significant portion of the overall CPU cycles as shown below.
+
+  9.30%  9.30%  905387  dataserver  /proc/kcore 0x7fff8163f4d2
+  [k] _raw_spin_lock_irq
+            |
+            ---_raw_spin_lock_irq
+               |
+               |--99.34%-- __set_current_blocked
+               |          sigprocmask
+               |          sys_rt_sigprocmask
+               |          system_call_fastpath
+               |          |
+               |          |--50.63%-- __swapcontext
+               |          |          |
+               |          |          |--99.91%-- upsleepgeneric
+               |          |
+               |          |--49.36%-- __setcontext
+               |          |          ktskRun
+
+Looking further into the swapcontext function in glibc, it was found that
+the function always call sigprocmask() without checking if there are
+changes in the signal mask.
+
+A check was added to the __set_current_blocked() function to avoid taking
+the sighand->siglock spinlock if there is no change in the signal mask.
+This will prevent unneeded spinlock contention when many threads are
+trying to call sigprocmask().
+
+With this patch applied, the spinlock contention in sigprocmask() was
+gone.
+
+Link: http://lkml.kernel.org/r/1474979209-11867-1-git-send-email-Waiman.Long@hpe.com
+Signed-off-by: Waiman Long <Waiman.Long@hpe.com>
+Acked-by: Oleg Nesterov <oleg@redhat.com>
+Cc: Ingo Molnar <mingo@kernel.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Stas Sergeev <stsp@list.ru>
+Cc: Scott J Norton <scott.norton@hpe.com>
+Cc: Douglas Hatch <doug.hatch@hpe.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ include/linux/signal.h |   17 +++++++++++++++++
+ kernel/signal.c        |    7 +++++++
+ 2 files changed, 24 insertions(+)
+
+--- a/include/linux/signal.h
++++ b/include/linux/signal.h
+@@ -97,6 +97,23 @@ static inline int sigisemptyset(sigset_t
+ 	}
+ }
+ 
++static inline int sigequalsets(const sigset_t *set1, const sigset_t *set2)
++{
++	switch (_NSIG_WORDS) {
++	case 4:
++		return	(set1->sig[3] == set2->sig[3]) &&
++			(set1->sig[2] == set2->sig[2]) &&
++			(set1->sig[1] == set2->sig[1]) &&
++			(set1->sig[0] == set2->sig[0]);
++	case 2:
++		return	(set1->sig[1] == set2->sig[1]) &&
++			(set1->sig[0] == set2->sig[0]);
++	case 1:
++		return	set1->sig[0] == set2->sig[0];
++	}
++	return 0;
++}
++
+ #define sigmask(sig)	(1UL << ((sig) - 1))
+ 
+ #ifndef __HAVE_ARCH_SIG_SETOPS
+--- a/kernel/signal.c
++++ b/kernel/signal.c
+@@ -2495,6 +2495,13 @@ void __set_current_blocked(const sigset_
+ {
+ 	struct task_struct *tsk = current;
+ 
++	/*
++	 * In case the signal mask hasn't changed, there is nothing we need
++	 * to do. The current->blocked shouldn't be modified by other task.
++	 */
++	if (sigequalsets(&tsk->blocked, newset))
++		return;
++
+ 	spin_lock_irq(&tsk->sighand->siglock);
+ 	__set_task_blocked(tsk, newset);
+ 	spin_unlock_irq(&tsk->sighand->siglock);
