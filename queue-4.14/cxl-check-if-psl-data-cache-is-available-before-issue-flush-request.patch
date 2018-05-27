@@ -1,0 +1,127 @@
+From foo@baz Sun May 27 16:52:54 CEST 2018
+From: Vaibhav Jain <vaibhav@linux.vnet.ibm.com>
+Date: Thu, 15 Feb 2018 21:19:24 +0530
+Subject: cxl: Check if PSL data-cache is available before issue flush request
+
+From: Vaibhav Jain <vaibhav@linux.vnet.ibm.com>
+
+[ Upstream commit 94322ed8e857e3b2a33cf75118051af9baaa110f ]
+
+PSL9D doesn't have a data-cache that needs to be flushed before
+resetting the card. However when cxl tries to flush data-cache on such
+a card, it times-out as PSL_Control register never indicates flush
+operation complete due to missing data-cache. This is usually
+indicated in the kernel logs with this message:
+
+"WARNING: cache flush timed out"
+
+To fix this the patch checks PSL_Debug register CDC-Field(BIT:27)
+which indicates the absence of a data-cache and sets a flag
+'no_data_cache' in 'struct cxl_native' to indicate this. When
+cxl_data_cache_flush() is called it checks the flag and if set bails
+out early without requesting a data-cache flush operation to the PSL.
+
+Signed-off-by: Vaibhav Jain <vaibhav@linux.vnet.ibm.com>
+Acked-by: Andrew Donnellan <andrew.donnellan@au1.ibm.com>
+Acked-by: Frederic Barrat <fbarrat@linux.vnet.ibm.com>
+Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Signed-off-by: Sasha Levin <alexander.levin@microsoft.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/misc/cxl/cxl.h    |    4 ++++
+ drivers/misc/cxl/native.c |   11 ++++++++++-
+ drivers/misc/cxl/pci.c    |   19 +++++++++++++------
+ 3 files changed, 27 insertions(+), 7 deletions(-)
+
+--- a/drivers/misc/cxl/cxl.h
++++ b/drivers/misc/cxl/cxl.h
+@@ -365,6 +365,9 @@ static const cxl_p2n_reg_t CXL_PSL_WED_A
+ #define CXL_PSL_TFC_An_AE (1ull << (63-30)) /* Restart PSL with address error */
+ #define CXL_PSL_TFC_An_R  (1ull << (63-31)) /* Restart PSL transaction */
+ 
++/****** CXL_PSL_DEBUG *****************************************************/
++#define CXL_PSL_DEBUG_CDC  (1ull << (63-27)) /* Coherent Data cache support */
++
+ /****** CXL_XSL9_IERAT_ERAT - CAIA 2 **********************************/
+ #define CXL_XSL9_IERAT_MLPID    (1ull << (63-0))  /* Match LPID */
+ #define CXL_XSL9_IERAT_MPID     (1ull << (63-1))  /* Match PID */
+@@ -659,6 +662,7 @@ struct cxl_native {
+ 	irq_hw_number_t err_hwirq;
+ 	unsigned int err_virq;
+ 	u64 ps_off;
++	bool no_data_cache; /* set if no data cache on the card */
+ 	const struct cxl_service_layer_ops *sl_ops;
+ };
+ 
+--- a/drivers/misc/cxl/native.c
++++ b/drivers/misc/cxl/native.c
+@@ -352,8 +352,17 @@ int cxl_data_cache_flush(struct cxl *ada
+ 	u64 reg;
+ 	unsigned long timeout = jiffies + (HZ * CXL_TIMEOUT);
+ 
+-	pr_devel("Flushing data cache\n");
++	/*
++	 * Do a datacache flush only if datacache is available.
++	 * In case of PSL9D datacache absent hence flush operation.
++	 * would timeout.
++	 */
++	if (adapter->native->no_data_cache) {
++		pr_devel("No PSL data cache. Ignoring cache flush req.\n");
++		return 0;
++	}
+ 
++	pr_devel("Flushing data cache\n");
+ 	reg = cxl_p1_read(adapter, CXL_PSL_Control);
+ 	reg |= CXL_PSL_Control_Fr;
+ 	cxl_p1_write(adapter, CXL_PSL_Control, reg);
+--- a/drivers/misc/cxl/pci.c
++++ b/drivers/misc/cxl/pci.c
+@@ -457,6 +457,7 @@ static int init_implementation_adapter_r
+ 	u64 chipid;
+ 	u32 phb_index;
+ 	u64 capp_unit_id;
++	u64 psl_debug;
+ 	int rc;
+ 
+ 	rc = cxl_calc_capp_routing(dev, &chipid, &phb_index, &capp_unit_id);
+@@ -507,6 +508,16 @@ static int init_implementation_adapter_r
+ 	if (cxl_is_power9_dd1())
+ 		cxl_p1_write(adapter, CXL_PSL9_GP_CT, 0x0400000000000001ULL);
+ 
++	/*
++	 * Check if PSL has data-cache. We need to flush adapter datacache
++	 * when as its about to be removed.
++	 */
++	psl_debug = cxl_p1_read(adapter, CXL_PSL9_DEBUG);
++	if (psl_debug & CXL_PSL_DEBUG_CDC) {
++		dev_dbg(&dev->dev, "No data-cache present\n");
++		adapter->native->no_data_cache = true;
++	}
++
+ 	return 0;
+ }
+ 
+@@ -1450,10 +1461,8 @@ int cxl_pci_reset(struct cxl *adapter)
+ 
+ 	/*
+ 	 * The adapter is about to be reset, so ignore errors.
+-	 * Not supported on P9 DD1
+ 	 */
+-	if ((cxl_is_power8()) || (!(cxl_is_power9_dd1())))
+-		cxl_data_cache_flush(adapter);
++	cxl_data_cache_flush(adapter);
+ 
+ 	/* pcie_warm_reset requests a fundamental pci reset which includes a
+ 	 * PERST assert/deassert.  PERST triggers a loading of the image
+@@ -1898,10 +1907,8 @@ static void cxl_pci_remove_adapter(struc
+ 
+ 	/*
+ 	 * Flush adapter datacache as its about to be removed.
+-	 * Not supported on P9 DD1.
+ 	 */
+-	if ((cxl_is_power8()) || (!(cxl_is_power9_dd1())))
+-		cxl_data_cache_flush(adapter);
++	cxl_data_cache_flush(adapter);
+ 
+ 	cxl_deconfigure_adapter(adapter);
+ 
