@@ -1,0 +1,96 @@
+From foo@baz Sun May 27 17:33:38 CEST 2018
+From: Mel Gorman <mgorman@techsingularity.net>
+Date: Wed, 31 Jan 2018 16:19:52 -0800
+Subject: mm: pin address_space before dereferencing it while isolating an LRU page
+
+From: Mel Gorman <mgorman@techsingularity.net>
+
+[ Upstream commit 69d763fc6d3aee787a3e8c8c35092b4f4960fa5d ]
+
+Minchan Kim asked the following question -- what locks protects
+address_space destroying when race happens between inode trauncation and
+__isolate_lru_page? Jan Kara clarified by describing the race as follows
+
+CPU1                                            CPU2
+
+truncate(inode)                                 __isolate_lru_page()
+  ...
+  truncate_inode_page(mapping, page);
+    delete_from_page_cache(page)
+      spin_lock_irqsave(&mapping->tree_lock, flags);
+        __delete_from_page_cache(page, NULL)
+          page_cache_tree_delete(..)
+            ...                                   mapping = page_mapping(page);
+            page->mapping = NULL;
+            ...
+      spin_unlock_irqrestore(&mapping->tree_lock, flags);
+      page_cache_free_page(mapping, page)
+        put_page(page)
+          if (put_page_testzero(page)) -> false
+- inode now has no pages and can be freed including embedded address_space
+
+                                                  if (mapping && !mapping->a_ops->migratepage)
+- we've dereferenced mapping which is potentially already free.
+
+The race is theoretically possible but unlikely.  Before the
+delete_from_page_cache, truncate_cleanup_page is called so the page is
+likely to be !PageDirty or PageWriteback which gets skipped by the only
+caller that checks the mappping in __isolate_lru_page.  Even if the race
+occurs, a substantial amount of work has to happen during a tiny window
+with no preemption but it could potentially be done using a virtual
+machine to artifically slow one CPU or halt it during the critical
+window.
+
+This patch should eliminate the race with truncation by try-locking the
+page before derefencing mapping and aborting if the lock was not
+acquired.  There was a suggestion from Huang Ying to use RCU as a
+side-effect to prevent mapping being freed.  However, I do not like the
+solution as it's an unconventional means of preserving a mapping and
+it's not a context where rcu_read_lock is obviously protecting rcu data.
+
+Link: http://lkml.kernel.org/r/20180104102512.2qos3h5vqzeisrek@techsingularity.net
+Fixes: c82449352854 ("mm: compaction: make isolate_lru_page() filter-aware again")
+Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
+Acked-by: Minchan Kim <minchan@kernel.org>
+Cc: "Huang, Ying" <ying.huang@intel.com>
+Cc: Jan Kara <jack@suse.cz>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Sasha Levin <alexander.levin@microsoft.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ mm/vmscan.c |   14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -1374,6 +1374,7 @@ int __isolate_lru_page(struct page *page
+ 
+ 		if (PageDirty(page)) {
+ 			struct address_space *mapping;
++			bool migrate_dirty;
+ 
+ 			/* ISOLATE_CLEAN means only clean pages */
+ 			if (mode & ISOLATE_CLEAN)
+@@ -1382,10 +1383,19 @@ int __isolate_lru_page(struct page *page
+ 			/*
+ 			 * Only pages without mappings or that have a
+ 			 * ->migratepage callback are possible to migrate
+-			 * without blocking
++			 * without blocking. However, we can be racing with
++			 * truncation so it's necessary to lock the page
++			 * to stabilise the mapping as truncation holds
++			 * the page lock until after the page is removed
++			 * from the page cache.
+ 			 */
++			if (!trylock_page(page))
++				return ret;
++
+ 			mapping = page_mapping(page);
+-			if (mapping && !mapping->a_ops->migratepage)
++			migrate_dirty = mapping && mapping->a_ops->migratepage;
++			unlock_page(page);
++			if (!migrate_dirty)
+ 				return ret;
+ 		}
+ 	}
