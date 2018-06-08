@@ -1,0 +1,114 @@
+From foo@baz Fri Jun  8 06:51:57 CEST 2018
+From: Jason Wang <jasowang@redhat.com>
+Date: Tue, 29 May 2018 14:18:19 +0800
+Subject: vhost_net: flush batched heads before trying to busy polling
+
+From: Jason Wang <jasowang@redhat.com>
+
+[ Upstream commit f5a4941aa6d190e676065e8f4ed35999f52a01c3 ]
+
+After commit e2b3b35eb989 ("vhost_net: batch used ring update in rx"),
+we tend to batch updating used heads. But it doesn't flush batched
+heads before trying to do busy polling, this will cause vhost to wait
+for guest TX which waits for the used RX. Fixing by flush batched
+heads before busy loop.
+
+1 byte TCP_RR performance recovers from 13107.83 to 50402.65.
+
+Fixes: e2b3b35eb989 ("vhost_net: batch used ring update in rx")
+Signed-off-by: Jason Wang <jasowang@redhat.com>
+Acked-by: Michael S. Tsirkin <mst@redhat.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/vhost/net.c |   37 ++++++++++++++++++++++++-------------
+ 1 file changed, 24 insertions(+), 13 deletions(-)
+
+--- a/drivers/vhost/net.c
++++ b/drivers/vhost/net.c
+@@ -101,7 +101,9 @@ struct vhost_net_virtqueue {
+ 	/* vhost zerocopy support fields below: */
+ 	/* last used idx for outstanding DMA zerocopy buffers */
+ 	int upend_idx;
+-	/* first used idx for DMA done zerocopy buffers */
++	/* For TX, first used idx for DMA done zerocopy buffers
++	 * For RX, number of batched heads
++	 */
+ 	int done_idx;
+ 	/* an array of userspace buffers info */
+ 	struct ubuf_info *ubuf_info;
+@@ -620,6 +622,18 @@ static int sk_has_rx_data(struct sock *s
+ 	return skb_queue_empty(&sk->sk_receive_queue);
+ }
+ 
++static void vhost_rx_signal_used(struct vhost_net_virtqueue *nvq)
++{
++	struct vhost_virtqueue *vq = &nvq->vq;
++	struct vhost_dev *dev = vq->dev;
++
++	if (!nvq->done_idx)
++		return;
++
++	vhost_add_used_and_signal_n(dev, vq, vq->heads, nvq->done_idx);
++	nvq->done_idx = 0;
++}
++
+ static int vhost_net_rx_peek_head_len(struct vhost_net *net, struct sock *sk)
+ {
+ 	struct vhost_net_virtqueue *rvq = &net->vqs[VHOST_NET_VQ_RX];
+@@ -629,6 +643,8 @@ static int vhost_net_rx_peek_head_len(st
+ 	int len = peek_head_len(rvq, sk);
+ 
+ 	if (!len && vq->busyloop_timeout) {
++		/* Flush batched heads first */
++		vhost_rx_signal_used(rvq);
+ 		/* Both tx vq and rx socket were polled here */
+ 		mutex_lock_nested(&vq->mutex, 1);
+ 		vhost_disable_notify(&net->dev, vq);
+@@ -756,7 +772,7 @@ static void handle_rx(struct vhost_net *
+ 	};
+ 	size_t total_len = 0;
+ 	int err, mergeable;
+-	s16 headcount, nheads = 0;
++	s16 headcount;
+ 	size_t vhost_hlen, sock_hlen;
+ 	size_t vhost_len, sock_len;
+ 	struct socket *sock;
+@@ -784,8 +800,8 @@ static void handle_rx(struct vhost_net *
+ 	while ((sock_len = vhost_net_rx_peek_head_len(net, sock->sk))) {
+ 		sock_len += sock_hlen;
+ 		vhost_len = sock_len + vhost_hlen;
+-		headcount = get_rx_bufs(vq, vq->heads + nheads, vhost_len,
+-					&in, vq_log, &log,
++		headcount = get_rx_bufs(vq, vq->heads + nvq->done_idx,
++					vhost_len, &in, vq_log, &log,
+ 					likely(mergeable) ? UIO_MAXIOV : 1);
+ 		/* On error, stop handling until the next kick. */
+ 		if (unlikely(headcount < 0))
+@@ -856,12 +872,9 @@ static void handle_rx(struct vhost_net *
+ 			vhost_discard_vq_desc(vq, headcount);
+ 			goto out;
+ 		}
+-		nheads += headcount;
+-		if (nheads > VHOST_RX_BATCH) {
+-			vhost_add_used_and_signal_n(&net->dev, vq, vq->heads,
+-						    nheads);
+-			nheads = 0;
+-		}
++		nvq->done_idx += headcount;
++		if (nvq->done_idx > VHOST_RX_BATCH)
++			vhost_rx_signal_used(nvq);
+ 		if (unlikely(vq_log))
+ 			vhost_log_write(vq, vq_log, log, vhost_len);
+ 		total_len += vhost_len;
+@@ -872,9 +885,7 @@ static void handle_rx(struct vhost_net *
+ 	}
+ 	vhost_net_enable_vq(net, vq);
+ out:
+-	if (nheads)
+-		vhost_add_used_and_signal_n(&net->dev, vq, vq->heads,
+-					    nheads);
++	vhost_rx_signal_used(nvq);
+ 	mutex_unlock(&vq->mutex);
+ }
+ 
