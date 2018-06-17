@@ -1,0 +1,205 @@
+From foo@baz Sun Jun 17 12:07:34 CEST 2018
+From: David Howells <dhowells@redhat.com>
+Date: Thu, 10 May 2018 08:43:04 +0100
+Subject: afs: Fix refcounting in callback registration
+
+From: David Howells <dhowells@redhat.com>
+
+[ Upstream commit d4a96bec7a7362834ef5c31d7b2cc9bf36eb0570 ]
+
+The refcounting on afs_cb_interest struct objects in
+afs_register_server_cb_interest() is wrong as it uses the server list
+entry's call back interest pointer without regard for the fact that it
+might be replaced at any time and the object thrown away.
+
+Fix this by:
+
+ (1) Put a lock on the afs_server_list struct that can be used to
+     mediate access to the callback interest pointers in the servers array.
+
+ (2) Keep a ref on the callback interest that we get from the entry.
+
+ (3) Dropping the old reference held by vnode->cb_interest if we replace
+     the pointer.
+
+Fixes: c435ee34551e ("afs: Overhaul the callback handling")
+Signed-off-by: David Howells <dhowells@redhat.com>
+Signed-off-by: Sasha Levin <alexander.levin@microsoft.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/afs/callback.c    |   56 ++++++++++++++++++++++++++++++++++++---------------
+ fs/afs/internal.h    |    7 ++++--
+ fs/afs/rotate.c      |    4 +--
+ fs/afs/server_list.c |    7 ++++--
+ 4 files changed, 52 insertions(+), 22 deletions(-)
+
+--- a/fs/afs/callback.c
++++ b/fs/afs/callback.c
+@@ -23,36 +23,55 @@
+ /*
+  * Set up an interest-in-callbacks record for a volume on a server and
+  * register it with the server.
+- * - Called with volume->server_sem held.
++ * - Called with vnode->io_lock held.
+  */
+ int afs_register_server_cb_interest(struct afs_vnode *vnode,
+-				    struct afs_server_entry *entry)
++				    struct afs_server_list *slist,
++				    unsigned int index)
+ {
+-	struct afs_cb_interest *cbi = entry->cb_interest, *vcbi, *new, *x;
++	struct afs_server_entry *entry = &slist->servers[index];
++	struct afs_cb_interest *cbi, *vcbi, *new, *old;
+ 	struct afs_server *server = entry->server;
+ 
+ again:
++	if (vnode->cb_interest &&
++	    likely(vnode->cb_interest == entry->cb_interest))
++		return 0;
++
++	read_lock(&slist->lock);
++	cbi = afs_get_cb_interest(entry->cb_interest);
++	read_unlock(&slist->lock);
++
+ 	vcbi = vnode->cb_interest;
+ 	if (vcbi) {
+-		if (vcbi == cbi)
++		if (vcbi == cbi) {
++			afs_put_cb_interest(afs_v2net(vnode), cbi);
+ 			return 0;
++		}
+ 
++		/* Use a new interest in the server list for the same server
++		 * rather than an old one that's still attached to a vnode.
++		 */
+ 		if (cbi && vcbi->server == cbi->server) {
+ 			write_seqlock(&vnode->cb_lock);
+-			vnode->cb_interest = afs_get_cb_interest(cbi);
++			old = vnode->cb_interest;
++			vnode->cb_interest = cbi;
+ 			write_sequnlock(&vnode->cb_lock);
+-			afs_put_cb_interest(afs_v2net(vnode), cbi);
++			afs_put_cb_interest(afs_v2net(vnode), old);
+ 			return 0;
+ 		}
+ 
++		/* Re-use the one attached to the vnode. */
+ 		if (!cbi && vcbi->server == server) {
+-			afs_get_cb_interest(vcbi);
+-			x = cmpxchg(&entry->cb_interest, cbi, vcbi);
+-			if (x != cbi) {
+-				cbi = x;
+-				afs_put_cb_interest(afs_v2net(vnode), vcbi);
++			write_lock(&slist->lock);
++			if (entry->cb_interest) {
++				write_unlock(&slist->lock);
++				afs_put_cb_interest(afs_v2net(vnode), cbi);
+ 				goto again;
+ 			}
++
++			entry->cb_interest = cbi;
++			write_unlock(&slist->lock);
+ 			return 0;
+ 		}
+ 	}
+@@ -72,13 +91,16 @@ again:
+ 		list_add_tail(&new->cb_link, &server->cb_interests);
+ 		write_unlock(&server->cb_break_lock);
+ 
+-		x = cmpxchg(&entry->cb_interest, cbi, new);
+-		if (x == cbi) {
++		write_lock(&slist->lock);
++		if (!entry->cb_interest) {
++			entry->cb_interest = afs_get_cb_interest(new);
+ 			cbi = new;
++			new = NULL;
+ 		} else {
+-			cbi = x;
+-			afs_put_cb_interest(afs_v2net(vnode), new);
++			cbi = afs_get_cb_interest(entry->cb_interest);
+ 		}
++		write_unlock(&slist->lock);
++		afs_put_cb_interest(afs_v2net(vnode), new);
+ 	}
+ 
+ 	ASSERT(cbi);
+@@ -88,11 +110,13 @@ again:
+ 	 */
+ 	write_seqlock(&vnode->cb_lock);
+ 
+-	vnode->cb_interest = afs_get_cb_interest(cbi);
++	old = vnode->cb_interest;
++	vnode->cb_interest = cbi;
+ 	vnode->cb_s_break = cbi->server->cb_s_break;
+ 	clear_bit(AFS_VNODE_CB_PROMISED, &vnode->flags);
+ 
+ 	write_sequnlock(&vnode->cb_lock);
++	afs_put_cb_interest(afs_v2net(vnode), old);
+ 	return 0;
+ }
+ 
+--- a/fs/afs/internal.h
++++ b/fs/afs/internal.h
+@@ -399,6 +399,7 @@ struct afs_server_list {
+ 	unsigned short		index;		/* Server currently in use */
+ 	unsigned short		vnovol_mask;	/* Servers to be skipped due to VNOVOL */
+ 	unsigned int		seq;		/* Set to ->servers_seq when installed */
++	rwlock_t		lock;
+ 	struct afs_server_entry	servers[];
+ };
+ 
+@@ -605,13 +606,15 @@ extern void afs_init_callback_state(stru
+ extern void afs_break_callback(struct afs_vnode *);
+ extern void afs_break_callbacks(struct afs_server *, size_t,struct afs_callback[]);
+ 
+-extern int afs_register_server_cb_interest(struct afs_vnode *, struct afs_server_entry *);
++extern int afs_register_server_cb_interest(struct afs_vnode *,
++					   struct afs_server_list *, unsigned int);
+ extern void afs_put_cb_interest(struct afs_net *, struct afs_cb_interest *);
+ extern void afs_clear_callback_interests(struct afs_net *, struct afs_server_list *);
+ 
+ static inline struct afs_cb_interest *afs_get_cb_interest(struct afs_cb_interest *cbi)
+ {
+-	refcount_inc(&cbi->usage);
++	if (cbi)
++		refcount_inc(&cbi->usage);
+ 	return cbi;
+ }
+ 
+--- a/fs/afs/rotate.c
++++ b/fs/afs/rotate.c
+@@ -350,8 +350,8 @@ use_server:
+ 	 * break request before we've finished decoding the reply and
+ 	 * installing the vnode.
+ 	 */
+-	fc->ac.error = afs_register_server_cb_interest(
+-		vnode, &fc->server_list->servers[fc->index]);
++	fc->ac.error = afs_register_server_cb_interest(vnode, fc->server_list,
++						       fc->index);
+ 	if (fc->ac.error < 0)
+ 		goto failed;
+ 
+--- a/fs/afs/server_list.c
++++ b/fs/afs/server_list.c
+@@ -49,6 +49,7 @@ struct afs_server_list *afs_alloc_server
+ 		goto error;
+ 
+ 	refcount_set(&slist->usage, 1);
++	rwlock_init(&slist->lock);
+ 
+ 	/* Make sure a records exists for each server in the list. */
+ 	for (i = 0; i < vldb->nr_servers; i++) {
+@@ -64,9 +65,11 @@ struct afs_server_list *afs_alloc_server
+ 			goto error_2;
+ 		}
+ 
+-		/* Insertion-sort by server pointer */
++		/* Insertion-sort by UUID */
+ 		for (j = 0; j < slist->nr_servers; j++)
+-			if (slist->servers[j].server >= server)
++			if (memcmp(&slist->servers[j].server->uuid,
++				   &server->uuid,
++				   sizeof(server->uuid)) >= 0)
+ 				break;
+ 		if (j < slist->nr_servers) {
+ 			if (slist->servers[j].server == server) {
