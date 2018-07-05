@@ -1,0 +1,103 @@
+From foo@baz Thu Jul  5 20:15:13 CEST 2018
+From: Paul Burton <paul.burton@mips.com>
+Date: Sat, 26 May 2018 08:46:47 -0700
+Subject: sched/core: Require cpu_active() in select_task_rq(), for user tasks
+
+From: Paul Burton <paul.burton@mips.com>
+
+[ Upstream commit 7af443ee1697607541c6346c87385adab2214743 ]
+
+select_task_rq() is used in a few paths to select the CPU upon which a
+thread should be run - for example it is used by try_to_wake_up() & by
+fork or exec balancing. As-is it allows use of any online CPU that is
+present in the task's cpus_allowed mask.
+
+This presents a problem because there is a period whilst CPUs are
+brought online where a CPU is marked online, but is not yet fully
+initialized - ie. the period where CPUHP_AP_ONLINE_IDLE <= state <
+CPUHP_ONLINE. Usually we don't run any user tasks during this window,
+but there are corner cases where this can happen. An example observed
+is:
+
+  - Some user task A, running on CPU X, forks to create task B.
+
+  - sched_fork() calls __set_task_cpu() with cpu=X, setting task B's
+    task_struct::cpu field to X.
+
+  - CPU X is offlined.
+
+  - Task A, currently somewhere between the __set_task_cpu() in
+    copy_process() and the call to wake_up_new_task(), is migrated to
+    CPU Y by migrate_tasks() when CPU X is offlined.
+
+  - CPU X is onlined, but still in the CPUHP_AP_ONLINE_IDLE state. The
+    scheduler is now active on CPU X, but there are no user tasks on
+    the runqueue.
+
+  - Task A runs on CPU Y & reaches wake_up_new_task(). This calls
+    select_task_rq() with cpu=X, taken from task B's task_struct,
+    and select_task_rq() allows CPU X to be returned.
+
+  - Task A enqueues task B on CPU X's runqueue, via activate_task() &
+    enqueue_task().
+
+  - CPU X now has a user task on its runqueue before it has reached the
+    CPUHP_ONLINE state.
+
+In most cases, the user tasks that schedule on the newly onlined CPU
+have no idea that anything went wrong, but one case observed to be
+problematic is if the task goes on to invoke the sched_setaffinity
+syscall. The newly onlined CPU reaches the CPUHP_AP_ONLINE_IDLE state
+before the CPU that brought it online calls stop_machine_unpark(). This
+means that for a portion of the window of time between
+CPUHP_AP_ONLINE_IDLE & CPUHP_ONLINE the newly onlined CPU's struct
+cpu_stopper has its enabled field set to false. If a user thread is
+executed on the CPU during this window and it invokes sched_setaffinity
+with a CPU mask that does not include the CPU it's running on, then when
+__set_cpus_allowed_ptr() calls stop_one_cpu() intending to invoke
+migration_cpu_stop() and perform the actual migration away from the CPU
+it will simply return -ENOENT rather than calling migration_cpu_stop().
+We then return from the sched_setaffinity syscall back to the user task
+that is now running on a CPU which it just asked not to run on, and
+which is not present in its cpus_allowed mask.
+
+This patch resolves the problem by having select_task_rq() enforce that
+user tasks run on CPUs that are active - the same requirement that
+select_fallback_rq() already enforces. This should ensure that newly
+onlined CPUs reach the CPUHP_AP_ACTIVE state before being able to
+schedule user tasks, and also implies that bringup_wait_for_ap() will
+have called stop_machine_unpark() which resolves the sched_setaffinity
+issue above.
+
+I haven't yet investigated them, but it may be of interest to review
+whether any of the actions performed by hotplug states between
+CPUHP_AP_ONLINE_IDLE & CPUHP_AP_ACTIVE could have similar unintended
+effects on user tasks that might schedule before they are reached, which
+might widen the scope of the problem from just affecting the behaviour
+of sched_setaffinity.
+
+Signed-off-by: Paul Burton <paul.burton@mips.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/20180526154648.11635-2-paul.burton@mips.com
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Sasha Levin <alexander.levin@microsoft.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ kernel/sched/core.c |    3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -1573,8 +1573,7 @@ int select_task_rq(struct task_struct *p
+ 	 * [ this allows ->select_task() to simply return task_cpu(p) and
+ 	 *   not worry about this generic constraint ]
+ 	 */
+-	if (unlikely(!cpumask_test_cpu(cpu, &p->cpus_allowed) ||
+-		     !cpu_online(cpu)))
++	if (unlikely(!is_cpu_allowed(p, cpu)))
+ 		cpu = select_fallback_rq(task_cpu(p), p);
+ 
+ 	return cpu;
