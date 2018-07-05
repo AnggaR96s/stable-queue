@@ -1,0 +1,86 @@
+From 35bfc52187f6df8779d0f1cebdb52b7f797baf4e Mon Sep 17 00:00:00 2001
+From: NeilBrown <neilb@suse.com>
+Date: Tue, 17 Oct 2017 13:46:43 +1100
+Subject: md: allow metadata update while suspending.
+
+From: NeilBrown <neilb@suse.com>
+
+commit 35bfc52187f6df8779d0f1cebdb52b7f797baf4e upstream.
+
+There are various deadlocks that can occur
+when a thread holds reconfig_mutex and calls
+->quiesce(mddev, 1).
+As some write request block waiting for
+metadata to be updated (e.g. to record device
+failure), and as the md thread updates the metadata
+while the reconfig mutex is held, holding the mutex
+can stop write requests completing, and this prevents
+->quiesce(mddev, 1) from completing.
+
+->quiesce() is now usually called from mddev_suspend(),
+and it is always called with reconfig_mutex held.  So
+at this time it is safe for the thread to update metadata
+without explicitly taking the lock.
+
+So add 2 new flags, one which says the unlocked updates is
+allowed, and one which ways it is happening.  Then allow it
+while the quiesce completes, and then wait for it to finish.
+
+Reported-and-tested-by: Xiao Ni <xni@redhat.com>
+Signed-off-by: NeilBrown <neilb@suse.com>
+Signed-off-by: Shaohua Li <shli@fb.com>
+Signed-off-by: Jack Wang <jinpu.wang@profitbricks.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/md/md.c |   14 ++++++++++++++
+ drivers/md/md.h |    6 ++++++
+ 2 files changed, 20 insertions(+)
+
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -364,8 +364,12 @@ void mddev_suspend(struct mddev *mddev)
+ 		return;
+ 	synchronize_rcu();
+ 	wake_up(&mddev->sb_wait);
++	set_bit(MD_ALLOW_SB_UPDATE, &mddev->flags);
++	smp_mb__after_atomic();
+ 	wait_event(mddev->sb_wait, atomic_read(&mddev->active_io) == 0);
+ 	mddev->pers->quiesce(mddev, 1);
++	clear_bit_unlock(MD_ALLOW_SB_UPDATE, &mddev->flags);
++	wait_event(mddev->sb_wait, !test_bit(MD_UPDATING_SB, &mddev->flags));
+ 
+ 	del_timer_sync(&mddev->safemode_timer);
+ }
+@@ -8882,6 +8886,16 @@ void md_check_recovery(struct mddev *mdd
+ 	unlock:
+ 		wake_up(&mddev->sb_wait);
+ 		mddev_unlock(mddev);
++	} else if (test_bit(MD_ALLOW_SB_UPDATE, &mddev->flags) && mddev->sb_flags) {
++		/* Write superblock - thread that called mddev_suspend()
++		 * holds reconfig_mutex for us.
++		 */
++		set_bit(MD_UPDATING_SB, &mddev->flags);
++		smp_mb__after_atomic();
++		if (test_bit(MD_ALLOW_SB_UPDATE, &mddev->flags))
++			md_update_sb(mddev, 0);
++		clear_bit_unlock(MD_UPDATING_SB, &mddev->flags);
++		wake_up(&mddev->sb_wait);
+ 	}
+ }
+ EXPORT_SYMBOL(md_check_recovery);
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@ -237,6 +237,12 @@ enum mddev_flags {
+ 				 */
+ 	MD_HAS_PPL,		/* The raid array has PPL feature set */
+ 	MD_HAS_MULTIPLE_PPLS,	/* The raid array has multiple PPLs feature set */
++	MD_ALLOW_SB_UPDATE,	/* md_check_recovery is allowed to update
++				 * the metadata without taking reconfig_mutex.
++				 */
++	MD_UPDATING_SB,		/* md_check_recovery is updating the metadata
++				 * without explicitly holding reconfig_mutex.
++				 */
+ };
+ 
+ enum mddev_sb_flags {
