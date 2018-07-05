@@ -1,0 +1,151 @@
+From 732a8049f365f514d0607e03938491bf6cb0d620 Mon Sep 17 00:00:00 2001
+From: Florian Westphal <fw@strlen.de>
+Date: Mon, 7 May 2018 15:22:36 +0200
+Subject: netfilter: nft_compat: fix handling of large matchinfo size
+
+From: Florian Westphal <fw@strlen.de>
+
+commit 732a8049f365f514d0607e03938491bf6cb0d620 upstream.
+
+currently matchinfo gets stored in the expression, but some xt matches
+are very large.
+
+To handle those we either need to switch nft core to kvmalloc and increase
+size limit, or allocate the info blob of large matches separately.
+
+This does the latter, this limits the scope of the changes to
+nft_compat.
+
+I picked a threshold of 192, this allows most matches to work as before and
+handle only few ones via separate alloation (cgroup, u32, sctp, rt).
+
+Signed-off-by: Florian Westphal <fw@strlen.de>
+Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ net/netfilter/nft_compat.c |   64 ++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 63 insertions(+), 1 deletion(-)
+
+--- a/net/netfilter/nft_compat.c
++++ b/net/netfilter/nft_compat.c
+@@ -36,6 +36,13 @@ struct nft_xt {
+ 	struct rcu_head		rcu_head;
+ };
+ 
++/* Used for matches where *info is larger than X byte */
++#define NFT_MATCH_LARGE_THRESH	192
++
++struct nft_xt_match_priv {
++	void *info;
++};
++
+ static bool nft_xt_put(struct nft_xt *xt)
+ {
+ 	if (--xt->refcnt == 0) {
+@@ -352,6 +359,15 @@ static void __nft_match_eval(const struc
+ 	}
+ }
+ 
++static void nft_match_large_eval(const struct nft_expr *expr,
++				 struct nft_regs *regs,
++				 const struct nft_pktinfo *pkt)
++{
++	struct nft_xt_match_priv *priv = nft_expr_priv(expr);
++
++	__nft_match_eval(expr, regs, pkt, priv->info);
++}
++
+ static void nft_match_eval(const struct nft_expr *expr,
+ 			   struct nft_regs *regs,
+ 			   const struct nft_pktinfo *pkt)
+@@ -458,6 +474,24 @@ nft_match_init(const struct nft_ctx *ctx
+ 	return __nft_match_init(ctx, expr, tb, nft_expr_priv(expr));
+ }
+ 
++static int
++nft_match_large_init(const struct nft_ctx *ctx, const struct nft_expr *expr,
++		     const struct nlattr * const tb[])
++{
++	struct nft_xt_match_priv *priv = nft_expr_priv(expr);
++	struct xt_match *m = expr->ops->data;
++	int ret;
++
++	priv->info = kmalloc(XT_ALIGN(m->matchsize), GFP_KERNEL);
++	if (!priv->info)
++		return -ENOMEM;
++
++	ret = __nft_match_init(ctx, expr, tb, priv->info);
++	if (ret)
++		kfree(priv->info);
++	return ret;
++}
++
+ static void
+ __nft_match_destroy(const struct nft_ctx *ctx, const struct nft_expr *expr,
+ 		    void *info)
+@@ -482,6 +516,15 @@ nft_match_destroy(const struct nft_ctx *
+ 	__nft_match_destroy(ctx, expr, nft_expr_priv(expr));
+ }
+ 
++static void
++nft_match_large_destroy(const struct nft_ctx *ctx, const struct nft_expr *expr)
++{
++	struct nft_xt_match_priv *priv = nft_expr_priv(expr);
++
++	__nft_match_destroy(ctx, expr, priv->info);
++	kfree(priv->info);
++}
++
+ static int __nft_match_dump(struct sk_buff *skb, const struct nft_expr *expr,
+ 			    void *info)
+ {
+@@ -503,6 +546,13 @@ static int nft_match_dump(struct sk_buff
+ 	return __nft_match_dump(skb, expr, nft_expr_priv(expr));
+ }
+ 
++static int nft_match_large_dump(struct sk_buff *skb, const struct nft_expr *e)
++{
++	struct nft_xt_match_priv *priv = nft_expr_priv(e);
++
++	return __nft_match_dump(skb, e, priv->info);
++}
++
+ static int nft_match_validate(const struct nft_ctx *ctx,
+ 			      const struct nft_expr *expr,
+ 			      const struct nft_data **data)
+@@ -670,6 +720,7 @@ nft_match_select_ops(const struct nft_ct
+ {
+ 	struct nft_xt *nft_match;
+ 	struct xt_match *match;
++	unsigned int matchsize;
+ 	char *mt_name;
+ 	u32 rev, family;
+ 	int err;
+@@ -709,7 +760,6 @@ nft_match_select_ops(const struct nft_ct
+ 
+ 	nft_match->refcnt = 0;
+ 	nft_match->ops.type = &nft_match_type;
+-	nft_match->ops.size = NFT_EXPR_SIZE(XT_ALIGN(match->matchsize));
+ 	nft_match->ops.eval = nft_match_eval;
+ 	nft_match->ops.init = nft_match_init;
+ 	nft_match->ops.destroy = nft_match_destroy;
+@@ -717,6 +767,18 @@ nft_match_select_ops(const struct nft_ct
+ 	nft_match->ops.validate = nft_match_validate;
+ 	nft_match->ops.data = match;
+ 
++	matchsize = NFT_EXPR_SIZE(XT_ALIGN(match->matchsize));
++	if (matchsize > NFT_MATCH_LARGE_THRESH) {
++		matchsize = NFT_EXPR_SIZE(sizeof(struct nft_xt_match_priv));
++
++		nft_match->ops.eval = nft_match_large_eval;
++		nft_match->ops.init = nft_match_large_init;
++		nft_match->ops.destroy = nft_match_large_destroy;
++		nft_match->ops.dump = nft_match_large_dump;
++	}
++
++	nft_match->ops.size = matchsize;
++
+ 	list_add(&nft_match->head, &nft_match_list);
+ 
+ 	return &nft_match->ops;
