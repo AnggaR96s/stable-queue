@@ -1,0 +1,232 @@
+From 2e8f08deabbc7eefe4c5838aaa6aa9a23a8acf2e Mon Sep 17 00:00:00 2001
+From: Richard Weinberger <richard@nod.at>
+Date: Wed, 24 Aug 2016 14:36:14 +0200
+Subject: ubi: Fix races around ubi_refill_pools()
+
+From: Richard Weinberger <richard@nod.at>
+
+commit 2e8f08deabbc7eefe4c5838aaa6aa9a23a8acf2e upstream.
+
+When writing a new Fastmap the first thing that happens
+is refilling the pools in memory.
+At this stage it is possible that new PEBs from the new pools
+get already claimed and written with data.
+If this happens before the new Fastmap data structure hits the
+flash and we face power cut the freshly written PEB will not
+scanned and unnoticed.
+
+Solve the issue by locking the pools until Fastmap is written.
+
+Cc: <stable@vger.kernel.org>
+Fixes: dbb7d2a88d ("UBI: Add fastmap core")
+Signed-off-by: Richard Weinberger <richard@nod.at>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/mtd/ubi/eba.c        |    4 ++--
+ drivers/mtd/ubi/fastmap-wl.c |    6 ++++--
+ drivers/mtd/ubi/fastmap.c    |   14 ++++++++++----
+ drivers/mtd/ubi/wl.c         |   20 ++++++++++++++------
+ 4 files changed, 30 insertions(+), 14 deletions(-)
+
+--- a/drivers/mtd/ubi/eba.c
++++ b/drivers/mtd/ubi/eba.c
+@@ -1178,6 +1178,8 @@ int ubi_eba_copy_leb(struct ubi_device *
+ 	struct ubi_volume *vol;
+ 	uint32_t crc;
+ 
++	ubi_assert(rwsem_is_locked(&ubi->fm_eba_sem));
++
+ 	vol_id = be32_to_cpu(vid_hdr->vol_id);
+ 	lnum = be32_to_cpu(vid_hdr->lnum);
+ 
+@@ -1346,9 +1348,7 @@ int ubi_eba_copy_leb(struct ubi_device *
+ 	}
+ 
+ 	ubi_assert(vol->eba_tbl[lnum] == from);
+-	down_read(&ubi->fm_eba_sem);
+ 	vol->eba_tbl[lnum] = to;
+-	up_read(&ubi->fm_eba_sem);
+ 
+ out_unlock_buf:
+ 	mutex_unlock(&ubi->buf_mutex);
+--- a/drivers/mtd/ubi/fastmap-wl.c
++++ b/drivers/mtd/ubi/fastmap-wl.c
+@@ -262,6 +262,8 @@ static struct ubi_wl_entry *get_peb_for_
+ 	struct ubi_fm_pool *pool = &ubi->fm_wl_pool;
+ 	int pnum;
+ 
++	ubi_assert(rwsem_is_locked(&ubi->fm_eba_sem));
++
+ 	if (pool->used == pool->size) {
+ 		/* We cannot update the fastmap here because this
+ 		 * function is called in atomic context.
+@@ -303,7 +305,7 @@ int ubi_ensure_anchor_pebs(struct ubi_de
+ 
+ 	wrk->anchor = 1;
+ 	wrk->func = &wear_leveling_worker;
+-	schedule_ubi_work(ubi, wrk);
++	__schedule_ubi_work(ubi, wrk);
+ 	return 0;
+ }
+ 
+@@ -344,7 +346,7 @@ int ubi_wl_put_fm_peb(struct ubi_device
+ 	spin_unlock(&ubi->wl_lock);
+ 
+ 	vol_id = lnum ? UBI_FM_DATA_VOLUME_ID : UBI_FM_SB_VOLUME_ID;
+-	return schedule_erase(ubi, e, vol_id, lnum, torture);
++	return schedule_erase(ubi, e, vol_id, lnum, torture, true);
+ }
+ 
+ /**
+--- a/drivers/mtd/ubi/fastmap.c
++++ b/drivers/mtd/ubi/fastmap.c
+@@ -1514,22 +1514,30 @@ int ubi_update_fastmap(struct ubi_device
+ 	struct ubi_wl_entry *tmp_e;
+ 
+ 	down_write(&ubi->fm_protect);
++	down_write(&ubi->work_sem);
++	down_write(&ubi->fm_eba_sem);
+ 
+ 	ubi_refill_pools(ubi);
+ 
+ 	if (ubi->ro_mode || ubi->fm_disabled) {
++		up_write(&ubi->fm_eba_sem);
++		up_write(&ubi->work_sem);
+ 		up_write(&ubi->fm_protect);
+ 		return 0;
+ 	}
+ 
+ 	ret = ubi_ensure_anchor_pebs(ubi);
+ 	if (ret) {
++		up_write(&ubi->fm_eba_sem);
++		up_write(&ubi->work_sem);
+ 		up_write(&ubi->fm_protect);
+ 		return ret;
+ 	}
+ 
+ 	new_fm = kzalloc(sizeof(*new_fm), GFP_KERNEL);
+ 	if (!new_fm) {
++		up_write(&ubi->fm_eba_sem);
++		up_write(&ubi->work_sem);
+ 		up_write(&ubi->fm_protect);
+ 		return -ENOMEM;
+ 	}
+@@ -1638,16 +1646,14 @@ int ubi_update_fastmap(struct ubi_device
+ 		new_fm->e[0] = tmp_e;
+ 	}
+ 
+-	down_write(&ubi->work_sem);
+-	down_write(&ubi->fm_eba_sem);
+ 	ret = ubi_write_fastmap(ubi, new_fm);
+-	up_write(&ubi->fm_eba_sem);
+-	up_write(&ubi->work_sem);
+ 
+ 	if (ret)
+ 		goto err;
+ 
+ out_unlock:
++	up_write(&ubi->fm_eba_sem);
++	up_write(&ubi->work_sem);
+ 	up_write(&ubi->fm_protect);
+ 	kfree(old_fm);
+ 	return ret;
+--- a/drivers/mtd/ubi/wl.c
++++ b/drivers/mtd/ubi/wl.c
+@@ -580,7 +580,7 @@ static int erase_worker(struct ubi_devic
+  * failure.
+  */
+ static int schedule_erase(struct ubi_device *ubi, struct ubi_wl_entry *e,
+-			  int vol_id, int lnum, int torture)
++			  int vol_id, int lnum, int torture, bool nested)
+ {
+ 	struct ubi_work *wl_wrk;
+ 
+@@ -599,7 +599,10 @@ static int schedule_erase(struct ubi_dev
+ 	wl_wrk->lnum = lnum;
+ 	wl_wrk->torture = torture;
+ 
+-	schedule_ubi_work(ubi, wl_wrk);
++	if (nested)
++		__schedule_ubi_work(ubi, wl_wrk);
++	else
++		schedule_ubi_work(ubi, wl_wrk);
+ 	return 0;
+ }
+ 
+@@ -658,6 +661,7 @@ static int wear_leveling_worker(struct u
+ 	if (!vid_hdr)
+ 		return -ENOMEM;
+ 
++	down_read(&ubi->fm_eba_sem);
+ 	mutex_lock(&ubi->move_mutex);
+ 	spin_lock(&ubi->wl_lock);
+ 	ubi_assert(!ubi->move_from && !ubi->move_to);
+@@ -884,6 +888,7 @@ static int wear_leveling_worker(struct u
+ 
+ 	dbg_wl("done");
+ 	mutex_unlock(&ubi->move_mutex);
++	up_read(&ubi->fm_eba_sem);
+ 	return 0;
+ 
+ 	/*
+@@ -925,6 +930,7 @@ out_not_moved:
+ 	}
+ 
+ 	mutex_unlock(&ubi->move_mutex);
++	up_read(&ubi->fm_eba_sem);
+ 	return 0;
+ 
+ out_error:
+@@ -946,6 +952,7 @@ out_error:
+ out_ro:
+ 	ubi_ro_mode(ubi);
+ 	mutex_unlock(&ubi->move_mutex);
++	up_read(&ubi->fm_eba_sem);
+ 	ubi_assert(err != 0);
+ 	return err < 0 ? err : -EIO;
+ 
+@@ -953,6 +960,7 @@ out_cancel:
+ 	ubi->wl_scheduled = 0;
+ 	spin_unlock(&ubi->wl_lock);
+ 	mutex_unlock(&ubi->move_mutex);
++	up_read(&ubi->fm_eba_sem);
+ 	ubi_free_vid_hdr(ubi, vid_hdr);
+ 	return 0;
+ }
+@@ -1075,7 +1083,7 @@ static int __erase_worker(struct ubi_dev
+ 		int err1;
+ 
+ 		/* Re-schedule the LEB for erasure */
+-		err1 = schedule_erase(ubi, e, vol_id, lnum, 0);
++		err1 = schedule_erase(ubi, e, vol_id, lnum, 0, false);
+ 		if (err1) {
+ 			wl_entry_destroy(ubi, e);
+ 			err = err1;
+@@ -1256,7 +1264,7 @@ retry:
+ 	}
+ 	spin_unlock(&ubi->wl_lock);
+ 
+-	err = schedule_erase(ubi, e, vol_id, lnum, torture);
++	err = schedule_erase(ubi, e, vol_id, lnum, torture, false);
+ 	if (err) {
+ 		spin_lock(&ubi->wl_lock);
+ 		wl_tree_add(e, &ubi->used);
+@@ -1544,7 +1552,7 @@ int ubi_wl_init(struct ubi_device *ubi,
+ 		e->pnum = aeb->pnum;
+ 		e->ec = aeb->ec;
+ 		ubi->lookuptbl[e->pnum] = e;
+-		if (schedule_erase(ubi, e, aeb->vol_id, aeb->lnum, 0)) {
++		if (schedule_erase(ubi, e, aeb->vol_id, aeb->lnum, 0, false)) {
+ 			wl_entry_destroy(ubi, e);
+ 			goto out_free;
+ 		}
+@@ -1624,7 +1632,7 @@ int ubi_wl_init(struct ubi_device *ubi,
+ 			e->ec = aeb->ec;
+ 			ubi_assert(!ubi->lookuptbl[e->pnum]);
+ 			ubi->lookuptbl[e->pnum] = e;
+-			if (schedule_erase(ubi, e, aeb->vol_id, aeb->lnum, 0)) {
++			if (schedule_erase(ubi, e, aeb->vol_id, aeb->lnum, 0, false)) {
+ 				wl_entry_destroy(ubi, e);
+ 				goto out_free;
+ 			}
