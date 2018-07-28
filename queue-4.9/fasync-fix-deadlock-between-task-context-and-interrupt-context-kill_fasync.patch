@@ -1,0 +1,118 @@
+From foo@baz Sat Jul 28 10:48:22 CEST 2018
+From: Kirill Tkhai <ktkhai@virtuozzo.com>
+Date: Thu, 5 Apr 2018 14:58:06 +0300
+Subject: fasync: Fix deadlock between task-context and interrupt-context kill_fasync()
+
+From: Kirill Tkhai <ktkhai@virtuozzo.com>
+
+[ Upstream commit 7a107c0f55a3b4c6f84a4323df5610360bde1684 ]
+
+I observed the following deadlock between them:
+
+[task 1]                          [task 2]                         [task 3]
+kill_fasync()                     mm_update_next_owner()           copy_process()
+ spin_lock_irqsave(&fa->fa_lock)   read_lock(&tasklist_lock)        write_lock_irq(&tasklist_lock)
+  send_sigio()                    <IRQ>                             ...
+   read_lock(&fown->lock)         kill_fasync()                     ...
+    read_lock(&tasklist_lock)      spin_lock_irqsave(&fa->fa_lock)  ...
+
+Task 1 can't acquire read locked tasklist_lock, since there is
+already task 3 expressed its wish to take the lock exclusive.
+Task 2 holds the read locked lock, but it can't take the spin lock.
+
+Also, there is possible another deadlock (which I haven't observed):
+
+[task 1]                            [task 2]
+f_getown()                          kill_fasync()
+ read_lock(&f_own->lock)             spin_lock_irqsave(&fa->fa_lock,)
+ <IRQ>                               send_sigio()                     write_lock_irq(&f_own->lock)
+  kill_fasync()                       read_lock(&fown->lock)
+   spin_lock_irqsave(&fa->fa_lock,)
+
+Actually, we do not need exclusive fa->fa_lock in kill_fasync_rcu(),
+as it guarantees fa->fa_file->f_owner integrity only. It may seem,
+that it used to give a task a small possibility to receive two sequential
+signals, if there are two parallel kill_fasync() callers, and task
+handles the first signal fastly, but the behaviour won't become
+different, since there is exclusive sighand lock in do_send_sig_info().
+
+The patch converts fa_lock into rwlock_t, and this fixes two above
+deadlocks, as rwlock is allowed to be taken from interrupt handler
+by qrwlock design.
+
+Signed-off-by: Kirill Tkhai <ktkhai@virtuozzo.com>
+Signed-off-by: Jeff Layton <jlayton@redhat.com>
+Signed-off-by: Sasha Levin <alexander.levin@microsoft.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/fcntl.c         |   15 +++++++--------
+ include/linux/fs.h |    2 +-
+ 2 files changed, 8 insertions(+), 9 deletions(-)
+
+--- a/fs/fcntl.c
++++ b/fs/fcntl.c
+@@ -588,9 +588,9 @@ int fasync_remove_entry(struct file *fil
+ 		if (fa->fa_file != filp)
+ 			continue;
+ 
+-		spin_lock_irq(&fa->fa_lock);
++		write_lock_irq(&fa->fa_lock);
+ 		fa->fa_file = NULL;
+-		spin_unlock_irq(&fa->fa_lock);
++		write_unlock_irq(&fa->fa_lock);
+ 
+ 		*fp = fa->fa_next;
+ 		call_rcu(&fa->fa_rcu, fasync_free_rcu);
+@@ -635,13 +635,13 @@ struct fasync_struct *fasync_insert_entr
+ 		if (fa->fa_file != filp)
+ 			continue;
+ 
+-		spin_lock_irq(&fa->fa_lock);
++		write_lock_irq(&fa->fa_lock);
+ 		fa->fa_fd = fd;
+-		spin_unlock_irq(&fa->fa_lock);
++		write_unlock_irq(&fa->fa_lock);
+ 		goto out;
+ 	}
+ 
+-	spin_lock_init(&new->fa_lock);
++	rwlock_init(&new->fa_lock);
+ 	new->magic = FASYNC_MAGIC;
+ 	new->fa_file = filp;
+ 	new->fa_fd = fd;
+@@ -704,14 +704,13 @@ static void kill_fasync_rcu(struct fasyn
+ {
+ 	while (fa) {
+ 		struct fown_struct *fown;
+-		unsigned long flags;
+ 
+ 		if (fa->magic != FASYNC_MAGIC) {
+ 			printk(KERN_ERR "kill_fasync: bad magic number in "
+ 			       "fasync_struct!\n");
+ 			return;
+ 		}
+-		spin_lock_irqsave(&fa->fa_lock, flags);
++		read_lock(&fa->fa_lock);
+ 		if (fa->fa_file) {
+ 			fown = &fa->fa_file->f_owner;
+ 			/* Don't send SIGURG to processes which have not set a
+@@ -720,7 +719,7 @@ static void kill_fasync_rcu(struct fasyn
+ 			if (!(sig == SIGURG && fown->signum == 0))
+ 				send_sigio(fown, fa->fa_fd, band);
+ 		}
+-		spin_unlock_irqrestore(&fa->fa_lock, flags);
++		read_unlock(&fa->fa_lock);
+ 		fa = rcu_dereference(fa->fa_next);
+ 	}
+ }
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -1277,7 +1277,7 @@ static inline int locks_lock_file_wait(s
+ }
+ 
+ struct fasync_struct {
+-	spinlock_t		fa_lock;
++	rwlock_t		fa_lock;
+ 	int			magic;
+ 	int			fa_fd;
+ 	struct fasync_struct	*fa_next; /* singly linked list */
