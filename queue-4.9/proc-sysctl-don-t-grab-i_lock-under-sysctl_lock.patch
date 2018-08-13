@@ -1,0 +1,139 @@
+From ace0c791e6c3cf5ef37cad2df69f0d90ccc40ffb Mon Sep 17 00:00:00 2001
+From: "Eric W. Biederman" <ebiederm@xmission.com>
+Date: Mon, 20 Feb 2017 18:17:03 +1300
+Subject: proc/sysctl: Don't grab i_lock under sysctl_lock.
+
+From: Eric W. Biederman <ebiederm@xmission.com>
+
+commit ace0c791e6c3cf5ef37cad2df69f0d90ccc40ffb upstream.
+
+Konstantin Khlebnikov <khlebnikov@yandex-team.ru> writes:
+> This patch has locking problem. I've got lockdep splat under LTP.
+>
+> [ 6633.115456] ======================================================
+> [ 6633.115502] [ INFO: possible circular locking dependency detected ]
+> [ 6633.115553] 4.9.10-debug+ #9 Tainted: G             L
+> [ 6633.115584] -------------------------------------------------------
+> [ 6633.115627] ksm02/284980 is trying to acquire lock:
+> [ 6633.115659]  (&sb->s_type->i_lock_key#4){+.+...}, at: [<ffffffff816bc1ce>] igrab+0x1e/0x80
+> [ 6633.115834] but task is already holding lock:
+> [ 6633.115882]  (sysctl_lock){+.+...}, at: [<ffffffff817e379b>] unregister_sysctl_table+0x6b/0x110
+> [ 6633.116026] which lock already depends on the new lock.
+> [ 6633.116026]
+> [ 6633.116080]
+> [ 6633.116080] the existing dependency chain (in reverse order) is:
+> [ 6633.116117]
+> -> #2 (sysctl_lock){+.+...}:
+> -> #1 (&(&dentry->d_lockref.lock)->rlock){+.+...}:
+> -> #0 (&sb->s_type->i_lock_key#4){+.+...}:
+>
+> d_lock nests inside i_lock
+> sysctl_lock nests inside d_lock in d_compare
+>
+> This patch adds i_lock nesting inside sysctl_lock.
+
+Al Viro <viro@ZenIV.linux.org.uk> replied:
+> Once ->unregistering is set, you can drop sysctl_lock just fine.  So I'd
+> try something like this - use rcu_read_lock() in proc_sys_prune_dcache(),
+> drop sysctl_lock() before it and regain after.  Make sure that no inodes
+> are added to the list ones ->unregistering has been set and use RCU list
+> primitives for modifying the inode list, with sysctl_lock still used to
+> serialize its modifications.
+>
+> Freeing struct inode is RCU-delayed (see proc_destroy_inode()), so doing
+> igrab() is safe there.  Since we don't drop inode reference until after we'd
+> passed beyond it in the list, list_for_each_entry_rcu() should be fine.
+
+I agree with Al Viro's analsysis of the situtation.
+
+Fixes: d6cffbbe9a7e ("proc/sysctl: prune stale dentries during unregistering")
+Reported-by: Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+Tested-by: Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+Suggested-by: Al Viro <viro@ZenIV.linux.org.uk>
+Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/proc/proc_sysctl.c |   31 ++++++++++++++++++-------------
+ 1 file changed, 18 insertions(+), 13 deletions(-)
+
+--- a/fs/proc/proc_sysctl.c
++++ b/fs/proc/proc_sysctl.c
+@@ -266,21 +266,19 @@ static void proc_sys_prune_dcache(struct
+ 	struct inode *inode, *prev = NULL;
+ 	struct proc_inode *ei;
+ 
+-	list_for_each_entry(ei, &head->inodes, sysctl_inodes) {
++	rcu_read_lock();
++	list_for_each_entry_rcu(ei, &head->inodes, sysctl_inodes) {
+ 		inode = igrab(&ei->vfs_inode);
+ 		if (inode) {
+-			spin_unlock(&sysctl_lock);
++			rcu_read_unlock();
+ 			iput(prev);
+ 			prev = inode;
+ 			d_prune_aliases(inode);
+-			spin_lock(&sysctl_lock);
++			rcu_read_lock();
+ 		}
+ 	}
+-	if (prev) {
+-		spin_unlock(&sysctl_lock);
+-		iput(prev);
+-		spin_lock(&sysctl_lock);
+-	}
++	rcu_read_unlock();
++	iput(prev);
+ }
+ 
+ /* called under sysctl_lock, will reacquire if has to wait */
+@@ -296,10 +294,10 @@ static void start_unregistering(struct c
+ 		p->unregistering = &wait;
+ 		spin_unlock(&sysctl_lock);
+ 		wait_for_completion(&wait);
+-		spin_lock(&sysctl_lock);
+ 	} else {
+ 		/* anything non-NULL; we'll never dereference it */
+ 		p->unregistering = ERR_PTR(-EINVAL);
++		spin_unlock(&sysctl_lock);
+ 	}
+ 	/*
+ 	 * Prune dentries for unregistered sysctls: namespaced sysctls
+@@ -310,6 +308,7 @@ static void start_unregistering(struct c
+ 	 * do not remove from the list until nobody holds it; walking the
+ 	 * list in do_sysctl() relies on that.
+ 	 */
++	spin_lock(&sysctl_lock);
+ 	erase_header(p);
+ }
+ 
+@@ -455,11 +454,17 @@ static struct inode *proc_sys_make_inode
+ 	inode->i_ino = get_next_ino();
+ 
+ 	ei = PROC_I(inode);
+-	ei->sysctl = head;
+-	ei->sysctl_entry = table;
+ 
+ 	spin_lock(&sysctl_lock);
+-	list_add(&ei->sysctl_inodes, &head->inodes);
++	if (unlikely(head->unregistering)) {
++		spin_unlock(&sysctl_lock);
++		iput(inode);
++		inode = NULL;
++		goto out;
++	}
++	ei->sysctl = head;
++	ei->sysctl_entry = table;
++	list_add_rcu(&ei->sysctl_inodes, &head->inodes);
+ 	head->count++;
+ 	spin_unlock(&sysctl_lock);
+ 
+@@ -487,7 +492,7 @@ out:
+ void proc_sys_evict_inode(struct inode *inode, struct ctl_table_header *head)
+ {
+ 	spin_lock(&sysctl_lock);
+-	list_del(&PROC_I(inode)->sysctl_inodes);
++	list_del_rcu(&PROC_I(inode)->sysctl_inodes);
+ 	if (!--head->count)
+ 		kfree_rcu(head, rcu);
+ 	spin_unlock(&sysctl_lock);
