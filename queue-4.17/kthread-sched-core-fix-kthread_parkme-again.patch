@@ -1,0 +1,212 @@
+From foo@baz Wed Aug 22 09:16:56 CEST 2018
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Thu, 7 Jun 2018 11:45:49 +0200
+Subject: kthread, sched/core: Fix kthread_parkme() (again...)
+
+From: Peter Zijlstra <peterz@infradead.org>
+
+[ Upstream commit 1cef1150ef40ec52f507436a14230cbc2623299c ]
+
+Gaurav reports that commit:
+
+  85f1abe0019f ("kthread, sched/wait: Fix kthread_parkme() completion issue")
+
+isn't working for him. Because of the following race:
+
+> controller Thread                               CPUHP Thread
+> takedown_cpu
+> kthread_park
+> kthread_parkme
+> Set KTHREAD_SHOULD_PARK
+>                                                 smpboot_thread_fn
+>                                                 set Task interruptible
+>
+>
+> wake_up_process
+>  if (!(p->state & state))
+>                 goto out;
+>
+>                                                 Kthread_parkme
+>                                                 SET TASK_PARKED
+>                                                 schedule
+>                                                 raw_spin_lock(&rq->lock)
+> ttwu_remote
+> waiting for __task_rq_lock
+>                                                 context_switch
+>
+>                                                 finish_lock_switch
+>
+>
+>
+>                                                 Case TASK_PARKED
+>                                                 kthread_park_complete
+>
+>
+> SET Running
+
+Furthermore, Oleg noticed that the whole scheduler TASK_PARKED
+handling is buggered because the TASK_DEAD thing is done with
+preemption disabled, the current code can still complete early on
+preemption :/
+
+So basically revert that earlier fix and go with a variant of the
+alternative mentioned in the commit. Promote TASK_PARKED to special
+state to avoid the store-store issue on task->state leading to the
+WARN in kthread_unpark() -> __kthread_bind().
+
+But in addition, add wait_task_inactive() to kthread_park() to ensure
+the task really is PARKED when we return from kthread_park(). This
+avoids the whole kthread still gets migrated nonsense -- although it
+would be really good to get this done differently.
+
+Reported-by: Gaurav Kohli <gkohli@codeaurora.org>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Oleg Nesterov <oleg@redhat.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Fixes: 85f1abe0019f ("kthread, sched/wait: Fix kthread_parkme() completion issue")
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Sasha Levin <alexander.levin@microsoft.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/linux/kthread.h |    1 -
+ include/linux/sched.h   |    2 +-
+ kernel/kthread.c        |   30 ++++++++++++++++++++++++------
+ kernel/sched/core.c     |   31 +++++++++++--------------------
+ 4 files changed, 36 insertions(+), 28 deletions(-)
+
+--- a/include/linux/kthread.h
++++ b/include/linux/kthread.h
+@@ -62,7 +62,6 @@ void *kthread_probe_data(struct task_str
+ int kthread_park(struct task_struct *k);
+ void kthread_unpark(struct task_struct *k);
+ void kthread_parkme(void);
+-void kthread_park_complete(struct task_struct *k);
+ 
+ int kthreadd(void *unused);
+ extern struct task_struct *kthreadd_task;
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -117,7 +117,7 @@ struct task_group;
+  * the comment with set_special_state().
+  */
+ #define is_special_task_state(state)				\
+-	((state) & (__TASK_STOPPED | __TASK_TRACED | TASK_DEAD))
++	((state) & (__TASK_STOPPED | __TASK_TRACED | TASK_PARKED | TASK_DEAD))
+ 
+ #define __set_current_state(state_value)			\
+ 	do {							\
+--- a/kernel/kthread.c
++++ b/kernel/kthread.c
+@@ -177,9 +177,20 @@ void *kthread_probe_data(struct task_str
+ static void __kthread_parkme(struct kthread *self)
+ {
+ 	for (;;) {
+-		set_current_state(TASK_PARKED);
++		/*
++		 * TASK_PARKED is a special state; we must serialize against
++		 * possible pending wakeups to avoid store-store collisions on
++		 * task->state.
++		 *
++		 * Such a collision might possibly result in the task state
++		 * changin from TASK_PARKED and us failing the
++		 * wait_task_inactive() in kthread_park().
++		 */
++		set_special_state(TASK_PARKED);
+ 		if (!test_bit(KTHREAD_SHOULD_PARK, &self->flags))
+ 			break;
++
++		complete_all(&self->parked);
+ 		schedule();
+ 	}
+ 	__set_current_state(TASK_RUNNING);
+@@ -191,11 +202,6 @@ void kthread_parkme(void)
+ }
+ EXPORT_SYMBOL_GPL(kthread_parkme);
+ 
+-void kthread_park_complete(struct task_struct *k)
+-{
+-	complete_all(&to_kthread(k)->parked);
+-}
+-
+ static int kthread(void *_create)
+ {
+ 	/* Copy data: it's on kthread's stack */
+@@ -467,6 +473,9 @@ void kthread_unpark(struct task_struct *
+ 
+ 	reinit_completion(&kthread->parked);
+ 	clear_bit(KTHREAD_SHOULD_PARK, &kthread->flags);
++	/*
++	 * __kthread_parkme() will either see !SHOULD_PARK or get the wakeup.
++	 */
+ 	wake_up_state(k, TASK_PARKED);
+ }
+ EXPORT_SYMBOL_GPL(kthread_unpark);
+@@ -493,7 +502,16 @@ int kthread_park(struct task_struct *k)
+ 	set_bit(KTHREAD_SHOULD_PARK, &kthread->flags);
+ 	if (k != current) {
+ 		wake_up_process(k);
++		/*
++		 * Wait for __kthread_parkme() to complete(), this means we
++		 * _will_ have TASK_PARKED and are about to call schedule().
++		 */
+ 		wait_for_completion(&kthread->parked);
++		/*
++		 * Now wait for that schedule() to complete and the task to
++		 * get scheduled out.
++		 */
++		WARN_ON_ONCE(!wait_task_inactive(k, TASK_PARKED));
+ 	}
+ 
+ 	return 0;
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -7,7 +7,6 @@
+  */
+ #include "sched.h"
+ 
+-#include <linux/kthread.h>
+ #include <linux/nospec.h>
+ 
+ #include <asm/switch_to.h>
+@@ -2738,28 +2737,20 @@ static struct rq *finish_task_switch(str
+ 		membarrier_mm_sync_core_before_usermode(mm);
+ 		mmdrop(mm);
+ 	}
+-	if (unlikely(prev_state & (TASK_DEAD|TASK_PARKED))) {
+-		switch (prev_state) {
+-		case TASK_DEAD:
+-			if (prev->sched_class->task_dead)
+-				prev->sched_class->task_dead(prev);
+-
+-			/*
+-			 * Remove function-return probe instances associated with this
+-			 * task and put them back on the free list.
+-			 */
+-			kprobe_flush_task(prev);
++	if (unlikely(prev_state == TASK_DEAD)) {
++		if (prev->sched_class->task_dead)
++			prev->sched_class->task_dead(prev);
+ 
+-			/* Task is done with its stack. */
+-			put_task_stack(prev);
++		/*
++		 * Remove function-return probe instances associated with this
++		 * task and put them back on the free list.
++		 */
++		kprobe_flush_task(prev);
+ 
+-			put_task_struct(prev);
+-			break;
++		/* Task is done with its stack. */
++		put_task_stack(prev);
+ 
+-		case TASK_PARKED:
+-			kthread_park_complete(prev);
+-			break;
+-		}
++		put_task_struct(prev);
+ 	}
+ 
+ 	tick_nohz_task_switch();
