@@ -1,0 +1,94 @@
+From 9c29c31830a4eca724e137a9339137204bbb31be Mon Sep 17 00:00:00 2001
+From: Prateek Sood <prsood@codeaurora.org>
+Date: Thu, 7 Sep 2017 20:00:58 +0530
+Subject: locking/rwsem-xadd: Fix missed wakeup due to reordering of load
+
+From: Prateek Sood <prsood@codeaurora.org>
+
+commit 9c29c31830a4eca724e137a9339137204bbb31be upstream.
+
+If a spinner is present, there is a chance that the load of
+rwsem_has_spinner() in rwsem_wake() can be reordered with
+respect to decrement of rwsem count in __up_write() leading
+to wakeup being missed:
+
+ spinning writer                  up_write caller
+ ---------------                  -----------------------
+ [S] osq_unlock()                 [L] osq
+  spin_lock(wait_lock)
+  sem->count=0xFFFFFFFF00000001
+            +0xFFFFFFFF00000000
+  count=sem->count
+  MB
+                                   sem->count=0xFFFFFFFE00000001
+                                             -0xFFFFFFFF00000001
+                                   spin_trylock(wait_lock)
+                                   return
+ rwsem_try_write_lock(count)
+ spin_unlock(wait_lock)
+ schedule()
+
+Reordering of atomic_long_sub_return_release() in __up_write()
+and rwsem_has_spinner() in rwsem_wake() can cause missing of
+wakeup in up_write() context. In spinning writer, sem->count
+and local variable count is 0XFFFFFFFE00000001. It would result
+in rwsem_try_write_lock() failing to acquire rwsem and spinning
+writer going to sleep in rwsem_down_write_failed().
+
+The smp_rmb() will make sure that the spinner state is
+consulted after sem->count is updated in up_write context.
+
+Signed-off-by: Prateek Sood <prsood@codeaurora.org>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: dave@stgolabs.net
+Cc: longman@redhat.com
+Cc: parri.andrea@gmail.com
+Cc: sramana@codeaurora.org
+Link: http://lkml.kernel.org/r/1504794658-15397-1-git-send-email-prsood@codeaurora.org
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Amit Pundir <amit.pundir@linaro.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ kernel/locking/rwsem-xadd.c |   27 +++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+--- a/kernel/locking/rwsem-xadd.c
++++ b/kernel/locking/rwsem-xadd.c
+@@ -574,6 +574,33 @@ struct rw_semaphore *rwsem_wake(struct r
+ 	WAKE_Q(wake_q);
+ 
+ 	/*
++	* __rwsem_down_write_failed_common(sem)
++	*   rwsem_optimistic_spin(sem)
++	*     osq_unlock(sem->osq)
++	*   ...
++	*   atomic_long_add_return(&sem->count)
++	*
++	*      - VS -
++	*
++	*              __up_write()
++	*                if (atomic_long_sub_return_release(&sem->count) < 0)
++	*                  rwsem_wake(sem)
++	*                    osq_is_locked(&sem->osq)
++	*
++	* And __up_write() must observe !osq_is_locked() when it observes the
++	* atomic_long_add_return() in order to not miss a wakeup.
++	*
++	* This boils down to:
++	*
++	* [S.rel] X = 1                [RmW] r0 = (Y += 0)
++	*         MB                         RMB
++	* [RmW]   Y += 1               [L]   r1 = X
++	*
++	* exists (r0=1 /\ r1=0)
++	*/
++	smp_rmb();
++
++	/*
+ 	 * If a spinner is present, it is not necessary to do the wakeup.
+ 	 * Try to do wakeup only if the trylock succeeds to minimize
+ 	 * spinlock contention which may introduce too much delay in the

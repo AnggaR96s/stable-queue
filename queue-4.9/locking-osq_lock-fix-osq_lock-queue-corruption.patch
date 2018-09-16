@@ -1,0 +1,132 @@
+From 50972fe78f24f1cd0b9d7bbf1f87d2be9e4f412e Mon Sep 17 00:00:00 2001
+From: Prateek Sood <prsood@codeaurora.org>
+Date: Fri, 14 Jul 2017 19:17:56 +0530
+Subject: locking/osq_lock: Fix osq_lock queue corruption
+
+From: Prateek Sood <prsood@codeaurora.org>
+
+commit 50972fe78f24f1cd0b9d7bbf1f87d2be9e4f412e upstream.
+
+Fix ordering of link creation between node->prev and prev->next in
+osq_lock(). A case in which the status of optimistic spin queue is
+CPU6->CPU2 in which CPU6 has acquired the lock.
+
+        tail
+          v
+  ,-. <- ,-.
+  |6|    |2|
+  `-' -> `-'
+
+At this point if CPU0 comes in to acquire osq_lock, it will update the
+tail count.
+
+  CPU2			CPU0
+  ----------------------------------
+
+				       tail
+				         v
+			  ,-. <- ,-.    ,-.
+			  |6|    |2|    |0|
+			  `-' -> `-'    `-'
+
+After tail count update if CPU2 starts to unqueue itself from
+optimistic spin queue, it will find an updated tail count with CPU0 and
+update CPU2 node->next to NULL in osq_wait_next().
+
+  unqueue-A
+
+	       tail
+	         v
+  ,-. <- ,-.    ,-.
+  |6|    |2|    |0|
+  `-'    `-'    `-'
+
+  unqueue-B
+
+  ->tail != curr && !node->next
+
+If reordering of following stores happen then prev->next where prev
+being CPU2 would be updated to point to CPU0 node:
+
+				       tail
+				         v
+			  ,-. <- ,-.    ,-.
+			  |6|    |2|    |0|
+			  `-'    `-' -> `-'
+
+  osq_wait_next()
+    node->next <- 0
+    xchg(node->next, NULL)
+
+	       tail
+	         v
+  ,-. <- ,-.    ,-.
+  |6|    |2|    |0|
+  `-'    `-'    `-'
+
+  unqueue-C
+
+At this point if next instruction
+	WRITE_ONCE(next->prev, prev);
+in CPU2 path is committed before the update of CPU0 node->prev = prev then
+CPU0 node->prev will point to CPU6 node.
+
+	       tail
+    v----------. v
+  ,-. <- ,-.    ,-.
+  |6|    |2|    |0|
+  `-'    `-'    `-'
+     `----------^
+
+At this point if CPU0 path's node->prev = prev is committed resulting
+in change of CPU0 prev back to CPU2 node. CPU2 node->next is NULL
+currently,
+
+				       tail
+			                 v
+			  ,-. <- ,-. <- ,-.
+			  |6|    |2|    |0|
+			  `-'    `-'    `-'
+			     `----------^
+
+so if CPU0 gets into unqueue path of osq_lock it will keep spinning
+in infinite loop as condition prev->next == node will never be true.
+
+Signed-off-by: Prateek Sood <prsood@codeaurora.org>
+[ Added pictures, rewrote comments. ]
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: sramana@codeaurora.org
+Link: http://lkml.kernel.org/r/1500040076-27626-1-git-send-email-prsood@codeaurora.org
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Amit Pundir <amit.pundir@linaro.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ kernel/locking/osq_lock.c |   13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+--- a/kernel/locking/osq_lock.c
++++ b/kernel/locking/osq_lock.c
+@@ -104,6 +104,19 @@ bool osq_lock(struct optimistic_spin_que
+ 
+ 	prev = decode_cpu(old);
+ 	node->prev = prev;
++
++	/*
++	 * osq_lock()			unqueue
++	 *
++	 * node->prev = prev		osq_wait_next()
++	 * WMB				MB
++	 * prev->next = node		next->prev = prev // unqueue-C
++	 *
++	 * Here 'node->prev' and 'next->prev' are the same variable and we need
++	 * to ensure these stores happen in-order to avoid corrupting the list.
++	 */
++	smp_wmb();
++
+ 	WRITE_ONCE(prev->next, node);
+ 
+ 	/*
