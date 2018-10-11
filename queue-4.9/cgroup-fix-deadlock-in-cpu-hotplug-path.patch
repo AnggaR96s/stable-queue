@@ -1,0 +1,81 @@
+From 116d2f7496c51b2e02e8e4ecdd2bdf5fb9d5a641 Mon Sep 17 00:00:00 2001
+From: Prateek Sood <prsood@codeaurora.org>
+Date: Tue, 19 Dec 2017 12:56:57 +0530
+Subject: cgroup: Fix deadlock in cpu hotplug path
+
+From: Prateek Sood <prsood@codeaurora.org>
+
+commit 116d2f7496c51b2e02e8e4ecdd2bdf5fb9d5a641 upstream.
+
+Deadlock during cgroup migration from cpu hotplug path when a task T is
+being moved from source to destination cgroup.
+
+kworker/0:0
+cpuset_hotplug_workfn()
+   cpuset_hotplug_update_tasks()
+      hotplug_update_tasks_legacy()
+        remove_tasks_in_empty_cpuset()
+          cgroup_transfer_tasks() // stuck in iterator loop
+            cgroup_migrate()
+              cgroup_migrate_add_task()
+
+In cgroup_migrate_add_task() it checks for PF_EXITING flag of task T.
+Task T will not migrate to destination cgroup. css_task_iter_start()
+will keep pointing to task T in loop waiting for task T cg_list node
+to be removed.
+
+Task T
+do_exit()
+  exit_signals() // sets PF_EXITING
+  exit_task_namespaces()
+    switch_task_namespaces()
+      free_nsproxy()
+        put_mnt_ns()
+          drop_collected_mounts()
+            namespace_unlock()
+              synchronize_rcu()
+                _synchronize_rcu_expedited()
+                  schedule_work() // on cpu0 low priority worker pool
+                  wait_event() // waiting for work item to execute
+
+Task T inserted a work item in the worklist of cpu0 low priority
+worker pool. It is waiting for expedited grace period work item
+to execute. This work item will only be executed once kworker/0:0
+complete execution of cpuset_hotplug_workfn().
+
+kworker/0:0 ==> Task T ==>kworker/0:0
+
+In case of PF_EXITING task being migrated from source to destination
+cgroup, migrate next available task in source cgroup.
+
+Signed-off-by: Prateek Sood <prsood@codeaurora.org>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+[AmitP: Upstream commit cherry-pick failed, so I picked the
+        backported changes from CAF/msm-4.9 tree instead:
+        https://source.codeaurora.org/quic/la/kernel/msm-4.9/commit/?id=49b74f1696417b270c89cd893ca9f37088928078]
+Signed-off-by: Amit Pundir <amit.pundir@linaro.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+This patch can be cleanly applied and build tested on 4.4.y and 3.18.y
+as well but I couldn't find it in msm-4.4 and msm-3.18 trees. So this
+patch is really untested on those stable trees.
+Build tested on 4.9.131, 4.4.159 and 3.18.123 for ARCH=arm/arm64 allmodconfig.
+
+ kernel/cgroup.c |    6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+--- a/kernel/cgroup.c
++++ b/kernel/cgroup.c
+@@ -4386,7 +4386,11 @@ int cgroup_transfer_tasks(struct cgroup
+ 	 */
+ 	do {
+ 		css_task_iter_start(&from->self, &it);
+-		task = css_task_iter_next(&it);
++
++		do {
++			task = css_task_iter_next(&it);
++		} while (task && (task->flags & PF_EXITING));
++
+ 		if (task)
+ 			get_task_struct(task);
+ 		css_task_iter_end(&it);
