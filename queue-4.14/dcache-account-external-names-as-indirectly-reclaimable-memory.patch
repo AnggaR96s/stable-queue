@@ -1,0 +1,161 @@
+From f1782c9bc547754f4bd3043fe8cfda53db85f13f Mon Sep 17 00:00:00 2001
+From: Roman Gushchin <guro@fb.com>
+Date: Tue, 10 Apr 2018 16:27:44 -0700
+Subject: dcache: account external names as indirectly reclaimable memory
+
+From: Roman Gushchin <guro@fb.com>
+
+commit f1782c9bc547754f4bd3043fe8cfda53db85f13f upstream.
+
+I received a report about suspicious growth of unreclaimable slabs on
+some machines.  I've found that it happens on machines with low memory
+pressure, and these unreclaimable slabs are external names attached to
+dentries.
+
+External names are allocated using generic kmalloc() function, so they
+are accounted as unreclaimable.  But they are held by dentries, which
+are reclaimable, and they will be reclaimed under the memory pressure.
+
+In particular, this breaks MemAvailable calculation, as it doesn't take
+unreclaimable slabs into account.  This leads to a silly situation, when
+a machine is almost idle, has no memory pressure and therefore has a big
+dentry cache.  And the resulting MemAvailable is too low to start a new
+workload.
+
+To address the issue, the NR_INDIRECTLY_RECLAIMABLE_BYTES counter is
+used to track the amount of memory, consumed by external names.  The
+counter is increased in the dentry allocation path, if an external name
+structure is allocated; and it's decreased in the dentry freeing path.
+
+To reproduce the problem I've used the following Python script:
+
+  import os
+
+  for iter in range (0, 10000000):
+      try:
+          name = ("/some_long_name_%d" % iter) + "_" * 220
+          os.stat(name)
+      except Exception:
+          pass
+
+Without this patch:
+  $ cat /proc/meminfo | grep MemAvailable
+  MemAvailable:    7811688 kB
+  $ python indirect.py
+  $ cat /proc/meminfo | grep MemAvailable
+  MemAvailable:    2753052 kB
+
+With the patch:
+  $ cat /proc/meminfo | grep MemAvailable
+  MemAvailable:    7809516 kB
+  $ python indirect.py
+  $ cat /proc/meminfo | grep MemAvailable
+  MemAvailable:    7749144 kB
+
+[guro@fb.com: fix indirectly reclaimable memory accounting for CONFIG_SLOB]
+  Link: http://lkml.kernel.org/r/20180312194140.19517-1-guro@fb.com
+[guro@fb.com: fix indirectly reclaimable memory accounting]
+  Link: http://lkml.kernel.org/r/20180313125701.7955-1-guro@fb.com
+Link: http://lkml.kernel.org/r/20180305133743.12746-5-guro@fb.com
+Signed-off-by: Roman Gushchin <guro@fb.com>
+Reviewed-by: Andrew Morton <akpm@linux-foundation.org>
+Cc: Alexander Viro <viro@zeniv.linux.org.uk>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/dcache.c |   38 +++++++++++++++++++++++++++++---------
+ 1 file changed, 29 insertions(+), 9 deletions(-)
+
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@ -270,11 +270,25 @@ static void __d_free(struct rcu_head *he
+ 	kmem_cache_free(dentry_cache, dentry); 
+ }
+ 
++static void __d_free_external_name(struct rcu_head *head)
++{
++	struct external_name *name = container_of(head, struct external_name,
++						  u.head);
++
++	mod_node_page_state(page_pgdat(virt_to_page(name)),
++			    NR_INDIRECTLY_RECLAIMABLE_BYTES,
++			    -ksize(name));
++
++	kfree(name);
++}
++
+ static void __d_free_external(struct rcu_head *head)
+ {
+ 	struct dentry *dentry = container_of(head, struct dentry, d_u.d_rcu);
+-	kfree(external_name(dentry));
+-	kmem_cache_free(dentry_cache, dentry); 
++
++	__d_free_external_name(&external_name(dentry)->u.head);
++
++	kmem_cache_free(dentry_cache, dentry);
+ }
+ 
+ static inline int dname_external(const struct dentry *dentry)
+@@ -305,7 +319,7 @@ void release_dentry_name_snapshot(struct
+ 		struct external_name *p;
+ 		p = container_of(name->name, struct external_name, name[0]);
+ 		if (unlikely(atomic_dec_and_test(&p->u.count)))
+-			kfree_rcu(p, u.head);
++			call_rcu(&p->u.head, __d_free_external_name);
+ 	}
+ }
+ EXPORT_SYMBOL(release_dentry_name_snapshot);
+@@ -1605,6 +1619,7 @@ EXPORT_SYMBOL(d_invalidate);
+  
+ struct dentry *__d_alloc(struct super_block *sb, const struct qstr *name)
+ {
++	struct external_name *ext = NULL;
+ 	struct dentry *dentry;
+ 	char *dname;
+ 	int err;
+@@ -1625,14 +1640,13 @@ struct dentry *__d_alloc(struct super_bl
+ 		dname = dentry->d_iname;
+ 	} else if (name->len > DNAME_INLINE_LEN-1) {
+ 		size_t size = offsetof(struct external_name, name[1]);
+-		struct external_name *p = kmalloc(size + name->len,
+-						  GFP_KERNEL_ACCOUNT);
+-		if (!p) {
++		ext = kmalloc(size + name->len, GFP_KERNEL_ACCOUNT);
++		if (!ext) {
+ 			kmem_cache_free(dentry_cache, dentry); 
+ 			return NULL;
+ 		}
+-		atomic_set(&p->u.count, 1);
+-		dname = p->name;
++		atomic_set(&ext->u.count, 1);
++		dname = ext->name;
+ 		if (IS_ENABLED(CONFIG_DCACHE_WORD_ACCESS))
+ 			kasan_unpoison_shadow(dname,
+ 				round_up(name->len + 1,	sizeof(unsigned long)));
+@@ -1675,6 +1689,12 @@ struct dentry *__d_alloc(struct super_bl
+ 		}
+ 	}
+ 
++	if (unlikely(ext)) {
++		pg_data_t *pgdat = page_pgdat(virt_to_page(ext));
++		mod_node_page_state(pgdat, NR_INDIRECTLY_RECLAIMABLE_BYTES,
++				    ksize(ext));
++	}
++
+ 	this_cpu_inc(nr_dentry);
+ 
+ 	return dentry;
+@@ -2769,7 +2789,7 @@ static void copy_name(struct dentry *den
+ 		dentry->d_name.hash_len = target->d_name.hash_len;
+ 	}
+ 	if (old_name && likely(atomic_dec_and_test(&old_name->u.count)))
+-		kfree_rcu(old_name, u.head);
++		call_rcu(&old_name->u.head, __d_free_external_name);
+ }
+ 
+ static void dentry_lock_for_move(struct dentry *dentry, struct dentry *target)
