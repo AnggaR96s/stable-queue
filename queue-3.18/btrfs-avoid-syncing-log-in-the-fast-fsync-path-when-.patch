@@ -1,0 +1,125 @@
+From bcab29bf6e4fdb81e5075265fd5396a22478b9d5 Mon Sep 17 00:00:00 2001
+From: Filipe Manana <fdmanana@suse.com>
+Date: Tue, 31 Mar 2015 14:16:52 +0100
+Subject: Btrfs: avoid syncing log in the fast fsync path when not necessary
+
+[ Upstream commit b659ef027792219b590d67a2baf1643a93727d29 ]
+
+Commit 3a8b36f37806 ("Btrfs: fix data loss in the fast fsync path") added
+a performance regression for that causes an unnecessary sync of the log
+trees (fs/subvol and root log trees) when 2 consecutive fsyncs are done
+against a file, without no writes or any metadata updates to the inode in
+between them and if a transaction is committed before the second fsync is
+called.
+
+Huang Ying reported this to lkml (https://lkml.org/lkml/2015/3/18/99)
+after a test sysbench test that measured a -62% decrease of file io
+requests per second for that tests' workload.
+
+The test is:
+
+  echo performance > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+  echo performance > /sys/devices/system/cpu/cpu1/cpufreq/scaling_governor
+  echo performance > /sys/devices/system/cpu/cpu2/cpufreq/scaling_governor
+  echo performance > /sys/devices/system/cpu/cpu3/cpufreq/scaling_governor
+  mkfs -t btrfs /dev/sda2
+  mount -t btrfs /dev/sda2 /fs/sda2
+  cd /fs/sda2
+  for ((i = 0; i < 1024; i++)); do fallocate -l 67108864 testfile.$i; done
+  sysbench --test=fileio --max-requests=0 --num-threads=4 --max-time=600 \
+    --file-test-mode=rndwr --file-total-size=68719476736 --file-io-mode=sync \
+    --file-num=1024 run
+
+A test on kvm guest, running a debug kernel gave me the following results:
+
+Without 3a8b36f378060d:             16.01 reqs/sec
+With 3a8b36f378060d:                 3.39 reqs/sec
+With 3a8b36f378060d and this patch: 16.04 reqs/sec
+
+Reported-by: Huang Ying <ying.huang@intel.com>
+Tested-by: Huang, Ying <ying.huang@intel.com>
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: Chris Mason <clm@fb.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/btrfs/file.c         |  9 ++++++---
+ fs/btrfs/ordered-data.c | 14 ++++++++++++++
+ fs/btrfs/ordered-data.h |  3 +++
+ 3 files changed, 23 insertions(+), 3 deletions(-)
+
+diff --git a/fs/btrfs/file.c b/fs/btrfs/file.c
+index 2ad4cb3da8f6..ba37ec6263ca 100644
+--- a/fs/btrfs/file.c
++++ b/fs/btrfs/file.c
+@@ -1879,6 +1879,7 @@ int btrfs_sync_file(struct file *file, loff_t start, loff_t end, int datasync)
+ 	struct btrfs_log_ctx ctx;
+ 	int ret = 0;
+ 	bool full_sync = 0;
++	const u64 len = end - start + 1;
+ 
+ 	trace_btrfs_sync_file(file, datasync);
+ 
+@@ -1907,7 +1908,7 @@ int btrfs_sync_file(struct file *file, loff_t start, loff_t end, int datasync)
+ 		 * all extents are persisted and the respective file extent
+ 		 * items are in the fs/subvol btree.
+ 		 */
+-		ret = btrfs_wait_ordered_range(inode, start, end - start + 1);
++		ret = btrfs_wait_ordered_range(inode, start, len);
+ 	} else {
+ 		/*
+ 		 * Start any new ordered operations before starting to log the
+@@ -1979,8 +1980,10 @@ int btrfs_sync_file(struct file *file, loff_t start, loff_t end, int datasync)
+ 	 */
+ 	smp_mb();
+ 	if (btrfs_inode_in_log(inode, root->fs_info->generation) ||
+-	    (full_sync && BTRFS_I(inode)->last_trans <=
+-	     root->fs_info->last_trans_committed)) {
++	    (BTRFS_I(inode)->last_trans <=
++	     root->fs_info->last_trans_committed &&
++	     (full_sync ||
++	      !btrfs_have_ordered_extents_in_range(inode, start, len)))) {
+ 		/*
+ 		 * We'v had everything committed since the last time we were
+ 		 * modified so clear this flag in case it was set for whatever
+diff --git a/fs/btrfs/ordered-data.c b/fs/btrfs/ordered-data.c
+index b23d024c0234..4c20199cef62 100644
+--- a/fs/btrfs/ordered-data.c
++++ b/fs/btrfs/ordered-data.c
+@@ -848,6 +848,20 @@ out:
+ 	return entry;
+ }
+ 
++bool btrfs_have_ordered_extents_in_range(struct inode *inode,
++					 u64 file_offset,
++					 u64 len)
++{
++	struct btrfs_ordered_extent *oe;
++
++	oe = btrfs_lookup_ordered_range(inode, file_offset, len);
++	if (oe) {
++		btrfs_put_ordered_extent(oe);
++		return true;
++	}
++	return false;
++}
++
+ /*
+  * lookup and return any extent before 'file_offset'.  NULL is returned
+  * if none is found
+diff --git a/fs/btrfs/ordered-data.h b/fs/btrfs/ordered-data.h
+index 0124bffc775f..a1bce0a5cccc 100644
+--- a/fs/btrfs/ordered-data.h
++++ b/fs/btrfs/ordered-data.h
+@@ -191,6 +191,9 @@ btrfs_lookup_first_ordered_extent(struct inode * inode, u64 file_offset);
+ struct btrfs_ordered_extent *btrfs_lookup_ordered_range(struct inode *inode,
+ 							u64 file_offset,
+ 							u64 len);
++bool btrfs_have_ordered_extents_in_range(struct inode *inode,
++					 u64 file_offset,
++					 u64 len);
+ int btrfs_ordered_update_i_size(struct inode *inode, u64 offset,
+ 				struct btrfs_ordered_extent *ordered);
+ int btrfs_find_ordered_sum(struct inode *inode, u64 offset, u64 disk_bytenr,
+-- 
+2.17.1
+
