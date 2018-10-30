@@ -1,0 +1,183 @@
+From 9dc3e2288fb483d44be72ceb8ec4997613b0d2ed Mon Sep 17 00:00:00 2001
+From: David Howells <dhowells@redhat.com>
+Date: Thu, 27 Sep 2018 15:13:08 +0100
+Subject: rxrpc: Fix RTT gathering
+
+[ Upstream commit b604dd9883f783a94020d772e4fe03160f455372 ]
+
+Fix RTT information gathering in AF_RXRPC by the following means:
+
+ (1) Enable Rx timestamping on the transport socket with SO_TIMESTAMPNS.
+
+ (2) If the sk_buff doesn't have a timestamp set when rxrpc_data_ready()
+     collects it, set it at that point.
+
+ (3) Allow ACKs to be requested on the last packet of a client call, but
+     not a service call.  We need to be careful lest we undo:
+
+	bf7d620abf22c321208a4da4f435e7af52551a21
+	Author: David Howells <dhowells@redhat.com>
+	Date:   Thu Oct 6 08:11:51 2016 +0100
+	rxrpc: Don't request an ACK on the last DATA packet of a call's Tx phase
+
+     but that only really applies to service calls that we're handling,
+     since the client side gets to send the final ACK (or not).
+
+ (4) When about to transmit an ACK or DATA packet, record the Tx timestamp
+     before only; don't update the timestamp afterwards.
+
+ (5) Switch the ordering between recording the serial and recording the
+     timestamp to always set the serial number first.  The serial number
+     shouldn't be seen referenced by an ACK packet until we've transmitted
+     the packet bearing it - so in the Rx path, we don't need the timestamp
+     until we've checked the serial number.
+
+Fixes: cf1a6474f807 ("rxrpc: Add per-peer RTT tracker")
+Signed-off-by: David Howells <dhowells@redhat.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ net/rxrpc/input.c        |  8 ++++++--
+ net/rxrpc/local_object.c |  9 +++++++++
+ net/rxrpc/output.c       | 31 ++++++++++++++++++-------------
+ 3 files changed, 33 insertions(+), 15 deletions(-)
+
+diff --git a/net/rxrpc/input.c b/net/rxrpc/input.c
+index 338fbbf216a9..f6027c875876 100644
+--- a/net/rxrpc/input.c
++++ b/net/rxrpc/input.c
+@@ -616,13 +616,14 @@ static void rxrpc_input_requested_ack(struct rxrpc_call *call,
+ 		if (!skb)
+ 			continue;
+ 
++		sent_at = skb->tstamp;
++		smp_rmb(); /* Read timestamp before serial. */
+ 		sp = rxrpc_skb(skb);
+ 		if (sp->hdr.serial != orig_serial)
+ 			continue;
+-		smp_rmb();
+-		sent_at = skb->tstamp;
+ 		goto found;
+ 	}
++
+ 	return;
+ 
+ found:
+@@ -1137,6 +1138,9 @@ void rxrpc_data_ready(struct sock *udp_sk)
+ 		return;
+ 	}
+ 
++	if (skb->tstamp == 0)
++		skb->tstamp = ktime_get_real();
++
+ 	rxrpc_new_skb(skb, rxrpc_skb_rx_received);
+ 
+ 	_net("recv skb %p", skb);
+diff --git a/net/rxrpc/local_object.c b/net/rxrpc/local_object.c
+index b493e6b62740..5d89ea5c1976 100644
+--- a/net/rxrpc/local_object.c
++++ b/net/rxrpc/local_object.c
+@@ -173,6 +173,15 @@ static int rxrpc_open_socket(struct rxrpc_local *local, struct net *net)
+ 			_debug("setsockopt failed");
+ 			goto error;
+ 		}
++
++		/* We want receive timestamps. */
++		opt = 1;
++		ret = kernel_setsockopt(local->socket, SOL_SOCKET, SO_TIMESTAMPNS,
++					(char *)&opt, sizeof(opt));
++		if (ret < 0) {
++			_debug("setsockopt failed");
++			goto error;
++		}
+ 		break;
+ 
+ 	default:
+diff --git a/net/rxrpc/output.c b/net/rxrpc/output.c
+index 4774c8f5634d..6ac21bb2071d 100644
+--- a/net/rxrpc/output.c
++++ b/net/rxrpc/output.c
+@@ -124,7 +124,6 @@ int rxrpc_send_ack_packet(struct rxrpc_call *call, bool ping,
+ 	struct kvec iov[2];
+ 	rxrpc_serial_t serial;
+ 	rxrpc_seq_t hard_ack, top;
+-	ktime_t now;
+ 	size_t len, n;
+ 	int ret;
+ 	u8 reason;
+@@ -196,9 +195,7 @@ int rxrpc_send_ack_packet(struct rxrpc_call *call, bool ping,
+ 		/* We need to stick a time in before we send the packet in case
+ 		 * the reply gets back before kernel_sendmsg() completes - but
+ 		 * asking UDP to send the packet can take a relatively long
+-		 * time, so we update the time after, on the assumption that
+-		 * the packet transmission is more likely to happen towards the
+-		 * end of the kernel_sendmsg() call.
++		 * time.
+ 		 */
+ 		call->ping_time = ktime_get_real();
+ 		set_bit(RXRPC_CALL_PINGING, &call->flags);
+@@ -206,9 +203,6 @@ int rxrpc_send_ack_packet(struct rxrpc_call *call, bool ping,
+ 	}
+ 
+ 	ret = kernel_sendmsg(conn->params.local->socket, &msg, iov, 2, len);
+-	now = ktime_get_real();
+-	if (ping)
+-		call->ping_time = now;
+ 	conn->params.peer->last_tx_at = ktime_get_seconds();
+ 	if (ret < 0)
+ 		trace_rxrpc_tx_fail(call->debug_id, serial, ret,
+@@ -357,8 +351,14 @@ int rxrpc_send_data_packet(struct rxrpc_call *call, struct sk_buff *skb,
+ 
+ 	/* If our RTT cache needs working on, request an ACK.  Also request
+ 	 * ACKs if a DATA packet appears to have been lost.
++	 *
++	 * However, we mustn't request an ACK on the last reply packet of a
++	 * service call, lest OpenAFS incorrectly send us an ACK with some
++	 * soft-ACKs in it and then never follow up with a proper hard ACK.
+ 	 */
+-	if (!(sp->hdr.flags & RXRPC_LAST_PACKET) &&
++	if ((!(sp->hdr.flags & RXRPC_LAST_PACKET) ||
++	     rxrpc_to_server(sp)
++	     ) &&
+ 	    (test_and_clear_bit(RXRPC_CALL_EV_ACK_LOST, &call->events) ||
+ 	     retrans ||
+ 	     call->cong_mode == RXRPC_CALL_SLOW_START ||
+@@ -384,6 +384,11 @@ int rxrpc_send_data_packet(struct rxrpc_call *call, struct sk_buff *skb,
+ 		goto send_fragmentable;
+ 
+ 	down_read(&conn->params.local->defrag_sem);
++
++	sp->hdr.serial = serial;
++	smp_wmb(); /* Set serial before timestamp */
++	skb->tstamp = ktime_get_real();
++
+ 	/* send the packet by UDP
+ 	 * - returns -EMSGSIZE if UDP would have to fragment the packet
+ 	 *   to go out of the interface
+@@ -404,12 +409,8 @@ done:
+ 	trace_rxrpc_tx_data(call, sp->hdr.seq, serial, whdr.flags,
+ 			    retrans, lost);
+ 	if (ret >= 0) {
+-		ktime_t now = ktime_get_real();
+-		skb->tstamp = now;
+-		smp_wmb();
+-		sp->hdr.serial = serial;
+ 		if (whdr.flags & RXRPC_REQUEST_ACK) {
+-			call->peer->rtt_last_req = now;
++			call->peer->rtt_last_req = skb->tstamp;
+ 			trace_rxrpc_rtt_tx(call, rxrpc_rtt_tx_data, serial);
+ 			if (call->peer->rtt_usage > 1) {
+ 				unsigned long nowj = jiffies, ack_lost_at;
+@@ -448,6 +449,10 @@ send_fragmentable:
+ 
+ 	down_write(&conn->params.local->defrag_sem);
+ 
++	sp->hdr.serial = serial;
++	smp_wmb(); /* Set serial before timestamp */
++	skb->tstamp = ktime_get_real();
++
+ 	switch (conn->params.local->srx.transport.family) {
+ 	case AF_INET:
+ 		opt = IP_PMTUDISC_DONT;
+-- 
+2.17.1
+
