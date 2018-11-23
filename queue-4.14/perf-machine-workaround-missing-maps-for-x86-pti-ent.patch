@@ -1,0 +1,191 @@
+From 98b4c8d3e0302ccaa377c1e589a55ac7206e59bd Mon Sep 17 00:00:00 2001
+From: Adrian Hunter <adrian.hunter@intel.com>
+Date: Wed, 21 Nov 2018 15:52:46 +0200
+Subject: perf machine: Workaround missing maps for x86 PTI entry trampolines
+
+commit 4d99e4136580d178e3523281a820be17bf814bf8 upstream.
+
+On x86_64 the PTI entry trampolines are not in the kernel map created by
+perf tools. That results in the addresses having no symbols and prevents
+annotation.  It also causes Intel PT to have decoding errors at the
+trampoline addresses.
+
+Workaround that by creating maps for the trampolines.
+
+At present the kernel does not export information revealing where the
+trampolines are.  Until that happens, the addresses are hardcoded.
+
+Signed-off-by: Adrian Hunter <adrian.hunter@intel.com>
+Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: H. Peter Anvin <hpa@zytor.com>
+Cc: Jiri Olsa <jolsa@redhat.com>
+Cc: Joerg Roedel <joro@8bytes.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: x86@kernel.org
+Link: http://lkml.kernel.org/r/1526986485-6562-6-git-send-email-adrian.hunter@intel.com
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ tools/perf/util/machine.c | 96 +++++++++++++++++++++++++++++++++++++++
+ tools/perf/util/machine.h |  3 ++
+ tools/perf/util/symbol.c  | 12 +++--
+ 3 files changed, 106 insertions(+), 5 deletions(-)
+
+diff --git a/tools/perf/util/machine.c b/tools/perf/util/machine.c
+index 78aa1c5f19ca..968fd0454e6b 100644
+--- a/tools/perf/util/machine.c
++++ b/tools/perf/util/machine.c
+@@ -818,6 +818,102 @@ static int machine__get_running_kernel_start(struct machine *machine,
+ 	return 0;
+ }
+ 
++/* Kernel-space maps for symbols that are outside the main kernel map and module maps */
++struct extra_kernel_map {
++	u64 start;
++	u64 end;
++	u64 pgoff;
++};
++
++static int machine__create_extra_kernel_map(struct machine *machine,
++					    struct dso *kernel,
++					    struct extra_kernel_map *xm)
++{
++	struct kmap *kmap;
++	struct map *map;
++
++	map = map__new2(xm->start, kernel, MAP__FUNCTION);
++	if (!map)
++		return -1;
++
++	map->end   = xm->end;
++	map->pgoff = xm->pgoff;
++
++	kmap = map__kmap(map);
++
++	kmap->kmaps = &machine->kmaps;
++
++	map_groups__insert(&machine->kmaps, map);
++
++	pr_debug2("Added extra kernel map %" PRIx64 "-%" PRIx64 "\n",
++		  map->start, map->end);
++
++	map__put(map);
++
++	return 0;
++}
++
++static u64 find_entry_trampoline(struct dso *dso)
++{
++	/* Duplicates are removed so lookup all aliases */
++	const char *syms[] = {
++		"_entry_trampoline",
++		"__entry_trampoline_start",
++		"entry_SYSCALL_64_trampoline",
++	};
++	struct symbol *sym = dso__first_symbol(dso, MAP__FUNCTION);
++	unsigned int i;
++
++	for (; sym; sym = dso__next_symbol(sym)) {
++		if (sym->binding != STB_GLOBAL)
++			continue;
++		for (i = 0; i < ARRAY_SIZE(syms); i++) {
++			if (!strcmp(sym->name, syms[i]))
++				return sym->start;
++		}
++	}
++
++	return 0;
++}
++
++/*
++ * These values can be used for kernels that do not have symbols for the entry
++ * trampolines in kallsyms.
++ */
++#define X86_64_CPU_ENTRY_AREA_PER_CPU	0xfffffe0000000000ULL
++#define X86_64_CPU_ENTRY_AREA_SIZE	0x2c000
++#define X86_64_ENTRY_TRAMPOLINE		0x6000
++
++/* Map x86_64 PTI entry trampolines */
++int machine__map_x86_64_entry_trampolines(struct machine *machine,
++					  struct dso *kernel)
++{
++	u64 pgoff = find_entry_trampoline(kernel);
++	int nr_cpus_avail, cpu;
++
++	if (!pgoff)
++		return 0;
++
++	nr_cpus_avail = machine__nr_cpus_avail(machine);
++
++	/* Add a 1 page map for each CPU's entry trampoline */
++	for (cpu = 0; cpu < nr_cpus_avail; cpu++) {
++		u64 va = X86_64_CPU_ENTRY_AREA_PER_CPU +
++			 cpu * X86_64_CPU_ENTRY_AREA_SIZE +
++			 X86_64_ENTRY_TRAMPOLINE;
++		struct extra_kernel_map xm = {
++			.start = va,
++			.end   = va + page_size,
++			.pgoff = pgoff,
++		};
++
++		if (machine__create_extra_kernel_map(machine, kernel, &xm) < 0)
++			return -1;
++	}
++
++	return 0;
++}
++
+ int __machine__create_kernel_maps(struct machine *machine, struct dso *kernel)
+ {
+ 	int type;
+diff --git a/tools/perf/util/machine.h b/tools/perf/util/machine.h
+index 245743d9ce63..13041b036a5b 100644
+--- a/tools/perf/util/machine.h
++++ b/tools/perf/util/machine.h
+@@ -266,4 +266,7 @@ int machine__set_current_tid(struct machine *machine, int cpu, pid_t pid,
+  */
+ char *machine__resolve_kernel_addr(void *vmachine, unsigned long long *addrp, char **modp);
+ 
++int machine__map_x86_64_entry_trampolines(struct machine *machine,
++					  struct dso *kernel);
++
+ #endif /* __PERF_MACHINE_H */
+diff --git a/tools/perf/util/symbol.c b/tools/perf/util/symbol.c
+index ec40e47aa198..3936f69f385c 100644
+--- a/tools/perf/util/symbol.c
++++ b/tools/perf/util/symbol.c
+@@ -1513,20 +1513,22 @@ int dso__load(struct dso *dso, struct map *map)
+ 		goto out;
+ 	}
+ 
++	if (map->groups && map->groups->machine)
++		machine = map->groups->machine;
++	else
++		machine = NULL;
++
+ 	if (dso->kernel) {
+ 		if (dso->kernel == DSO_TYPE_KERNEL)
+ 			ret = dso__load_kernel_sym(dso, map);
+ 		else if (dso->kernel == DSO_TYPE_GUEST_KERNEL)
+ 			ret = dso__load_guest_kernel_sym(dso, map);
+ 
++		if (machine__is(machine, "x86_64"))
++			machine__map_x86_64_entry_trampolines(machine, dso);
+ 		goto out;
+ 	}
+ 
+-	if (map->groups && map->groups->machine)
+-		machine = map->groups->machine;
+-	else
+-		machine = NULL;
+-
+ 	dso->adjust_symbols = 0;
+ 
+ 	if (perfmap) {
+-- 
+2.17.1
+
