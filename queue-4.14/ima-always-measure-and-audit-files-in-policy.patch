@@ -1,0 +1,188 @@
+From f3cc6b25dcc5616f0d5c720009b2ac66f97df2ff Mon Sep 17 00:00:00 2001
+From: Mimi Zohar <zohar@linux.vnet.ibm.com>
+Date: Sat, 17 Jun 2017 23:56:23 -0400
+Subject: ima: always measure and audit files in policy
+
+From: Mimi Zohar <zohar@linux.vnet.ibm.com>
+
+commit f3cc6b25dcc5616f0d5c720009b2ac66f97df2ff upstream.
+
+All files matching a "measure" rule must be included in the IMA
+measurement list, even when the file hash cannot be calculated.
+Similarly, all files matching an "audit" rule must be audited, even when
+the file hash can not be calculated.
+
+The file data hash field contained in the IMA measurement list template
+data will contain 0's instead of the actual file hash digest.
+
+Note:
+In general, adding, deleting or in anyway changing which files are
+included in the IMA measurement list is not a good idea, as it might
+result in not being able to unseal trusted keys sealed to a specific
+TPM PCR value.  This patch not only adds file measurements that were
+not previously measured, but specifies that the file hash value for
+these files will be 0's.
+
+As the IMA measurement list ordering is not consistent from one boot
+to the next, it is unlikely that anyone is sealing keys based on the
+IMA measurement list.  Remote attestation servers should be able to
+process these new measurement records, but might complain about
+these unknown records.
+
+Signed-off-by: Mimi Zohar <zohar@linux.vnet.ibm.com>
+Reviewed-by: Dmitry Kasatkin <dmitry.kasatkin@huawei.com>
+Cc: Aditya Kali <adityakali@google.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ security/integrity/ima/ima_api.c    |   69 ++++++++++++++++++++++--------------
+ security/integrity/ima/ima_crypto.c |   10 +++++
+ security/integrity/ima/ima_main.c   |    9 ++--
+ 3 files changed, 57 insertions(+), 31 deletions(-)
+
+--- a/security/integrity/ima/ima_api.c
++++ b/security/integrity/ima/ima_api.c
+@@ -199,42 +199,59 @@ int ima_collect_measurement(struct integ
+ 	struct inode *inode = file_inode(file);
+ 	const char *filename = file->f_path.dentry->d_name.name;
+ 	int result = 0;
++	int length;
++	void *tmpbuf;
++	u64 i_version;
+ 	struct {
+ 		struct ima_digest_data hdr;
+ 		char digest[IMA_MAX_DIGEST_SIZE];
+ 	} hash;
+ 
+-	if (!(iint->flags & IMA_COLLECTED)) {
+-		u64 i_version = file_inode(file)->i_version;
++	if (iint->flags & IMA_COLLECTED)
++		goto out;
+ 
+-		if (file->f_flags & O_DIRECT) {
+-			audit_cause = "failed(directio)";
+-			result = -EACCES;
+-			goto out;
+-		}
+-
+-		hash.hdr.algo = algo;
+-
+-		result = (!buf) ?  ima_calc_file_hash(file, &hash.hdr) :
+-			ima_calc_buffer_hash(buf, size, &hash.hdr);
+-		if (!result) {
+-			int length = sizeof(hash.hdr) + hash.hdr.length;
+-			void *tmpbuf = krealloc(iint->ima_hash, length,
+-						GFP_NOFS);
+-			if (tmpbuf) {
+-				iint->ima_hash = tmpbuf;
+-				memcpy(iint->ima_hash, &hash, length);
+-				iint->version = i_version;
+-				iint->flags |= IMA_COLLECTED;
+-			} else
+-				result = -ENOMEM;
+-		}
++	/*
++	 * Dectecting file change is based on i_version. On filesystems
++	 * which do not support i_version, support is limited to an initial
++	 * measurement/appraisal/audit.
++	 */
++	i_version = file_inode(file)->i_version;
++	hash.hdr.algo = algo;
++
++	/* Initialize hash digest to 0's in case of failure */
++	memset(&hash.digest, 0, sizeof(hash.digest));
++
++	if (buf)
++		result = ima_calc_buffer_hash(buf, size, &hash.hdr);
++	else
++		result = ima_calc_file_hash(file, &hash.hdr);
++
++	if (result && result != -EBADF && result != -EINVAL)
++		goto out;
++
++	length = sizeof(hash.hdr) + hash.hdr.length;
++	tmpbuf = krealloc(iint->ima_hash, length, GFP_NOFS);
++	if (!tmpbuf) {
++		result = -ENOMEM;
++		goto out;
+ 	}
++
++	iint->ima_hash = tmpbuf;
++	memcpy(iint->ima_hash, &hash, length);
++	iint->version = i_version;
++
++	/* Possibly temporary failure due to type of read (eg. O_DIRECT) */
++	if (!result)
++		iint->flags |= IMA_COLLECTED;
+ out:
+-	if (result)
++	if (result) {
++		if (file->f_flags & O_DIRECT)
++			audit_cause = "failed(directio)";
++
+ 		integrity_audit_msg(AUDIT_INTEGRITY_DATA, inode,
+ 				    filename, "collect_data", audit_cause,
+ 				    result, 0);
++	}
+ 	return result;
+ }
+ 
+@@ -278,7 +295,7 @@ void ima_store_measurement(struct integr
+ 	}
+ 
+ 	result = ima_store_template(entry, violation, inode, filename, pcr);
+-	if (!result || result == -EEXIST) {
++	if ((!result || result == -EEXIST) && !(file->f_flags & O_DIRECT)) {
+ 		iint->flags |= IMA_MEASURED;
+ 		iint->measured_pcrs |= (0x1 << pcr);
+ 	}
+--- a/security/integrity/ima/ima_crypto.c
++++ b/security/integrity/ima/ima_crypto.c
+@@ -443,6 +443,16 @@ int ima_calc_file_hash(struct file *file
+ 	loff_t i_size;
+ 	int rc;
+ 
++	/*
++	 * For consistency, fail file's opened with the O_DIRECT flag on
++	 * filesystems mounted with/without DAX option.
++	 */
++	if (file->f_flags & O_DIRECT) {
++		hash->length = hash_digest_size[ima_hash_algo];
++		hash->algo = ima_hash_algo;
++		return -EINVAL;
++	}
++
+ 	i_size = i_size_read(file_inode(file));
+ 
+ 	if (ima_ahash_minsize && i_size >= ima_ahash_minsize) {
+--- a/security/integrity/ima/ima_main.c
++++ b/security/integrity/ima/ima_main.c
+@@ -242,11 +242,8 @@ static int process_measurement(struct fi
+ 	hash_algo = ima_get_hash_algo(xattr_value, xattr_len);
+ 
+ 	rc = ima_collect_measurement(iint, file, buf, size, hash_algo);
+-	if (rc != 0) {
+-		if (file->f_flags & O_DIRECT)
+-			rc = (iint->flags & IMA_PERMIT_DIRECTIO) ? 0 : -EACCES;
++	if (rc != 0 && rc != -EBADF && rc != -EINVAL)
+ 		goto out_digsig;
+-	}
+ 
+ 	if (!pathbuf)	/* ima_rdwr_violation possibly pre-fetched */
+ 		pathname = ima_d_path(&file->f_path, &pathbuf, filename);
+@@ -254,12 +251,14 @@ static int process_measurement(struct fi
+ 	if (action & IMA_MEASURE)
+ 		ima_store_measurement(iint, file, pathname,
+ 				      xattr_value, xattr_len, pcr);
+-	if (action & IMA_APPRAISE_SUBMASK)
++	if (rc == 0 && (action & IMA_APPRAISE_SUBMASK))
+ 		rc = ima_appraise_measurement(func, iint, file, pathname,
+ 					      xattr_value, xattr_len, opened);
+ 	if (action & IMA_AUDIT)
+ 		ima_audit_measurement(iint, pathname);
+ 
++	if ((file->f_flags & O_DIRECT) && (iint->flags & IMA_PERMIT_DIRECTIO))
++		rc = 0;
+ out_digsig:
+ 	if ((mask & MAY_WRITE) && (iint->flags & IMA_DIGSIG) &&
+ 	     !(iint->flags & IMA_NEW_FILE))
