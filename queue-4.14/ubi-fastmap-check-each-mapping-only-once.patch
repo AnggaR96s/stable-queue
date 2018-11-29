@@ -1,0 +1,177 @@
+From 34653fd8c46e771585fce5975e4243f8fd401914 Mon Sep 17 00:00:00 2001
+From: Richard Weinberger <richard@nod.at>
+Date: Mon, 28 May 2018 22:04:33 +0200
+Subject: ubi: fastmap: Check each mapping only once
+
+From: Richard Weinberger <richard@nod.at>
+
+commit 34653fd8c46e771585fce5975e4243f8fd401914 upstream.
+
+Maintain a bitmap to keep track of which LEB->PEB mapping
+was checked already.
+That way we have to read back VID headers only once.
+
+Fixes: a23cf10d9abb ("ubi: fastmap: Correctly handle interrupted erasures in EBA")
+Signed-off-by: Richard Weinberger <richard@nod.at>
+Signed-off-by: Martin Kepplinger <martin.kepplinger@ginzinger.com>
+
+---
+ drivers/mtd/ubi/build.c   |    1 +
+ drivers/mtd/ubi/eba.c     |    4 ++++
+ drivers/mtd/ubi/fastmap.c |   20 ++++++++++++++++++++
+ drivers/mtd/ubi/ubi.h     |   11 +++++++++++
+ drivers/mtd/ubi/vmt.c     |    1 +
+ drivers/mtd/ubi/vtbl.c    |   16 +++++++++++++++-
+ 6 files changed, 52 insertions(+), 1 deletion(-)
+
+--- a/drivers/mtd/ubi/build.c
++++ b/drivers/mtd/ubi/build.c
+@@ -526,6 +526,7 @@ void ubi_free_internal_volumes(struct ub
+ 	for (i = ubi->vtbl_slots;
+ 	     i < ubi->vtbl_slots + UBI_INT_VOL_COUNT; i++) {
+ 		ubi_eba_replace_table(ubi->volumes[i], NULL);
++		ubi_fastmap_destroy_checkmap(ubi->volumes[i]);
+ 		kfree(ubi->volumes[i]);
+ 	}
+ }
+--- a/drivers/mtd/ubi/eba.c
++++ b/drivers/mtd/ubi/eba.c
+@@ -517,6 +517,9 @@ static int check_mapping(struct ubi_devi
+ 	if (!ubi->fast_attach)
+ 		return 0;
+ 
++	if (!vol->checkmap || test_bit(lnum, vol->checkmap))
++		return 0;
++
+ 	vidb = ubi_alloc_vid_buf(ubi, GFP_NOFS);
+ 	if (!vidb)
+ 		return -ENOMEM;
+@@ -551,6 +554,7 @@ static int check_mapping(struct ubi_devi
+ 		goto out_free;
+ 	}
+ 
++	set_bit(lnum, vol->checkmap);
+ 	err = 0;
+ 
+ out_free:
+--- a/drivers/mtd/ubi/fastmap.c
++++ b/drivers/mtd/ubi/fastmap.c
+@@ -1101,6 +1101,26 @@ free_fm_sb:
+ 	goto out;
+ }
+ 
++int ubi_fastmap_init_checkmap(struct ubi_volume *vol, int leb_count)
++{
++	struct ubi_device *ubi = vol->ubi;
++
++	if (!ubi->fast_attach)
++		return 0;
++
++	vol->checkmap = kcalloc(BITS_TO_LONGS(leb_count), sizeof(unsigned long),
++				GFP_KERNEL);
++	if (!vol->checkmap)
++		return -ENOMEM;
++
++	return 0;
++}
++
++void ubi_fastmap_destroy_checkmap(struct ubi_volume *vol)
++{
++	kfree(vol->checkmap);
++}
++
+ /**
+  * ubi_write_fastmap - writes a fastmap.
+  * @ubi: UBI device object
+--- a/drivers/mtd/ubi/ubi.h
++++ b/drivers/mtd/ubi/ubi.h
+@@ -334,6 +334,9 @@ struct ubi_eba_leb_desc {
+  * @changing_leb: %1 if the atomic LEB change ioctl command is in progress
+  * @direct_writes: %1 if direct writes are enabled for this volume
+  *
++ * @checkmap: bitmap to remember which PEB->LEB mappings got checked,
++ *            protected by UBI LEB lock tree.
++ *
+  * The @corrupted field indicates that the volume's contents is corrupted.
+  * Since UBI protects only static volumes, this field is not relevant to
+  * dynamic volumes - it is user's responsibility to assure their data
+@@ -377,6 +380,10 @@ struct ubi_volume {
+ 	unsigned int updating:1;
+ 	unsigned int changing_leb:1;
+ 	unsigned int direct_writes:1;
++
++#ifdef CONFIG_MTD_UBI_FASTMAP
++	unsigned long *checkmap;
++#endif
+ };
+ 
+ /**
+@@ -965,8 +972,12 @@ size_t ubi_calc_fm_size(struct ubi_devic
+ int ubi_update_fastmap(struct ubi_device *ubi);
+ int ubi_scan_fastmap(struct ubi_device *ubi, struct ubi_attach_info *ai,
+ 		     struct ubi_attach_info *scan_ai);
++int ubi_fastmap_init_checkmap(struct ubi_volume *vol, int leb_count);
++void ubi_fastmap_destroy_checkmap(struct ubi_volume *vol);
+ #else
+ static inline int ubi_update_fastmap(struct ubi_device *ubi) { return 0; }
++int static inline ubi_fastmap_init_checkmap(struct ubi_volume *vol, int leb_count) { return 0; }
++static inline void ubi_fastmap_destroy_checkmap(struct ubi_volume *vol) {}
+ #endif
+ 
+ /* block.c */
+--- a/drivers/mtd/ubi/vmt.c
++++ b/drivers/mtd/ubi/vmt.c
+@@ -139,6 +139,7 @@ static void vol_release(struct device *d
+ 	struct ubi_volume *vol = container_of(dev, struct ubi_volume, dev);
+ 
+ 	ubi_eba_replace_table(vol, NULL);
++	ubi_fastmap_destroy_checkmap(vol);
+ 	kfree(vol);
+ }
+ 
+--- a/drivers/mtd/ubi/vtbl.c
++++ b/drivers/mtd/ubi/vtbl.c
+@@ -534,7 +534,7 @@ static int init_volumes(struct ubi_devic
+ 			const struct ubi_attach_info *ai,
+ 			const struct ubi_vtbl_record *vtbl)
+ {
+-	int i, reserved_pebs = 0;
++	int i, err, reserved_pebs = 0;
+ 	struct ubi_ainf_volume *av;
+ 	struct ubi_volume *vol;
+ 
+@@ -620,6 +620,16 @@ static int init_volumes(struct ubi_devic
+ 			(long long)(vol->used_ebs - 1) * vol->usable_leb_size;
+ 		vol->used_bytes += av->last_data_size;
+ 		vol->last_eb_bytes = av->last_data_size;
++
++		/*
++		 * We use ubi->peb_count and not vol->reserved_pebs because
++		 * we want to keep the code simple. Otherwise we'd have to
++		 * resize/check the bitmap upon volume resize too.
++		 * Allocating a few bytes more does not hurt.
++		 */
++		err = ubi_fastmap_init_checkmap(vol, ubi->peb_count);
++		if (err)
++			return err;
+ 	}
+ 
+ 	/* And add the layout volume */
+@@ -645,6 +655,9 @@ static int init_volumes(struct ubi_devic
+ 	reserved_pebs += vol->reserved_pebs;
+ 	ubi->vol_count += 1;
+ 	vol->ubi = ubi;
++	err = ubi_fastmap_init_checkmap(vol, UBI_LAYOUT_VOLUME_EBS);
++	if (err)
++		return err;
+ 
+ 	if (reserved_pebs > ubi->avail_pebs) {
+ 		ubi_err(ubi, "not enough PEBs, required %d, available %d",
+@@ -849,6 +862,7 @@ int ubi_read_volume_table(struct ubi_dev
+ out_free:
+ 	vfree(ubi->vtbl);
+ 	for (i = 0; i < ubi->vtbl_slots + UBI_INT_VOL_COUNT; i++) {
++		ubi_fastmap_destroy_checkmap(ubi->volumes[i]);
+ 		kfree(ubi->volumes[i]);
+ 		ubi->volumes[i] = NULL;
+ 	}
