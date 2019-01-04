@@ -1,0 +1,84 @@
+From foo@baz Fri Jan  4 20:01:52 CET 2019
+From: Myungho Jung <mhjungk@gmail.com>
+Date: Tue, 18 Dec 2018 09:02:25 -0800
+Subject: net/smc: fix TCP fallback socket release
+
+From: Myungho Jung <mhjungk@gmail.com>
+
+[ Upstream commit 78abe3d0dfad196959b1246003366e2610775ea6 ]
+
+clcsock can be released while kernel_accept() references it in TCP
+listen worker. Also, clcsock needs to wake up before released if TCP
+fallback is used and the clcsock is blocked by accept. Add a lock to
+safely release clcsock and call kernel_sock_shutdown() to wake up
+clcsock from accept in smc_release().
+
+Reported-by: syzbot+0bf2e01269f1274b4b03@syzkaller.appspotmail.com
+Reported-by: syzbot+e3132895630f957306bc@syzkaller.appspotmail.com
+Signed-off-by: Myungho Jung <mhjungk@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/smc/af_smc.c |   14 ++++++++++++--
+ net/smc/smc.h    |    4 ++++
+ 2 files changed, 16 insertions(+), 2 deletions(-)
+
+--- a/net/smc/af_smc.c
++++ b/net/smc/af_smc.c
+@@ -133,8 +133,14 @@ static int smc_release(struct socket *so
+ 		sk->sk_shutdown |= SHUTDOWN_MASK;
+ 	}
+ 	if (smc->clcsock) {
++		if (smc->use_fallback && sk->sk_state == SMC_LISTEN) {
++			/* wake up clcsock accept */
++			rc = kernel_sock_shutdown(smc->clcsock, SHUT_RDWR);
++		}
++		mutex_lock(&smc->clcsock_release_lock);
+ 		sock_release(smc->clcsock);
+ 		smc->clcsock = NULL;
++		mutex_unlock(&smc->clcsock_release_lock);
+ 	}
+ 
+ 	/* detach socket */
+@@ -184,6 +190,7 @@ static struct sock *smc_sock_alloc(struc
+ 	INIT_DELAYED_WORK(&smc->sock_put_work, smc_close_sock_put_work);
+ 	sk->sk_prot->hash(sk);
+ 	sk_refcnt_debug_inc(sk);
++	mutex_init(&smc->clcsock_release_lock);
+ 
+ 	return sk;
+ }
+@@ -577,7 +584,7 @@ static int smc_clcsock_accept(struct smc
+ 	struct sock *sk = &lsmc->sk;
+ 	struct socket *new_clcsock;
+ 	struct sock *new_sk;
+-	int rc;
++	int rc = -EINVAL;
+ 
+ 	release_sock(&lsmc->sk);
+ 	new_sk = smc_sock_alloc(sock_net(sk), NULL);
+@@ -590,7 +597,10 @@ static int smc_clcsock_accept(struct smc
+ 	}
+ 	*new_smc = smc_sk(new_sk);
+ 
+-	rc = kernel_accept(lsmc->clcsock, &new_clcsock, 0);
++	mutex_lock(&lsmc->clcsock_release_lock);
++	if (lsmc->clcsock)
++		rc = kernel_accept(lsmc->clcsock, &new_clcsock, 0);
++	mutex_unlock(&lsmc->clcsock_release_lock);
+ 	lock_sock(&lsmc->sk);
+ 	if  (rc < 0) {
+ 		lsmc->sk.sk_err = -rc;
+--- a/net/smc/smc.h
++++ b/net/smc/smc.h
+@@ -185,6 +185,10 @@ struct smc_sock {				/* smc sock contain
+ 						 * started, waiting for unsent
+ 						 * data to be sent
+ 						 */
++	struct mutex            clcsock_release_lock;
++						/* protects clcsock of a listen
++						 * socket
++						 * */
+ };
+ 
+ static inline struct smc_sock *smc_sk(const struct sock *sk)
