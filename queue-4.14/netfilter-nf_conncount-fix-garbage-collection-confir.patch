@@ -1,0 +1,146 @@
+From ecc52ff44d90a4f1dfb06cafc1497e290334f12f Mon Sep 17 00:00:00 2001
+From: Florian Westphal <fw@strlen.de>
+Date: Wed, 2 Jan 2019 18:42:03 -0200
+Subject: netfilter: nf_conncount: fix garbage collection confirm race
+
+commit b36e4523d4d56e2595e28f16f6ccf1cd6a9fc452 upstream.
+
+Yi-Hung Wei and Justin Pettit found a race in the garbage collection scheme
+used by nf_conncount.
+
+When doing list walk, we lookup the tuple in the conntrack table.
+If the lookup fails we remove this tuple from our list because
+the conntrack entry is gone.
+
+This is the common cause, but turns out its not the only one.
+The list entry could have been created just before by another cpu, i.e. the
+conntrack entry might not yet have been inserted into the global hash.
+
+The avoid this, we introduce a timestamp and the owning cpu.
+If the entry appears to be stale, evict only if:
+ 1. The current cpu is the one that added the entry, or,
+ 2. The timestamp is older than two jiffies
+
+The second constraint allows GC to be taken over by other
+cpu too (e.g. because a cpu was offlined or napi got moved to another
+cpu).
+
+We can't pretend the 'doubtful' entry wasn't in our list.
+Instead, when we don't find an entry indicate via IS_ERR
+that entry was removed ('did not exist' or withheld
+('might-be-unconfirmed').
+
+This most likely also fixes a xt_connlimit imbalance earlier reported by
+Dmitry Andrianov.
+
+Cc: Dmitry Andrianov <dmitry.andrianov@alertme.com>
+Reported-by: Justin Pettit <jpettit@vmware.com>
+Reported-by: Yi-Hung Wei <yihung.wei@gmail.com>
+Signed-off-by: Florian Westphal <fw@strlen.de>
+Acked-by: Yi-Hung Wei <yihung.wei@gmail.com>
+Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+
+[mfo: backport: refresh context lines and use older symbol/file names:
+ - nf_conncount.c -> xt_connlimit.c.
+   - nf_conncount_rb -> xt_connlimit_rb
+   - nf_conncount_tuple -> xt_connlimit_conn
+   - conncount_conn_cachep -> connlimit_conn_cachep]
+Signed-off-by: Mauricio Faria de Oliveira <mfo@canonical.com>
+
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ net/netfilter/xt_connlimit.c | 52 ++++++++++++++++++++++++++++++++----
+ 1 file changed, 47 insertions(+), 5 deletions(-)
+
+diff --git a/net/netfilter/xt_connlimit.c b/net/netfilter/xt_connlimit.c
+index ab1f849464fa..913b86ef3a8d 100644
+--- a/net/netfilter/xt_connlimit.c
++++ b/net/netfilter/xt_connlimit.c
+@@ -47,6 +47,8 @@ struct xt_connlimit_conn {
+ 	struct hlist_node		node;
+ 	struct nf_conntrack_tuple	tuple;
+ 	struct nf_conntrack_zone	zone;
++	int				cpu;
++	u32				jiffies32;
+ };
+ 
+ struct xt_connlimit_rb {
+@@ -126,11 +128,42 @@ bool nf_conncount_add(struct hlist_head *head,
+ 		return false;
+ 	conn->tuple = *tuple;
+ 	conn->zone = *zone;
++	conn->cpu = raw_smp_processor_id();
++	conn->jiffies32 = (u32)jiffies;
+ 	hlist_add_head(&conn->node, head);
+ 	return true;
+ }
+ EXPORT_SYMBOL_GPL(nf_conncount_add);
+ 
++static const struct nf_conntrack_tuple_hash *
++find_or_evict(struct net *net, struct xt_connlimit_conn *conn)
++{
++	const struct nf_conntrack_tuple_hash *found;
++	unsigned long a, b;
++	int cpu = raw_smp_processor_id();
++	__s32 age;
++
++	found = nf_conntrack_find_get(net, &conn->zone, &conn->tuple);
++	if (found)
++		return found;
++	b = conn->jiffies32;
++	a = (u32)jiffies;
++
++	/* conn might have been added just before by another cpu and
++	 * might still be unconfirmed.  In this case, nf_conntrack_find()
++	 * returns no result.  Thus only evict if this cpu added the
++	 * stale entry or if the entry is older than two jiffies.
++	 */
++	age = a - b;
++	if (conn->cpu == cpu || age >= 2) {
++		hlist_del(&conn->node);
++		kmem_cache_free(connlimit_conn_cachep, conn);
++		return ERR_PTR(-ENOENT);
++	}
++
++	return ERR_PTR(-EAGAIN);
++}
++
+ unsigned int nf_conncount_lookup(struct net *net, struct hlist_head *head,
+ 				 const struct nf_conntrack_tuple *tuple,
+ 				 const struct nf_conntrack_zone *zone,
+@@ -138,18 +171,27 @@ unsigned int nf_conncount_lookup(struct net *net, struct hlist_head *head,
+ {
+ 	const struct nf_conntrack_tuple_hash *found;
+ 	struct xt_connlimit_conn *conn;
+-	struct hlist_node *n;
+ 	struct nf_conn *found_ct;
++	struct hlist_node *n;
+ 	unsigned int length = 0;
+ 
+ 	*addit = true;
+ 
+ 	/* check the saved connections */
+ 	hlist_for_each_entry_safe(conn, n, head, node) {
+-		found = nf_conntrack_find_get(net, &conn->zone, &conn->tuple);
+-		if (found == NULL) {
+-			hlist_del(&conn->node);
+-			kmem_cache_free(connlimit_conn_cachep, conn);
++		found = find_or_evict(net, conn);
++		if (IS_ERR(found)) {
++			/* Not found, but might be about to be confirmed */
++			if (PTR_ERR(found) == -EAGAIN) {
++				length++;
++				if (!tuple)
++					continue;
++
++				if (nf_ct_tuple_equal(&conn->tuple, tuple) &&
++				    nf_ct_zone_id(&conn->zone, conn->zone.dir) ==
++				    nf_ct_zone_id(zone, zone->dir))
++					*addit = false;
++			}
+ 			continue;
+ 		}
+ 
+-- 
+2.19.1
+
