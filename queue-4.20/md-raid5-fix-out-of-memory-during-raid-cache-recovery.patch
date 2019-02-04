@@ -1,0 +1,125 @@
+From 483cbbeddd5fe2c80fd4141ff0748fa06c4ff146 Mon Sep 17 00:00:00 2001
+From: Alexei Naberezhnov <anaberezhnov@fb.com>
+Date: Tue, 27 Mar 2018 16:54:16 -0700
+Subject: md/raid5: fix 'out of memory' during raid cache recovery
+
+From: Alexei Naberezhnov <anaberezhnov@fb.com>
+
+commit 483cbbeddd5fe2c80fd4141ff0748fa06c4ff146 upstream.
+
+This fixes the case when md array assembly fails because of raid cache recovery
+unable to allocate a stripe, despite attempts to replay stripes and increase
+cache size. This happens because stripes released by r5c_recovery_replay_stripes
+and raid5_set_cache_size don't become available for allocation immediately.
+Released stripes first are placed on conf->released_stripes list and require
+md thread to merge them on conf->inactive_list before they can be allocated.
+
+Patch allows final allocation attempt during cache recovery to wait for
+new stripes to become availabe for allocation.
+
+Cc: linux-raid@vger.kernel.org
+Cc: Shaohua Li <shli@kernel.org>
+Cc: linux-stable <stable@vger.kernel.org> # 4.10+
+Fixes: b4c625c67362 ("md/r5cache: r5cache recovery: part 1")
+Signed-off-by: Alexei Naberezhnov <anaberezhnov@fb.com>
+Signed-off-by: Song Liu <songliubraving@fb.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ drivers/md/raid5-cache.c |   33 ++++++++++++++++++++++-----------
+ drivers/md/raid5.c       |    8 ++++++--
+ 2 files changed, 28 insertions(+), 13 deletions(-)
+
+--- a/drivers/md/raid5-cache.c
++++ b/drivers/md/raid5-cache.c
+@@ -1935,12 +1935,14 @@ out:
+ }
+ 
+ static struct stripe_head *
+-r5c_recovery_alloc_stripe(struct r5conf *conf,
+-			  sector_t stripe_sect)
++r5c_recovery_alloc_stripe(
++		struct r5conf *conf,
++		sector_t stripe_sect,
++		int noblock)
+ {
+ 	struct stripe_head *sh;
+ 
+-	sh = raid5_get_active_stripe(conf, stripe_sect, 0, 1, 0);
++	sh = raid5_get_active_stripe(conf, stripe_sect, 0, noblock, 0);
+ 	if (!sh)
+ 		return NULL;  /* no more stripe available */
+ 
+@@ -2150,7 +2152,7 @@ r5c_recovery_analyze_meta_block(struct r
+ 						stripe_sect);
+ 
+ 		if (!sh) {
+-			sh = r5c_recovery_alloc_stripe(conf, stripe_sect);
++			sh = r5c_recovery_alloc_stripe(conf, stripe_sect, 1);
+ 			/*
+ 			 * cannot get stripe from raid5_get_active_stripe
+ 			 * try replay some stripes
+@@ -2159,20 +2161,29 @@ r5c_recovery_analyze_meta_block(struct r
+ 				r5c_recovery_replay_stripes(
+ 					cached_stripe_list, ctx);
+ 				sh = r5c_recovery_alloc_stripe(
+-					conf, stripe_sect);
++					conf, stripe_sect, 1);
+ 			}
+ 			if (!sh) {
++				int new_size = conf->min_nr_stripes * 2;
+ 				pr_debug("md/raid:%s: Increasing stripe cache size to %d to recovery data on journal.\n",
+ 					mdname(mddev),
+-					conf->min_nr_stripes * 2);
+-				raid5_set_cache_size(mddev,
+-						     conf->min_nr_stripes * 2);
+-				sh = r5c_recovery_alloc_stripe(conf,
+-							       stripe_sect);
++					new_size);
++				ret = raid5_set_cache_size(mddev, new_size);
++				if (conf->min_nr_stripes <= new_size / 2) {
++					pr_err("md/raid:%s: Cannot increase cache size, ret=%d, new_size=%d, min_nr_stripes=%d, max_nr_stripes=%d\n",
++						mdname(mddev),
++						ret,
++						new_size,
++						conf->min_nr_stripes,
++						conf->max_nr_stripes);
++					return -ENOMEM;
++				}
++				sh = r5c_recovery_alloc_stripe(
++					conf, stripe_sect, 0);
+ 			}
+ 			if (!sh) {
+ 				pr_err("md/raid:%s: Cannot get enough stripes due to memory pressure. Recovery failed.\n",
+-				       mdname(mddev));
++					mdname(mddev));
+ 				return -ENOMEM;
+ 			}
+ 			list_add_tail(&sh->lru, cached_stripe_list);
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -6369,6 +6369,7 @@ raid5_show_stripe_cache_size(struct mdde
+ int
+ raid5_set_cache_size(struct mddev *mddev, int size)
+ {
++	int result = 0;
+ 	struct r5conf *conf = mddev->private;
+ 
+ 	if (size <= 16 || size > 32768)
+@@ -6385,11 +6386,14 @@ raid5_set_cache_size(struct mddev *mddev
+ 
+ 	mutex_lock(&conf->cache_size_mutex);
+ 	while (size > conf->max_nr_stripes)
+-		if (!grow_one_stripe(conf, GFP_KERNEL))
++		if (!grow_one_stripe(conf, GFP_KERNEL)) {
++			conf->min_nr_stripes = conf->max_nr_stripes;
++			result = -ENOMEM;
+ 			break;
++		}
+ 	mutex_unlock(&conf->cache_size_mutex);
+ 
+-	return 0;
++	return result;
+ }
+ EXPORT_SYMBOL(raid5_set_cache_size);
+ 
