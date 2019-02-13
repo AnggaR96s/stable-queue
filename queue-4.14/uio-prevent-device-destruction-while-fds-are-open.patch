@@ -1,0 +1,306 @@
+From foo@baz Wed Feb 13 19:34:05 CET 2019
+From: "Rantala, Tommi T. (Nokia - FI/Espoo)" <tommi.t.rantala@nokia.com>
+Date: Wed, 13 Feb 2019 16:29:29 +0000
+Subject: uio: Prevent device destruction while fds are open
+To: "stable@vger.kernel.org" <stable@vger.kernel.org>
+Cc: "linux-kernel@vger.kernel.org" <linux-kernel@vger.kernel.org>, Hamish Martin <hamish.martin@alliedtelesis.co.nz>, Chris Packham <chris.packham@alliedtelesis.co.nz>, Greg Kroah-Hartman <gregkh@linuxfoundation.org>, "Rantala, Tommi T. (Nokia - FI/Espoo)" <tommi.t.rantala@nokia.com>
+Message-ID: <20190213162845.11688-3-tommi.t.rantala@nokia.com>
+
+From: Hamish Martin <hamish.martin@alliedtelesis.co.nz>
+
+commit a93e7b331568227500186a465fee3c2cb5dffd1f upstream.
+
+Prevent destruction of a uio_device while user space apps hold open
+file descriptors to that device. Further, access to the 'info' member
+of the struct uio_device is protected by spinlock. This is to ensure
+stale pointers to data not under control of the UIO subsystem are not
+dereferenced.
+
+Signed-off-by: Hamish Martin <hamish.martin@alliedtelesis.co.nz>
+Reviewed-by: Chris Packham <chris.packham@alliedtelesis.co.nz>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+[4.14 change __poll_t to unsigned int]
+Signed-off-by: Tommi Rantala <tommi.t.rantala@nokia.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/uio/uio.c          |   98 +++++++++++++++++++++++++++++++++------------
+ include/linux/uio_driver.h |    4 +
+ 2 files changed, 75 insertions(+), 27 deletions(-)
+
+--- a/drivers/uio/uio.c
++++ b/drivers/uio/uio.c
+@@ -272,7 +272,7 @@ static int uio_dev_add_attributes(struct
+ 		if (!map_found) {
+ 			map_found = 1;
+ 			idev->map_dir = kobject_create_and_add("maps",
+-							&idev->dev->kobj);
++							&idev->dev.kobj);
+ 			if (!idev->map_dir) {
+ 				ret = -ENOMEM;
+ 				goto err_map;
+@@ -301,7 +301,7 @@ static int uio_dev_add_attributes(struct
+ 		if (!portio_found) {
+ 			portio_found = 1;
+ 			idev->portio_dir = kobject_create_and_add("portio",
+-							&idev->dev->kobj);
++							&idev->dev.kobj);
+ 			if (!idev->portio_dir) {
+ 				ret = -ENOMEM;
+ 				goto err_portio;
+@@ -344,7 +344,7 @@ err_map_kobj:
+ 		kobject_put(&map->kobj);
+ 	}
+ 	kobject_put(idev->map_dir);
+-	dev_err(idev->dev, "error creating sysfs files (%d)\n", ret);
++	dev_err(&idev->dev, "error creating sysfs files (%d)\n", ret);
+ 	return ret;
+ }
+ 
+@@ -381,7 +381,7 @@ static int uio_get_minor(struct uio_devi
+ 		idev->minor = retval;
+ 		retval = 0;
+ 	} else if (retval == -ENOSPC) {
+-		dev_err(idev->dev, "too many uio devices\n");
++		dev_err(&idev->dev, "too many uio devices\n");
+ 		retval = -EINVAL;
+ 	}
+ 	mutex_unlock(&minor_lock);
+@@ -435,6 +435,7 @@ static int uio_open(struct inode *inode,
+ 	struct uio_device *idev;
+ 	struct uio_listener *listener;
+ 	int ret = 0;
++	unsigned long flags;
+ 
+ 	mutex_lock(&minor_lock);
+ 	idev = idr_find(&uio_idr, iminor(inode));
+@@ -444,9 +445,11 @@ static int uio_open(struct inode *inode,
+ 		goto out;
+ 	}
+ 
++	get_device(&idev->dev);
++
+ 	if (!try_module_get(idev->owner)) {
+ 		ret = -ENODEV;
+-		goto out;
++		goto err_module_get;
+ 	}
+ 
+ 	listener = kmalloc(sizeof(*listener), GFP_KERNEL);
+@@ -459,11 +462,13 @@ static int uio_open(struct inode *inode,
+ 	listener->event_count = atomic_read(&idev->event);
+ 	filep->private_data = listener;
+ 
+-	if (idev->info->open) {
++	spin_lock_irqsave(&idev->info_lock, flags);
++	if (idev->info && idev->info->open)
+ 		ret = idev->info->open(idev->info, inode);
+-		if (ret)
+-			goto err_infoopen;
+-	}
++	spin_unlock_irqrestore(&idev->info_lock, flags);
++	if (ret)
++		goto err_infoopen;
++
+ 	return 0;
+ 
+ err_infoopen:
+@@ -472,6 +477,9 @@ err_infoopen:
+ err_alloc_listener:
+ 	module_put(idev->owner);
+ 
++err_module_get:
++	put_device(&idev->dev);
++
+ out:
+ 	return ret;
+ }
+@@ -489,12 +497,16 @@ static int uio_release(struct inode *ino
+ 	int ret = 0;
+ 	struct uio_listener *listener = filep->private_data;
+ 	struct uio_device *idev = listener->dev;
++	unsigned long flags;
+ 
+-	if (idev->info->release)
++	spin_lock_irqsave(&idev->info_lock, flags);
++	if (idev->info && idev->info->release)
+ 		ret = idev->info->release(idev->info, inode);
++	spin_unlock_irqrestore(&idev->info_lock, flags);
+ 
+ 	module_put(idev->owner);
+ 	kfree(listener);
++	put_device(&idev->dev);
+ 	return ret;
+ }
+ 
+@@ -502,9 +514,16 @@ static unsigned int uio_poll(struct file
+ {
+ 	struct uio_listener *listener = filep->private_data;
+ 	struct uio_device *idev = listener->dev;
++	unsigned int ret = 0;
++	unsigned long flags;
++
++	spin_lock_irqsave(&idev->info_lock, flags);
++	if (!idev->info || !idev->info->irq)
++		ret = -EIO;
++	spin_unlock_irqrestore(&idev->info_lock, flags);
+ 
+-	if (!idev->info->irq)
+-		return -EIO;
++	if (ret)
++		return ret;
+ 
+ 	poll_wait(filep, &idev->wait, wait);
+ 	if (listener->event_count != atomic_read(&idev->event))
+@@ -518,11 +537,17 @@ static ssize_t uio_read(struct file *fil
+ 	struct uio_listener *listener = filep->private_data;
+ 	struct uio_device *idev = listener->dev;
+ 	DECLARE_WAITQUEUE(wait, current);
+-	ssize_t retval;
++	ssize_t retval = 0;
+ 	s32 event_count;
++	unsigned long flags;
++
++	spin_lock_irqsave(&idev->info_lock, flags);
++	if (!idev->info || !idev->info->irq)
++		retval = -EIO;
++	spin_unlock_irqrestore(&idev->info_lock, flags);
+ 
+-	if (!idev->info->irq)
+-		return -EIO;
++	if (retval)
++		return retval;
+ 
+ 	if (count != sizeof(s32))
+ 		return -EINVAL;
+@@ -569,8 +594,10 @@ static ssize_t uio_write(struct file *fi
+ 	struct uio_device *idev = listener->dev;
+ 	ssize_t retval;
+ 	s32 irq_on;
++	unsigned long flags;
+ 
+-	if (!idev->info->irq) {
++	spin_lock_irqsave(&idev->info_lock, flags);
++	if (!idev->info || !idev->info->irq) {
+ 		retval = -EIO;
+ 		goto out;
+ 	}
+@@ -593,6 +620,7 @@ static ssize_t uio_write(struct file *fi
+ 	retval = idev->info->irqcontrol(idev->info, irq_on);
+ 
+ out:
++	spin_unlock_irqrestore(&idev->info_lock, flags);
+ 	return retval ? retval : sizeof(s32);
+ }
+ 
+@@ -809,6 +837,13 @@ static void release_uio_class(void)
+ 	uio_major_cleanup();
+ }
+ 
++static void uio_device_release(struct device *dev)
++{
++	struct uio_device *idev = dev_get_drvdata(dev);
++
++	kfree(idev);
++}
++
+ /**
+  * uio_register_device - register a new userspace IO device
+  * @owner:	module that creates the new device
+@@ -832,13 +867,14 @@ int __uio_register_device(struct module
+ 
+ 	info->uio_dev = NULL;
+ 
+-	idev = devm_kzalloc(parent, sizeof(*idev), GFP_KERNEL);
++	idev = kzalloc(sizeof(*idev), GFP_KERNEL);
+ 	if (!idev) {
+ 		return -ENOMEM;
+ 	}
+ 
+ 	idev->owner = owner;
+ 	idev->info = info;
++	spin_lock_init(&idev->info_lock);
+ 	init_waitqueue_head(&idev->wait);
+ 	atomic_set(&idev->event, 0);
+ 
+@@ -846,14 +882,19 @@ int __uio_register_device(struct module
+ 	if (ret)
+ 		return ret;
+ 
+-	idev->dev = device_create(&uio_class, parent,
+-				  MKDEV(uio_major, idev->minor), idev,
+-				  "uio%d", idev->minor);
+-	if (IS_ERR(idev->dev)) {
+-		printk(KERN_ERR "UIO: device register failed\n");
+-		ret = PTR_ERR(idev->dev);
++	idev->dev.devt = MKDEV(uio_major, idev->minor);
++	idev->dev.class = &uio_class;
++	idev->dev.parent = parent;
++	idev->dev.release = uio_device_release;
++	dev_set_drvdata(&idev->dev, idev);
++
++	ret = dev_set_name(&idev->dev, "uio%d", idev->minor);
++	if (ret)
++		goto err_device_create;
++
++	ret = device_register(&idev->dev);
++	if (ret)
+ 		goto err_device_create;
+-	}
+ 
+ 	ret = uio_dev_add_attributes(idev);
+ 	if (ret)
+@@ -883,7 +924,7 @@ int __uio_register_device(struct module
+ err_request_irq:
+ 	uio_dev_del_attributes(idev);
+ err_uio_dev_add_attributes:
+-	device_destroy(&uio_class, MKDEV(uio_major, idev->minor));
++	device_unregister(&idev->dev);
+ err_device_create:
+ 	uio_free_minor(idev);
+ 	return ret;
+@@ -898,6 +939,7 @@ EXPORT_SYMBOL_GPL(__uio_register_device)
+ void uio_unregister_device(struct uio_info *info)
+ {
+ 	struct uio_device *idev;
++	unsigned long flags;
+ 
+ 	if (!info || !info->uio_dev)
+ 		return;
+@@ -911,7 +953,11 @@ void uio_unregister_device(struct uio_in
+ 	if (info->irq && info->irq != UIO_IRQ_CUSTOM)
+ 		free_irq(info->irq, idev);
+ 
+-	device_destroy(&uio_class, MKDEV(uio_major, idev->minor));
++	spin_lock_irqsave(&idev->info_lock, flags);
++	idev->info = NULL;
++	spin_unlock_irqrestore(&idev->info_lock, flags);
++
++	device_unregister(&idev->dev);
+ 
+ 	return;
+ }
+--- a/include/linux/uio_driver.h
++++ b/include/linux/uio_driver.h
+@@ -14,6 +14,7 @@
+ #ifndef _UIO_DRIVER_H_
+ #define _UIO_DRIVER_H_
+ 
++#include <linux/device.h>
+ #include <linux/fs.h>
+ #include <linux/interrupt.h>
+ 
+@@ -68,12 +69,13 @@ struct uio_port {
+ 
+ struct uio_device {
+         struct module           *owner;
+-        struct device           *dev;
++	struct device		dev;
+         int                     minor;
+         atomic_t                event;
+         struct fasync_struct    *async_queue;
+         wait_queue_head_t       wait;
+         struct uio_info         *info;
++	spinlock_t		info_lock;
+         struct kobject          *map_dir;
+         struct kobject          *portio_dir;
+ };
