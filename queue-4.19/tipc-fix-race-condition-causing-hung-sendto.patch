@@ -1,0 +1,85 @@
+From foo@baz Fri Mar  8 08:25:51 CET 2019
+From: Tung Nguyen <tung.q.nguyen@dektech.com.au>
+Date: Mon, 25 Feb 2019 10:57:20 +0700
+Subject: tipc: fix race condition causing hung sendto
+
+From: Tung Nguyen <tung.q.nguyen@dektech.com.au>
+
+[ Upstream commit bfd07f3dd4f111b884d7922b37eb239280f83d8c ]
+
+When sending multicast messages via blocking socket,
+if sending link is congested (tsk->cong_link_cnt is set to 1),
+the sending thread will be put into sleeping state. However,
+tipc_sk_filter_rcv() is called under socket spin lock but
+tipc_wait_for_cond() is not. So, there is no guarantee that
+the setting of tsk->cong_link_cnt to 0 in tipc_sk_proto_rcv() in
+CPU-1 will be perceived by CPU-0. If that is the case, the sending
+thread in CPU-0 after being waken up, will continue to see
+tsk->cong_link_cnt as 1 and put the sending thread into sleeping
+state again. The sending thread will sleep forever.
+
+CPU-0                                | CPU-1
+tipc_wait_for_cond()                 |
+{                                    |
+ // condition_ = !tsk->cong_link_cnt |
+ while ((rc_ = !(condition_))) {     |
+  ...                                |
+  release_sock(sk_);                 |
+  wait_woken();                      |
+                                     | if (!sock_owned_by_user(sk))
+                                     |  tipc_sk_filter_rcv()
+                                     |  {
+                                     |   ...
+                                     |   tipc_sk_proto_rcv()
+                                     |   {
+                                     |    ...
+                                     |    tsk->cong_link_cnt--;
+                                     |    ...
+                                     |    sk->sk_write_space(sk);
+                                     |    ...
+                                     |   }
+                                     |   ...
+                                     |  }
+  sched_annotate_sleep();            |
+  lock_sock(sk_);                    |
+  remove_wait_queue();               |
+ }                                   |
+}                                    |
+
+This commit fixes it by adding memory barrier to tipc_sk_proto_rcv()
+and tipc_wait_for_cond().
+
+Acked-by: Jon Maloy <jon.maloy@ericsson.com>
+Signed-off-by: Tung Nguyen <tung.q.nguyen@dektech.com.au>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/tipc/socket.c |    6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+--- a/net/tipc/socket.c
++++ b/net/tipc/socket.c
+@@ -377,11 +377,13 @@ static int tipc_sk_sock_err(struct socke
+ 
+ #define tipc_wait_for_cond(sock_, timeo_, condition_)			       \
+ ({                                                                             \
++	DEFINE_WAIT_FUNC(wait_, woken_wake_function);                          \
+ 	struct sock *sk_;						       \
+ 	int rc_;							       \
+ 									       \
+ 	while ((rc_ = !(condition_))) {					       \
+-		DEFINE_WAIT_FUNC(wait_, woken_wake_function);	               \
++		/* coupled with smp_wmb() in tipc_sk_proto_rcv() */            \
++		smp_rmb();                                                     \
+ 		sk_ = (sock_)->sk;					       \
+ 		rc_ = tipc_sk_sock_err((sock_), timeo_);		       \
+ 		if (rc_)						       \
+@@ -1961,6 +1963,8 @@ static void tipc_sk_proto_rcv(struct soc
+ 		return;
+ 	case SOCK_WAKEUP:
+ 		tipc_dest_del(&tsk->cong_links, msg_orignode(hdr), 0);
++		/* coupled with smp_rmb() in tipc_wait_for_cond() */
++		smp_wmb();
+ 		tsk->cong_link_cnt--;
+ 		wakeup = true;
+ 		break;
