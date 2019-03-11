@@ -1,0 +1,96 @@
+From 92b83a6a6df05cdfe8b77fec1cec329e94bccc46 Mon Sep 17 00:00:00 2001
+From: Keith Busch <keith.busch@intel.com>
+Date: Mon, 28 Jan 2019 09:46:07 -0700
+Subject: nvme: lock NS list changes while handling command effects
+
+[ Upstream commit e7ad43c3eda6a1690c4c3c341f95dc1c6898da83 ]
+
+If a controller supports the NS Change Notification, the namespace
+scan_work is automatically triggered after attaching a new namespace.
+
+Occasionally the namespace scan_work may append the new namespace to the
+list before the admin command effects handling is completed. The effects
+handling unfreezes namespaces, but if it unfreezes the newly attached
+namespace, its request_queue freeze depth will be off and we'll hit the
+warning in blk_mq_unfreeze_queue().
+
+On the next namespace add, we will fail to freeze that queue due to the
+previous bad accounting and deadlock waiting for frozen.
+
+Fix that by preventing scan work from altering the namespace list while
+command effects handling needs to pair freeze with unfreeze.
+
+Reported-by: Wen Xiong <wenxiong@us.ibm.com>
+Tested-by: Wen Xiong <wenxiong@us.ibm.com>
+Signed-off-by: Keith Busch <keith.busch@intel.com>
+Reviewed-by: Chaitanya Kulkarni <chaitanya.kulkarni@wdc.com>
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/nvme/host/core.c | 8 +++++++-
+ drivers/nvme/host/nvme.h | 1 +
+ 2 files changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index 5f9a5ef93969..21d7b646c73d 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -1182,6 +1182,7 @@ static u32 nvme_passthru_start(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
+ 	 * effects say only one namespace is affected.
+ 	 */
+ 	if (effects & (NVME_CMD_EFFECTS_LBCC | NVME_CMD_EFFECTS_CSE_MASK)) {
++		mutex_lock(&ctrl->scan_lock);
+ 		nvme_start_freeze(ctrl);
+ 		nvme_wait_freeze(ctrl);
+ 	}
+@@ -1210,8 +1211,10 @@ static void nvme_passthru_end(struct nvme_ctrl *ctrl, u32 effects)
+ 	 */
+ 	if (effects & NVME_CMD_EFFECTS_LBCC)
+ 		nvme_update_formats(ctrl);
+-	if (effects & (NVME_CMD_EFFECTS_LBCC | NVME_CMD_EFFECTS_CSE_MASK))
++	if (effects & (NVME_CMD_EFFECTS_LBCC | NVME_CMD_EFFECTS_CSE_MASK)) {
+ 		nvme_unfreeze(ctrl);
++		mutex_unlock(&ctrl->scan_lock);
++	}
+ 	if (effects & NVME_CMD_EFFECTS_CCC)
+ 		nvme_init_identify(ctrl);
+ 	if (effects & (NVME_CMD_EFFECTS_NIC | NVME_CMD_EFFECTS_NCC))
+@@ -3300,6 +3303,7 @@ static void nvme_scan_work(struct work_struct *work)
+ 	if (nvme_identify_ctrl(ctrl, &id))
+ 		return;
+ 
++	mutex_lock(&ctrl->scan_lock);
+ 	nn = le32_to_cpu(id->nn);
+ 	if (ctrl->vs >= NVME_VS(1, 1, 0) &&
+ 	    !(ctrl->quirks & NVME_QUIRK_IDENTIFY_CNS)) {
+@@ -3308,6 +3312,7 @@ static void nvme_scan_work(struct work_struct *work)
+ 	}
+ 	nvme_scan_ns_sequential(ctrl, nn);
+ out_free_id:
++	mutex_unlock(&ctrl->scan_lock);
+ 	kfree(id);
+ 	down_write(&ctrl->namespaces_rwsem);
+ 	list_sort(NULL, &ctrl->namespaces, ns_cmp);
+@@ -3550,6 +3555,7 @@ int nvme_init_ctrl(struct nvme_ctrl *ctrl, struct device *dev,
+ 
+ 	ctrl->state = NVME_CTRL_NEW;
+ 	spin_lock_init(&ctrl->lock);
++	mutex_init(&ctrl->scan_lock);
+ 	INIT_LIST_HEAD(&ctrl->namespaces);
+ 	init_rwsem(&ctrl->namespaces_rwsem);
+ 	ctrl->dev = dev;
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index 6ffa99a10a60..5274881f9141 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -153,6 +153,7 @@ struct nvme_ctrl {
+ 	enum nvme_ctrl_state state;
+ 	bool identified;
+ 	spinlock_t lock;
++	struct mutex scan_lock;
+ 	const struct nvme_ctrl_ops *ops;
+ 	struct request_queue *admin_q;
+ 	struct request_queue *connect_q;
+-- 
+2.19.1
+

@@ -1,0 +1,92 @@
+From 63d808447e0e75c1323a020fbe03bb5aafeff0b9 Mon Sep 17 00:00:00 2001
+From: Alexei Starovoitov <ast@kernel.org>
+Date: Mon, 28 Jan 2019 18:43:34 -0800
+Subject: bpf: run bpf programs with preemption disabled
+
+[ Upstream commit 6cab5e90ab2bd323c9f3811b6c70a4687df51e27 ]
+
+Disabled preemption is necessary for proper access to per-cpu maps
+from BPF programs.
+
+But the sender side of socket filters didn't have preemption disabled:
+unix_dgram_sendmsg->sk_filter->sk_filter_trim_cap->bpf_prog_run_save_cb->BPF_PROG_RUN
+
+and a combination of af_packet with tun device didn't disable either:
+tpacket_snd->packet_direct_xmit->packet_pick_tx_queue->ndo_select_queue->
+  tun_select_queue->tun_ebpf_select_queue->bpf_prog_run_clear_cb->BPF_PROG_RUN
+
+Disable preemption before executing BPF programs (both classic and extended).
+
+Reported-by: Jann Horn <jannh@google.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Song Liu <songliubraving@fb.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/linux/filter.h | 21 ++++++++++++++++++---
+ kernel/bpf/cgroup.c    |  2 +-
+ 2 files changed, 19 insertions(+), 4 deletions(-)
+
+diff --git a/include/linux/filter.h b/include/linux/filter.h
+index b776626aeb84..958eddbc44d3 100644
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@ -591,8 +591,8 @@ static inline u8 *bpf_skb_cb(struct sk_buff *skb)
+ 	return qdisc_skb_cb(skb)->data;
+ }
+ 
+-static inline u32 bpf_prog_run_save_cb(const struct bpf_prog *prog,
+-				       struct sk_buff *skb)
++static inline u32 __bpf_prog_run_save_cb(const struct bpf_prog *prog,
++					 struct sk_buff *skb)
+ {
+ 	u8 *cb_data = bpf_skb_cb(skb);
+ 	u8 cb_saved[BPF_SKB_CB_LEN];
+@@ -611,15 +611,30 @@ static inline u32 bpf_prog_run_save_cb(const struct bpf_prog *prog,
+ 	return res;
+ }
+ 
++static inline u32 bpf_prog_run_save_cb(const struct bpf_prog *prog,
++				       struct sk_buff *skb)
++{
++	u32 res;
++
++	preempt_disable();
++	res = __bpf_prog_run_save_cb(prog, skb);
++	preempt_enable();
++	return res;
++}
++
+ static inline u32 bpf_prog_run_clear_cb(const struct bpf_prog *prog,
+ 					struct sk_buff *skb)
+ {
+ 	u8 *cb_data = bpf_skb_cb(skb);
++	u32 res;
+ 
+ 	if (unlikely(prog->cb_access))
+ 		memset(cb_data, 0, BPF_SKB_CB_LEN);
+ 
+-	return BPF_PROG_RUN(prog, skb);
++	preempt_disable();
++	res = BPF_PROG_RUN(prog, skb);
++	preempt_enable();
++	return res;
+ }
+ 
+ static __always_inline u32 bpf_prog_run_xdp(const struct bpf_prog *prog,
+diff --git a/kernel/bpf/cgroup.c b/kernel/bpf/cgroup.c
+index 9425c2fb872f..6c24b1fb2db8 100644
+--- a/kernel/bpf/cgroup.c
++++ b/kernel/bpf/cgroup.c
+@@ -572,7 +572,7 @@ int __cgroup_bpf_run_filter_skb(struct sock *sk,
+ 	bpf_compute_and_save_data_end(skb, &saved_data_end);
+ 
+ 	ret = BPF_PROG_RUN_ARRAY(cgrp->bpf.effective[type], skb,
+-				 bpf_prog_run_save_cb);
++				 __bpf_prog_run_save_cb);
+ 	bpf_restore_data_end(skb, saved_data_end);
+ 	__skb_pull(skb, offset);
+ 	skb->sk = save_sk;
+-- 
+2.19.1
+

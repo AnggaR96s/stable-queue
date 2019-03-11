@@ -1,0 +1,80 @@
+From 98f37270e918a5ee3320588e801dc7064de7ba3e Mon Sep 17 00:00:00 2001
+From: Martin KaFai Lau <kafai@fb.com>
+Date: Wed, 30 Jan 2019 18:12:45 -0800
+Subject: bpf: Fix syscall's stackmap lookup potential deadlock
+
+[ Upstream commit 7c4cd051add3d00bbff008a133c936c515eaa8fe ]
+
+The map_lookup_elem used to not acquiring spinlock
+in order to optimize the reader.
+
+It was true until commit 557c0c6e7df8 ("bpf: convert stackmap to pre-allocation")
+The syscall's map_lookup_elem(stackmap) calls bpf_stackmap_copy().
+bpf_stackmap_copy() may find the elem no longer needed after the copy is done.
+If that is the case, pcpu_freelist_push() saves this elem for reuse later.
+This push requires a spinlock.
+
+If a tracing bpf_prog got run in the middle of the syscall's
+map_lookup_elem(stackmap) and this tracing bpf_prog is calling
+bpf_get_stackid(stackmap) which also requires the same pcpu_freelist's
+spinlock, it may end up with a dead lock situation as reported by
+Eric Dumazet in https://patchwork.ozlabs.org/patch/1030266/
+
+The situation is the same as the syscall's map_update_elem() which
+needs to acquire the pcpu_freelist's spinlock and could race
+with tracing bpf_prog.  Hence, this patch fixes it by protecting
+bpf_stackmap_copy() with this_cpu_inc(bpf_prog_active)
+to prevent tracing bpf_prog from running.
+
+A later syscall's map_lookup_elem commit f1a2e44a3aec ("bpf: add queue and stack maps")
+also acquires a spinlock and races with tracing bpf_prog similarly.
+Hence, this patch is forward looking and protects the majority
+of the map lookups.  bpf_map_offload_lookup_elem() is the exception
+since it is for network bpf_prog only (i.e. never called by tracing
+bpf_prog).
+
+Fixes: 557c0c6e7df8 ("bpf: convert stackmap to pre-allocation")
+Reported-by: Eric Dumazet <eric.dumazet@gmail.com>
+Acked-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ kernel/bpf/syscall.c | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index cf5040fd5434..5f03ddf7b615 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -712,8 +712,13 @@ static int map_lookup_elem(union bpf_attr *attr)
+ 
+ 	if (bpf_map_is_dev_bound(map)) {
+ 		err = bpf_map_offload_lookup_elem(map, key, value);
+-	} else if (map->map_type == BPF_MAP_TYPE_PERCPU_HASH ||
+-		   map->map_type == BPF_MAP_TYPE_LRU_PERCPU_HASH) {
++		goto done;
++	}
++
++	preempt_disable();
++	this_cpu_inc(bpf_prog_active);
++	if (map->map_type == BPF_MAP_TYPE_PERCPU_HASH ||
++	    map->map_type == BPF_MAP_TYPE_LRU_PERCPU_HASH) {
+ 		err = bpf_percpu_hash_copy(map, key, value);
+ 	} else if (map->map_type == BPF_MAP_TYPE_PERCPU_ARRAY) {
+ 		err = bpf_percpu_array_copy(map, key, value);
+@@ -743,7 +748,10 @@ static int map_lookup_elem(union bpf_attr *attr)
+ 		}
+ 		rcu_read_unlock();
+ 	}
++	this_cpu_dec(bpf_prog_active);
++	preempt_enable();
+ 
++done:
+ 	if (err)
+ 		goto free_value;
+ 
+-- 
+2.19.1
+
