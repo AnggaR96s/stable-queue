@@ -1,0 +1,128 @@
+From b7ac72b6cf18c0f6d7bb4d92cddef1a84c015d2b Mon Sep 17 00:00:00 2001
+From: Max Filippov <jcmvbkbc@gmail.com>
+Date: Fri, 21 Dec 2018 08:26:20 -0800
+Subject: xtensa: SMP: fix secondary CPU initialization
+
+[ Upstream commit 32a7726c4f4aadfabdb82440d84f88a5a2c8fe13 ]
+
+- add missing memory barriers to the secondary CPU synchronization spin
+  loops; add comment to the matching memory barrier in the boot_secondary
+  and __cpu_die functions;
+- use READ_ONCE/WRITE_ONCE to access cpu_start_id/cpu_start_ccount
+  instead of reading/writing them directly;
+- re-initialize cpu_running every time before starting secondary CPU to
+  flush possible previous CPU startup results.
+
+Signed-off-by: Max Filippov <jcmvbkbc@gmail.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ arch/xtensa/kernel/head.S |  5 ++++-
+ arch/xtensa/kernel/smp.c  | 34 +++++++++++++++++++++-------------
+ 2 files changed, 25 insertions(+), 14 deletions(-)
+
+diff --git a/arch/xtensa/kernel/head.S b/arch/xtensa/kernel/head.S
+index 64140998e117..16bdb414784a 100644
+--- a/arch/xtensa/kernel/head.S
++++ b/arch/xtensa/kernel/head.S
+@@ -281,12 +281,13 @@ should_never_return:
+ 
+ 	movi	a2, cpu_start_ccount
+ 1:
++	memw
+ 	l32i	a3, a2, 0
+ 	beqi	a3, 0, 1b
+ 	movi	a3, 0
+ 	s32i	a3, a2, 0
+-	memw
+ 1:
++	memw
+ 	l32i	a3, a2, 0
+ 	beqi	a3, 0, 1b
+ 	wsr	a3, ccount
+@@ -323,11 +324,13 @@ ENTRY(cpu_restart)
+ 	rsr	a0, prid
+ 	neg	a2, a0
+ 	movi	a3, cpu_start_id
++	memw
+ 	s32i	a2, a3, 0
+ #if XCHAL_DCACHE_IS_WRITEBACK
+ 	dhwbi	a3, 0
+ #endif
+ 1:
++	memw
+ 	l32i	a2, a3, 0
+ 	dhi	a3, 0
+ 	bne	a2, a0, 1b
+diff --git a/arch/xtensa/kernel/smp.c b/arch/xtensa/kernel/smp.c
+index 4d02e38514f5..545144d1431d 100644
+--- a/arch/xtensa/kernel/smp.c
++++ b/arch/xtensa/kernel/smp.c
+@@ -192,9 +192,11 @@ static int boot_secondary(unsigned int cpu, struct task_struct *ts)
+ 	int i;
+ 
+ #ifdef CONFIG_HOTPLUG_CPU
+-	cpu_start_id = cpu;
+-	system_flush_invalidate_dcache_range(
+-			(unsigned long)&cpu_start_id, sizeof(cpu_start_id));
++	WRITE_ONCE(cpu_start_id, cpu);
++	/* Pairs with the third memw in the cpu_restart */
++	mb();
++	system_flush_invalidate_dcache_range((unsigned long)&cpu_start_id,
++					     sizeof(cpu_start_id));
+ #endif
+ 	smp_call_function_single(0, mx_cpu_start, (void *)cpu, 1);
+ 
+@@ -203,18 +205,21 @@ static int boot_secondary(unsigned int cpu, struct task_struct *ts)
+ 			ccount = get_ccount();
+ 		while (!ccount);
+ 
+-		cpu_start_ccount = ccount;
++		WRITE_ONCE(cpu_start_ccount, ccount);
+ 
+-		while (time_before(jiffies, timeout)) {
++		do {
++			/*
++			 * Pairs with the first two memws in the
++			 * .Lboot_secondary.
++			 */
+ 			mb();
+-			if (!cpu_start_ccount)
+-				break;
+-		}
++			ccount = READ_ONCE(cpu_start_ccount);
++		} while (ccount && time_before(jiffies, timeout));
+ 
+-		if (cpu_start_ccount) {
++		if (ccount) {
+ 			smp_call_function_single(0, mx_cpu_stop,
+-					(void *)cpu, 1);
+-			cpu_start_ccount = 0;
++						 (void *)cpu, 1);
++			WRITE_ONCE(cpu_start_ccount, 0);
+ 			return -EIO;
+ 		}
+ 	}
+@@ -234,6 +239,7 @@ int __cpu_up(unsigned int cpu, struct task_struct *idle)
+ 	pr_debug("%s: Calling wakeup_secondary(cpu:%d, idle:%p, sp: %08lx)\n",
+ 			__func__, cpu, idle, start_info.stack);
+ 
++	init_completion(&cpu_running);
+ 	ret = boot_secondary(cpu, idle);
+ 	if (ret == 0) {
+ 		wait_for_completion_timeout(&cpu_running,
+@@ -295,8 +301,10 @@ void __cpu_die(unsigned int cpu)
+ 	unsigned long timeout = jiffies + msecs_to_jiffies(1000);
+ 	while (time_before(jiffies, timeout)) {
+ 		system_invalidate_dcache_range((unsigned long)&cpu_start_id,
+-				sizeof(cpu_start_id));
+-		if (cpu_start_id == -cpu) {
++					       sizeof(cpu_start_id));
++		/* Pairs with the second memw in the cpu_restart */
++		mb();
++		if (READ_ONCE(cpu_start_id) == -cpu) {
+ 			platform_cpu_kill(cpu);
+ 			return;
+ 		}
+-- 
+2.19.1
+
