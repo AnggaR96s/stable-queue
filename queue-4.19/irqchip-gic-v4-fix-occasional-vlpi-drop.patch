@@ -1,0 +1,138 @@
+From 732f5c03a95072998890ea1e07bcc24486573a74 Mon Sep 17 00:00:00 2001
+From: Heyi Guo <guoheyi@huawei.com>
+Date: Thu, 24 Jan 2019 21:37:08 +0800
+Subject: irqchip/gic-v4: Fix occasional VLPI drop
+
+[ Upstream commit 6479450f72c1391c03f08affe0d0110f41ae7ca0 ]
+
+1. In current implementation, every VLPI will temporarily be mapped to
+the first CPU in system (normally CPU0) and then moved to the real
+scheduled CPU later.
+
+2. So there is a time window and a VLPI may be sent to CPU0 instead of
+the real scheduled vCPU, in a multi-CPU virtual machine.
+
+3. However, CPU0 may have not been scheduled as a virtual CPU after
+system boots up, so the value of its GICR_VPROPBASER is unknown at
+that moment.
+
+4. If the INTID of VLPI is larger than 2^(GICR_VPROPBASER.IDbits+1),
+while IDbits is also in unknown state, GIC will behave as if the VLPI
+is out of range and simply drop it, which results in interrupt missing
+in Guest.
+
+As no code will clear GICR_VPROPBASER at runtime, we can safely
+initialize the IDbits field at boot time for each CPU to get rid of
+this issue.
+
+We also clear Valid bit of GICR_VPENDBASER in case any ancient
+programming gets left in and causes memory corrupting. A new function
+its_clear_vpend_valid() is added to reuse the code in
+its_vpe_deschedule().
+
+Fixes: e643d8034036 ("irqchip/gic-v3-its: Add VPE scheduling")
+Signed-off-by: Heyi Guo <guoheyi@huawei.com>
+Signed-off-by: Heyi Guo <heyi.guo@linaro.org>
+Signed-off-by: Marc Zyngier <marc.zyngier@arm.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/irqchip/irq-gic-v3-its.c | 66 ++++++++++++++++++++++++--------
+ 1 file changed, 49 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/irqchip/irq-gic-v3-its.c b/drivers/irqchip/irq-gic-v3-its.c
+index 4c2246fe5dbe..d9a880108315 100644
+--- a/drivers/irqchip/irq-gic-v3-its.c
++++ b/drivers/irqchip/irq-gic-v3-its.c
+@@ -1951,6 +1951,29 @@ static void its_free_pending_table(struct page *pt)
+ 		   get_order(max_t(u32, LPI_PENDBASE_SZ, SZ_64K)));
+ }
+ 
++static u64 its_clear_vpend_valid(void __iomem *vlpi_base)
++{
++	u32 count = 1000000;	/* 1s! */
++	bool clean;
++	u64 val;
++
++	val = gits_read_vpendbaser(vlpi_base + GICR_VPENDBASER);
++	val &= ~GICR_VPENDBASER_Valid;
++	gits_write_vpendbaser(val, vlpi_base + GICR_VPENDBASER);
++
++	do {
++		val = gits_read_vpendbaser(vlpi_base + GICR_VPENDBASER);
++		clean = !(val & GICR_VPENDBASER_Dirty);
++		if (!clean) {
++			count--;
++			cpu_relax();
++			udelay(1);
++		}
++	} while (!clean && count);
++
++	return val;
++}
++
+ static void its_cpu_init_lpis(void)
+ {
+ 	void __iomem *rbase = gic_data_rdist_rd_base();
+@@ -2024,6 +2047,30 @@ static void its_cpu_init_lpis(void)
+ 	val |= GICR_CTLR_ENABLE_LPIS;
+ 	writel_relaxed(val, rbase + GICR_CTLR);
+ 
++	if (gic_rdists->has_vlpis) {
++		void __iomem *vlpi_base = gic_data_rdist_vlpi_base();
++
++		/*
++		 * It's possible for CPU to receive VLPIs before it is
++		 * sheduled as a vPE, especially for the first CPU, and the
++		 * VLPI with INTID larger than 2^(IDbits+1) will be considered
++		 * as out of range and dropped by GIC.
++		 * So we initialize IDbits to known value to avoid VLPI drop.
++		 */
++		val = (LPI_NRBITS - 1) & GICR_VPROPBASER_IDBITS_MASK;
++		pr_debug("GICv4: CPU%d: Init IDbits to 0x%llx for GICR_VPROPBASER\n",
++			smp_processor_id(), val);
++		gits_write_vpropbaser(val, vlpi_base + GICR_VPROPBASER);
++
++		/*
++		 * Also clear Valid bit of GICR_VPENDBASER, in case some
++		 * ancient programming gets left in and has possibility of
++		 * corrupting memory.
++		 */
++		val = its_clear_vpend_valid(vlpi_base);
++		WARN_ON(val & GICR_VPENDBASER_Dirty);
++	}
++
+ 	/* Make sure the GIC has seen the above */
+ 	dsb(sy);
+ }
+@@ -2644,26 +2691,11 @@ static void its_vpe_schedule(struct its_vpe *vpe)
+ static void its_vpe_deschedule(struct its_vpe *vpe)
+ {
+ 	void __iomem *vlpi_base = gic_data_rdist_vlpi_base();
+-	u32 count = 1000000;	/* 1s! */
+-	bool clean;
+ 	u64 val;
+ 
+-	/* We're being scheduled out */
+-	val = gits_read_vpendbaser(vlpi_base + GICR_VPENDBASER);
+-	val &= ~GICR_VPENDBASER_Valid;
+-	gits_write_vpendbaser(val, vlpi_base + GICR_VPENDBASER);
+-
+-	do {
+-		val = gits_read_vpendbaser(vlpi_base + GICR_VPENDBASER);
+-		clean = !(val & GICR_VPENDBASER_Dirty);
+-		if (!clean) {
+-			count--;
+-			cpu_relax();
+-			udelay(1);
+-		}
+-	} while (!clean && count);
++	val = its_clear_vpend_valid(vlpi_base);
+ 
+-	if (unlikely(!clean && !count)) {
++	if (unlikely(val & GICR_VPENDBASER_Dirty)) {
+ 		pr_err_ratelimited("ITS virtual pending table not cleaning\n");
+ 		vpe->idai = false;
+ 		vpe->pending_last = true;
+-- 
+2.19.1
+
