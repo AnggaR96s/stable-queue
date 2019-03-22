@@ -1,0 +1,138 @@
+From bbeac2830f4de270bb48141681cb730aadf8dce1 Mon Sep 17 00:00:00 2001
+From: Wanpeng Li <kernellwp@gmail.com>
+Date: Wed, 9 Aug 2017 22:33:12 -0700
+Subject: KVM: X86: Fix residual mmio emulation request to userspace
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+From: Wanpeng Li <kernellwp@gmail.com>
+
+commit bbeac2830f4de270bb48141681cb730aadf8dce1 upstream.
+
+Reported by syzkaller:
+
+The kvm-intel.unrestricted_guest=0
+
+   WARNING: CPU: 5 PID: 1014 at /home/kernel/data/kvm/arch/x86/kvm//x86.c:7227 kvm_arch_vcpu_ioctl_run+0x38b/0x1be0 [kvm]
+   CPU: 5 PID: 1014 Comm: warn_test Tainted: G        W  OE   4.13.0-rc3+ #8
+   RIP: 0010:kvm_arch_vcpu_ioctl_run+0x38b/0x1be0 [kvm]
+   Call Trace:
+    ? put_pid+0x3a/0x50
+    ? rcu_read_lock_sched_held+0x79/0x80
+    ? kmem_cache_free+0x2f2/0x350
+    kvm_vcpu_ioctl+0x340/0x700 [kvm]
+    ? kvm_vcpu_ioctl+0x340/0x700 [kvm]
+    ? __fget+0xfc/0x210
+    do_vfs_ioctl+0xa4/0x6a0
+    ? __fget+0x11d/0x210
+    SyS_ioctl+0x79/0x90
+    entry_SYSCALL_64_fastpath+0x23/0xc2
+    ? __this_cpu_preempt_check+0x13/0x20
+
+The syszkaller folks reported a residual mmio emulation request to userspace
+due to vm86 fails to emulate inject real mode interrupt(fails to read CS) and
+incurs a triple fault. The vCPU returns to userspace with vcpu->mmio_needed == true
+and KVM_EXIT_SHUTDOWN exit reason. However, the syszkaller testcase constructs
+several threads to launch the same vCPU, the thread which lauch this vCPU after
+the thread whichs get the vcpu->mmio_needed == true and KVM_EXIT_SHUTDOWN will
+trigger the warning.
+
+   #define _GNU_SOURCE
+   #include <pthread.h>
+   #include <stdio.h>
+   #include <stdlib.h>
+   #include <string.h>
+   #include <sys/wait.h>
+   #include <sys/types.h>
+   #include <sys/stat.h>
+   #include <sys/mman.h>
+   #include <fcntl.h>
+   #include <unistd.h>
+   #include <linux/kvm.h>
+   #include <stdio.h>
+
+   int kvmcpu;
+   struct kvm_run *run;
+
+   void* thr(void* arg)
+   {
+     int res;
+     res = ioctl(kvmcpu, KVM_RUN, 0);
+     printf("ret1=%d exit_reason=%d suberror=%d\n",
+         res, run->exit_reason, run->internal.suberror);
+     return 0;
+   }
+
+   void test()
+   {
+     int i, kvm, kvmvm;
+     pthread_t th[4];
+
+     kvm = open("/dev/kvm", O_RDWR);
+     kvmvm = ioctl(kvm, KVM_CREATE_VM, 0);
+     kvmcpu = ioctl(kvmvm, KVM_CREATE_VCPU, 0);
+     run = (struct kvm_run*)mmap(0, 4096, PROT_READ|PROT_WRITE, MAP_SHARED, kvmcpu, 0);
+     srand(getpid());
+     for (i = 0; i < 4; i++) {
+       pthread_create(&th[i], 0, thr, 0);
+       usleep(rand() % 10000);
+     }
+     for (i = 0; i < 4; i++)
+       pthread_join(th[i], 0);
+   }
+
+   int main()
+   {
+     for (;;) {
+       int pid = fork();
+       if (pid < 0)
+         exit(1);
+       if (pid == 0) {
+         test();
+         exit(0);
+       }
+       int status;
+       while (waitpid(pid, &status, __WALL) != pid) {}
+     }
+     return 0;
+   }
+
+This patch fixes it by resetting the vcpu->mmio_needed once we receive
+the triple fault to avoid the residue.
+
+Reported-by: Dmitry Vyukov <dvyukov@google.com>
+Tested-by: Dmitry Vyukov <dvyukov@google.com>
+Cc: Paolo Bonzini <pbonzini@redhat.com>
+Cc: Radim Krčmář <rkrcmar@redhat.com>
+Cc: Dmitry Vyukov <dvyukov@google.com>
+Signed-off-by: Wanpeng Li <wanpeng.li@hotmail.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Cc: Zubin Mithra <zsm@chromium.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ arch/x86/kvm/vmx.c |    1 +
+ arch/x86/kvm/x86.c |    1 +
+ 2 files changed, 2 insertions(+)
+
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -5965,6 +5965,7 @@ static int handle_external_interrupt(str
+ static int handle_triple_fault(struct kvm_vcpu *vcpu)
+ {
+ 	vcpu->run->exit_reason = KVM_EXIT_SHUTDOWN;
++	vcpu->mmio_needed = 0;
+ 	return 0;
+ }
+ 
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -6769,6 +6769,7 @@ static int vcpu_enter_guest(struct kvm_v
+ 		}
+ 		if (kvm_check_request(KVM_REQ_TRIPLE_FAULT, vcpu)) {
+ 			vcpu->run->exit_reason = KVM_EXIT_SHUTDOWN;
++			vcpu->mmio_needed = 0;
+ 			r = 0;
+ 			goto out;
+ 		}
