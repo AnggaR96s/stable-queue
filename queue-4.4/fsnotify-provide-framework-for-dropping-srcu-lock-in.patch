@@ -1,0 +1,205 @@
+From 20d9781ac3caf400ff765a7966b7ebd82b2f20a1 Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Wed, 10 Apr 2019 16:54:54 +1200
+Subject: fsnotify: Provide framework for dropping SRCU lock in ->handle_event
+
+commit abc77577a669f424c5d0c185b9994f2621c52aa4 upstream.
+
+fanotify wants to drop fsnotify_mark_srcu lock when waiting for response
+from userspace so that the whole notification subsystem is not blocked
+during that time. This patch provides a framework for safely getting
+mark reference for a mark found in the object list which pins the mark
+in that list. We can then drop fsnotify_mark_srcu, wait for userspace
+response and then safely continue iteration of the object list once we
+reaquire fsnotify_mark_srcu.
+
+Reviewed-by: Miklos Szeredi <mszeredi@redhat.com>
+Reviewed-by: Amir Goldstein <amir73il@gmail.com>
+Signed-off-by: Jan Kara <jack@suse.cz>
+[mruffell: backport: realign file fs/notify/mark.c]
+Signed-off-by: Matthew Ruffell <matthew.ruffell@canonical.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/notify/fsnotify.h             |  6 +++
+ fs/notify/group.c                |  1 +
+ fs/notify/mark.c                 | 83 +++++++++++++++++++++++++++++++-
+ include/linux/fsnotify_backend.h |  5 ++
+ 4 files changed, 94 insertions(+), 1 deletion(-)
+
+diff --git a/fs/notify/fsnotify.h b/fs/notify/fsnotify.h
+index 0a3bc2cf192c..0ad0eb9f2e14 100644
+--- a/fs/notify/fsnotify.h
++++ b/fs/notify/fsnotify.h
+@@ -8,6 +8,12 @@
+ 
+ #include "../mount.h"
+ 
++struct fsnotify_iter_info {
++	struct fsnotify_mark *inode_mark;
++	struct fsnotify_mark *vfsmount_mark;
++	int srcu_idx;
++};
++
+ /* destroy all events sitting in this groups notification queue */
+ extern void fsnotify_flush_notify(struct fsnotify_group *group);
+ 
+diff --git a/fs/notify/group.c b/fs/notify/group.c
+index b47f7cfdcaa4..4c63b148835f 100644
+--- a/fs/notify/group.c
++++ b/fs/notify/group.c
+@@ -124,6 +124,7 @@ struct fsnotify_group *fsnotify_alloc_group(const struct fsnotify_ops *ops)
+ 	/* set to 0 when there a no external references to this group */
+ 	atomic_set(&group->refcnt, 1);
+ 	atomic_set(&group->num_marks, 0);
++	atomic_set(&group->user_waits, 0);
+ 
+ 	mutex_init(&group->notification_mutex);
+ 	INIT_LIST_HEAD(&group->notification_list);
+diff --git a/fs/notify/mark.c b/fs/notify/mark.c
+index d3fea0bd89e2..d3005d95d530 100644
+--- a/fs/notify/mark.c
++++ b/fs/notify/mark.c
+@@ -105,6 +105,16 @@ void fsnotify_get_mark(struct fsnotify_mark *mark)
+ 	atomic_inc(&mark->refcnt);
+ }
+ 
++/*
++ * Get mark reference when we found the mark via lockless traversal of object
++ * list. Mark can be already removed from the list by now and on its way to be
++ * destroyed once SRCU period ends.
++ */
++static bool fsnotify_get_mark_safe(struct fsnotify_mark *mark)
++{
++	return atomic_inc_not_zero(&mark->refcnt);
++}
++
+ void fsnotify_put_mark(struct fsnotify_mark *mark)
+ {
+ 	if (atomic_dec_and_test(&mark->refcnt)) {
+@@ -125,6 +135,72 @@ u32 fsnotify_recalc_mask(struct hlist_head *head)
+ 	return new_mask;
+ }
+ 
++bool fsnotify_prepare_user_wait(struct fsnotify_iter_info *iter_info)
++{
++	struct fsnotify_group *group;
++
++	if (WARN_ON_ONCE(!iter_info->inode_mark && !iter_info->vfsmount_mark))
++		return false;
++
++	if (iter_info->inode_mark)
++		group = iter_info->inode_mark->group;
++	else
++		group = iter_info->vfsmount_mark->group;
++
++	/*
++	 * Since acquisition of mark reference is an atomic op as well, we can
++	 * be sure this inc is seen before any effect of refcount increment.
++	 */
++	atomic_inc(&group->user_waits);
++
++	if (iter_info->inode_mark) {
++		/* This can fail if mark is being removed */
++		if (!fsnotify_get_mark_safe(iter_info->inode_mark))
++			goto out_wait;
++	}
++	if (iter_info->vfsmount_mark) {
++		if (!fsnotify_get_mark_safe(iter_info->vfsmount_mark))
++			goto out_inode;
++	}
++
++	/*
++	 * Now that both marks are pinned by refcount in the inode / vfsmount
++	 * lists, we can drop SRCU lock, and safely resume the list iteration
++	 * once userspace returns.
++	 */
++	srcu_read_unlock(&fsnotify_mark_srcu, iter_info->srcu_idx);
++
++	return true;
++out_inode:
++	if (iter_info->inode_mark)
++		fsnotify_put_mark(iter_info->inode_mark);
++out_wait:
++	if (atomic_dec_and_test(&group->user_waits) && group->shutdown)
++		wake_up(&group->notification_waitq);
++	return false;
++}
++
++void fsnotify_finish_user_wait(struct fsnotify_iter_info *iter_info)
++{
++	struct fsnotify_group *group = NULL;
++
++	iter_info->srcu_idx = srcu_read_lock(&fsnotify_mark_srcu);
++	if (iter_info->inode_mark) {
++		group = iter_info->inode_mark->group;
++		fsnotify_put_mark(iter_info->inode_mark);
++	}
++	if (iter_info->vfsmount_mark) {
++		group = iter_info->vfsmount_mark->group;
++		fsnotify_put_mark(iter_info->vfsmount_mark);
++	}
++	/*
++	 * We abuse notification_waitq on group shutdown for waiting for all
++	 * marks pinned when waiting for userspace.
++	 */
++	if (atomic_dec_and_test(&group->user_waits) && group->shutdown)
++		wake_up(&group->notification_waitq);
++}
++
+ /*
+  * Remove mark from inode / vfsmount list, group list, drop inode reference
+  * if we got one.
+@@ -161,7 +237,6 @@ void fsnotify_detach_mark(struct fsnotify_mark *mark)
+ 	 * __fsnotify_parent() lazily when next event happens on one of our
+ 	 * children.
+ 	 */
+-
+ 	list_del_init(&mark->g_list);
+ 
+ 	spin_unlock(&mark->lock);
+@@ -508,6 +583,12 @@ void fsnotify_detach_group_marks(struct fsnotify_group *group)
+ 		__fsnotify_free_mark(mark);
+ 		fsnotify_put_mark(mark);
+ 	}
++	/*
++	 * Some marks can still be pinned when waiting for response from
++	 * userspace. Wait for those now. fsnotify_prepare_user_wait() will
++	 * not succeed now so this wait is race-free.
++	 */
++	wait_event(group->notification_waitq, !atomic_read(&group->user_waits));
+ }
+ 
+ void fsnotify_duplicate_mark(struct fsnotify_mark *new, struct fsnotify_mark *old)
+diff --git a/include/linux/fsnotify_backend.h b/include/linux/fsnotify_backend.h
+index c611724ff16b..c7c5ea590d54 100644
+--- a/include/linux/fsnotify_backend.h
++++ b/include/linux/fsnotify_backend.h
+@@ -79,6 +79,7 @@ struct fsnotify_event;
+ struct fsnotify_mark;
+ struct fsnotify_event_private_data;
+ struct fsnotify_fname;
++struct fsnotify_iter_info;
+ 
+ /*
+  * Each group much define these ops.  The fsnotify infrastructure will call
+@@ -162,6 +163,8 @@ struct fsnotify_group {
+ 	struct fsnotify_event *overflow_event;	/* Event we queue when the
+ 						 * notification list is too
+ 						 * full */
++	atomic_t user_waits;		/* Number of tasks waiting for user
++					 * response */
+ 
+ 	/* groups can define private fields here or use the void *private */
+ 	union {
+@@ -367,6 +370,8 @@ extern void fsnotify_clear_marks_by_group_flags(struct fsnotify_group *group, un
+ extern void fsnotify_get_mark(struct fsnotify_mark *mark);
+ extern void fsnotify_put_mark(struct fsnotify_mark *mark);
+ extern void fsnotify_unmount_inodes(struct super_block *sb);
++extern void fsnotify_finish_user_wait(struct fsnotify_iter_info *iter_info);
++extern bool fsnotify_prepare_user_wait(struct fsnotify_iter_info *iter_info);
+ 
+ /* put here because inotify does some weird stuff when destroying watches */
+ extern void fsnotify_init_event(struct fsnotify_event *event,
+-- 
+2.19.1
+
