@@ -1,0 +1,140 @@
+From 6255a964f4da99e383ff4382ebce2efae4d26b3b Mon Sep 17 00:00:00 2001
+From: Florian Westphal <fw@strlen.de>
+Date: Fri, 12 Apr 2019 10:55:03 -0700
+Subject: netfilter: nfnetlink_cttimeout: fetch timeouts for udplite and gre,
+ too
+
+commit 89259088c1b7fecb43e8e245dc931909132a4e03 upstream
+
+syzbot was able to trigger the WARN in cttimeout_default_get() by
+passing UDPLITE as l4protocol.  Alias UDPLITE to UDP, both use
+same timeout values.
+
+Furthermore, also fetch GRE timeouts.  GRE is a bit more complicated,
+as it still can be a module and its netns_proto_gre struct layout isn't
+visible outside of the gre module. Can't move timeouts around, it
+appears conntrack sysctl unregister assumes net_generic() returns
+nf_proto_net, so we get crash. Expose layout of netns_proto_gre instead.
+
+A followup nf-next patch could make gre tracker be built-in as well
+if needed, its not that large.
+
+Last, make the WARN() mention the missing protocol value in case
+anything else is missing.
+
+Reported-by: syzbot+2fae8fa157dd92618cae@syzkaller.appspotmail.com
+Fixes: 8866df9264a3 ("netfilter: nfnetlink_cttimeout: pass default timeout policy to obj_to_nlattr")
+Signed-off-by: Florian Westphal <fw@strlen.de>
+Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+Signed-off-by: Zubin Mithra <zsm@chromium.org>
+Signed-off-by: Sasha Levin (Microsoft) <sashal@kernel.org>
+---
+ include/linux/netfilter/nf_conntrack_proto_gre.h | 13 +++++++++++++
+ net/netfilter/nf_conntrack_proto_gre.c           | 14 ++------------
+ net/netfilter/nfnetlink_cttimeout.c              | 15 +++++++++++++--
+ 3 files changed, 28 insertions(+), 14 deletions(-)
+
+diff --git a/include/linux/netfilter/nf_conntrack_proto_gre.h b/include/linux/netfilter/nf_conntrack_proto_gre.h
+index b8d95564bd53..14edb795ab43 100644
+--- a/include/linux/netfilter/nf_conntrack_proto_gre.h
++++ b/include/linux/netfilter/nf_conntrack_proto_gre.h
+@@ -21,6 +21,19 @@ struct nf_ct_gre_keymap {
+ 	struct nf_conntrack_tuple tuple;
+ };
+ 
++enum grep_conntrack {
++	GRE_CT_UNREPLIED,
++	GRE_CT_REPLIED,
++	GRE_CT_MAX
++};
++
++struct netns_proto_gre {
++	struct nf_proto_net	nf;
++	rwlock_t		keymap_lock;
++	struct list_head	keymap_list;
++	unsigned int		gre_timeouts[GRE_CT_MAX];
++};
++
+ /* add new tuple->key_reply pair to keymap */
+ int nf_ct_gre_keymap_add(struct nf_conn *ct, enum ip_conntrack_dir dir,
+ 			 struct nf_conntrack_tuple *t);
+diff --git a/net/netfilter/nf_conntrack_proto_gre.c b/net/netfilter/nf_conntrack_proto_gre.c
+index 650eb4fba2c5..841c472aae1c 100644
+--- a/net/netfilter/nf_conntrack_proto_gre.c
++++ b/net/netfilter/nf_conntrack_proto_gre.c
+@@ -43,24 +43,12 @@
+ #include <linux/netfilter/nf_conntrack_proto_gre.h>
+ #include <linux/netfilter/nf_conntrack_pptp.h>
+ 
+-enum grep_conntrack {
+-	GRE_CT_UNREPLIED,
+-	GRE_CT_REPLIED,
+-	GRE_CT_MAX
+-};
+-
+ static const unsigned int gre_timeouts[GRE_CT_MAX] = {
+ 	[GRE_CT_UNREPLIED]	= 30*HZ,
+ 	[GRE_CT_REPLIED]	= 180*HZ,
+ };
+ 
+ static unsigned int proto_gre_net_id __read_mostly;
+-struct netns_proto_gre {
+-	struct nf_proto_net	nf;
+-	rwlock_t		keymap_lock;
+-	struct list_head	keymap_list;
+-	unsigned int		gre_timeouts[GRE_CT_MAX];
+-};
+ 
+ static inline struct netns_proto_gre *gre_pernet(struct net *net)
+ {
+@@ -408,6 +396,8 @@ static int __init nf_ct_proto_gre_init(void)
+ {
+ 	int ret;
+ 
++	BUILD_BUG_ON(offsetof(struct netns_proto_gre, nf) != 0);
++
+ 	ret = register_pernet_subsys(&proto_gre_net_ops);
+ 	if (ret < 0)
+ 		goto out_pernet;
+diff --git a/net/netfilter/nfnetlink_cttimeout.c b/net/netfilter/nfnetlink_cttimeout.c
+index 1dc4ea327cbe..70a7382b9787 100644
+--- a/net/netfilter/nfnetlink_cttimeout.c
++++ b/net/netfilter/nfnetlink_cttimeout.c
+@@ -469,7 +469,8 @@ static int cttimeout_default_get(struct net *net, struct sock *ctnl,
+ 	case IPPROTO_TCP:
+ 		timeouts = net->ct.nf_ct_proto.tcp.timeouts;
+ 		break;
+-	case IPPROTO_UDP:
++	case IPPROTO_UDP: /* fallthrough */
++	case IPPROTO_UDPLITE:
+ 		timeouts = net->ct.nf_ct_proto.udp.timeouts;
+ 		break;
+ 	case IPPROTO_DCCP:
+@@ -483,13 +484,23 @@ static int cttimeout_default_get(struct net *net, struct sock *ctnl,
+ 	case IPPROTO_SCTP:
+ #ifdef CONFIG_NF_CT_PROTO_SCTP
+ 		timeouts = net->ct.nf_ct_proto.sctp.timeouts;
++#endif
++		break;
++	case IPPROTO_GRE:
++#ifdef CONFIG_NF_CT_PROTO_GRE
++		if (l4proto->net_id) {
++			struct netns_proto_gre *net_gre;
++
++			net_gre = net_generic(net, *l4proto->net_id);
++			timeouts = net_gre->gre_timeouts;
++		}
+ #endif
+ 		break;
+ 	case 255:
+ 		timeouts = &net->ct.nf_ct_proto.generic.timeout;
+ 		break;
+ 	default:
+-		WARN_ON_ONCE(1);
++		WARN_ONCE(1, "Missing timeouts for proto %d", l4proto->l4proto);
+ 		break;
+ 	}
+ 
+-- 
+2.19.1
+
