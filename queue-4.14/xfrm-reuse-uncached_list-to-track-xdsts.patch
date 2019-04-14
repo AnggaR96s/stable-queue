@@ -1,0 +1,199 @@
+From 66a256e4423a44db3bd0433babc7ad6beaa5853d Mon Sep 17 00:00:00 2001
+From: Xin Long <lucien.xin@gmail.com>
+Date: Wed, 14 Feb 2018 19:06:02 +0800
+Subject: xfrm: reuse uncached_list to track xdsts
+
+[ Upstream commit 510c321b557121861601f9d259aadd65aa274f35 ]
+
+In early time, when freeing a xdst, it would be inserted into
+dst_garbage.list first. Then if it's refcnt was still held
+somewhere, later it would be put into dst_busy_list in
+dst_gc_task().
+
+When one dev was being unregistered, the dev of these dsts in
+dst_busy_list would be set with loopback_dev and put this dev.
+So that this dev's removal wouldn't get blocked, and avoid the
+kmsg warning:
+
+  kernel:unregister_netdevice: waiting for veth0 to become \
+  free. Usage count = 2
+
+However after Commit 52df157f17e5 ("xfrm: take refcnt of dst
+when creating struct xfrm_dst bundle"), the xdst will not be
+freed with dst gc, and this warning happens.
+
+To fix it, we need to find these xdsts that are still held by
+others when removing the dev, and free xdst's dev and set it
+with loopback_dev.
+
+But unfortunately after flow_cache for xfrm was deleted, no
+list tracks them anymore. So we need to save these xdsts
+somewhere to release the xdst's dev later.
+
+To make this easier, this patch is to reuse uncached_list to
+track xdsts, so that the dev refcnt can be released in the
+event NETDEV_UNREGISTER process of fib_netdev_notifier.
+
+Thanks to Florian, we could move forward this fix quickly.
+
+Fixes: 52df157f17e5 ("xfrm: take refcnt of dst when creating struct xfrm_dst bundle")
+Reported-by: Jianlin Shi <jishi@redhat.com>
+Reported-by: Hangbin Liu <liuhangbin@gmail.com>
+Tested-by: Eyal Birger <eyal.birger@gmail.com>
+Signed-off-by: Xin Long <lucien.xin@gmail.com>
+Signed-off-by: Steffen Klassert <steffen.klassert@secunet.com>
+Signed-off-by: Sasha Levin (Microsoft) <sashal@kernel.org>
+---
+ include/net/ip6_route.h |  3 +++
+ include/net/route.h     |  3 +++
+ net/ipv4/route.c        | 21 +++++++++++++--------
+ net/ipv4/xfrm4_policy.c |  4 +++-
+ net/ipv6/route.c        |  4 ++--
+ net/ipv6/xfrm6_policy.c |  5 +++++
+ 6 files changed, 29 insertions(+), 11 deletions(-)
+
+diff --git a/include/net/ip6_route.h b/include/net/ip6_route.h
+index bee528135cf1..00eb9162dbf1 100644
+--- a/include/net/ip6_route.h
++++ b/include/net/ip6_route.h
+@@ -165,6 +165,9 @@ void rt6_mtu_change(struct net_device *dev, unsigned int mtu);
+ void rt6_remove_prefsrc(struct inet6_ifaddr *ifp);
+ void rt6_clean_tohost(struct net *net, struct in6_addr *gateway);
+ 
++void rt6_uncached_list_add(struct rt6_info *rt);
++void rt6_uncached_list_del(struct rt6_info *rt);
++
+ static inline const struct rt6_info *skb_rt6_info(const struct sk_buff *skb)
+ {
+ 	const struct dst_entry *dst = skb_dst(skb);
+diff --git a/include/net/route.h b/include/net/route.h
+index 6077a0fb3044..1ab8b6f82812 100644
+--- a/include/net/route.h
++++ b/include/net/route.h
+@@ -228,6 +228,9 @@ struct in_ifaddr;
+ void fib_add_ifaddr(struct in_ifaddr *);
+ void fib_del_ifaddr(struct in_ifaddr *, struct in_ifaddr *);
+ 
++void rt_add_uncached_list(struct rtable *rt);
++void rt_del_uncached_list(struct rtable *rt);
++
+ static inline void ip_rt_put(struct rtable *rt)
+ {
+ 	/* dst_release() accepts a NULL parameter.
+diff --git a/net/ipv4/route.c b/net/ipv4/route.c
+index a1bf87711bfa..9fc2dbce424f 100644
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@ -1440,7 +1440,7 @@ struct uncached_list {
+ 
+ static DEFINE_PER_CPU_ALIGNED(struct uncached_list, rt_uncached_list);
+ 
+-static void rt_add_uncached_list(struct rtable *rt)
++void rt_add_uncached_list(struct rtable *rt)
+ {
+ 	struct uncached_list *ul = raw_cpu_ptr(&rt_uncached_list);
+ 
+@@ -1451,14 +1451,8 @@ static void rt_add_uncached_list(struct rtable *rt)
+ 	spin_unlock_bh(&ul->lock);
+ }
+ 
+-static void ipv4_dst_destroy(struct dst_entry *dst)
++void rt_del_uncached_list(struct rtable *rt)
+ {
+-	struct dst_metrics *p = (struct dst_metrics *)DST_METRICS_PTR(dst);
+-	struct rtable *rt = (struct rtable *) dst;
+-
+-	if (p != &dst_default_metrics && refcount_dec_and_test(&p->refcnt))
+-		kfree(p);
+-
+ 	if (!list_empty(&rt->rt_uncached)) {
+ 		struct uncached_list *ul = rt->rt_uncached_list;
+ 
+@@ -1468,6 +1462,17 @@ static void ipv4_dst_destroy(struct dst_entry *dst)
+ 	}
+ }
+ 
++static void ipv4_dst_destroy(struct dst_entry *dst)
++{
++	struct dst_metrics *p = (struct dst_metrics *)DST_METRICS_PTR(dst);
++	struct rtable *rt = (struct rtable *)dst;
++
++	if (p != &dst_default_metrics && refcount_dec_and_test(&p->refcnt))
++		kfree(p);
++
++	rt_del_uncached_list(rt);
++}
++
+ void rt_flush_dev(struct net_device *dev)
+ {
+ 	struct net *net = dev_net(dev);
+diff --git a/net/ipv4/xfrm4_policy.c b/net/ipv4/xfrm4_policy.c
+index 4b586e7d5637..fbebda67ac1b 100644
+--- a/net/ipv4/xfrm4_policy.c
++++ b/net/ipv4/xfrm4_policy.c
+@@ -103,6 +103,7 @@ static int xfrm4_fill_dst(struct xfrm_dst *xdst, struct net_device *dev,
+ 	xdst->u.rt.rt_mtu_locked = rt->rt_mtu_locked;
+ 	xdst->u.rt.rt_table_id = rt->rt_table_id;
+ 	INIT_LIST_HEAD(&xdst->u.rt.rt_uncached);
++	rt_add_uncached_list(&xdst->u.rt);
+ 
+ 	return 0;
+ }
+@@ -242,7 +243,8 @@ static void xfrm4_dst_destroy(struct dst_entry *dst)
+ 	struct xfrm_dst *xdst = (struct xfrm_dst *)dst;
+ 
+ 	dst_destroy_metrics_generic(dst);
+-
++	if (xdst->u.rt.rt_uncached_list)
++		rt_del_uncached_list(&xdst->u.rt);
+ 	xfrm_dst_destroy(xdst);
+ }
+ 
+diff --git a/net/ipv6/route.c b/net/ipv6/route.c
+index 00f8fe8cebd5..620553401d75 100644
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@ -124,7 +124,7 @@ struct uncached_list {
+ 
+ static DEFINE_PER_CPU_ALIGNED(struct uncached_list, rt6_uncached_list);
+ 
+-static void rt6_uncached_list_add(struct rt6_info *rt)
++void rt6_uncached_list_add(struct rt6_info *rt)
+ {
+ 	struct uncached_list *ul = raw_cpu_ptr(&rt6_uncached_list);
+ 
+@@ -135,7 +135,7 @@ static void rt6_uncached_list_add(struct rt6_info *rt)
+ 	spin_unlock_bh(&ul->lock);
+ }
+ 
+-static void rt6_uncached_list_del(struct rt6_info *rt)
++void rt6_uncached_list_del(struct rt6_info *rt)
+ {
+ 	if (!list_empty(&rt->rt6i_uncached)) {
+ 		struct uncached_list *ul = rt->rt6i_uncached_list;
+diff --git a/net/ipv6/xfrm6_policy.c b/net/ipv6/xfrm6_policy.c
+index d6b012295b45..d99929113230 100644
+--- a/net/ipv6/xfrm6_policy.c
++++ b/net/ipv6/xfrm6_policy.c
+@@ -113,6 +113,9 @@ static int xfrm6_fill_dst(struct xfrm_dst *xdst, struct net_device *dev,
+ 	xdst->u.rt6.rt6i_gateway = rt->rt6i_gateway;
+ 	xdst->u.rt6.rt6i_dst = rt->rt6i_dst;
+ 	xdst->u.rt6.rt6i_src = rt->rt6i_src;
++	INIT_LIST_HEAD(&xdst->u.rt6.rt6i_uncached);
++	rt6_uncached_list_add(&xdst->u.rt6);
++	atomic_inc(&dev_net(dev)->ipv6.rt6_stats->fib_rt_uncache);
+ 
+ 	return 0;
+ }
+@@ -243,6 +246,8 @@ static void xfrm6_dst_destroy(struct dst_entry *dst)
+ 	if (likely(xdst->u.rt6.rt6i_idev))
+ 		in6_dev_put(xdst->u.rt6.rt6i_idev);
+ 	dst_destroy_metrics_generic(dst);
++	if (xdst->u.rt6.rt6i_uncached_list)
++		rt6_uncached_list_del(&xdst->u.rt6);
+ 	xfrm_dst_destroy(xdst);
+ }
+ 
+-- 
+2.19.1
+
