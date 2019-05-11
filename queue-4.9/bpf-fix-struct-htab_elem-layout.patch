@@ -1,0 +1,88 @@
+From 7a0847107ec1c0477b91c8e67b50f5b0f982c6d8 Mon Sep 17 00:00:00 2001
+From: Alexei Starovoitov <ast@fb.com>
+Date: Thu, 9 May 2019 19:33:53 -0700
+Subject: bpf: fix struct htab_elem layout
+
+commit 9f691549f76d488a0c74397b3e51e943865ea01f upstream.
+
+when htab_elem is removed from the bucket list the htab_elem.hash_node.next
+field should not be overridden too early otherwise we have a tiny race window
+between lookup and delete.
+The bug was discovered by manual code analysis and reproducible
+only with explicit udelay() in lookup_elem_raw().
+
+Fixes: 6c9059817432 ("bpf: pre-allocate hash map elements")
+Reported-by: Jonathan Perry <jonperry@fb.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Acked-by: Daniel Borkmann <daniel@iogearbox.net>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Chenbo Feng <fengc@google.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ kernel/bpf/hashtab.c | 28 ++++++++++++++++++++++------
+ 1 file changed, 22 insertions(+), 6 deletions(-)
+
+diff --git a/kernel/bpf/hashtab.c b/kernel/bpf/hashtab.c
+index a36a532c056df..f9d53ac57f640 100644
+--- a/kernel/bpf/hashtab.c
++++ b/kernel/bpf/hashtab.c
+@@ -41,8 +41,13 @@ enum extra_elem_state {
+ struct htab_elem {
+ 	union {
+ 		struct hlist_node hash_node;
+-		struct bpf_htab *htab;
+-		struct pcpu_freelist_node fnode;
++		struct {
++			void *padding;
++			union {
++				struct bpf_htab *htab;
++				struct pcpu_freelist_node fnode;
++			};
++		};
+ 	};
+ 	union {
+ 		struct rcu_head rcu;
+@@ -114,8 +119,10 @@ static int prealloc_elems_and_freelist(struct bpf_htab *htab)
+ 	if (err)
+ 		goto free_elems;
+ 
+-	pcpu_freelist_populate(&htab->freelist, htab->elems, htab->elem_size,
+-			       htab->map.max_entries);
++	pcpu_freelist_populate(&htab->freelist,
++			       htab->elems + offsetof(struct htab_elem, fnode),
++			       htab->elem_size, htab->map.max_entries);
++
+ 	return 0;
+ 
+ free_elems:
+@@ -148,6 +155,11 @@ static struct bpf_map *htab_map_alloc(union bpf_attr *attr)
+ 	int err, i;
+ 	u64 cost;
+ 
++	BUILD_BUG_ON(offsetof(struct htab_elem, htab) !=
++		     offsetof(struct htab_elem, hash_node.pprev));
++	BUILD_BUG_ON(offsetof(struct htab_elem, fnode.next) !=
++		     offsetof(struct htab_elem, hash_node.pprev));
++
+ 	if (attr->map_flags & ~BPF_F_NO_PREALLOC)
+ 		/* reserved bits should not be used */
+ 		return ERR_PTR(-EINVAL);
+@@ -429,9 +441,13 @@ static struct htab_elem *alloc_htab_elem(struct bpf_htab *htab, void *key,
+ 	int err = 0;
+ 
+ 	if (prealloc) {
+-		l_new = (struct htab_elem *)pcpu_freelist_pop(&htab->freelist);
+-		if (!l_new)
++		struct pcpu_freelist_node *l;
++
++		l = pcpu_freelist_pop(&htab->freelist);
++		if (!l)
+ 			err = -E2BIG;
++		else
++			l_new = container_of(l, struct htab_elem, fnode);
+ 	} else {
+ 		if (atomic_inc_return(&htab->count) > htab->map.max_entries) {
+ 			atomic_dec(&htab->count);
+-- 
+2.20.1
+
