@@ -1,0 +1,121 @@
+From 47663fb01cbb1c2369e828e26335ecce0534014e Mon Sep 17 00:00:00 2001
+From: Florian Westphal <fw@strlen.de>
+Date: Wed, 17 Apr 2019 02:17:23 +0200
+Subject: netfilter: never get/set skb->tstamp
+
+[ Upstream commit 916f6efae62305796e012e7c3a7884a267cbacbf ]
+
+setting net.netfilter.nf_conntrack_timestamp=1 breaks xmit with fq
+scheduler.  skb->tstamp might be "refreshed" using ktime_get_real(),
+but fq expects CLOCK_MONOTONIC.
+
+This patch removes all places in netfilter that check/set skb->tstamp:
+
+1. To fix the bogus "start" time seen with conntrack timestamping for
+   outgoing packets, never use skb->tstamp and always use current time.
+2. In nfqueue and nflog, only use skb->tstamp for incoming packets,
+   as determined by current hook (prerouting, input, forward).
+3. xt_time has to use system clock as well rather than skb->tstamp.
+   We could still use skb->tstamp for prerouting/input/foward, but
+   I see no advantage to make this conditional.
+
+Fixes: fb420d5d91c1 ("tcp/fq: move back to CLOCK_MONOTONIC")
+Cc: Eric Dumazet <edumazet@google.com>
+Reported-by: Michal Soltys <soltys@ziu.info>
+Signed-off-by: Florian Westphal <fw@strlen.de>
+Acked-by: Eric Dumazet <edumazet@google.com>
+Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ net/netfilter/nf_conntrack_core.c |  7 ++-----
+ net/netfilter/nfnetlink_log.c     |  2 +-
+ net/netfilter/nfnetlink_queue.c   |  2 +-
+ net/netfilter/xt_time.c           | 23 ++++++++++++++---------
+ 4 files changed, 18 insertions(+), 16 deletions(-)
+
+diff --git a/net/netfilter/nf_conntrack_core.c b/net/netfilter/nf_conntrack_core.c
+index 1982faf21ebb5..d7ac2f82bb6d8 100644
+--- a/net/netfilter/nf_conntrack_core.c
++++ b/net/netfilter/nf_conntrack_core.c
+@@ -983,12 +983,9 @@ __nf_conntrack_confirm(struct sk_buff *skb)
+ 
+ 	/* set conntrack timestamp, if enabled. */
+ 	tstamp = nf_conn_tstamp_find(ct);
+-	if (tstamp) {
+-		if (skb->tstamp == 0)
+-			__net_timestamp(skb);
++	if (tstamp)
++		tstamp->start = ktime_get_real_ns();
+ 
+-		tstamp->start = ktime_to_ns(skb->tstamp);
+-	}
+ 	/* Since the lookup is lockless, hash insertion must be done after
+ 	 * starting the timer and setting the CONFIRMED bit. The RCU barriers
+ 	 * guarantee that no other CPU can find the conntrack before the above
+diff --git a/net/netfilter/nfnetlink_log.c b/net/netfilter/nfnetlink_log.c
+index b1f9c5303f026..0b3347570265c 100644
+--- a/net/netfilter/nfnetlink_log.c
++++ b/net/netfilter/nfnetlink_log.c
+@@ -540,7 +540,7 @@ __build_packet_message(struct nfnl_log_net *log,
+ 			goto nla_put_failure;
+ 	}
+ 
+-	if (skb->tstamp) {
++	if (hooknum <= NF_INET_FORWARD && skb->tstamp) {
+ 		struct nfulnl_msg_packet_timestamp ts;
+ 		struct timespec64 kts = ktime_to_timespec64(skb->tstamp);
+ 		ts.sec = cpu_to_be64(kts.tv_sec);
+diff --git a/net/netfilter/nfnetlink_queue.c b/net/netfilter/nfnetlink_queue.c
+index 0dcc3592d053f..e057b2961d313 100644
+--- a/net/netfilter/nfnetlink_queue.c
++++ b/net/netfilter/nfnetlink_queue.c
+@@ -582,7 +582,7 @@ nfqnl_build_packet_message(struct net *net, struct nfqnl_instance *queue,
+ 	if (nfqnl_put_bridge(entry, skb) < 0)
+ 		goto nla_put_failure;
+ 
+-	if (entskb->tstamp) {
++	if (entry->state.hook <= NF_INET_FORWARD && entskb->tstamp) {
+ 		struct nfqnl_msg_packet_timestamp ts;
+ 		struct timespec64 kts = ktime_to_timespec64(entskb->tstamp);
+ 
+diff --git a/net/netfilter/xt_time.c b/net/netfilter/xt_time.c
+index c13bcd0ab4913..8dbb4d48f2ed5 100644
+--- a/net/netfilter/xt_time.c
++++ b/net/netfilter/xt_time.c
+@@ -163,19 +163,24 @@ time_mt(const struct sk_buff *skb, struct xt_action_param *par)
+ 	s64 stamp;
+ 
+ 	/*
+-	 * We cannot use get_seconds() instead of __net_timestamp() here.
++	 * We need real time here, but we can neither use skb->tstamp
++	 * nor __net_timestamp().
++	 *
++	 * skb->tstamp and skb->skb_mstamp_ns overlap, however, they
++	 * use different clock types (real vs monotonic).
++	 *
+ 	 * Suppose you have two rules:
+-	 * 	1. match before 13:00
+-	 * 	2. match after 13:00
++	 *	1. match before 13:00
++	 *	2. match after 13:00
++	 *
+ 	 * If you match against processing time (get_seconds) it
+ 	 * may happen that the same packet matches both rules if
+-	 * it arrived at the right moment before 13:00.
++	 * it arrived at the right moment before 13:00, so it would be
++	 * better to check skb->tstamp and set it via __net_timestamp()
++	 * if needed.  This however breaks outgoing packets tx timestamp,
++	 * and causes them to get delayed forever by fq packet scheduler.
+ 	 */
+-	if (skb->tstamp == 0)
+-		__net_timestamp((struct sk_buff *)skb);
+-
+-	stamp = ktime_to_ns(skb->tstamp);
+-	stamp = div_s64(stamp, NSEC_PER_SEC);
++	stamp = get_seconds();
+ 
+ 	if (info->flags & XT_TIME_LOCAL_TZ)
+ 		/* Adjust for local timezone */
+-- 
+2.20.1
+
