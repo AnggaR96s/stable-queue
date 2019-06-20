@@ -1,0 +1,83 @@
+From 2d0a678f24f1debfa1de9f64648876ac41e2cd25 Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Thu, 16 May 2019 16:01:27 +0200
+Subject: loop: Don't change loop device under exclusive opener
+
+[ Upstream commit 33ec3e53e7b1869d7851e59e126bdb0fe0bd1982 ]
+
+Loop module allows calling LOOP_SET_FD while there are other openers of
+the loop device. Even exclusive ones. This can lead to weird
+consequences such as kernel deadlocks like:
+
+mount_bdev()				lo_ioctl()
+  udf_fill_super()
+    udf_load_vrs()
+      sb_set_blocksize() - sets desired block size B
+      udf_tread()
+        sb_bread()
+          __bread_gfp(bdev, block, B)
+					  loop_set_fd()
+					    set_blocksize()
+            - now __getblk_slow() indefinitely loops because B != bdev
+              block size
+
+Fix the problem by disallowing LOOP_SET_FD ioctl when there are
+exclusive openers of a loop device.
+
+[Deliberately chosen not to CC stable as a user with priviledges to
+trigger this race has other means of taking the system down and this
+has a potential of breaking some weird userspace setup]
+
+Reported-and-tested-by: syzbot+10007d66ca02b08f0e60@syzkaller.appspotmail.com
+Signed-off-by: Jan Kara <jack@suse.cz>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/block/loop.c | 18 +++++++++++++++++-
+ 1 file changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/block/loop.c b/drivers/block/loop.c
+index f1e63eb7cbca..a443910f5d6f 100644
+--- a/drivers/block/loop.c
++++ b/drivers/block/loop.c
+@@ -920,9 +920,20 @@ static int loop_set_fd(struct loop_device *lo, fmode_t mode,
+ 	if (!file)
+ 		goto out;
+ 
++	/*
++	 * If we don't hold exclusive handle for the device, upgrade to it
++	 * here to avoid changing device under exclusive owner.
++	 */
++	if (!(mode & FMODE_EXCL)) {
++		bdgrab(bdev);
++		error = blkdev_get(bdev, mode | FMODE_EXCL, loop_set_fd);
++		if (error)
++			goto out_putf;
++	}
++
+ 	error = mutex_lock_killable(&loop_ctl_mutex);
+ 	if (error)
+-		goto out_putf;
++		goto out_bdev;
+ 
+ 	error = -EBUSY;
+ 	if (lo->lo_state != Lo_unbound)
+@@ -986,10 +997,15 @@ static int loop_set_fd(struct loop_device *lo, fmode_t mode,
+ 	mutex_unlock(&loop_ctl_mutex);
+ 	if (partscan)
+ 		loop_reread_partitions(lo, bdev);
++	if (!(mode & FMODE_EXCL))
++		blkdev_put(bdev, mode | FMODE_EXCL);
+ 	return 0;
+ 
+ out_unlock:
+ 	mutex_unlock(&loop_ctl_mutex);
++out_bdev:
++	if (!(mode & FMODE_EXCL))
++		blkdev_put(bdev, mode | FMODE_EXCL);
+ out_putf:
+ 	fput(file);
+ out:
+-- 
+2.20.1
+
