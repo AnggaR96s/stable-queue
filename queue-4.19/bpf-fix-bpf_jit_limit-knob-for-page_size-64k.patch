@@ -1,0 +1,176 @@
+From 0d98fff4237824bc80e61763870b55e14cc6ade4 Mon Sep 17 00:00:00 2001
+From: Daniel Borkmann <daniel@iogearbox.net>
+Date: Tue, 11 Dec 2018 12:14:12 +0100
+Subject: bpf: fix bpf_jit_limit knob for PAGE_SIZE >= 64K
+
+[ Upstream commit fdadd04931c2d7cd294dc5b2b342863f94be53a3 ]
+
+Michael and Sandipan report:
+
+  Commit ede95a63b5 introduced a bpf_jit_limit tuneable to limit BPF
+  JIT allocations. At compile time it defaults to PAGE_SIZE * 40000,
+  and is adjusted again at init time if MODULES_VADDR is defined.
+
+  For ppc64 kernels, MODULES_VADDR isn't defined, so we're stuck with
+  the compile-time default at boot-time, which is 0x9c400000 when
+  using 64K page size. This overflows the signed 32-bit bpf_jit_limit
+  value:
+
+  root@ubuntu:/tmp# cat /proc/sys/net/core/bpf_jit_limit
+  -1673527296
+
+  and can cause various unexpected failures throughout the network
+  stack. In one case `strace dhclient eth0` reported:
+
+  setsockopt(5, SOL_SOCKET, SO_ATTACH_FILTER, {len=11, filter=0x105dd27f8},
+             16) = -1 ENOTSUPP (Unknown error 524)
+
+  and similar failures can be seen with tools like tcpdump. This doesn't
+  always reproduce however, and I'm not sure why. The more consistent
+  failure I've seen is an Ubuntu 18.04 KVM guest booted on a POWER9
+  host would time out on systemd/netplan configuring a virtio-net NIC
+  with no noticeable errors in the logs.
+
+Given this and also given that in near future some architectures like
+arm64 will have a custom area for BPF JIT image allocations we should
+get rid of the BPF_JIT_LIMIT_DEFAULT fallback / default entirely. For
+4.21, we have an overridable bpf_jit_alloc_exec(), bpf_jit_free_exec()
+so therefore add another overridable bpf_jit_alloc_exec_limit() helper
+function which returns the possible size of the memory area for deriving
+the default heuristic in bpf_jit_charge_init().
+
+Like bpf_jit_alloc_exec() and bpf_jit_free_exec(), the new
+bpf_jit_alloc_exec_limit() assumes that module_alloc() is the default
+JIT memory provider, and therefore in case archs implement their custom
+module_alloc() we use MODULES_{END,_VADDR} for limits and otherwise for
+vmalloc_exec() cases like on ppc64 we use VMALLOC_{END,_START}.
+
+Additionally, for archs supporting large page sizes, we should change
+the sysctl to be handled as long to not run into sysctl restrictions
+in future.
+
+Fixes: ede95a63b5e8 ("bpf: add bpf_jit_limit knob to restrict unpriv allocations")
+Reported-by: Sandipan Das <sandipan@linux.ibm.com>
+Reported-by: Michael Roth <mdroth@linux.vnet.ibm.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Tested-by: Michael Roth <mdroth@linux.vnet.ibm.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/linux/filter.h     |  2 +-
+ kernel/bpf/core.c          | 21 +++++++++++++++------
+ net/core/sysctl_net_core.c | 20 +++++++++++++++++---
+ 3 files changed, 33 insertions(+), 10 deletions(-)
+
+diff --git a/include/linux/filter.h b/include/linux/filter.h
+index d52a7484aeb2..3705c6f10b17 100644
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@ -837,7 +837,7 @@ bpf_run_sk_reuseport(struct sock_reuseport *reuse, struct sock *sk,
+ extern int bpf_jit_enable;
+ extern int bpf_jit_harden;
+ extern int bpf_jit_kallsyms;
+-extern int bpf_jit_limit;
++extern long bpf_jit_limit;
+ 
+ typedef void (*bpf_jit_fill_hole_t)(void *area, unsigned int size);
+ 
+diff --git a/kernel/bpf/core.c b/kernel/bpf/core.c
+index bad9985b8a08..36be400c3e65 100644
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@ -366,13 +366,11 @@ void bpf_prog_kallsyms_del_all(struct bpf_prog *fp)
+ }
+ 
+ #ifdef CONFIG_BPF_JIT
+-# define BPF_JIT_LIMIT_DEFAULT	(PAGE_SIZE * 40000)
+-
+ /* All BPF JIT sysctl knobs here. */
+ int bpf_jit_enable   __read_mostly = IS_BUILTIN(CONFIG_BPF_JIT_ALWAYS_ON);
+ int bpf_jit_harden   __read_mostly;
+ int bpf_jit_kallsyms __read_mostly;
+-int bpf_jit_limit    __read_mostly = BPF_JIT_LIMIT_DEFAULT;
++long bpf_jit_limit   __read_mostly;
+ 
+ static __always_inline void
+ bpf_get_prog_addr_region(const struct bpf_prog *prog,
+@@ -583,16 +581,27 @@ int bpf_get_kallsym(unsigned int symnum, unsigned long *value, char *type,
+ 
+ static atomic_long_t bpf_jit_current;
+ 
++/* Can be overridden by an arch's JIT compiler if it has a custom,
++ * dedicated BPF backend memory area, or if neither of the two
++ * below apply.
++ */
++u64 __weak bpf_jit_alloc_exec_limit(void)
++{
+ #if defined(MODULES_VADDR)
++	return MODULES_END - MODULES_VADDR;
++#else
++	return VMALLOC_END - VMALLOC_START;
++#endif
++}
++
+ static int __init bpf_jit_charge_init(void)
+ {
+ 	/* Only used as heuristic here to derive limit. */
+-	bpf_jit_limit = min_t(u64, round_up((MODULES_END - MODULES_VADDR) >> 2,
+-					    PAGE_SIZE), INT_MAX);
++	bpf_jit_limit = min_t(u64, round_up(bpf_jit_alloc_exec_limit() >> 2,
++					    PAGE_SIZE), LONG_MAX);
+ 	return 0;
+ }
+ pure_initcall(bpf_jit_charge_init);
+-#endif
+ 
+ static int bpf_jit_charge_modmem(u32 pages)
+ {
+diff --git a/net/core/sysctl_net_core.c b/net/core/sysctl_net_core.c
+index 37b4667128a3..d67ec17f2cc8 100644
+--- a/net/core/sysctl_net_core.c
++++ b/net/core/sysctl_net_core.c
+@@ -28,6 +28,8 @@ static int two __maybe_unused = 2;
+ static int min_sndbuf = SOCK_MIN_SNDBUF;
+ static int min_rcvbuf = SOCK_MIN_RCVBUF;
+ static int max_skb_frags = MAX_SKB_FRAGS;
++static long long_one __maybe_unused = 1;
++static long long_max __maybe_unused = LONG_MAX;
+ 
+ static int net_msg_warn;	/* Unused, but still a sysctl */
+ 
+@@ -289,6 +291,17 @@ proc_dointvec_minmax_bpf_restricted(struct ctl_table *table, int write,
+ 
+ 	return proc_dointvec_minmax(table, write, buffer, lenp, ppos);
+ }
++
++static int
++proc_dolongvec_minmax_bpf_restricted(struct ctl_table *table, int write,
++				     void __user *buffer, size_t *lenp,
++				     loff_t *ppos)
++{
++	if (!capable(CAP_SYS_ADMIN))
++		return -EPERM;
++
++	return proc_doulongvec_minmax(table, write, buffer, lenp, ppos);
++}
+ #endif
+ 
+ static struct ctl_table net_core_table[] = {
+@@ -398,10 +411,11 @@ static struct ctl_table net_core_table[] = {
+ 	{
+ 		.procname	= "bpf_jit_limit",
+ 		.data		= &bpf_jit_limit,
+-		.maxlen		= sizeof(int),
++		.maxlen		= sizeof(long),
+ 		.mode		= 0600,
+-		.proc_handler	= proc_dointvec_minmax_bpf_restricted,
+-		.extra1		= &one,
++		.proc_handler	= proc_dolongvec_minmax_bpf_restricted,
++		.extra1		= &long_one,
++		.extra2		= &long_max,
+ 	},
+ #endif
+ 	{
+-- 
+2.20.1
+
