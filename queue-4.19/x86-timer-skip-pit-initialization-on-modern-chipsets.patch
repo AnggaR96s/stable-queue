@@ -1,0 +1,209 @@
+From c8c4076723daca08bf35ccd68f22ea1c6219e207 Mon Sep 17 00:00:00 2001
+From: Thomas Gleixner <tglx@linutronix.de>
+Date: Fri, 28 Jun 2019 15:23:07 +0800
+Subject: x86/timer: Skip PIT initialization on modern chipsets
+
+From: Thomas Gleixner <tglx@linutronix.de>
+
+commit c8c4076723daca08bf35ccd68f22ea1c6219e207 upstream.
+
+Recent Intel chipsets including Skylake and ApolloLake have a special
+ITSSPRC register which allows the 8254 PIT to be gated.  When gated, the
+8254 registers can still be programmed as normal, but there are no IRQ0
+timer interrupts.
+
+Some products such as the Connex L1430 and exone go Rugged E11 use this
+register to ship with the PIT gated by default. This causes Linux to fail
+to boot:
+
+  Kernel panic - not syncing: IO-APIC + timer doesn't work! Boot with
+  apic=debug and send a report.
+
+The panic happens before the framebuffer is initialized, so to the user, it
+appears as an early boot hang on a black screen.
+
+Affected products typically have a BIOS option that can be used to enable
+the 8254 and make Linux work (Chipset -> South Cluster Configuration ->
+Miscellaneous Configuration -> 8254 Clock Gating), however it would be best
+to make Linux support the no-8254 case.
+
+Modern sytems allow to discover the TSC and local APIC timer frequencies,
+so the calibration against the PIT is not required. These systems have
+always running timers and the local APIC timer works also in deep power
+states.
+
+So the setup of the PIT including the IO-APIC timer interrupt delivery
+checks are a pointless exercise.
+
+Skip the PIT setup and the IO-APIC timer interrupt checks on these systems,
+which avoids the panic caused by non ticking PITs and also speeds up the
+boot process.
+
+Thanks to Daniel for providing the changelog, initial analysis of the
+problem and testing against a variety of machines.
+
+Reported-by: Daniel Drake <drake@endlessm.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Tested-by: Daniel Drake <drake@endlessm.com>
+Cc: bp@alien8.de
+Cc: hpa@zytor.com
+Cc: linux@endlessm.com
+Cc: rafael.j.wysocki@intel.com
+Cc: hdegoede@redhat.com
+Link: https://lkml.kernel.org/r/20190628072307.24678-1-drake@endlessm.com
+Cc: Kai-Heng Feng <kai.heng.feng@canonical.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ arch/x86/include/asm/apic.h    |    2 ++
+ arch/x86/include/asm/time.h    |    1 +
+ arch/x86/kernel/apic/apic.c    |   27 +++++++++++++++++++++++++++
+ arch/x86/kernel/apic/io_apic.c |    4 ++++
+ arch/x86/kernel/i8253.c        |   25 ++++++++++++++++++++++++-
+ arch/x86/kernel/time.c         |    7 +++++--
+ 6 files changed, 63 insertions(+), 3 deletions(-)
+
+--- a/arch/x86/include/asm/apic.h
++++ b/arch/x86/include/asm/apic.h
+@@ -174,6 +174,7 @@ extern void lapic_assign_system_vectors(
+ extern void lapic_assign_legacy_vector(unsigned int isairq, bool replace);
+ extern void lapic_online(void);
+ extern void lapic_offline(void);
++extern bool apic_needs_pit(void);
+ 
+ #else /* !CONFIG_X86_LOCAL_APIC */
+ static inline void lapic_shutdown(void) { }
+@@ -187,6 +188,7 @@ static inline void init_bsp_APIC(void) {
+ static inline void apic_intr_mode_init(void) { }
+ static inline void lapic_assign_system_vectors(void) { }
+ static inline void lapic_assign_legacy_vector(unsigned int i, bool r) { }
++static inline bool apic_needs_pit(void) { return true; }
+ #endif /* !CONFIG_X86_LOCAL_APIC */
+ 
+ #ifdef CONFIG_X86_X2APIC
+--- a/arch/x86/include/asm/time.h
++++ b/arch/x86/include/asm/time.h
+@@ -7,6 +7,7 @@
+ 
+ extern void hpet_time_init(void);
+ extern void time_init(void);
++extern bool pit_timer_init(void);
+ 
+ extern struct clock_event_device *global_clock_event;
+ 
+--- a/arch/x86/kernel/apic/apic.c
++++ b/arch/x86/kernel/apic/apic.c
+@@ -796,6 +796,33 @@ calibrate_by_pmtimer(long deltapm, long
+ 	return 0;
+ }
+ 
++bool __init apic_needs_pit(void)
++{
++	/*
++	 * If the frequencies are not known, PIT is required for both TSC
++	 * and apic timer calibration.
++	 */
++	if (!tsc_khz || !cpu_khz)
++		return true;
++
++	/* Is there an APIC at all? */
++	if (!boot_cpu_has(X86_FEATURE_APIC))
++		return true;
++
++	/* Deadline timer is based on TSC so no further PIT action required */
++	if (boot_cpu_has(X86_FEATURE_TSC_DEADLINE_TIMER))
++		return false;
++
++	/* APIC timer disabled? */
++	if (disable_apic_timer)
++		return true;
++	/*
++	 * The APIC timer frequency is known already, no PIT calibration
++	 * required. If unknown, let the PIT be initialized.
++	 */
++	return lapic_timer_period == 0;
++}
++
+ static int __init calibrate_APIC_clock(void)
+ {
+ 	struct clock_event_device *levt = this_cpu_ptr(&lapic_events);
+--- a/arch/x86/kernel/apic/io_apic.c
++++ b/arch/x86/kernel/apic/io_apic.c
+@@ -58,6 +58,7 @@
+ #include <asm/acpi.h>
+ #include <asm/dma.h>
+ #include <asm/timer.h>
++#include <asm/time.h>
+ #include <asm/i8259.h>
+ #include <asm/setup.h>
+ #include <asm/irq_remapping.h>
+@@ -2127,6 +2128,9 @@ static inline void __init check_timer(vo
+ 	unsigned long flags;
+ 	int no_pin1 = 0;
+ 
++	if (!global_clock_event)
++		return;
++
+ 	local_irq_save(flags);
+ 
+ 	/*
+--- a/arch/x86/kernel/i8253.c
++++ b/arch/x86/kernel/i8253.c
+@@ -8,6 +8,7 @@
+ #include <linux/timex.h>
+ #include <linux/i8253.h>
+ 
++#include <asm/apic.h>
+ #include <asm/hpet.h>
+ #include <asm/time.h>
+ #include <asm/smp.h>
+@@ -18,10 +19,32 @@
+  */
+ struct clock_event_device *global_clock_event;
+ 
+-void __init setup_pit_timer(void)
++/*
++ * Modern chipsets can disable the PIT clock which makes it unusable. It
++ * would be possible to enable the clock but the registers are chipset
++ * specific and not discoverable. Avoid the whack a mole game.
++ *
++ * These platforms have discoverable TSC/CPU frequencies but this also
++ * requires to know the local APIC timer frequency as it normally is
++ * calibrated against the PIT interrupt.
++ */
++static bool __init use_pit(void)
+ {
++	if (!IS_ENABLED(CONFIG_X86_TSC) || !boot_cpu_has(X86_FEATURE_TSC))
++		return true;
++
++	/* This also returns true when APIC is disabled */
++	return apic_needs_pit();
++}
++
++bool __init pit_timer_init(void)
++{
++	if (!use_pit())
++		return false;
++
+ 	clockevent_i8253_init(true);
+ 	global_clock_event = &i8253_clockevent;
++	return true;
+ }
+ 
+ #ifndef CONFIG_X86_64
+--- a/arch/x86/kernel/time.c
++++ b/arch/x86/kernel/time.c
+@@ -81,8 +81,11 @@ static void __init setup_default_timer_i
+ /* Default timer init function */
+ void __init hpet_time_init(void)
+ {
+-	if (!hpet_enable())
+-		setup_pit_timer();
++	if (!hpet_enable()) {
++		if (!pit_timer_init())
++			return;
++	}
++
+ 	setup_default_timer_irq();
+ }
+ 
