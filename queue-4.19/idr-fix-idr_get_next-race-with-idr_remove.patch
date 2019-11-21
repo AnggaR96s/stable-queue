@@ -1,0 +1,139 @@
+From 5c089fd0c73411f2170ab795c9ffc16718c7d007 Mon Sep 17 00:00:00 2001
+From: "Matthew Wilcox (Oracle)" <willy@infradead.org>
+Date: Tue, 14 May 2019 16:05:45 -0400
+Subject: idr: Fix idr_get_next race with idr_remove
+
+From: Matthew Wilcox (Oracle) <willy@infradead.org>
+
+commit 5c089fd0c73411f2170ab795c9ffc16718c7d007 upstream.
+
+If the entry is deleted from the IDR between the call to
+radix_tree_iter_find() and rcu_dereference_raw(), idr_get_next()
+will return NULL, which will end the iteration prematurely.  We should
+instead continue to the next entry in the IDR.  This only happens if the
+iteration is protected by the RCU lock.  Most IDR users use a spinlock
+or semaphore to exclude simultaneous modifications.  It was noticed once
+the PID allocator was converted to use the IDR, as it uses the RCU lock,
+but there may be other users elsewhere in the kernel.
+
+We can't use the normal pattern of calling radix_tree_deref_retry()
+(which catches both a retry entry in a leaf node and a node entry in
+the root) as the IDR supports storing entries which are unaligned,
+which will trigger an infinite loop if they are encountered.  Instead,
+we have to explicitly check whether the entry is a retry entry.
+
+Fixes: 0a835c4f090a ("Reimplement IDR and IDA using the radix tree")
+Reported-by: Brendan Gregg <bgregg@netflix.com>
+Tested-by: Brendan Gregg <bgregg@netflix.com>
+Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+
+---
+ lib/idr.c                           |   15 +++++++++-
+ tools/testing/radix-tree/idr-test.c |   52 ++++++++++++++++++++++++++++++++++++
+ 2 files changed, 65 insertions(+), 2 deletions(-)
+
+--- a/lib/idr.c
++++ b/lib/idr.c
+@@ -231,11 +231,22 @@ void *idr_get_next(struct idr *idr, int
+ {
+ 	struct radix_tree_iter iter;
+ 	void __rcu **slot;
++	void *entry = NULL;
+ 	unsigned long base = idr->idr_base;
+ 	unsigned long id = *nextid;
+ 
+ 	id = (id < base) ? 0 : id - base;
+-	slot = radix_tree_iter_find(&idr->idr_rt, &iter, id);
++	radix_tree_for_each_slot(slot, &idr->idr_rt, &iter, id) {
++		entry = radix_tree_deref_slot(slot);
++		if (!entry)
++			continue;
++		if (!radix_tree_deref_retry(entry))
++			break;
++		if (slot != (void *)&idr->idr_rt.rnode &&
++				entry != (void *)RADIX_TREE_INTERNAL_NODE)
++			break;
++		slot = radix_tree_iter_retry(&iter);
++	}
+ 	if (!slot)
+ 		return NULL;
+ 	id = iter.index + base;
+@@ -244,7 +255,7 @@ void *idr_get_next(struct idr *idr, int
+ 		return NULL;
+ 
+ 	*nextid = id;
+-	return rcu_dereference_raw(*slot);
++	return entry;
+ }
+ EXPORT_SYMBOL(idr_get_next);
+ 
+--- a/tools/testing/radix-tree/idr-test.c
++++ b/tools/testing/radix-tree/idr-test.c
+@@ -227,6 +227,57 @@ void idr_u32_test(int base)
+ 	idr_u32_test1(&idr, 0xffffffff);
+ }
+ 
++static inline void *idr_mk_value(unsigned long v)
++{
++	BUG_ON((long)v < 0);
++	return (void *)((v & 1) | 2 | (v << 1));
++}
++
++DEFINE_IDR(find_idr);
++
++static void *idr_throbber(void *arg)
++{
++	time_t start = time(NULL);
++	int id = *(int *)arg;
++
++	rcu_register_thread();
++	do {
++		idr_alloc(&find_idr, idr_mk_value(id), id, id + 1, GFP_KERNEL);
++		idr_remove(&find_idr, id);
++	} while (time(NULL) < start + 10);
++	rcu_unregister_thread();
++
++	return NULL;
++}
++
++void idr_find_test_1(int anchor_id, int throbber_id)
++{
++	pthread_t throbber;
++	time_t start = time(NULL);
++
++	pthread_create(&throbber, NULL, idr_throbber, &throbber_id);
++
++	BUG_ON(idr_alloc(&find_idr, idr_mk_value(anchor_id), anchor_id,
++				anchor_id + 1, GFP_KERNEL) != anchor_id);
++
++	do {
++		int id = 0;
++		void *entry = idr_get_next(&find_idr, &id);
++		BUG_ON(entry != idr_mk_value(id));
++	} while (time(NULL) < start + 11);
++
++	pthread_join(throbber, NULL);
++
++	idr_remove(&find_idr, anchor_id);
++	BUG_ON(!idr_is_empty(&find_idr));
++}
++
++void idr_find_test(void)
++{
++	idr_find_test_1(100000, 0);
++	idr_find_test_1(0, 100000);
++}
++
+ void idr_checks(void)
+ {
+ 	unsigned long i;
+@@ -307,6 +358,7 @@ void idr_checks(void)
+ 	idr_u32_test(4);
+ 	idr_u32_test(1);
+ 	idr_u32_test(0);
++	idr_find_test();
+ }
+ 
+ #define module_init(x)
