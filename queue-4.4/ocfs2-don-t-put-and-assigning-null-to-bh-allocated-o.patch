@@ -1,0 +1,216 @@
+From 3b4c4a07b792d2e64eecc811e81f01527388c28a Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 2 Nov 2018 15:48:19 -0700
+Subject: ocfs2: don't put and assigning null to bh allocated outside
+
+From: Changwei Ge <ge.changwei@h3c.com>
+
+[ Upstream commit cf76c78595ca87548ca5e45c862ac9e0949c4687 ]
+
+ocfs2_read_blocks() and ocfs2_read_blocks_sync() are both used to read
+several blocks from disk.  Currently, the input argument *bhs* can be
+NULL or NOT.  It depends on the caller's behavior.  If the function
+fails in reading blocks from disk, the corresponding bh will be assigned
+to NULL and put.
+
+Obviously, above process for non-NULL input bh is not appropriate.
+Because the caller doesn't even know its bhs are put and re-assigned.
+
+If buffer head is managed by caller, ocfs2_read_blocks and
+ocfs2_read_blocks_sync() should not evaluate it to NULL.  It will cause
+caller accessing illegal memory, thus crash.
+
+Link: http://lkml.kernel.org/r/HK2PR06MB045285E0F4FBB561F9F2F9B3D5680@HK2PR06MB0452.apcprd06.prod.outlook.com
+Signed-off-by: Changwei Ge <ge.changwei@h3c.com>
+Reviewed-by: Guozhonghua <guozhonghua@h3c.com>
+Cc: Mark Fasheh <mark@fasheh.com>
+Cc: Joel Becker <jlbec@evilplan.org>
+Cc: Junxiao Bi <junxiao.bi@oracle.com>
+Cc: Joseph Qi <jiangqi903@gmail.com>
+Cc: Changwei Ge <ge.changwei@h3c.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/ocfs2/buffer_head_io.c | 77 ++++++++++++++++++++++++++++++---------
+ 1 file changed, 59 insertions(+), 18 deletions(-)
+
+diff --git a/fs/ocfs2/buffer_head_io.c b/fs/ocfs2/buffer_head_io.c
+index 9ee8bcfbf00f3..92593179f7e2b 100644
+--- a/fs/ocfs2/buffer_head_io.c
++++ b/fs/ocfs2/buffer_head_io.c
+@@ -98,25 +98,34 @@ int ocfs2_write_block(struct ocfs2_super *osb, struct buffer_head *bh,
+ 	return ret;
+ }
+ 
++/* Caller must provide a bhs[] with all NULL or non-NULL entries, so it
++ * will be easier to handle read failure.
++ */
+ int ocfs2_read_blocks_sync(struct ocfs2_super *osb, u64 block,
+ 			   unsigned int nr, struct buffer_head *bhs[])
+ {
+ 	int status = 0;
+ 	unsigned int i;
+ 	struct buffer_head *bh;
++	int new_bh = 0;
+ 
+ 	trace_ocfs2_read_blocks_sync((unsigned long long)block, nr);
+ 
+ 	if (!nr)
+ 		goto bail;
+ 
++	/* Don't put buffer head and re-assign it to NULL if it is allocated
++	 * outside since the caller can't be aware of this alternation!
++	 */
++	new_bh = (bhs[0] == NULL);
++
+ 	for (i = 0 ; i < nr ; i++) {
+ 		if (bhs[i] == NULL) {
+ 			bhs[i] = sb_getblk(osb->sb, block++);
+ 			if (bhs[i] == NULL) {
+ 				status = -ENOMEM;
+ 				mlog_errno(status);
+-				goto bail;
++				break;
+ 			}
+ 		}
+ 		bh = bhs[i];
+@@ -151,9 +160,26 @@ int ocfs2_read_blocks_sync(struct ocfs2_super *osb, u64 block,
+ 		submit_bh(READ, bh);
+ 	}
+ 
++read_failure:
+ 	for (i = nr; i > 0; i--) {
+ 		bh = bhs[i - 1];
+ 
++		if (unlikely(status)) {
++			if (new_bh && bh) {
++				/* If middle bh fails, let previous bh
++				 * finish its read and then put it to
++				 * aovoid bh leak
++				 */
++				if (!buffer_jbd(bh))
++					wait_on_buffer(bh);
++				put_bh(bh);
++				bhs[i - 1] = NULL;
++			} else if (bh && buffer_uptodate(bh)) {
++				clear_buffer_uptodate(bh);
++			}
++			continue;
++		}
++
+ 		/* No need to wait on the buffer if it's managed by JBD. */
+ 		if (!buffer_jbd(bh))
+ 			wait_on_buffer(bh);
+@@ -163,8 +189,7 @@ int ocfs2_read_blocks_sync(struct ocfs2_super *osb, u64 block,
+ 			 * so we can safely record this and loop back
+ 			 * to cleanup the other buffers. */
+ 			status = -EIO;
+-			put_bh(bh);
+-			bhs[i - 1] = NULL;
++			goto read_failure;
+ 		}
+ 	}
+ 
+@@ -172,6 +197,9 @@ int ocfs2_read_blocks_sync(struct ocfs2_super *osb, u64 block,
+ 	return status;
+ }
+ 
++/* Caller must provide a bhs[] with all NULL or non-NULL entries, so it
++ * will be easier to handle read failure.
++ */
+ int ocfs2_read_blocks(struct ocfs2_caching_info *ci, u64 block, int nr,
+ 		      struct buffer_head *bhs[], int flags,
+ 		      int (*validate)(struct super_block *sb,
+@@ -181,6 +209,7 @@ int ocfs2_read_blocks(struct ocfs2_caching_info *ci, u64 block, int nr,
+ 	int i, ignore_cache = 0;
+ 	struct buffer_head *bh;
+ 	struct super_block *sb = ocfs2_metadata_cache_get_super(ci);
++	int new_bh = 0;
+ 
+ 	trace_ocfs2_read_blocks_begin(ci, (unsigned long long)block, nr, flags);
+ 
+@@ -206,6 +235,11 @@ int ocfs2_read_blocks(struct ocfs2_caching_info *ci, u64 block, int nr,
+ 		goto bail;
+ 	}
+ 
++	/* Don't put buffer head and re-assign it to NULL if it is allocated
++	 * outside since the caller can't be aware of this alternation!
++	 */
++	new_bh = (bhs[0] == NULL);
++
+ 	ocfs2_metadata_cache_io_lock(ci);
+ 	for (i = 0 ; i < nr ; i++) {
+ 		if (bhs[i] == NULL) {
+@@ -214,7 +248,8 @@ int ocfs2_read_blocks(struct ocfs2_caching_info *ci, u64 block, int nr,
+ 				ocfs2_metadata_cache_io_unlock(ci);
+ 				status = -ENOMEM;
+ 				mlog_errno(status);
+-				goto bail;
++				/* Don't forget to put previous bh! */
++				break;
+ 			}
+ 		}
+ 		bh = bhs[i];
+@@ -308,16 +343,27 @@ int ocfs2_read_blocks(struct ocfs2_caching_info *ci, u64 block, int nr,
+ 		}
+ 	}
+ 
+-	status = 0;
+-
++read_failure:
+ 	for (i = (nr - 1); i >= 0; i--) {
+ 		bh = bhs[i];
+ 
+ 		if (!(flags & OCFS2_BH_READAHEAD)) {
+-			if (status) {
+-				/* Clear the rest of the buffers on error */
+-				put_bh(bh);
+-				bhs[i] = NULL;
++			if (unlikely(status)) {
++				/* Clear the buffers on error including those
++				 * ever succeeded in reading
++				 */
++				if (new_bh && bh) {
++					/* If middle bh fails, let previous bh
++					 * finish its read and then put it to
++					 * aovoid bh leak
++					 */
++					if (!buffer_jbd(bh))
++						wait_on_buffer(bh);
++					put_bh(bh);
++					bhs[i] = NULL;
++				} else if (bh && buffer_uptodate(bh)) {
++					clear_buffer_uptodate(bh);
++				}
+ 				continue;
+ 			}
+ 			/* We know this can't have changed as we hold the
+@@ -335,9 +381,7 @@ int ocfs2_read_blocks(struct ocfs2_caching_info *ci, u64 block, int nr,
+ 				 * uptodate. */
+ 				status = -EIO;
+ 				clear_buffer_needs_validate(bh);
+-				put_bh(bh);
+-				bhs[i] = NULL;
+-				continue;
++				goto read_failure;
+ 			}
+ 
+ 			if (buffer_needs_validate(bh)) {
+@@ -347,11 +391,8 @@ int ocfs2_read_blocks(struct ocfs2_caching_info *ci, u64 block, int nr,
+ 				BUG_ON(buffer_jbd(bh));
+ 				clear_buffer_needs_validate(bh);
+ 				status = validate(sb, bh);
+-				if (status) {
+-					put_bh(bh);
+-					bhs[i] = NULL;
+-					continue;
+-				}
++				if (status)
++					goto read_failure;
+ 			}
+ 		}
+ 
+-- 
+2.20.1
+
