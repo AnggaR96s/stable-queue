@@ -1,0 +1,147 @@
+From c775d7637b2601eb00d46c5430e0c70c11f7bc25 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 24 Oct 2018 20:42:25 +0000
+Subject: bpf, btf: fix a missing check bug in btf_parse
+
+From: Martin Lau <kafai@fb.com>
+
+[ Upstream commit 4a6998aff82a20a1aece86a186d8e5263f8b2315 ]
+
+Wenwen Wang reported:
+
+  In btf_parse(), the header of the user-space btf data 'btf_data'
+  is firstly parsed and verified through btf_parse_hdr().
+  In btf_parse_hdr(), the header is copied from user-space 'btf_data'
+  to kernel-space 'btf->hdr' and then verified. If no error happens
+  during the verification process, the whole data of 'btf_data',
+  including the header, is then copied to 'data' in btf_parse(). It
+  is obvious that the header is copied twice here. More importantly,
+  no check is enforced after the second copy to make sure the headers
+  obtained in these two copies are same. Given that 'btf_data' resides
+  in the user space, a malicious user can race to modify the header
+  between these two copies. By doing so, the user can inject
+  inconsistent data, which can cause undefined behavior of the
+  kernel and introduce potential security risk.
+
+This issue is similar to the one fixed in commit 8af03d1ae2e1 ("bpf:
+btf: Fix a missing check bug"). To fix it, this patch copies the user
+'btf_data' *before* parsing / verifying the BTF header.
+
+Fixes: 69b693f0aefa ("bpf: btf: Introduce BPF Type Format (BTF)")
+Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+Co-developed-by: Wenwen Wang <wang6495@umn.edu>
+Acked-by: Song Liu <songliubraving@fb.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ kernel/bpf/btf.c | 55 ++++++++++++++++++++++--------------------------
+ 1 file changed, 25 insertions(+), 30 deletions(-)
+
+diff --git a/kernel/bpf/btf.c b/kernel/bpf/btf.c
+index 378cef70341c4..cfa27b7d1168c 100644
+--- a/kernel/bpf/btf.c
++++ b/kernel/bpf/btf.c
+@@ -2067,50 +2067,44 @@ static int btf_check_sec_info(struct btf_verifier_env *env,
+ 	return 0;
+ }
+ 
+-static int btf_parse_hdr(struct btf_verifier_env *env, void __user *btf_data,
+-			 u32 btf_data_size)
++static int btf_parse_hdr(struct btf_verifier_env *env)
+ {
++	u32 hdr_len, hdr_copy, btf_data_size;
+ 	const struct btf_header *hdr;
+-	u32 hdr_len, hdr_copy;
+-	/*
+-	 * Minimal part of the "struct btf_header" that
+-	 * contains the hdr_len.
+-	 */
+-	struct btf_min_header {
+-		u16	magic;
+-		u8	version;
+-		u8	flags;
+-		u32	hdr_len;
+-	} __user *min_hdr;
+ 	struct btf *btf;
+ 	int err;
+ 
+ 	btf = env->btf;
+-	min_hdr = btf_data;
++	btf_data_size = btf->data_size;
+ 
+-	if (btf_data_size < sizeof(*min_hdr)) {
++	if (btf_data_size <
++	    offsetof(struct btf_header, hdr_len) + sizeof(hdr->hdr_len)) {
+ 		btf_verifier_log(env, "hdr_len not found");
+ 		return -EINVAL;
+ 	}
+ 
+-	if (get_user(hdr_len, &min_hdr->hdr_len))
+-		return -EFAULT;
+-
++	hdr = btf->data;
++	hdr_len = hdr->hdr_len;
+ 	if (btf_data_size < hdr_len) {
+ 		btf_verifier_log(env, "btf_header not found");
+ 		return -EINVAL;
+ 	}
+ 
+-	err = bpf_check_uarg_tail_zero(btf_data, sizeof(btf->hdr), hdr_len);
+-	if (err) {
+-		if (err == -E2BIG)
+-			btf_verifier_log(env, "Unsupported btf_header");
+-		return err;
++	/* Ensure the unsupported header fields are zero */
++	if (hdr_len > sizeof(btf->hdr)) {
++		u8 *expected_zero = btf->data + sizeof(btf->hdr);
++		u8 *end = btf->data + hdr_len;
++
++		for (; expected_zero < end; expected_zero++) {
++			if (*expected_zero) {
++				btf_verifier_log(env, "Unsupported btf_header");
++				return -E2BIG;
++			}
++		}
+ 	}
+ 
+ 	hdr_copy = min_t(u32, hdr_len, sizeof(btf->hdr));
+-	if (copy_from_user(&btf->hdr, btf_data, hdr_copy))
+-		return -EFAULT;
++	memcpy(&btf->hdr, btf->data, hdr_copy);
+ 
+ 	hdr = &btf->hdr;
+ 
+@@ -2186,10 +2180,6 @@ static struct btf *btf_parse(void __user *btf_data, u32 btf_data_size,
+ 	}
+ 	env->btf = btf;
+ 
+-	err = btf_parse_hdr(env, btf_data, btf_data_size);
+-	if (err)
+-		goto errout;
+-
+ 	data = kvmalloc(btf_data_size, GFP_KERNEL | __GFP_NOWARN);
+ 	if (!data) {
+ 		err = -ENOMEM;
+@@ -2198,13 +2188,18 @@ static struct btf *btf_parse(void __user *btf_data, u32 btf_data_size,
+ 
+ 	btf->data = data;
+ 	btf->data_size = btf_data_size;
+-	btf->nohdr_data = btf->data + btf->hdr.hdr_len;
+ 
+ 	if (copy_from_user(data, btf_data, btf_data_size)) {
+ 		err = -EFAULT;
+ 		goto errout;
+ 	}
+ 
++	err = btf_parse_hdr(env);
++	if (err)
++		goto errout;
++
++	btf->nohdr_data = btf->data + btf->hdr.hdr_len;
++
+ 	err = btf_parse_str_sec(env);
+ 	if (err)
+ 		goto errout;
+-- 
+2.20.1
+
