@@ -1,0 +1,127 @@
+From 9e1b45a33d0e60b52ae190876e03356c8425b606 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 6 Dec 2018 16:48:45 -0700
+Subject: scsi: qla2xxx: deadlock by configfs_depend_item
+
+From: Anatoliy Glagolev <glagolig@gmail.com>
+
+[ Upstream commit 17b18eaa6f59044a5172db7d07149e31ede0f920 ]
+
+The intent of invoking configfs_depend_item in commit 7474f52a82d51
+("tcm_qla2xxx: Perform configfs depend/undepend for base_tpg")
+was to prevent a physical Fibre Channel port removal when
+virtual (NPIV) ports announced through that physical port are active.
+The change does not work as expected: it makes enabled physical port
+dependent on target configfs subsystem (the port's parent), something
+the configfs guarantees anyway.
+
+Besides, scheduling work in a worker thread and waiting for the work's
+completion is not really a valid workaround for the requirement not to call
+configfs_depend_item from a configfs callback: the call occasionally
+deadlocks.
+
+Thus, removing configfs_depend_item calls does not break anything and fixes
+the deadlock problem.
+
+Signed-off-by: Anatoliy Glagolev <glagolig@gmail.com>
+Acked-by: Himanshu Madhani <hmadhani@marvell.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/scsi/qla2xxx/tcm_qla2xxx.c | 48 +++++-------------------------
+ drivers/scsi/qla2xxx/tcm_qla2xxx.h |  3 --
+ 2 files changed, 8 insertions(+), 43 deletions(-)
+
+diff --git a/drivers/scsi/qla2xxx/tcm_qla2xxx.c b/drivers/scsi/qla2xxx/tcm_qla2xxx.c
+index b8c1a739dfbd1..654e1af7f542c 100644
+--- a/drivers/scsi/qla2xxx/tcm_qla2xxx.c
++++ b/drivers/scsi/qla2xxx/tcm_qla2xxx.c
+@@ -926,38 +926,14 @@ static ssize_t tcm_qla2xxx_tpg_enable_show(struct config_item *item,
+ 			atomic_read(&tpg->lport_tpg_enabled));
+ }
+ 
+-static void tcm_qla2xxx_depend_tpg(struct work_struct *work)
+-{
+-	struct tcm_qla2xxx_tpg *base_tpg = container_of(work,
+-				struct tcm_qla2xxx_tpg, tpg_base_work);
+-	struct se_portal_group *se_tpg = &base_tpg->se_tpg;
+-	struct scsi_qla_host *base_vha = base_tpg->lport->qla_vha;
+-
+-	if (!target_depend_item(&se_tpg->tpg_group.cg_item)) {
+-		atomic_set(&base_tpg->lport_tpg_enabled, 1);
+-		qlt_enable_vha(base_vha);
+-	}
+-	complete(&base_tpg->tpg_base_comp);
+-}
+-
+-static void tcm_qla2xxx_undepend_tpg(struct work_struct *work)
+-{
+-	struct tcm_qla2xxx_tpg *base_tpg = container_of(work,
+-				struct tcm_qla2xxx_tpg, tpg_base_work);
+-	struct se_portal_group *se_tpg = &base_tpg->se_tpg;
+-	struct scsi_qla_host *base_vha = base_tpg->lport->qla_vha;
+-
+-	if (!qlt_stop_phase1(base_vha->vha_tgt.qla_tgt)) {
+-		atomic_set(&base_tpg->lport_tpg_enabled, 0);
+-		target_undepend_item(&se_tpg->tpg_group.cg_item);
+-	}
+-	complete(&base_tpg->tpg_base_comp);
+-}
+-
+ static ssize_t tcm_qla2xxx_tpg_enable_store(struct config_item *item,
+ 		const char *page, size_t count)
+ {
+ 	struct se_portal_group *se_tpg = to_tpg(item);
++	struct se_wwn *se_wwn = se_tpg->se_tpg_wwn;
++	struct tcm_qla2xxx_lport *lport = container_of(se_wwn,
++			struct tcm_qla2xxx_lport, lport_wwn);
++	struct scsi_qla_host *vha = lport->qla_vha;
+ 	struct tcm_qla2xxx_tpg *tpg = container_of(se_tpg,
+ 			struct tcm_qla2xxx_tpg, se_tpg);
+ 	unsigned long op;
+@@ -976,24 +952,16 @@ static ssize_t tcm_qla2xxx_tpg_enable_store(struct config_item *item,
+ 		if (atomic_read(&tpg->lport_tpg_enabled))
+ 			return -EEXIST;
+ 
+-		INIT_WORK(&tpg->tpg_base_work, tcm_qla2xxx_depend_tpg);
++		atomic_set(&tpg->lport_tpg_enabled, 1);
++		qlt_enable_vha(vha);
+ 	} else {
+ 		if (!atomic_read(&tpg->lport_tpg_enabled))
+ 			return count;
+ 
+-		INIT_WORK(&tpg->tpg_base_work, tcm_qla2xxx_undepend_tpg);
++		atomic_set(&tpg->lport_tpg_enabled, 0);
++		qlt_stop_phase1(vha->vha_tgt.qla_tgt);
+ 	}
+-	init_completion(&tpg->tpg_base_comp);
+-	schedule_work(&tpg->tpg_base_work);
+-	wait_for_completion(&tpg->tpg_base_comp);
+ 
+-	if (op) {
+-		if (!atomic_read(&tpg->lport_tpg_enabled))
+-			return -ENODEV;
+-	} else {
+-		if (atomic_read(&tpg->lport_tpg_enabled))
+-			return -EPERM;
+-	}
+ 	return count;
+ }
+ 
+diff --git a/drivers/scsi/qla2xxx/tcm_qla2xxx.h b/drivers/scsi/qla2xxx/tcm_qla2xxx.h
+index 7550ba2831c36..147cf6c903666 100644
+--- a/drivers/scsi/qla2xxx/tcm_qla2xxx.h
++++ b/drivers/scsi/qla2xxx/tcm_qla2xxx.h
+@@ -48,9 +48,6 @@ struct tcm_qla2xxx_tpg {
+ 	struct tcm_qla2xxx_tpg_attrib tpg_attrib;
+ 	/* Returned by tcm_qla2xxx_make_tpg() */
+ 	struct se_portal_group se_tpg;
+-	/* Items for dealing with configfs_depend_item */
+-	struct completion tpg_base_comp;
+-	struct work_struct tpg_base_work;
+ };
+ 
+ struct tcm_qla2xxx_fc_loopid {
+-- 
+2.20.1
+

@@ -1,0 +1,112 @@
+From 1bcaca6e448f0f04378a13c92b053e4640376b7b Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 28 Dec 2018 00:35:18 -0800
+Subject: mm/page_alloc.c: free order-0 pages through PCP in page_frag_free()
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+From: Aaron Lu <aaron.lu@intel.com>
+
+[ Upstream commit 65895b67ad27df0f62bfaf82dd5622f95ea29196 ]
+
+page_frag_free() calls __free_pages_ok() to free the page back to Buddy.
+This is OK for high order page, but for order-0 pages, it misses the
+optimization opportunity of using Per-Cpu-Pages and can cause zone lock
+contention when called frequently.
+
+Pawel Staszewski recently shared his result of 'how Linux kernel handles
+normal traffic'[1] and from perf data, Jesper Dangaard Brouer found the
+lock contention comes from page allocator:
+
+  mlx5e_poll_tx_cq
+  |
+   --16.34%--napi_consume_skb
+             |
+             |--12.65%--__free_pages_ok
+             |          |
+             |           --11.86%--free_one_page
+             |                     |
+             |                     |--10.10%--queued_spin_lock_slowpath
+             |                     |
+             |                      --0.65%--_raw_spin_lock
+             |
+             |--1.55%--page_frag_free
+             |
+              --1.44%--skb_release_data
+
+Jesper explained how it happened: mlx5 driver RX-page recycle mechanism is
+not effective in this workload and pages have to go through the page
+allocator.  The lock contention happens during mlx5 DMA TX completion
+cycle.  And the page allocator cannot keep up at these speeds.[2]
+
+I thought that __free_pages_ok() are mostly freeing high order pages and
+thought this is an lock contention for high order pages but Jesper
+explained in detail that __free_pages_ok() here are actually freeing
+order-0 pages because mlx5 is using order-0 pages to satisfy its page pool
+allocation request.[3]
+
+The free path as pointed out by Jesper is:
+skb_free_head()
+  -> skb_free_frag()
+    -> page_frag_free()
+And the pages being freed on this path are order-0 pages.
+
+Fix this by doing similar things as in __page_frag_cache_drain() - send
+the being freed page to PCP if it's an order-0 page, or directly to Buddy
+if it is a high order page.
+
+With this change, Paweł hasn't noticed lock contention yet in his
+workload and Jesper has noticed a 7% performance improvement using a micro
+benchmark and lock contention is gone.  Ilias' test on a 'low' speed 1Gbit
+interface on an cortex-a53 shows ~11% performance boost testing with
+64byte packets and __free_pages_ok() disappeared from perf top.
+
+[1]: https://www.spinics.net/lists/netdev/msg531362.html
+[2]: https://www.spinics.net/lists/netdev/msg531421.html
+[3]: https://www.spinics.net/lists/netdev/msg531556.html
+
+[akpm@linux-foundation.org: add comment]
+Link: http://lkml.kernel.org/r/20181120014544.GB10657@intel.com
+Signed-off-by: Aaron Lu <aaron.lu@intel.com>
+Reported-by: Pawel Staszewski <pstaszewski@itcare.pl>
+Analysed-by: Jesper Dangaard Brouer <brouer@redhat.com>
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
+Acked-by: Mel Gorman <mgorman@techsingularity.net>
+Acked-by: Jesper Dangaard Brouer <brouer@redhat.com>
+Acked-by: Ilias Apalodimas <ilias.apalodimas@linaro.org>
+Tested-by: Ilias Apalodimas <ilias.apalodimas@linaro.org>
+Acked-by: Alexander Duyck <alexander.h.duyck@linux.intel.com>
+Acked-by: Tariq Toukan <tariqt@mellanox.com>
+Acked-by: Pankaj gupta <pagupta@redhat.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ mm/page_alloc.c | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index b34348a41bfed..dcc46d955df2e 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -4581,8 +4581,14 @@ void page_frag_free(void *addr)
+ {
+ 	struct page *page = virt_to_head_page(addr);
+ 
+-	if (unlikely(put_page_testzero(page)))
+-		__free_pages_ok(page, compound_order(page));
++	if (unlikely(put_page_testzero(page))) {
++		unsigned int order = compound_order(page);
++
++		if (order == 0)		/* Via pcp? */
++			free_unref_page(page);
++		else
++			__free_pages_ok(page, order);
++	}
+ }
+ EXPORT_SYMBOL(page_frag_free);
+ 
+-- 
+2.20.1
+
