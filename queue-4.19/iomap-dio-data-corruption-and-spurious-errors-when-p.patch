@@ -1,0 +1,107 @@
+From d074dfabfcde1eda4ac093d6fecb29ca3f138b82 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 19 Nov 2018 13:31:11 -0800
+Subject: iomap: dio data corruption and spurious errors when pipes fill
+
+From: Dave Chinner <dchinner@redhat.com>
+
+[ Upstream commit 4721a6010990971440b4ffefbdf014976b8eda2f ]
+
+When doing direct IO to a pipe for do_splice_direct(), then pipe is
+trivial to fill up and overflow as it can only hold 16 pages. At
+this point bio_iov_iter_get_pages() then returns -EFAULT, and we
+abort the IO submission process. Unfortunately, iomap_dio_rw()
+propagates the error back up the stack.
+
+The error is converted from the EFAULT to EAGAIN in
+generic_file_splice_read() to tell the splice layers that the pipe
+is full. do_splice_direct() completely fails to handle EAGAIN errors
+(it aborts on error) and returns EAGAIN to the caller.
+
+copy_file_write() then completely fails to handle EAGAIN as well,
+and so returns EAGAIN to userspace, having failed to copy the data
+it was asked to.
+
+Avoid this whole steaming pile of fail by having iomap_dio_rw()
+silently swallow EFAULT errors and so do short reads.
+
+To make matters worse, iomap_dio_actor() has a stale data exposure
+bug bio_iov_iter_get_pages() fails - it does not zero the tail block
+that it may have been left uncovered by partial IO. Fix the error
+handling case to drop to the sub-block zeroing rather than
+immmediately returning the -EFAULT error.
+
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/iomap.c | 22 +++++++++++++++++++---
+ 1 file changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/fs/iomap.c b/fs/iomap.c
+index d3d227682f7d4..0ff0f8ca3b197 100644
+--- a/fs/iomap.c
++++ b/fs/iomap.c
+@@ -1603,7 +1603,7 @@ iomap_dio_bio_actor(struct inode *inode, loff_t pos, loff_t length,
+ 	struct bio *bio;
+ 	bool need_zeroout = false;
+ 	bool use_fua = false;
+-	int nr_pages, ret;
++	int nr_pages, ret = 0;
+ 	size_t copied = 0;
+ 
+ 	if ((pos | length | align) & ((1 << blkbits) - 1))
+@@ -1668,8 +1668,14 @@ iomap_dio_bio_actor(struct inode *inode, loff_t pos, loff_t length,
+ 
+ 		ret = bio_iov_iter_get_pages(bio, &iter);
+ 		if (unlikely(ret)) {
++			/*
++			 * We have to stop part way through an IO. We must fall
++			 * through to the sub-block tail zeroing here, otherwise
++			 * this short IO may expose stale data in the tail of
++			 * the block we haven't written data to.
++			 */
+ 			bio_put(bio);
+-			return copied ? copied : ret;
++			goto zero_tail;
+ 		}
+ 
+ 		n = bio->bi_iter.bi_size;
+@@ -1706,6 +1712,7 @@ iomap_dio_bio_actor(struct inode *inode, loff_t pos, loff_t length,
+ 	 * the block tail in the latter case, we can expose stale data via mmap
+ 	 * reads of the EOF block.
+ 	 */
++zero_tail:
+ 	if (need_zeroout ||
+ 	    ((dio->flags & IOMAP_DIO_WRITE) && pos >= i_size_read(inode))) {
+ 		/* zero out from the end of the write to the end of the block */
+@@ -1713,7 +1720,7 @@ iomap_dio_bio_actor(struct inode *inode, loff_t pos, loff_t length,
+ 		if (pad)
+ 			iomap_dio_zero(dio, iomap, pos, fs_block_size - pad);
+ 	}
+-	return copied;
++	return copied ? copied : ret;
+ }
+ 
+ static loff_t
+@@ -1888,6 +1895,15 @@ iomap_dio_rw(struct kiocb *iocb, struct iov_iter *iter,
+ 				wait_for_completion = true;
+ 				ret = 0;
+ 			}
++
++			/*
++			 * Splicing to pipes can fail on a full pipe. We have to
++			 * swallow this to make it look like a short IO
++			 * otherwise the higher splice layers will completely
++			 * mishandle the error and stop moving data.
++			 */
++			if (ret == -EFAULT)
++				ret = 0;
+ 			break;
+ 		}
+ 		pos += ret;
+-- 
+2.20.1
+
