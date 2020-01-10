@@ -1,0 +1,143 @@
+From 1c87f73578497a6c3cc77bcbfd2e5bf15fe753c7 Mon Sep 17 00:00:00 2001
+From: Linus Walleij <linus.walleij@linaro.org>
+Date: Wed, 4 Oct 2017 11:10:07 +0200
+Subject: mmc: block: Fix bug when removing RPMB chardev
+
+From: Linus Walleij <linus.walleij@linaro.org>
+
+commit 1c87f73578497a6c3cc77bcbfd2e5bf15fe753c7 upstream.
+
+I forgot to account for the fact that the device core holds a
+reference to a device added with device_initialize() that need
+to be released with a corresponding put_device() to reach a 0
+refcount at the end of the lifecycle.
+
+This led to a NULL pointer reference when freeing the device
+when e.g. unbidning the host device in sysfs.
+
+Fix this and use the device .release() callback to free the
+IDA and free:ing the memory used by the RPMB device.
+
+Before this patch:
+
+/sys/bus/amba/drivers/mmci-pl18x$ echo 80114000.sdi4_per2 > unbind
+[   29.797332] mmc3: card 0001 removed
+[   29.810791] Unable to handle kernel NULL pointer dereference at
+               virtual address 00000050
+[   29.818878] pgd = de70c000
+[   29.821624] [00000050] *pgd=1e70a831, *pte=00000000, *ppte=00000000
+[   29.827911] Internal error: Oops: 17 [#1] PREEMPT SMP ARM
+[   29.833282] Modules linked in:
+[   29.836334] CPU: 1 PID: 154 Comm: sh Not tainted
+               4.14.0-rc3-00039-g83318e309566-dirty #736
+[   29.844604] Hardware name: ST-Ericsson Ux5x0 platform (Device Tree Support)
+[   29.851562] task: de572700 task.stack: de742000
+[   29.856079] PC is at kernfs_find_ns+0x8/0x100
+[   29.860443] LR is at kernfs_find_and_get_ns+0x30/0x48
+
+After this patch:
+
+/sys/bus/amba/drivers/mmci-pl18x$ echo 80005000.sdi4_per2 > unbind
+[   20.623382] mmc3: card 0001 removed
+
+Fixes: 97548575bef3 ("mmc: block: Convert RPMB to a character device")
+Reported-by: Adrian Hunter <adrian.hunter@intel.com>
+Signed-off-by: Linus Walleij <linus.walleij@linaro.org>
+Acked-by: Adrian Hunter <adrian.hunter@intel.com>
+Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+Cc: Jisheng Zhang <Jisheng.Zhang@synaptics.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/mmc/core/block.c |   32 ++++++++++++++++++--------------
+ 1 file changed, 18 insertions(+), 14 deletions(-)
+
+--- a/drivers/mmc/core/block.c
++++ b/drivers/mmc/core/block.c
+@@ -2323,9 +2323,7 @@ static int mmc_rpmb_chrdev_open(struct i
+ 
+ 	get_device(&rpmb->dev);
+ 	filp->private_data = rpmb;
+-	mutex_lock(&open_lock);
+-	rpmb->md->usage++;
+-	mutex_unlock(&open_lock);
++	mmc_blk_get(rpmb->md->disk);
+ 
+ 	return nonseekable_open(inode, filp);
+ }
+@@ -2336,9 +2334,7 @@ static int mmc_rpmb_chrdev_release(struc
+ 						  struct mmc_rpmb_data, chrdev);
+ 
+ 	put_device(&rpmb->dev);
+-	mutex_lock(&open_lock);
+-	rpmb->md->usage--;
+-	mutex_unlock(&open_lock);
++	mmc_blk_put(rpmb->md);
+ 
+ 	return 0;
+ }
+@@ -2354,6 +2350,13 @@ static const struct file_operations mmc_
+ #endif
+ };
+ 
++static void mmc_blk_rpmb_device_release(struct device *dev)
++{
++	struct mmc_rpmb_data *rpmb = dev_get_drvdata(dev);
++
++	ida_simple_remove(&mmc_rpmb_ida, rpmb->id);
++	kfree(rpmb);
++}
+ 
+ static int mmc_blk_alloc_rpmb_part(struct mmc_card *card,
+ 				   struct mmc_blk_data *md,
+@@ -2372,8 +2375,10 @@ static int mmc_blk_alloc_rpmb_part(struc
+ 		return devidx;
+ 
+ 	rpmb = kzalloc(sizeof(*rpmb), GFP_KERNEL);
+-	if (!rpmb)
++	if (!rpmb) {
++		ida_simple_remove(&mmc_rpmb_ida, devidx);
+ 		return -ENOMEM;
++	}
+ 
+ 	snprintf(rpmb_name, sizeof(rpmb_name),
+ 		 "mmcblk%u%s", card->host->index, subname ? subname : "");
+@@ -2384,6 +2389,7 @@ static int mmc_blk_alloc_rpmb_part(struc
+ 	rpmb->dev.bus = &mmc_rpmb_bus_type;
+ 	rpmb->dev.devt = MKDEV(MAJOR(mmc_rpmb_devt), rpmb->id);
+ 	rpmb->dev.parent = &card->dev;
++	rpmb->dev.release = mmc_blk_rpmb_device_release;
+ 	device_initialize(&rpmb->dev);
+ 	dev_set_drvdata(&rpmb->dev, rpmb);
+ 	rpmb->md = md;
+@@ -2393,7 +2399,7 @@ static int mmc_blk_alloc_rpmb_part(struc
+ 	ret = cdev_device_add(&rpmb->chrdev, &rpmb->dev);
+ 	if (ret) {
+ 		pr_err("%s: could not add character device\n", rpmb_name);
+-		goto out_remove_ida;
++		goto out_put_device;
+ 	}
+ 
+ 	list_add(&rpmb->node, &md->rpmbs);
+@@ -2408,18 +2414,16 @@ static int mmc_blk_alloc_rpmb_part(struc
+ 
+ 	return 0;
+ 
+-out_remove_ida:
+-	ida_simple_remove(&mmc_rpmb_ida, rpmb->id);
+-	kfree(rpmb);
++out_put_device:
++	put_device(&rpmb->dev);
+ 	return ret;
+ }
+ 
+ static void mmc_blk_remove_rpmb_part(struct mmc_rpmb_data *rpmb)
++
+ {
+ 	cdev_device_del(&rpmb->chrdev, &rpmb->dev);
+-	device_del(&rpmb->dev);
+-	ida_simple_remove(&mmc_rpmb_ida, rpmb->id);
+-	kfree(rpmb);
++	put_device(&rpmb->dev);
+ }
+ 
+ /* MMC Physical partitions consist of two boot partitions and
