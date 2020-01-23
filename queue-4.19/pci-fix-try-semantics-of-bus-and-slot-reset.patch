@@ -1,0 +1,163 @@
+From a9619fb965c82cdee75c68dcfc1f1bd534a1a5fd Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 18 Feb 2019 12:46:46 -0700
+Subject: PCI: Fix "try" semantics of bus and slot reset
+
+From: Alex Williamson <alex.williamson@redhat.com>
+
+[ Upstream commit ddefc033eecf23f1e8b81d0663c5db965adf5516 ]
+
+The commit referenced below introduced device locking around save and
+restore of state for each device during a PCI bus "try" reset, making it
+decidely non-"try" and prone to deadlock in the event that a device is
+already locked.  Restore __pci_reset_bus() and __pci_reset_slot() to their
+advertised locking semantics by pushing the save and restore functions into
+the branch where the entire tree is already locked.  Extend the helper
+function names with "_locked" and update the comment to reflect this
+calling requirement.
+
+Fixes: b014e96d1abb ("PCI: Protect pci_error_handlers->reset_notify() usage with device_lock()")
+Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+Reviewed-by: Sinan Kaya <okaya@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/pci/pci.c | 54 +++++++++++++++++++++++------------------------
+ 1 file changed, 26 insertions(+), 28 deletions(-)
+
+diff --git a/drivers/pci/pci.c b/drivers/pci/pci.c
+index c9f51fc24563c..57a87a001b4f4 100644
+--- a/drivers/pci/pci.c
++++ b/drivers/pci/pci.c
+@@ -5039,39 +5039,42 @@ unlock:
+ 	return 0;
+ }
+ 
+-/* Save and disable devices from the top of the tree down */
+-static void pci_bus_save_and_disable(struct pci_bus *bus)
++/*
++ * Save and disable devices from the top of the tree down while holding
++ * the @dev mutex lock for the entire tree.
++ */
++static void pci_bus_save_and_disable_locked(struct pci_bus *bus)
+ {
+ 	struct pci_dev *dev;
+ 
+ 	list_for_each_entry(dev, &bus->devices, bus_list) {
+-		pci_dev_lock(dev);
+ 		pci_dev_save_and_disable(dev);
+-		pci_dev_unlock(dev);
+ 		if (dev->subordinate)
+-			pci_bus_save_and_disable(dev->subordinate);
++			pci_bus_save_and_disable_locked(dev->subordinate);
+ 	}
+ }
+ 
+ /*
+- * Restore devices from top of the tree down - parent bridges need to be
+- * restored before we can get to subordinate devices.
++ * Restore devices from top of the tree down while holding @dev mutex lock
++ * for the entire tree.  Parent bridges need to be restored before we can
++ * get to subordinate devices.
+  */
+-static void pci_bus_restore(struct pci_bus *bus)
++static void pci_bus_restore_locked(struct pci_bus *bus)
+ {
+ 	struct pci_dev *dev;
+ 
+ 	list_for_each_entry(dev, &bus->devices, bus_list) {
+-		pci_dev_lock(dev);
+ 		pci_dev_restore(dev);
+-		pci_dev_unlock(dev);
+ 		if (dev->subordinate)
+-			pci_bus_restore(dev->subordinate);
++			pci_bus_restore_locked(dev->subordinate);
+ 	}
+ }
+ 
+-/* Save and disable devices from the top of the tree down */
+-static void pci_slot_save_and_disable(struct pci_slot *slot)
++/*
++ * Save and disable devices from the top of the tree down while holding
++ * the @dev mutex lock for the entire tree.
++ */
++static void pci_slot_save_and_disable_locked(struct pci_slot *slot)
+ {
+ 	struct pci_dev *dev;
+ 
+@@ -5080,26 +5083,25 @@ static void pci_slot_save_and_disable(struct pci_slot *slot)
+ 			continue;
+ 		pci_dev_save_and_disable(dev);
+ 		if (dev->subordinate)
+-			pci_bus_save_and_disable(dev->subordinate);
++			pci_bus_save_and_disable_locked(dev->subordinate);
+ 	}
+ }
+ 
+ /*
+- * Restore devices from top of the tree down - parent bridges need to be
+- * restored before we can get to subordinate devices.
++ * Restore devices from top of the tree down while holding @dev mutex lock
++ * for the entire tree.  Parent bridges need to be restored before we can
++ * get to subordinate devices.
+  */
+-static void pci_slot_restore(struct pci_slot *slot)
++static void pci_slot_restore_locked(struct pci_slot *slot)
+ {
+ 	struct pci_dev *dev;
+ 
+ 	list_for_each_entry(dev, &slot->bus->devices, bus_list) {
+ 		if (!dev->slot || dev->slot != slot)
+ 			continue;
+-		pci_dev_lock(dev);
+ 		pci_dev_restore(dev);
+-		pci_dev_unlock(dev);
+ 		if (dev->subordinate)
+-			pci_bus_restore(dev->subordinate);
++			pci_bus_restore_locked(dev->subordinate);
+ 	}
+ }
+ 
+@@ -5158,17 +5160,15 @@ static int __pci_reset_slot(struct pci_slot *slot)
+ 	if (rc)
+ 		return rc;
+ 
+-	pci_slot_save_and_disable(slot);
+-
+ 	if (pci_slot_trylock(slot)) {
++		pci_slot_save_and_disable_locked(slot);
+ 		might_sleep();
+ 		rc = pci_reset_hotplug_slot(slot->hotplug, 0);
++		pci_slot_restore_locked(slot);
+ 		pci_slot_unlock(slot);
+ 	} else
+ 		rc = -EAGAIN;
+ 
+-	pci_slot_restore(slot);
+-
+ 	return rc;
+ }
+ 
+@@ -5254,17 +5254,15 @@ static int __pci_reset_bus(struct pci_bus *bus)
+ 	if (rc)
+ 		return rc;
+ 
+-	pci_bus_save_and_disable(bus);
+-
+ 	if (pci_bus_trylock(bus)) {
++		pci_bus_save_and_disable_locked(bus);
+ 		might_sleep();
+ 		rc = pci_bridge_secondary_bus_reset(bus->self);
++		pci_bus_restore_locked(bus);
+ 		pci_bus_unlock(bus);
+ 	} else
+ 		rc = -EAGAIN;
+ 
+-	pci_bus_restore(bus);
+-
+ 	return rc;
+ }
+ 
+-- 
+2.20.1
+
