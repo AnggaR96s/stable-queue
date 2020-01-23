@@ -1,0 +1,94 @@
+From 1c9df81aaa6cfe46c8a37c04e2ff67c3ebcd61ad Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 18 Dec 2018 13:16:02 +0000
+Subject: vxlan: changelink: Fix handling of default remotes
+
+From: Petr Machata <petrm@mellanox.com>
+
+[ Upstream commit ce5e098f7a10b4bf8e948c12fa350320c5c3afad ]
+
+Default remotes are stored as FDB entries with an Ethernet address of
+00:00:00:00:00:00. When a request is made to change a remote address of
+a VXLAN device, vxlan_changelink() first deletes the existing default
+remote, and then creates a new FDB entry.
+
+This works well as long as the list of default remotes matches exactly
+the configuration of a VXLAN remote address. Thus when the VXLAN device
+has a remote of X, there should be exactly one default remote FDB entry
+X. If the VXLAN device has no remote address, there should be no such
+entry.
+
+Besides using "ip link set", it is possible to manipulate the list of
+default remotes by using the "bridge fdb". It is therefore easy to break
+the above condition. Under such circumstances, the __vxlan_fdb_delete()
+call doesn't delete the FDB entry itself, but just one remote. The
+following vxlan_fdb_create() then creates a new FDB entry, leading to a
+situation where two entries exist for the address 00:00:00:00:00:00,
+each with a different subset of default remotes.
+
+An even more obvious breakage rooted in the same cause can be observed
+when a remote address is configured for a VXLAN device that did not have
+one before. In that case vxlan_changelink() doesn't remove any remote,
+and just creates a new FDB entry for the new address:
+
+$ ip link add name vx up type vxlan id 2000 dstport 4789
+$ bridge fdb ap dev vx 00:00:00:00:00:00 dst 192.0.2.20 self permanent
+$ bridge fdb ap dev vx 00:00:00:00:00:00 dst 192.0.2.30 self permanent
+$ ip link set dev vx type vxlan remote 192.0.2.30
+$ bridge fdb sh dev vx | grep 00:00:00:00:00:00
+00:00:00:00:00:00 dst 192.0.2.30 self permanent <- new entry, 1 rdst
+00:00:00:00:00:00 dst 192.0.2.20 self permanent <- orig. entry, 2 rdsts
+00:00:00:00:00:00 dst 192.0.2.30 self permanent
+
+To fix this, instead of calling vxlan_fdb_create() directly, defer to
+vxlan_fdb_update(). That has logic to handle the duplicates properly.
+Additionally, it also handles notifications, so drop that call from
+changelink as well.
+
+Fixes: 0241b836732f ("vxlan: fix default fdb entry netlink notify ordering during netdev create")
+Signed-off-by: Petr Machata <petrm@mellanox.com>
+Acked-by: Roopa Prabhu <roopa@cumulusnetworks.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/net/vxlan.c | 7 +++----
+ 1 file changed, 3 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/vxlan.c b/drivers/net/vxlan.c
+index 5aa7d5091f4d0..4d97a7b5fe3ca 100644
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@ -3494,7 +3494,6 @@ static int vxlan_changelink(struct net_device *dev, struct nlattr *tb[],
+ 	struct vxlan_rdst *dst = &vxlan->default_dst;
+ 	struct vxlan_rdst old_dst;
+ 	struct vxlan_config conf;
+-	struct vxlan_fdb *f = NULL;
+ 	int err;
+ 
+ 	err = vxlan_nl2conf(tb, data,
+@@ -3520,19 +3519,19 @@ static int vxlan_changelink(struct net_device *dev, struct nlattr *tb[],
+ 					   old_dst.remote_ifindex, 0);
+ 
+ 		if (!vxlan_addr_any(&dst->remote_ip)) {
+-			err = vxlan_fdb_create(vxlan, all_zeros_mac,
++			err = vxlan_fdb_update(vxlan, all_zeros_mac,
+ 					       &dst->remote_ip,
+ 					       NUD_REACHABLE | NUD_PERMANENT,
++					       NLM_F_APPEND | NLM_F_CREATE,
+ 					       vxlan->cfg.dst_port,
+ 					       dst->remote_vni,
+ 					       dst->remote_vni,
+ 					       dst->remote_ifindex,
+-					       NTF_SELF, &f);
++					       NTF_SELF);
+ 			if (err) {
+ 				spin_unlock_bh(&vxlan->hash_lock);
+ 				return err;
+ 			}
+-			vxlan_fdb_notify(vxlan, f, first_remote_rtnl(f), RTM_NEWNEIGH);
+ 		}
+ 		spin_unlock_bh(&vxlan->hash_lock);
+ 	}
+-- 
+2.20.1
+

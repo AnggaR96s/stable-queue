@@ -1,0 +1,80 @@
+From 7eb010ee5409574815d27ee643eccf2033a84f42 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 4 Jul 2019 16:24:32 +0100
+Subject: Btrfs: fix inode cache waiters hanging on failure to start caching
+ thread
+
+From: Filipe Manana <fdmanana@suse.com>
+
+[ Upstream commit a68ebe0790fc88b4314d17984a2cf99ce2361901 ]
+
+If we fail to start the inode caching thread, we print an error message
+and disable the inode cache, however we never wake up any waiters, so they
+hang forever waiting for the caching to finish. Fix this by waking them
+up and have them fallback to a call to btrfs_find_free_objectid().
+
+Fixes: e60efa84252c05 ("Btrfs: avoid triggering bug_on() when we fail to start inode caching task")
+Reviewed-by: Nikolay Borisov <nborisov@suse.com>
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/btrfs/inode-map.c | 23 ++++++++++++++++++-----
+ 1 file changed, 18 insertions(+), 5 deletions(-)
+
+diff --git a/fs/btrfs/inode-map.c b/fs/btrfs/inode-map.c
+index 7dc2923655d98..b1c3a4ec76c8c 100644
+--- a/fs/btrfs/inode-map.c
++++ b/fs/btrfs/inode-map.c
+@@ -26,6 +26,19 @@
+ #include "inode-map.h"
+ #include "transaction.h"
+ 
++static void fail_caching_thread(struct btrfs_root *root)
++{
++	struct btrfs_fs_info *fs_info = root->fs_info;
++
++	btrfs_warn(fs_info, "failed to start inode caching task");
++	btrfs_clear_pending_and_info(fs_info, INODE_MAP_CACHE,
++				     "disabling inode map caching");
++	spin_lock(&root->ino_cache_lock);
++	root->ino_cache_state = BTRFS_CACHE_ERROR;
++	spin_unlock(&root->ino_cache_lock);
++	wake_up(&root->ino_cache_wait);
++}
++
+ static int caching_kthread(void *data)
+ {
+ 	struct btrfs_root *root = data;
+@@ -178,11 +191,8 @@ static void start_caching(struct btrfs_root *root)
+ 
+ 	tsk = kthread_run(caching_kthread, root, "btrfs-ino-cache-%llu",
+ 			  root->root_key.objectid);
+-	if (IS_ERR(tsk)) {
+-		btrfs_warn(fs_info, "failed to start inode caching task");
+-		btrfs_clear_pending_and_info(fs_info, INODE_MAP_CACHE,
+-					     "disabling inode map caching");
+-	}
++	if (IS_ERR(tsk))
++		fail_caching_thread(root);
+ }
+ 
+ int btrfs_find_free_ino(struct btrfs_root *root, u64 *objectid)
+@@ -200,11 +210,14 @@ again:
+ 
+ 	wait_event(root->ino_cache_wait,
+ 		   root->ino_cache_state == BTRFS_CACHE_FINISHED ||
++		   root->ino_cache_state == BTRFS_CACHE_ERROR ||
+ 		   root->free_ino_ctl->free_space > 0);
+ 
+ 	if (root->ino_cache_state == BTRFS_CACHE_FINISHED &&
+ 	    root->free_ino_ctl->free_space == 0)
+ 		return -ENOSPC;
++	else if (root->ino_cache_state == BTRFS_CACHE_ERROR)
++		return btrfs_find_free_objectid(root, objectid);
+ 	else
+ 		goto again;
+ }
+-- 
+2.20.1
+
