@@ -1,0 +1,183 @@
+From 7d7587db0d7fd1138f2afcffdc46a8e15630b944 Mon Sep 17 00:00:00 2001
+From: David Howells <dhowells@redhat.com>
+Date: Thu, 12 Mar 2020 21:40:06 +0000
+Subject: afs: Fix client call Rx-phase signal handling
+
+From: David Howells <dhowells@redhat.com>
+
+commit 7d7587db0d7fd1138f2afcffdc46a8e15630b944 upstream.
+
+Fix the handling of signals in client rxrpc calls made by the afs
+filesystem.  Ignore signals completely, leaving call abandonment or
+connection loss to be detected by timeouts inside AF_RXRPC.
+
+Allowing a filesystem call to be interrupted after the entire request has
+been transmitted and an abort sent means that the server may or may not
+have done the action - and we don't know.  It may even be worse than that
+for older servers.
+
+Fixes: bc5e3a546d55 ("rxrpc: Use MSG_WAITALL to tell sendmsg() to temporarily ignore signals")
+Signed-off-by: David Howells <dhowells@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ fs/afs/rxrpc.c          |   34 ++--------------------------------
+ include/net/af_rxrpc.h  |    4 +---
+ net/rxrpc/af_rxrpc.c    |   33 +++------------------------------
+ net/rxrpc/ar-internal.h |    1 -
+ net/rxrpc/input.c       |    1 -
+ 5 files changed, 6 insertions(+), 67 deletions(-)
+
+--- a/fs/afs/rxrpc.c
++++ b/fs/afs/rxrpc.c
+@@ -603,11 +603,7 @@ call_complete:
+ long afs_wait_for_call_to_complete(struct afs_call *call,
+ 				   struct afs_addr_cursor *ac)
+ {
+-	signed long rtt2, timeout;
+ 	long ret;
+-	bool stalled = false;
+-	u64 rtt;
+-	u32 life, last_life;
+ 	bool rxrpc_complete = false;
+ 
+ 	DECLARE_WAITQUEUE(myself, current);
+@@ -618,14 +614,6 @@ long afs_wait_for_call_to_complete(struc
+ 	if (ret < 0)
+ 		goto out;
+ 
+-	rtt = rxrpc_kernel_get_rtt(call->net->socket, call->rxcall);
+-	rtt2 = nsecs_to_jiffies64(rtt) * 2;
+-	if (rtt2 < 2)
+-		rtt2 = 2;
+-
+-	timeout = rtt2;
+-	rxrpc_kernel_check_life(call->net->socket, call->rxcall, &last_life);
+-
+ 	add_wait_queue(&call->waitq, &myself);
+ 	for (;;) {
+ 		set_current_state(TASK_UNINTERRUPTIBLE);
+@@ -636,37 +624,19 @@ long afs_wait_for_call_to_complete(struc
+ 			call->need_attention = false;
+ 			__set_current_state(TASK_RUNNING);
+ 			afs_deliver_to_call(call);
+-			timeout = rtt2;
+ 			continue;
+ 		}
+ 
+ 		if (afs_check_call_state(call, AFS_CALL_COMPLETE))
+ 			break;
+ 
+-		if (!rxrpc_kernel_check_life(call->net->socket, call->rxcall, &life)) {
++		if (!rxrpc_kernel_check_life(call->net->socket, call->rxcall)) {
+ 			/* rxrpc terminated the call. */
+ 			rxrpc_complete = true;
+ 			break;
+ 		}
+ 
+-		if (call->intr && timeout == 0 &&
+-		    life == last_life && signal_pending(current)) {
+-			if (stalled)
+-				break;
+-			__set_current_state(TASK_RUNNING);
+-			rxrpc_kernel_probe_life(call->net->socket, call->rxcall);
+-			timeout = rtt2;
+-			stalled = true;
+-			continue;
+-		}
+-
+-		if (life != last_life) {
+-			timeout = rtt2;
+-			last_life = life;
+-			stalled = false;
+-		}
+-
+-		timeout = schedule_timeout(timeout);
++		schedule();
+ 	}
+ 
+ 	remove_wait_queue(&call->waitq, &myself);
+--- a/include/net/af_rxrpc.h
++++ b/include/net/af_rxrpc.h
+@@ -58,9 +58,7 @@ int rxrpc_kernel_charge_accept(struct so
+ 			       rxrpc_user_attach_call_t, unsigned long, gfp_t,
+ 			       unsigned int);
+ void rxrpc_kernel_set_tx_length(struct socket *, struct rxrpc_call *, s64);
+-bool rxrpc_kernel_check_life(const struct socket *, const struct rxrpc_call *,
+-			     u32 *);
+-void rxrpc_kernel_probe_life(struct socket *, struct rxrpc_call *);
++bool rxrpc_kernel_check_life(const struct socket *, const struct rxrpc_call *);
+ u32 rxrpc_kernel_get_epoch(struct socket *, struct rxrpc_call *);
+ bool rxrpc_kernel_get_reply_time(struct socket *, struct rxrpc_call *,
+ 				 ktime_t *);
+--- a/net/rxrpc/af_rxrpc.c
++++ b/net/rxrpc/af_rxrpc.c
+@@ -371,45 +371,18 @@ EXPORT_SYMBOL(rxrpc_kernel_end_call);
+  * rxrpc_kernel_check_life - Check to see whether a call is still alive
+  * @sock: The socket the call is on
+  * @call: The call to check
+- * @_life: Where to store the life value
+  *
+- * Allow a kernel service to find out whether a call is still alive - ie. we're
+- * getting ACKs from the server.  Passes back in *_life a number representing
+- * the life state which can be compared to that returned by a previous call and
+- * return true if the call is still alive.
+- *
+- * If the life state stalls, rxrpc_kernel_probe_life() should be called and
+- * then 2RTT waited.
++ * Allow a kernel service to find out whether a call is still alive -
++ * ie. whether it has completed.
+  */
+ bool rxrpc_kernel_check_life(const struct socket *sock,
+-			     const struct rxrpc_call *call,
+-			     u32 *_life)
++			     const struct rxrpc_call *call)
+ {
+-	*_life = call->acks_latest;
+ 	return call->state != RXRPC_CALL_COMPLETE;
+ }
+ EXPORT_SYMBOL(rxrpc_kernel_check_life);
+ 
+ /**
+- * rxrpc_kernel_probe_life - Poke the peer to see if it's still alive
+- * @sock: The socket the call is on
+- * @call: The call to check
+- *
+- * In conjunction with rxrpc_kernel_check_life(), allow a kernel service to
+- * find out whether a call is still alive by pinging it.  This should cause the
+- * life state to be bumped in about 2*RTT.
+- *
+- * The must be called in TASK_RUNNING state on pain of might_sleep() objecting.
+- */
+-void rxrpc_kernel_probe_life(struct socket *sock, struct rxrpc_call *call)
+-{
+-	rxrpc_propose_ACK(call, RXRPC_ACK_PING, 0, true, false,
+-			  rxrpc_propose_ack_ping_for_check_life);
+-	rxrpc_send_ack_packet(call, true, NULL);
+-}
+-EXPORT_SYMBOL(rxrpc_kernel_probe_life);
+-
+-/**
+  * rxrpc_kernel_get_epoch - Retrieve the epoch value from a call.
+  * @sock: The socket the call is on
+  * @call: The call to query
+--- a/net/rxrpc/ar-internal.h
++++ b/net/rxrpc/ar-internal.h
+@@ -675,7 +675,6 @@ struct rxrpc_call {
+ 
+ 	/* transmission-phase ACK management */
+ 	ktime_t			acks_latest_ts;	/* Timestamp of latest ACK received */
+-	rxrpc_serial_t		acks_latest;	/* serial number of latest ACK received */
+ 	rxrpc_seq_t		acks_lowest_nak; /* Lowest NACK in the buffer (or ==tx_hard_ack) */
+ 	rxrpc_seq_t		acks_lost_top;	/* tx_top at the time lost-ack ping sent */
+ 	rxrpc_serial_t		acks_lost_ping;	/* Serial number of probe ACK */
+--- a/net/rxrpc/input.c
++++ b/net/rxrpc/input.c
+@@ -882,7 +882,6 @@ static void rxrpc_input_ack(struct rxrpc
+ 	    before(prev_pkt, call->ackr_prev_seq))
+ 		goto out;
+ 	call->acks_latest_ts = skb->tstamp;
+-	call->acks_latest = sp->hdr.serial;
+ 
+ 	call->ackr_first_seq = first_soft_ack;
+ 	call->ackr_prev_seq = prev_pkt;
