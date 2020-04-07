@@ -1,0 +1,68 @@
+From dad8cea7add96a353fa1898b5ccefbb72da66f29 Mon Sep 17 00:00:00 2001
+From: Neal Cardwell <ncardwell@google.com>
+Date: Sat, 22 Feb 2020 11:21:15 -0500
+Subject: tcp: fix TFO SYNACK undo to avoid double-timestamp-undo
+
+From: Neal Cardwell <ncardwell@google.com>
+
+commit dad8cea7add96a353fa1898b5ccefbb72da66f29 upstream.
+
+In a rare corner case the new logic for undo of SYNACK RTO could
+result in triggering the warning in tcp_fastretrans_alert() that says:
+        WARN_ON(tp->retrans_out != 0);
+
+The warning looked like:
+
+WARNING: CPU: 1 PID: 1 at net/ipv4/tcp_input.c:2818 tcp_ack+0x13e0/0x3270
+
+The sequence that tickles this bug is:
+ - Fast Open server receives TFO SYN with data, sends SYNACK
+ - (client receives SYNACK and sends ACK, but ACK is lost)
+ - server app sends some data packets
+ - (N of the first data packets are lost)
+ - server receives client ACK that has a TS ECR matching first SYNACK,
+   and also SACKs suggesting the first N data packets were lost
+    - server performs TS undo of SYNACK RTO, then immediately
+      enters recovery
+    - buggy behavior then performed a *second* undo that caused
+      the connection to be in CA_Open with retrans_out != 0
+
+Basically, the incoming ACK packet with SACK blocks causes us to first
+undo the cwnd reduction from the SYNACK RTO, but then immediately
+enters fast recovery, which then makes us eligible for undo again. And
+then tcp_rcv_synrecv_state_fastopen() accidentally performs an undo
+using a "mash-up" of state from two different loss recovery phases: it
+uses the timestamp info from the ACK of the original SYNACK, and the
+undo_marker from the fast recovery.
+
+This fix refines the logic to only invoke the tcp_try_undo_loss()
+inside tcp_rcv_synrecv_state_fastopen() if the connection is still in
+CA_Loss.  If peer SACKs triggered fast recovery, then
+tcp_rcv_synrecv_state_fastopen() can't safely undo.
+
+Fixes: 794200d66273 ("tcp: undo cwnd on Fast Open spurious SYNACK retransmit")
+Signed-off-by: Neal Cardwell <ncardwell@google.com>
+Signed-off-by: Yuchung Cheng <ycheng@google.com>
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ net/ipv4/tcp_input.c |    6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -6096,7 +6096,11 @@ static void tcp_rcv_synrecv_state_fastop
+ {
+ 	struct request_sock *req;
+ 
+-	tcp_try_undo_loss(sk, false);
++	/* If we are still handling the SYNACK RTO, see if timestamp ECR allows
++	 * undo. If peer SACKs triggered fast recovery, we can't undo here.
++	 */
++	if (inet_csk(sk)->icsk_ca_state == TCP_CA_Loss)
++		tcp_try_undo_loss(sk, false);
+ 
+ 	/* Reset rtx states to prevent spurious retransmits_timed_out() */
+ 	tcp_sk(sk)->retrans_stamp = 0;
