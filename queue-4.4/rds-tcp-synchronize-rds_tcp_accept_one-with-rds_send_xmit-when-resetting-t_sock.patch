@@ -1,0 +1,108 @@
+From eb192840266fab3e3da644018121eed30153355d Mon Sep 17 00:00:00 2001
+From: Sowmini Varadhan <sowmini.varadhan@oracle.com>
+Date: Mon, 2 May 2016 11:24:51 -0700
+Subject: RDS:TCP: Synchronize rds_tcp_accept_one with rds_send_xmit when resetting t_sock
+
+From: Sowmini Varadhan <sowmini.varadhan@oracle.com>
+
+commit eb192840266fab3e3da644018121eed30153355d upstream.
+
+There is a race condition between rds_send_xmit -> rds_tcp_xmit
+and the code that deals with resolution of duelling syns added
+by commit 241b271952eb ("RDS-TCP: Reset tcp callbacks if re-using an
+outgoing socket in rds_tcp_accept_one()").
+
+Specifically, we may end up derefencing a null pointer in rds_send_xmit
+if we have the interleaving sequence:
+           rds_tcp_accept_one                  rds_send_xmit
+
+                                             conn is RDS_CONN_UP, so
+    					 invoke rds_tcp_xmit
+
+                                             tc = conn->c_transport_data
+        rds_tcp_restore_callbacks
+            /* reset t_sock */
+    					 null ptr deref from tc->t_sock
+
+The race condition can be avoided without adding the overhead of
+additional locking in the xmit path: have rds_tcp_accept_one wait
+for rds_tcp_xmit threads to complete before resetting callbacks.
+The synchronization can be done in the same manner as rds_conn_shutdown().
+First set the rds_conn_state to something other than RDS_CONN_UP
+(so that new threads cannot get into rds_tcp_xmit()), then wait for
+RDS_IN_XMIT to be cleared in the conn->c_flags indicating that any
+threads in rds_tcp_xmit are done.
+
+Fixes: 241b271952eb ("RDS-TCP: Reset tcp callbacks if re-using an
+outgoing socket in rds_tcp_accept_one()")
+Signed-off-by: Sowmini Varadhan <sowmini.varadhan@oracle.com>
+Acked-by: Santosh Shilimkar <santosh.shilimkar@oracle.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ net/rds/tcp.c        |    2 +-
+ net/rds/tcp_listen.c |   38 +++++++++++++++++++++++---------------
+ 2 files changed, 24 insertions(+), 16 deletions(-)
+
+--- a/net/rds/tcp.c
++++ b/net/rds/tcp.c
+@@ -110,7 +110,7 @@ void rds_tcp_restore_callbacks(struct so
+ 
+ /*
+  * This is the only path that sets tc->t_sock.  Send and receive trust that
+- * it is set.  The RDS_CONN_CONNECTED bit protects those paths from being
++ * it is set.  The RDS_CONN_UP bit protects those paths from being
+  * called while it isn't set.
+  */
+ void rds_tcp_set_callbacks(struct socket *sock, struct rds_connection *conn)
+--- a/net/rds/tcp_listen.c
++++ b/net/rds/tcp_listen.c
+@@ -115,24 +115,32 @@ int rds_tcp_accept_one(struct socket *so
+ 	 * rds_tcp_state_change() will do that cleanup
+ 	 */
+ 	rs_tcp = (struct rds_tcp_connection *)conn->c_transport_data;
+-	if (rs_tcp->t_sock &&
+-	    ntohl(inet->inet_saddr) < ntohl(inet->inet_daddr)) {
+-		struct sock *nsk = new_sock->sk;
++	rds_conn_transition(conn, RDS_CONN_DOWN, RDS_CONN_CONNECTING);
++	if (rs_tcp->t_sock) {
++		/* Need to resolve a duelling SYN between peers.
++		 * We have an outstanding SYN to this peer, which may
++		 * potentially have transitioned to the RDS_CONN_UP state,
++		 * so we must quiesce any send threads before resetting
++		 * c_transport_data.
++		 */
++		wait_event(conn->c_waitq,
++			   !test_bit(RDS_IN_XMIT, &conn->c_flags));
++		if (ntohl(inet->inet_saddr) < ntohl(inet->inet_daddr)) {
++			struct sock *nsk = new_sock->sk;
+ 
+-		nsk->sk_user_data = NULL;
+-		nsk->sk_prot->disconnect(nsk, 0);
+-		tcp_done(nsk);
+-		new_sock = NULL;
+-		ret = 0;
+-		goto out;
+-	} else if (rs_tcp->t_sock) {
+-		rds_tcp_restore_callbacks(rs_tcp->t_sock, rs_tcp);
+-		conn->c_outgoing = 0;
++			nsk->sk_user_data = NULL;
++			nsk->sk_prot->disconnect(nsk, 0);
++			tcp_done(nsk);
++			new_sock = NULL;
++			ret = 0;
++			goto out;
++		} else if (rs_tcp->t_sock) {
++			rds_tcp_restore_callbacks(rs_tcp->t_sock, rs_tcp);
++			conn->c_outgoing = 0;
++		}
+ 	}
+-
+-	rds_conn_transition(conn, RDS_CONN_DOWN, RDS_CONN_CONNECTING);
+ 	rds_tcp_set_callbacks(new_sock, conn);
+-	rds_connect_complete(conn);
++	rds_connect_complete(conn); /* marks RDS_CONN_UP */
+ 	new_sock = NULL;
+ 	ret = 0;
+ 
