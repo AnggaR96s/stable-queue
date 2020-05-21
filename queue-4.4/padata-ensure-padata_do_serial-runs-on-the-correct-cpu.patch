@@ -1,0 +1,95 @@
+From 350ef88e7e922354f82a931897ad4a4ce6c686ff Mon Sep 17 00:00:00 2001
+From: Mathias Krause <minipli@googlemail.com>
+Date: Fri, 8 Sep 2017 20:57:11 +0200
+Subject: padata: ensure padata_do_serial() runs on the correct CPU
+
+From: Mathias Krause <minipli@googlemail.com>
+
+commit 350ef88e7e922354f82a931897ad4a4ce6c686ff upstream.
+
+If the algorithm we're parallelizing is asynchronous we might change
+CPUs between padata_do_parallel() and padata_do_serial(). However, we
+don't expect this to happen as we need to enqueue the padata object into
+the per-cpu reorder queue we took it from, i.e. the same-cpu's parallel
+queue.
+
+Ensure we're not switching CPUs for a given padata object by tracking
+the CPU within the padata object. If the serial callback gets called on
+the wrong CPU, defer invoking padata_reorder() via a kernel worker on
+the CPU we're expected to run on.
+
+Signed-off-by: Mathias Krause <minipli@googlemail.com>
+Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+Cc: Ben Hutchings <ben@decadent.org.uk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ include/linux/padata.h |    2 ++
+ kernel/padata.c        |   20 +++++++++++++++++++-
+ 2 files changed, 21 insertions(+), 1 deletion(-)
+
+--- a/include/linux/padata.h
++++ b/include/linux/padata.h
+@@ -37,6 +37,7 @@
+  * @list: List entry, to attach to the padata lists.
+  * @pd: Pointer to the internal control structure.
+  * @cb_cpu: Callback cpu for serializatioon.
++ * @cpu: Cpu for parallelization.
+  * @seq_nr: Sequence number of the parallelized data object.
+  * @info: Used to pass information from the parallel to the serial function.
+  * @parallel: Parallel execution function.
+@@ -46,6 +47,7 @@ struct padata_priv {
+ 	struct list_head	list;
+ 	struct parallel_data	*pd;
+ 	int			cb_cpu;
++	int			cpu;
+ 	int			info;
+ 	void                    (*parallel)(struct padata_priv *padata);
+ 	void                    (*serial)(struct padata_priv *padata);
+--- a/kernel/padata.c
++++ b/kernel/padata.c
+@@ -132,6 +132,7 @@ int padata_do_parallel(struct padata_ins
+ 	padata->cb_cpu = cb_cpu;
+ 
+ 	target_cpu = padata_cpu_hash(pd);
++	padata->cpu = target_cpu;
+ 	queue = per_cpu_ptr(pd->pqueue, target_cpu);
+ 
+ 	spin_lock(&queue->parallel.lock);
+@@ -375,10 +376,21 @@ void padata_do_serial(struct padata_priv
+ 	int cpu;
+ 	struct padata_parallel_queue *pqueue;
+ 	struct parallel_data *pd;
++	int reorder_via_wq = 0;
+ 
+ 	pd = padata->pd;
+ 
+ 	cpu = get_cpu();
++
++	/* We need to run on the same CPU padata_do_parallel(.., padata, ..)
++	 * was called on -- or, at least, enqueue the padata object into the
++	 * correct per-cpu queue.
++	 */
++	if (cpu != padata->cpu) {
++		reorder_via_wq = 1;
++		cpu = padata->cpu;
++	}
++
+ 	pqueue = per_cpu_ptr(pd->pqueue, cpu);
+ 
+ 	spin_lock(&pqueue->reorder.lock);
+@@ -395,7 +407,13 @@ void padata_do_serial(struct padata_priv
+ 
+ 	put_cpu();
+ 
+-	padata_reorder(pd);
++	/* If we're running on the wrong CPU, call padata_reorder() via a
++	 * kernel worker.
++	 */
++	if (reorder_via_wq)
++		queue_work_on(cpu, pd->pinst->wq, &pqueue->reorder_work);
++	else
++		padata_reorder(pd);
+ }
+ EXPORT_SYMBOL(padata_do_serial);
+ 
