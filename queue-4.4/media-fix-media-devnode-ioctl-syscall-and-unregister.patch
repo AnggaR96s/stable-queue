@@ -1,0 +1,186 @@
+From 653727fd92f2a8d2db75dcf55ba5c2cbad1cfdd4 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 10 Jun 2016 14:37:23 -0300
+Subject: media: fix media devnode ioctl/syscall and unregister race
+
+From: Shuah Khan <shuahkh@osg.samsung.com>
+
+commit 6f0dd24a084a17f9984dd49dffbf7055bf123993 upstream.
+
+Media devnode open/ioctl could be in progress when media device unregister
+is initiated. System calls and ioctls check media device registered status
+at the beginning, however, there is a window where unregister could be in
+progress without changing the media devnode status to unregistered.
+
+process 1				process 2
+fd = open(/dev/media0)
+media_devnode_is_registered()
+	(returns true here)
+
+					media_device_unregister()
+						(unregister is in progress
+						and devnode isn't
+						unregistered yet)
+					...
+ioctl(fd, ...)
+__media_ioctl()
+media_devnode_is_registered()
+	(returns true here)
+					...
+					media_devnode_unregister()
+					...
+					(driver releases the media device
+					memory)
+
+media_device_ioctl()
+	(By this point
+	devnode->media_dev does not
+	point to allocated memory.
+	use-after free in in mutex_lock_nested)
+
+BUG: KASAN: use-after-free in mutex_lock_nested+0x79c/0x800 at addr
+ffff8801ebe914f0
+
+Fix it by clearing register bit when unregister starts to avoid the race.
+
+process 1                               process 2
+fd = open(/dev/media0)
+media_devnode_is_registered()
+        (could return true here)
+
+                                        media_device_unregister()
+                                                (clear the register bit,
+						 then start unregister.)
+                                        ...
+ioctl(fd, ...)
+__media_ioctl()
+media_devnode_is_registered()
+        (return false here, ioctl
+	 returns I/O error, and
+	 will not access media
+	 device memory)
+                                        ...
+                                        media_devnode_unregister()
+                                        ...
+                                        (driver releases the media device
+					 memory)
+
+Signed-off-by: Shuah Khan <shuahkh@osg.samsung.com>
+Suggested-by: Sakari Ailus <sakari.ailus@linux.intel.com>
+Reported-by: Mauro Carvalho Chehab <mchehab@osg.samsung.com>
+Tested-by: Mauro Carvalho Chehab <mchehab@osg.samsung.com>
+Signed-off-by: Mauro Carvalho Chehab <mchehab@s-opensource.com>
+[bwh: Backported to 4.4: adjut filename, context]
+Signed-off-by: Ben Hutchings <ben.hutchings@codethink.co.uk>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/media/media-device.c  | 15 ++++++++-------
+ drivers/media/media-devnode.c | 19 ++++++++++++-------
+ include/media/media-devnode.h | 14 ++++++++++++++
+ 3 files changed, 34 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/media/media-device.c b/drivers/media/media-device.c
+index 5d79cd481730..0ca9506f4654 100644
+--- a/drivers/media/media-device.c
++++ b/drivers/media/media-device.c
+@@ -405,6 +405,7 @@ int __must_check __media_device_register(struct media_device *mdev,
+ 	if (ret < 0) {
+ 		/* devnode free is handled in media_devnode_*() */
+ 		mdev->devnode = NULL;
++		media_devnode_unregister_prepare(devnode);
+ 		media_devnode_unregister(devnode);
+ 		return ret;
+ 	}
+@@ -423,16 +424,16 @@ void media_device_unregister(struct media_device *mdev)
+ 	struct media_entity *entity;
+ 	struct media_entity *next;
+ 
++	/* Clear the devnode register bit to avoid races with media dev open */
++	media_devnode_unregister_prepare(mdev->devnode);
++
+ 	list_for_each_entry_safe(entity, next, &mdev->entities, list)
+ 		media_device_unregister_entity(entity);
+ 
+-	/* Check if mdev devnode was registered */
+-	if (media_devnode_is_registered(mdev->devnode)) {
+-		device_remove_file(&mdev->devnode->dev, &dev_attr_model);
+-		media_devnode_unregister(mdev->devnode);
+-		/* devnode free is handled in media_devnode_*() */
+-		mdev->devnode = NULL;
+-	}
++	device_remove_file(&mdev->devnode->dev, &dev_attr_model);
++	media_devnode_unregister(mdev->devnode);
++	/* devnode free is handled in media_devnode_*() */
++	mdev->devnode = NULL;
+ }
+ EXPORT_SYMBOL_GPL(media_device_unregister);
+ 
+diff --git a/drivers/media/media-devnode.c b/drivers/media/media-devnode.c
+index 45bb70d27224..e887120d19aa 100644
+--- a/drivers/media/media-devnode.c
++++ b/drivers/media/media-devnode.c
+@@ -302,6 +302,17 @@ int __must_check media_devnode_register(struct media_device *mdev,
+ 	return ret;
+ }
+ 
++void media_devnode_unregister_prepare(struct media_devnode *devnode)
++{
++	/* Check if devnode was ever registered at all */
++	if (!media_devnode_is_registered(devnode))
++		return;
++
++	mutex_lock(&media_devnode_lock);
++	clear_bit(MEDIA_FLAG_REGISTERED, &devnode->flags);
++	mutex_unlock(&media_devnode_lock);
++}
++
+ /**
+  * media_devnode_unregister - unregister a media device node
+  * @devnode: the device node to unregister
+@@ -309,17 +320,11 @@ int __must_check media_devnode_register(struct media_device *mdev,
+  * This unregisters the passed device. Future open calls will be met with
+  * errors.
+  *
+- * This function can safely be called if the device node has never been
+- * registered or has already been unregistered.
++ * Should be called after media_devnode_unregister_prepare()
+  */
+ void media_devnode_unregister(struct media_devnode *devnode)
+ {
+-	/* Check if devnode was ever registered at all */
+-	if (!media_devnode_is_registered(devnode))
+-		return;
+-
+ 	mutex_lock(&media_devnode_lock);
+-	clear_bit(MEDIA_FLAG_REGISTERED, &devnode->flags);
+ 	/* Delete the cdev on this minor as well */
+ 	cdev_del(&devnode->cdev);
+ 	mutex_unlock(&media_devnode_lock);
+diff --git a/include/media/media-devnode.h b/include/media/media-devnode.h
+index 8b854c044032..d5ff95bf2d4b 100644
+--- a/include/media/media-devnode.h
++++ b/include/media/media-devnode.h
+@@ -93,6 +93,20 @@ struct media_devnode {
+ int __must_check media_devnode_register(struct media_device *mdev,
+ 					struct media_devnode *devnode,
+ 					struct module *owner);
++
++/**
++ * media_devnode_unregister_prepare - clear the media device node register bit
++ * @devnode: the device node to prepare for unregister
++ *
++ * This clears the passed device register bit. Future open calls will be met
++ * with errors. Should be called before media_devnode_unregister() to avoid
++ * races with unregister and device file open calls.
++ *
++ * This function can safely be called if the device node has never been
++ * registered or has already been unregistered.
++ */
++void media_devnode_unregister_prepare(struct media_devnode *devnode);
++
+ void media_devnode_unregister(struct media_devnode *devnode);
+ 
+ static inline struct media_devnode *media_devnode_data(struct file *filp)
+-- 
+2.25.1
+
