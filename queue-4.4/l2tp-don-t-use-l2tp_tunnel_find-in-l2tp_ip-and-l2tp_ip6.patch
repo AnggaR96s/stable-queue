@@ -1,0 +1,131 @@
+From foo@baz Tue 26 May 2020 12:27:38 PM CEST
+From: Giuliano Procida <gprocida@google.com>
+Date: Fri, 22 May 2020 00:57:18 +0100
+Subject: l2tp: don't use l2tp_tunnel_find() in l2tp_ip and l2tp_ip6
+To: greg@kroah.com
+Cc: stable@vger.kernel.org, Guillaume Nault <g.nault@alphalink.fr>,  "David S . Miller" <davem@davemloft.net>, Nicolas Schier <n.schier@avm.de>,  Greg Kroah-Hartman <gregkh@linuxfoundation.org>, Giuliano Procida <gprocida@google.com>
+Message-ID: <20200521235740.191338-6-gprocida@google.com>
+
+From: Guillaume Nault <g.nault@alphalink.fr>
+
+commit 8f7dc9ae4a7aece9fbc3e6637bdfa38b36bcdf09 upstream.
+
+Using l2tp_tunnel_find() in l2tp_ip_recv() is wrong for two reasons:
+
+  * It doesn't take a reference on the returned tunnel, which makes the
+    call racy wrt. concurrent tunnel deletion.
+
+  * The lookup is only based on the tunnel identifier, so it can return
+    a tunnel that doesn't match the packet's addresses or protocol.
+
+For example, a packet sent to an L2TPv3 over IPv6 tunnel can be
+delivered to an L2TPv2 over UDPv4 tunnel. This is worse than a simple
+cross-talk: when delivering the packet to an L2TP over UDP tunnel, the
+corresponding socket is UDP, where ->sk_backlog_rcv() is NULL. Calling
+sk_receive_skb() will then crash the kernel by trying to execute this
+callback.
+
+And l2tp_tunnel_find() isn't even needed here. __l2tp_ip_bind_lookup()
+properly checks the socket binding and connection settings. It was used
+as a fallback mechanism for finding tunnels that didn't have their data
+path registered yet. But it's not limited to this case and can be used
+to replace l2tp_tunnel_find() in the general case.
+
+Fix l2tp_ip6 in the same way.
+
+Fixes: 0d76751fad77 ("l2tp: Add L2TPv3 IP encapsulation (no UDP) support")
+Fixes: a32e0eec7042 ("l2tp: introduce L2TPv3 IP encapsulation support for IPv6")
+Signed-off-by: Guillaume Nault <g.nault@alphalink.fr>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Cc: Nicolas Schier <n.schier@avm.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Giuliano Procida <gprocida@google.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/l2tp/l2tp_ip.c  |   22 ++++++++--------------
+ net/l2tp/l2tp_ip6.c |   23 ++++++++---------------
+ 2 files changed, 16 insertions(+), 29 deletions(-)
+
+--- a/net/l2tp/l2tp_ip.c
++++ b/net/l2tp/l2tp_ip.c
+@@ -122,6 +122,7 @@ static int l2tp_ip_recv(struct sk_buff *
+ 	unsigned char *ptr, *optr;
+ 	struct l2tp_session *session;
+ 	struct l2tp_tunnel *tunnel = NULL;
++	struct iphdr *iph;
+ 	int length;
+ 
+ 	if (!pskb_may_pull(skb, 4))
+@@ -180,23 +181,16 @@ pass_up:
+ 		goto discard;
+ 
+ 	tunnel_id = ntohl(*(__be32 *) &skb->data[4]);
+-	tunnel = l2tp_tunnel_find(net, tunnel_id);
+-	if (tunnel) {
+-		sk = tunnel->sock;
+-		sock_hold(sk);
+-	} else {
+-		struct iphdr *iph = (struct iphdr *) skb_network_header(skb);
+-
+-		read_lock_bh(&l2tp_ip_lock);
+-		sk = __l2tp_ip_bind_lookup(net, iph->daddr, 0, tunnel_id);
+-		if (!sk) {
+-			read_unlock_bh(&l2tp_ip_lock);
+-			goto discard;
+-		}
++	iph = (struct iphdr *)skb_network_header(skb);
+ 
+-		sock_hold(sk);
++	read_lock_bh(&l2tp_ip_lock);
++	sk = __l2tp_ip_bind_lookup(net, iph->daddr, 0, tunnel_id);
++	if (!sk) {
+ 		read_unlock_bh(&l2tp_ip_lock);
++		goto discard;
+ 	}
++	sock_hold(sk);
++	read_unlock_bh(&l2tp_ip_lock);
+ 
+ 	if (!xfrm4_policy_check(sk, XFRM_POLICY_IN, skb))
+ 		goto discard_put;
+--- a/net/l2tp/l2tp_ip6.c
++++ b/net/l2tp/l2tp_ip6.c
+@@ -134,6 +134,7 @@ static int l2tp_ip6_recv(struct sk_buff
+ 	unsigned char *ptr, *optr;
+ 	struct l2tp_session *session;
+ 	struct l2tp_tunnel *tunnel = NULL;
++	struct ipv6hdr *iph;
+ 	int length;
+ 
+ 	if (!pskb_may_pull(skb, 4))
+@@ -193,24 +194,16 @@ pass_up:
+ 		goto discard;
+ 
+ 	tunnel_id = ntohl(*(__be32 *) &skb->data[4]);
+-	tunnel = l2tp_tunnel_find(net, tunnel_id);
+-	if (tunnel) {
+-		sk = tunnel->sock;
+-		sock_hold(sk);
+-	} else {
+-		struct ipv6hdr *iph = ipv6_hdr(skb);
+-
+-		read_lock_bh(&l2tp_ip6_lock);
+-		sk = __l2tp_ip6_bind_lookup(net, &iph->daddr,
+-					    0, tunnel_id);
+-		if (!sk) {
+-			read_unlock_bh(&l2tp_ip6_lock);
+-			goto discard;
+-		}
++	iph = ipv6_hdr(skb);
+ 
+-		sock_hold(sk);
++	read_lock_bh(&l2tp_ip6_lock);
++	sk = __l2tp_ip6_bind_lookup(net, &iph->daddr, 0, tunnel_id);
++	if (!sk) {
+ 		read_unlock_bh(&l2tp_ip6_lock);
++		goto discard;
+ 	}
++	sock_hold(sk);
++	read_unlock_bh(&l2tp_ip6_lock);
+ 
+ 	if (!xfrm6_policy_check(sk, XFRM_POLICY_IN, skb))
+ 		goto discard_put;
