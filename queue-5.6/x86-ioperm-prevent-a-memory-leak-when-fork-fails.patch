@@ -1,0 +1,153 @@
+From 4bfe6cce133cad82cea04490c308795275857782 Mon Sep 17 00:00:00 2001
+From: Jay Lang <jaytlang@mit.edu>
+Date: Sun, 24 May 2020 12:27:39 -0400
+Subject: x86/ioperm: Prevent a memory leak when fork fails
+
+From: Jay Lang <jaytlang@mit.edu>
+
+commit 4bfe6cce133cad82cea04490c308795275857782 upstream.
+
+In the copy_process() routine called by _do_fork(), failure to allocate
+a PID (or further along in the function) will trigger an invocation to
+exit_thread(). This is done to clean up from an earlier call to
+copy_thread_tls(). Naturally, the child task is passed into exit_thread(),
+however during the process, io_bitmap_exit() nullifies the parent's
+io_bitmap rather than the child's.
+
+As copy_thread_tls() has been called ahead of the failure, the reference
+count on the calling thread's io_bitmap is incremented as we would expect.
+However, io_bitmap_exit() doesn't accept any arguments, and thus assumes
+it should trash the current thread's io_bitmap reference rather than the
+child's. This is pretty sneaky in practice, because in all instances but
+this one, exit_thread() is called with respect to the current task and
+everything works out.
+
+A determined attacker can issue an appropriate ioctl (i.e. KDENABIO) to
+get a bitmap allocated, and force a clone3() syscall to fail by passing
+in a zeroed clone_args structure. The kernel handles the erroneous struct
+and the buggy code path is followed, and even though the parent's reference
+to the io_bitmap is trashed, the child still holds a reference and thus
+the structure will never be freed.
+
+Fix this by tweaking io_bitmap_exit() and its subroutines to accept a
+task_struct argument which to operate on.
+
+Fixes: ea5f1cd7ab49 ("x86/ioperm: Remove bitmap if all permissions dropped")
+Signed-off-by: Jay Lang <jaytlang@mit.edu>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Cc: stable#@vger.kernel.org
+Link: https://lkml.kernel.org/r/20200524162742.253727-1-jaytlang@mit.edu
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ arch/x86/include/asm/io_bitmap.h |    4 ++--
+ arch/x86/kernel/ioport.c         |   22 +++++++++++-----------
+ arch/x86/kernel/process.c        |    4 ++--
+ 3 files changed, 15 insertions(+), 15 deletions(-)
+
+--- a/arch/x86/include/asm/io_bitmap.h
++++ b/arch/x86/include/asm/io_bitmap.h
+@@ -17,7 +17,7 @@ struct task_struct;
+ 
+ #ifdef CONFIG_X86_IOPL_IOPERM
+ void io_bitmap_share(struct task_struct *tsk);
+-void io_bitmap_exit(void);
++void io_bitmap_exit(struct task_struct *tsk);
+ 
+ void native_tss_update_io_bitmap(void);
+ 
+@@ -29,7 +29,7 @@ void native_tss_update_io_bitmap(void);
+ 
+ #else
+ static inline void io_bitmap_share(struct task_struct *tsk) { }
+-static inline void io_bitmap_exit(void) { }
++static inline void io_bitmap_exit(struct task_struct *tsk) { }
+ static inline void tss_update_io_bitmap(void) { }
+ #endif
+ 
+--- a/arch/x86/kernel/ioport.c
++++ b/arch/x86/kernel/ioport.c
+@@ -32,15 +32,15 @@ void io_bitmap_share(struct task_struct
+ 	set_tsk_thread_flag(tsk, TIF_IO_BITMAP);
+ }
+ 
+-static void task_update_io_bitmap(void)
++static void task_update_io_bitmap(struct task_struct *tsk)
+ {
+-	struct thread_struct *t = &current->thread;
++	struct thread_struct *t = &tsk->thread;
+ 
+ 	if (t->iopl_emul == 3 || t->io_bitmap) {
+ 		/* TSS update is handled on exit to user space */
+-		set_thread_flag(TIF_IO_BITMAP);
++		set_tsk_thread_flag(tsk, TIF_IO_BITMAP);
+ 	} else {
+-		clear_thread_flag(TIF_IO_BITMAP);
++		clear_tsk_thread_flag(tsk, TIF_IO_BITMAP);
+ 		/* Invalidate TSS */
+ 		preempt_disable();
+ 		tss_update_io_bitmap();
+@@ -48,12 +48,12 @@ static void task_update_io_bitmap(void)
+ 	}
+ }
+ 
+-void io_bitmap_exit(void)
++void io_bitmap_exit(struct task_struct *tsk)
+ {
+-	struct io_bitmap *iobm = current->thread.io_bitmap;
++	struct io_bitmap *iobm = tsk->thread.io_bitmap;
+ 
+-	current->thread.io_bitmap = NULL;
+-	task_update_io_bitmap();
++	tsk->thread.io_bitmap = NULL;
++	task_update_io_bitmap(tsk);
+ 	if (iobm && refcount_dec_and_test(&iobm->refcnt))
+ 		kfree(iobm);
+ }
+@@ -101,7 +101,7 @@ long ksys_ioperm(unsigned long from, uns
+ 		if (!iobm)
+ 			return -ENOMEM;
+ 		refcount_set(&iobm->refcnt, 1);
+-		io_bitmap_exit();
++		io_bitmap_exit(current);
+ 	}
+ 
+ 	/*
+@@ -133,7 +133,7 @@ long ksys_ioperm(unsigned long from, uns
+ 	}
+ 	/* All permissions dropped? */
+ 	if (max_long == UINT_MAX) {
+-		io_bitmap_exit();
++		io_bitmap_exit(current);
+ 		return 0;
+ 	}
+ 
+@@ -191,7 +191,7 @@ SYSCALL_DEFINE1(iopl, unsigned int, leve
+ 	}
+ 
+ 	t->iopl_emul = level;
+-	task_update_io_bitmap();
++	task_update_io_bitmap(current);
+ 
+ 	return 0;
+ }
+--- a/arch/x86/kernel/process.c
++++ b/arch/x86/kernel/process.c
+@@ -97,7 +97,7 @@ int arch_dup_task_struct(struct task_str
+ }
+ 
+ /*
+- * Free current thread data structures etc..
++ * Free thread data structures etc..
+  */
+ void exit_thread(struct task_struct *tsk)
+ {
+@@ -105,7 +105,7 @@ void exit_thread(struct task_struct *tsk
+ 	struct fpu *fpu = &t->fpu;
+ 
+ 	if (test_thread_flag(TIF_IO_BITMAP))
+-		io_bitmap_exit();
++		io_bitmap_exit(tsk);
+ 
+ 	free_vm86(t);
+ 
