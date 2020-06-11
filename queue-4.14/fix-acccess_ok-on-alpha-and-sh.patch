@@ -1,0 +1,126 @@
+From 94bd8a05cd4de344a9a57e52ef7d99550251984f Mon Sep 17 00:00:00 2001
+From: Linus Torvalds <torvalds@linux-foundation.org>
+Date: Sun, 6 Jan 2019 11:15:04 -0800
+Subject: Fix 'acccess_ok()' on alpha and SH
+
+From: Linus Torvalds <torvalds@linux-foundation.org>
+
+commit 94bd8a05cd4de344a9a57e52ef7d99550251984f upstream.
+
+Commit 594cc251fdd0 ("make 'user_access_begin()' do 'access_ok()'")
+broke both alpha and SH booting in qemu, as noticed by Guenter Roeck.
+
+It turns out that the bug wasn't actually in that commit itself (which
+would have been surprising: it was mostly a no-op), but in how the
+addition of access_ok() to the strncpy_from_user() and strnlen_user()
+functions now triggered the case where those functions would test the
+access of the very last byte of the user address space.
+
+The string functions actually did that user range test before too, but
+they did it manually by just comparing against user_addr_max().  But
+with user_access_begin() doing the check (using "access_ok()"), it now
+exposed problems in the architecture implementations of that function.
+
+For example, on alpha, the access_ok() helper macro looked like this:
+
+  #define __access_ok(addr, size) \
+        ((get_fs().seg & (addr | size | (addr+size))) == 0)
+
+and what it basically tests is of any of the high bits get set (the
+USER_DS masking value is 0xfffffc0000000000).
+
+And that's completely wrong for the "addr+size" check.  Because it's
+off-by-one for the case where we check to the very end of the user
+address space, which is exactly what the strn*_user() functions do.
+
+Why? Because "addr+size" will be exactly the size of the address space,
+so trying to access the last byte of the user address space will fail
+the __access_ok() check, even though it shouldn't.  As a result, the
+user string accessor functions failed consistently - because they
+literally don't know how long the string is going to be, and the max
+access is going to be that last byte of the user address space.
+
+Side note: that alpha macro is buggy for another reason too - it re-uses
+the arguments twice.
+
+And SH has another version of almost the exact same bug:
+
+  #define __addr_ok(addr) \
+        ((unsigned long __force)(addr) < current_thread_info()->addr_limit.seg)
+
+so far so good: yes, a user address must be below the limit.  But then:
+
+  #define __access_ok(addr, size)         \
+        (__addr_ok((addr) + (size)))
+
+is wrong with the exact same off-by-one case: the case when "addr+size"
+is exactly _equal_ to the limit is actually perfectly fine (think "one
+byte access at the last address of the user address space")
+
+The SH version is actually seriously buggy in another way: it doesn't
+actually check for overflow, even though it did copy the _comment_ that
+talks about overflow.
+
+So it turns out that both SH and alpha actually have completely buggy
+implementations of access_ok(), but they happened to work in practice
+(although the SH overflow one is a serious serious security bug, not
+that anybody likely cares about SH security).
+
+This fixes the problems by using a similar macro on both alpha and SH.
+It isn't trying to be clever, the end address is based on this logic:
+
+        unsigned long __ao_end = __ao_a + __ao_b - !!__ao_b;
+
+which basically says "add start and length, and then subtract one unless
+the length was zero".  We can't subtract one for a zero length, or we'd
+just hit an underflow instead.
+
+For a lot of access_ok() users the length is a constant, so this isn't
+actually as expensive as it initially looks.
+
+Reported-and-tested-by: Guenter Roeck <linux@roeck-us.net>
+Cc: Matt Turner <mattst88@gmail.com>
+Cc: Yoshinori Sato <ysato@users.sourceforge.jp>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Miles Chen <miles.chen@mediatek.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/alpha/include/asm/uaccess.h |    8 +++++---
+ arch/sh/include/asm/uaccess.h    |    7 +++++--
+ 2 files changed, 10 insertions(+), 5 deletions(-)
+
+--- a/arch/alpha/include/asm/uaccess.h
++++ b/arch/alpha/include/asm/uaccess.h
+@@ -30,11 +30,13 @@
+  * Address valid if:
+  *  - "addr" doesn't have any high-bits set
+  *  - AND "size" doesn't have any high-bits set
+- *  - AND "addr+size" doesn't have any high-bits set
++ *  - AND "addr+size-(size != 0)" doesn't have any high-bits set
+  *  - OR we are in kernel mode.
+  */
+-#define __access_ok(addr, size) \
+-	((get_fs().seg & (addr | size | (addr+size))) == 0)
++#define __access_ok(addr, size) ({				\
++	unsigned long __ao_a = (addr), __ao_b = (size);		\
++	unsigned long __ao_end = __ao_a + __ao_b - !!__ao_b;	\
++	(get_fs().seg & (__ao_a | __ao_b | __ao_end)) == 0; })
+ 
+ #define access_ok(type, addr, size)			\
+ ({							\
+--- a/arch/sh/include/asm/uaccess.h
++++ b/arch/sh/include/asm/uaccess.h
+@@ -16,8 +16,11 @@
+  * sum := addr + size;  carry? --> flag = true;
+  * if (sum >= addr_limit) flag = true;
+  */
+-#define __access_ok(addr, size)		\
+-	(__addr_ok((addr) + (size)))
++#define __access_ok(addr, size)	({				\
++	unsigned long __ao_a = (addr), __ao_b = (size);		\
++	unsigned long __ao_end = __ao_a + __ao_b - !!__ao_b;	\
++	__ao_end >= __ao_a && __addr_ok(__ao_end); })
++
+ #define access_ok(type, addr, size)	\
+ 	(__chk_user_ptr(addr),		\
+ 	 __access_ok((unsigned long __force)(addr), (size)))
