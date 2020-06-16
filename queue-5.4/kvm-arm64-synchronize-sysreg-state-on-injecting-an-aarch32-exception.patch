@@ -1,0 +1,112 @@
+From 0370964dd3ff7d3d406f292cb443a927952cbd05 Mon Sep 17 00:00:00 2001
+From: Marc Zyngier <maz@kernel.org>
+Date: Tue, 9 Jun 2020 08:50:29 +0100
+Subject: KVM: arm64: Synchronize sysreg state on injecting an AArch32 exception
+
+From: Marc Zyngier <maz@kernel.org>
+
+commit 0370964dd3ff7d3d406f292cb443a927952cbd05 upstream.
+
+On a VHE system, the EL1 state is left in the CPU most of the time,
+and only syncronized back to memory when vcpu_put() is called (most
+of the time on preemption).
+
+Which means that when injecting an exception, we'd better have a way
+to either:
+(1) write directly to the EL1 sysregs
+(2) synchronize the state back to memory, and do the changes there
+
+For an AArch64, we already do (1), so we are safe. Unfortunately,
+doing the same thing for AArch32 would be pretty invasive. Instead,
+we can easily implement (2) by calling the put/load architectural
+backends, and keep preemption disabled. We can then reload the
+state back into EL1.
+
+Cc: stable@vger.kernel.org
+Reported-by: James Morse <james.morse@arm.com>
+Signed-off-by: Marc Zyngier <maz@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ arch/arm/include/asm/kvm_host.h   |    2 ++
+ arch/arm64/include/asm/kvm_host.h |    2 ++
+ virt/kvm/arm/aarch32.c            |   28 ++++++++++++++++++++++++++++
+ 3 files changed, 32 insertions(+)
+
+--- a/arch/arm/include/asm/kvm_host.h
++++ b/arch/arm/include/asm/kvm_host.h
+@@ -421,4 +421,6 @@ static inline bool kvm_arm_vcpu_is_final
+ 	return true;
+ }
+ 
++#define kvm_arm_vcpu_loaded(vcpu)	(false)
++
+ #endif /* __ARM_KVM_HOST_H__ */
+--- a/arch/arm64/include/asm/kvm_host.h
++++ b/arch/arm64/include/asm/kvm_host.h
+@@ -679,4 +679,6 @@ bool kvm_arm_vcpu_is_finalized(struct kv
+ #define kvm_arm_vcpu_sve_finalized(vcpu) \
+ 	((vcpu)->arch.flags & KVM_ARM64_VCPU_SVE_FINALIZED)
+ 
++#define kvm_arm_vcpu_loaded(vcpu)	((vcpu)->arch.sysregs_loaded_on_cpu)
++
+ #endif /* __ARM64_KVM_HOST_H__ */
+--- a/virt/kvm/arm/aarch32.c
++++ b/virt/kvm/arm/aarch32.c
+@@ -33,6 +33,26 @@ static const u8 return_offsets[8][2] = {
+ 	[7] = { 4, 4 },		/* FIQ, unused */
+ };
+ 
++static bool pre_fault_synchronize(struct kvm_vcpu *vcpu)
++{
++	preempt_disable();
++	if (kvm_arm_vcpu_loaded(vcpu)) {
++		kvm_arch_vcpu_put(vcpu);
++		return true;
++	}
++
++	preempt_enable();
++	return false;
++}
++
++static void post_fault_synchronize(struct kvm_vcpu *vcpu, bool loaded)
++{
++	if (loaded) {
++		kvm_arch_vcpu_load(vcpu, smp_processor_id());
++		preempt_enable();
++	}
++}
++
+ /*
+  * When an exception is taken, most CPSR fields are left unchanged in the
+  * handler. However, some are explicitly overridden (e.g. M[4:0]).
+@@ -155,7 +175,10 @@ static void prepare_fault32(struct kvm_v
+ 
+ void kvm_inject_undef32(struct kvm_vcpu *vcpu)
+ {
++	bool loaded = pre_fault_synchronize(vcpu);
++
+ 	prepare_fault32(vcpu, PSR_AA32_MODE_UND, 4);
++	post_fault_synchronize(vcpu, loaded);
+ }
+ 
+ /*
+@@ -168,6 +191,9 @@ static void inject_abt32(struct kvm_vcpu
+ 	u32 vect_offset;
+ 	u32 *far, *fsr;
+ 	bool is_lpae;
++	bool loaded;
++
++	loaded = pre_fault_synchronize(vcpu);
+ 
+ 	if (is_pabt) {
+ 		vect_offset = 12;
+@@ -191,6 +217,8 @@ static void inject_abt32(struct kvm_vcpu
+ 		/* no need to shuffle FS[4] into DFSR[10] as its 0 */
+ 		*fsr = DFSR_FSC_EXTABT_nLPAE;
+ 	}
++
++	post_fault_synchronize(vcpu, loaded);
+ }
+ 
+ void kvm_inject_dabt32(struct kvm_vcpu *vcpu, unsigned long addr)
