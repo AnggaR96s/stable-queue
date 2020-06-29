@@ -1,0 +1,122 @@
+From 2dbebf7ae1ed9a420d954305e2c9d5ed39ec57c3 Mon Sep 17 00:00:00 2001
+From: Sean Christopherson <sean.j.christopherson@intel.com>
+Date: Mon, 22 Jun 2020 14:58:29 -0700
+Subject: KVM: nVMX: Plumb L2 GPA through to PML emulation
+
+From: Sean Christopherson <sean.j.christopherson@intel.com>
+
+commit 2dbebf7ae1ed9a420d954305e2c9d5ed39ec57c3 upstream.
+
+Explicitly pass the L2 GPA to kvm_arch_write_log_dirty(), which for all
+intents and purposes is vmx_write_pml_buffer(), instead of having the
+latter pull the GPA from vmcs.GUEST_PHYSICAL_ADDRESS.  If the dirty bit
+update is the result of KVM emulation (rare for L2), then the GPA in the
+VMCS may be stale and/or hold a completely unrelated GPA.
+
+Fixes: c5f983f6e8455 ("nVMX: Implement emulated Page Modification Logging")
+Cc: stable@vger.kernel.org
+Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+Message-Id: <20200622215832.22090-2-sean.j.christopherson@intel.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ arch/x86/include/asm/kvm_host.h |    2 +-
+ arch/x86/kvm/mmu.c              |    4 ++--
+ arch/x86/kvm/mmu.h              |    2 +-
+ arch/x86/kvm/paging_tmpl.h      |    7 ++++---
+ arch/x86/kvm/vmx/vmx.c          |    6 +++---
+ 5 files changed, 11 insertions(+), 10 deletions(-)
+
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1160,7 +1160,7 @@ struct kvm_x86_ops {
+ 	void (*enable_log_dirty_pt_masked)(struct kvm *kvm,
+ 					   struct kvm_memory_slot *slot,
+ 					   gfn_t offset, unsigned long mask);
+-	int (*write_log_dirty)(struct kvm_vcpu *vcpu);
++	int (*write_log_dirty)(struct kvm_vcpu *vcpu, gpa_t l2_gpa);
+ 
+ 	/* pmu operations of sub-arch */
+ 	const struct kvm_pmu_ops *pmu_ops;
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@ -1819,10 +1819,10 @@ void kvm_arch_mmu_enable_log_dirty_pt_ma
+  * Emulate arch specific page modification logging for the
+  * nested hypervisor
+  */
+-int kvm_arch_write_log_dirty(struct kvm_vcpu *vcpu)
++int kvm_arch_write_log_dirty(struct kvm_vcpu *vcpu, gpa_t l2_gpa)
+ {
+ 	if (kvm_x86_ops->write_log_dirty)
+-		return kvm_x86_ops->write_log_dirty(vcpu);
++		return kvm_x86_ops->write_log_dirty(vcpu, l2_gpa);
+ 
+ 	return 0;
+ }
+--- a/arch/x86/kvm/mmu.h
++++ b/arch/x86/kvm/mmu.h
+@@ -209,7 +209,7 @@ void kvm_mmu_gfn_disallow_lpage(struct k
+ void kvm_mmu_gfn_allow_lpage(struct kvm_memory_slot *slot, gfn_t gfn);
+ bool kvm_mmu_slot_gfn_write_protect(struct kvm *kvm,
+ 				    struct kvm_memory_slot *slot, u64 gfn);
+-int kvm_arch_write_log_dirty(struct kvm_vcpu *vcpu);
++int kvm_arch_write_log_dirty(struct kvm_vcpu *vcpu, gpa_t l2_gpa);
+ 
+ int kvm_mmu_post_init_vm(struct kvm *kvm);
+ void kvm_mmu_pre_destroy_vm(struct kvm *kvm);
+--- a/arch/x86/kvm/paging_tmpl.h
++++ b/arch/x86/kvm/paging_tmpl.h
+@@ -220,7 +220,7 @@ static inline unsigned FNAME(gpte_access
+ static int FNAME(update_accessed_dirty_bits)(struct kvm_vcpu *vcpu,
+ 					     struct kvm_mmu *mmu,
+ 					     struct guest_walker *walker,
+-					     int write_fault)
++					     gpa_t addr, int write_fault)
+ {
+ 	unsigned level, index;
+ 	pt_element_t pte, orig_pte;
+@@ -245,7 +245,7 @@ static int FNAME(update_accessed_dirty_b
+ 				!(pte & PT_GUEST_DIRTY_MASK)) {
+ 			trace_kvm_mmu_set_dirty_bit(table_gfn, index, sizeof(pte));
+ #if PTTYPE == PTTYPE_EPT
+-			if (kvm_arch_write_log_dirty(vcpu))
++			if (kvm_arch_write_log_dirty(vcpu, addr))
+ 				return -EINVAL;
+ #endif
+ 			pte |= PT_GUEST_DIRTY_MASK;
+@@ -442,7 +442,8 @@ retry_walk:
+ 			(PT_GUEST_DIRTY_SHIFT - PT_GUEST_ACCESSED_SHIFT);
+ 
+ 	if (unlikely(!accessed_dirty)) {
+-		ret = FNAME(update_accessed_dirty_bits)(vcpu, mmu, walker, write_fault);
++		ret = FNAME(update_accessed_dirty_bits)(vcpu, mmu, walker,
++							addr, write_fault);
+ 		if (unlikely(ret < 0))
+ 			goto error;
+ 		else if (ret)
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -7272,11 +7272,11 @@ static void vmx_flush_log_dirty(struct k
+ 	kvm_flush_pml_buffers(kvm);
+ }
+ 
+-static int vmx_write_pml_buffer(struct kvm_vcpu *vcpu)
++static int vmx_write_pml_buffer(struct kvm_vcpu *vcpu, gpa_t gpa)
+ {
+ 	struct vmcs12 *vmcs12;
+ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
+-	gpa_t gpa, dst;
++	gpa_t dst;
+ 
+ 	if (is_guest_mode(vcpu)) {
+ 		WARN_ON_ONCE(vmx->nested.pml_full);
+@@ -7295,7 +7295,7 @@ static int vmx_write_pml_buffer(struct k
+ 			return 1;
+ 		}
+ 
+-		gpa = vmcs_read64(GUEST_PHYSICAL_ADDRESS) & ~0xFFFull;
++		gpa &= ~0xFFFull;
+ 		dst = vmcs12->pml_address + sizeof(u64) * vmcs12->guest_pml_index;
+ 
+ 		if (kvm_write_guest_page(vcpu->kvm, gpa_to_gfn(dst), &gpa,
