@@ -1,0 +1,104 @@
+From 2aeb1883547626d82c597cce2c99f0b9c62e2425 Mon Sep 17 00:00:00 2001
+From: Jiri Olsa <jolsa@kernel.org>
+Date: Thu, 20 Jul 2017 16:14:55 +0200
+Subject: perf/core: Fix locking for children siblings group read
+
+From: Jiri Olsa <jolsa@kernel.org>
+
+commit 2aeb1883547626d82c597cce2c99f0b9c62e2425 upstream.
+
+We're missing ctx lock when iterating children siblings
+within the perf_read path for group reading. Following
+race and crash can happen:
+
+User space doing read syscall on event group leader:
+
+T1:
+  perf_read
+    lock event->ctx->mutex
+    perf_read_group
+      lock leader->child_mutex
+      __perf_read_group_add(child)
+        list_for_each_entry(sub, &leader->sibling_list, group_entry)
+
+---->   sub might be invalid at this point, because it could
+        get removed via perf_event_exit_task_context in T2
+
+Child exiting and cleaning up its events:
+
+T2:
+  perf_event_exit_task_context
+    lock ctx->mutex
+    list_for_each_entry_safe(child_event, next, &child_ctx->event_list,...
+      perf_event_exit_event(child)
+        lock ctx->lock
+        perf_group_detach(child)
+        unlock ctx->lock
+
+---->   child is removed from sibling_list without any sync
+        with T1 path above
+
+        ...
+        free_event(child)
+
+Before the child is removed from the leader's child_list,
+(and thus is omitted from perf_read_group processing), we
+need to ensure that perf_read_group touches child's
+siblings under its ctx->lock.
+
+Peter further notes:
+
+| One additional note; this bug got exposed by commit:
+|
+|   ba5213ae6b88 ("perf/core: Correct event creation with PERF_FORMAT_GROUP")
+|
+| which made it possible to actually trigger this code-path.
+
+Tested-by: Andi Kleen <ak@linux.intel.com>
+Signed-off-by: Jiri Olsa <jolsa@kernel.org>
+Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+Cc: Jiri Olsa <jolsa@redhat.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Fixes: ba5213ae6b88 ("perf/core: Correct event creation with PERF_FORMAT_GROUP")
+Link: http://lkml.kernel.org/r/20170720141455.2106-1-jolsa@kernel.org
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Cc: Guenter Roeck <linux@roeck-us.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ kernel/events/core.c |    5 +++++
+ 1 file changed, 5 insertions(+)
+
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -3940,7 +3940,9 @@ EXPORT_SYMBOL_GPL(perf_event_read_value)
+ static int __perf_read_group_add(struct perf_event *leader,
+ 					u64 read_format, u64 *values)
+ {
++	struct perf_event_context *ctx = leader->ctx;
+ 	struct perf_event *sub;
++	unsigned long flags;
+ 	int n = 1; /* skip @nr */
+ 	int ret;
+ 
+@@ -3970,12 +3972,15 @@ static int __perf_read_group_add(struct
+ 	if (read_format & PERF_FORMAT_ID)
+ 		values[n++] = primary_event_id(leader);
+ 
++	raw_spin_lock_irqsave(&ctx->lock, flags);
++
+ 	list_for_each_entry(sub, &leader->sibling_list, group_entry) {
+ 		values[n++] += perf_event_count(sub);
+ 		if (read_format & PERF_FORMAT_ID)
+ 			values[n++] = primary_event_id(sub);
+ 	}
+ 
++	raw_spin_unlock_irqrestore(&ctx->lock, flags);
+ 	return 0;
+ }
+ 
