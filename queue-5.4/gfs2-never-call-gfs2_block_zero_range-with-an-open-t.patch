@@ -1,0 +1,158 @@
+From ce47414b53a0142cdfa2429fbf82c112266cecc6 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 24 Jul 2020 12:06:31 -0500
+Subject: gfs2: Never call gfs2_block_zero_range with an open transaction
+
+From: Bob Peterson <rpeterso@redhat.com>
+
+[ Upstream commit 70499cdfeb3625c87eebe4f7a7ea06fa7447e5df ]
+
+Before this patch, some functions started transactions then they called
+gfs2_block_zero_range. However, gfs2_block_zero_range, like writes, can
+start transactions, which results in a recursive transaction error.
+For example:
+
+do_shrink
+   trunc_start
+      gfs2_trans_begin <------------------------------------------------
+         gfs2_block_zero_range
+            iomap_zero_range(inode, from, length, NULL, &gfs2_iomap_ops);
+               iomap_apply ... iomap_zero_range_actor
+                  iomap_begin
+                     gfs2_iomap_begin
+                        gfs2_iomap_begin_write
+                  actor (iomap_zero_range_actor)
+		     iomap_zero
+			iomap_write_begin
+			   gfs2_iomap_page_prepare
+			      gfs2_trans_begin <------------------------
+
+This patch reorders the callers of gfs2_block_zero_range so that they
+only start their transactions after the call. It also adds a BUG_ON to
+ensure this doesn't happen again.
+
+Fixes: 2257e468a63b ("gfs2: implement gfs2_block_zero_range using iomap_zero_range")
+Cc: stable@vger.kernel.org # v5.5+
+Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/gfs2/bmap.c | 69 ++++++++++++++++++++++++++++----------------------
+ 1 file changed, 39 insertions(+), 30 deletions(-)
+
+diff --git a/fs/gfs2/bmap.c b/fs/gfs2/bmap.c
+index 4846e0c47e6af..50fa3e08c02f3 100644
+--- a/fs/gfs2/bmap.c
++++ b/fs/gfs2/bmap.c
+@@ -1350,9 +1350,15 @@ int gfs2_extent_map(struct inode *inode, u64 lblock, int *new, u64 *dblock, unsi
+ 	return ret;
+ }
+ 
++/*
++ * NOTE: Never call gfs2_block_zero_range with an open transaction because it
++ * uses iomap write to perform its actions, which begin their own transactions
++ * (iomap_begin, page_prepare, etc.)
++ */
+ static int gfs2_block_zero_range(struct inode *inode, loff_t from,
+ 				 unsigned int length)
+ {
++	BUG_ON(current->journal_info);
+ 	return iomap_zero_range(inode, from, length, NULL, &gfs2_iomap_ops);
+ }
+ 
+@@ -1413,6 +1419,16 @@ static int trunc_start(struct inode *inode, u64 newsize)
+ 	u64 oldsize = inode->i_size;
+ 	int error;
+ 
++	if (!gfs2_is_stuffed(ip)) {
++		unsigned int blocksize = i_blocksize(inode);
++		unsigned int offs = newsize & (blocksize - 1);
++		if (offs) {
++			error = gfs2_block_zero_range(inode, newsize,
++						      blocksize - offs);
++			if (error)
++				return error;
++		}
++	}
+ 	if (journaled)
+ 		error = gfs2_trans_begin(sdp, RES_DINODE + RES_JDATA, GFS2_JTRUNC_REVOKES);
+ 	else
+@@ -1426,19 +1442,10 @@ static int trunc_start(struct inode *inode, u64 newsize)
+ 
+ 	gfs2_trans_add_meta(ip->i_gl, dibh);
+ 
+-	if (gfs2_is_stuffed(ip)) {
++	if (gfs2_is_stuffed(ip))
+ 		gfs2_buffer_clear_tail(dibh, sizeof(struct gfs2_dinode) + newsize);
+-	} else {
+-		unsigned int blocksize = i_blocksize(inode);
+-		unsigned int offs = newsize & (blocksize - 1);
+-		if (offs) {
+-			error = gfs2_block_zero_range(inode, newsize,
+-						      blocksize - offs);
+-			if (error)
+-				goto out;
+-		}
++	else
+ 		ip->i_diskflags |= GFS2_DIF_TRUNC_IN_PROG;
+-	}
+ 
+ 	i_size_write(inode, newsize);
+ 	ip->i_inode.i_mtime = ip->i_inode.i_ctime = current_time(&ip->i_inode);
+@@ -2446,25 +2453,7 @@ int __gfs2_punch_hole(struct file *file, loff_t offset, loff_t length)
+ 	loff_t start, end;
+ 	int error;
+ 
+-	start = round_down(offset, blocksize);
+-	end = round_up(offset + length, blocksize) - 1;
+-	error = filemap_write_and_wait_range(inode->i_mapping, start, end);
+-	if (error)
+-		return error;
+-
+-	if (gfs2_is_jdata(ip))
+-		error = gfs2_trans_begin(sdp, RES_DINODE + 2 * RES_JDATA,
+-					 GFS2_JTRUNC_REVOKES);
+-	else
+-		error = gfs2_trans_begin(sdp, RES_DINODE, 0);
+-	if (error)
+-		return error;
+-
+-	if (gfs2_is_stuffed(ip)) {
+-		error = stuffed_zero_range(inode, offset, length);
+-		if (error)
+-			goto out;
+-	} else {
++	if (!gfs2_is_stuffed(ip)) {
+ 		unsigned int start_off, end_len;
+ 
+ 		start_off = offset & (blocksize - 1);
+@@ -2487,6 +2476,26 @@ int __gfs2_punch_hole(struct file *file, loff_t offset, loff_t length)
+ 		}
+ 	}
+ 
++	start = round_down(offset, blocksize);
++	end = round_up(offset + length, blocksize) - 1;
++	error = filemap_write_and_wait_range(inode->i_mapping, start, end);
++	if (error)
++		return error;
++
++	if (gfs2_is_jdata(ip))
++		error = gfs2_trans_begin(sdp, RES_DINODE + 2 * RES_JDATA,
++					 GFS2_JTRUNC_REVOKES);
++	else
++		error = gfs2_trans_begin(sdp, RES_DINODE, 0);
++	if (error)
++		return error;
++
++	if (gfs2_is_stuffed(ip)) {
++		error = stuffed_zero_range(inode, offset, length);
++		if (error)
++			goto out;
++	}
++
+ 	if (gfs2_is_jdata(ip)) {
+ 		BUG_ON(!current->journal_info);
+ 		gfs2_journaled_truncate_range(inode, offset, length);
+-- 
+2.25.1
+
