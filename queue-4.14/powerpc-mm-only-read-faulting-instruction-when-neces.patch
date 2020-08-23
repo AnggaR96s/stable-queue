@@ -1,0 +1,180 @@
+From 678ba6516fac09d9fbb6f23d38b5659df1554622 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 23 May 2018 10:53:22 +0200
+Subject: powerpc/mm: Only read faulting instruction when necessary in
+ do_page_fault()
+
+From: Christophe Leroy <christophe.leroy@c-s.fr>
+
+[ Upstream commit 0e36b0d12501e278686634712975b785bae11641 ]
+
+Commit a7a9dcd882a67 ("powerpc: Avoid taking a data miss on every
+userspace instruction miss") has shown that limiting the read of
+faulting instruction to likely cases improves performance.
+
+This patch goes further into this direction by limiting the read
+of the faulting instruction to the only cases where it is likely
+needed.
+
+On an MPC885, with the same benchmark app as in the commit referred
+above, we see a reduction of about 3900 dTLB misses (approx 3%):
+
+Before the patch:
+ Performance counter stats for './fault 500' (10 runs):
+
+         683033312      cpu-cycles                                                    ( +-  0.03% )
+            134538      dTLB-load-misses                                              ( +-  0.03% )
+             46099      iTLB-load-misses                                              ( +-  0.02% )
+             19681      faults                                                        ( +-  0.02% )
+
+       5.389747878 seconds time elapsed                                          ( +-  0.06% )
+
+With the patch:
+
+ Performance counter stats for './fault 500' (10 runs):
+
+         682112862      cpu-cycles                                                    ( +-  0.03% )
+            130619      dTLB-load-misses                                              ( +-  0.03% )
+             46073      iTLB-load-misses                                              ( +-  0.05% )
+             19681      faults                                                        ( +-  0.01% )
+
+       5.381342641 seconds time elapsed                                          ( +-  0.07% )
+
+The proper work of the huge stack expansion was tested with the
+following app:
+
+int main(int argc, char **argv)
+{
+	char buf[1024 * 1025];
+
+	sprintf(buf, "Hello world !\n");
+	printf(buf);
+
+	exit(0);
+}
+
+Signed-off-by: Christophe Leroy <christophe.leroy@c-s.fr>
+Reviewed-by: Nicholas Piggin <npiggin@gmail.com>
+[mpe: Add include of pagemap.h to fix build errors]
+Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ arch/powerpc/mm/fault.c | 50 ++++++++++++++++++++++++++++-------------
+ 1 file changed, 34 insertions(+), 16 deletions(-)
+
+diff --git a/arch/powerpc/mm/fault.c b/arch/powerpc/mm/fault.c
+index 5fc8a010fdf07..998c77e600a43 100644
+--- a/arch/powerpc/mm/fault.c
++++ b/arch/powerpc/mm/fault.c
+@@ -22,6 +22,7 @@
+ #include <linux/errno.h>
+ #include <linux/string.h>
+ #include <linux/types.h>
++#include <linux/pagemap.h>
+ #include <linux/ptrace.h>
+ #include <linux/mman.h>
+ #include <linux/mm.h>
+@@ -66,15 +67,11 @@ static inline bool notify_page_fault(struct pt_regs *regs)
+ }
+ 
+ /*
+- * Check whether the instruction at regs->nip is a store using
++ * Check whether the instruction inst is a store using
+  * an update addressing form which will update r1.
+  */
+-static bool store_updates_sp(struct pt_regs *regs)
++static bool store_updates_sp(unsigned int inst)
+ {
+-	unsigned int inst;
+-
+-	if (get_user(inst, (unsigned int __user *)regs->nip))
+-		return false;
+ 	/* check for 1 in the rA field */
+ 	if (((inst >> 16) & 0x1f) != 1)
+ 		return false;
+@@ -228,8 +225,8 @@ static bool bad_kernel_fault(bool is_exec, unsigned long error_code,
+ }
+ 
+ static bool bad_stack_expansion(struct pt_regs *regs, unsigned long address,
+-				struct vm_area_struct *vma,
+-				bool store_update_sp)
++				struct vm_area_struct *vma, unsigned int flags,
++				bool *must_retry)
+ {
+ 	/*
+ 	 * N.B. The POWER/Open ABI allows programs to access up to
+@@ -241,6 +238,7 @@ static bool bad_stack_expansion(struct pt_regs *regs, unsigned long address,
+ 	 * expand to 1MB without further checks.
+ 	 */
+ 	if (address + 0x100000 < vma->vm_end) {
++		unsigned int __user *nip = (unsigned int __user *)regs->nip;
+ 		/* get user regs even if this fault is in kernel mode */
+ 		struct pt_regs *uregs = current->thread.regs;
+ 		if (uregs == NULL)
+@@ -258,8 +256,22 @@ static bool bad_stack_expansion(struct pt_regs *regs, unsigned long address,
+ 		 * between the last mapped region and the stack will
+ 		 * expand the stack rather than segfaulting.
+ 		 */
+-		if (address + 2048 < uregs->gpr[1] && !store_update_sp)
+-			return true;
++		if (address + 2048 >= uregs->gpr[1])
++			return false;
++
++		if ((flags & FAULT_FLAG_WRITE) && (flags & FAULT_FLAG_USER) &&
++		    access_ok(VERIFY_READ, nip, sizeof(*nip))) {
++			unsigned int inst;
++			int res;
++
++			pagefault_disable();
++			res = __get_user_inatomic(inst, nip);
++			pagefault_enable();
++			if (!res)
++				return !store_updates_sp(inst);
++			*must_retry = true;
++		}
++		return true;
+ 	}
+ 	return false;
+ }
+@@ -392,7 +404,7 @@ static int __do_page_fault(struct pt_regs *regs, unsigned long address,
+ 	int is_user = user_mode(regs);
+ 	int is_write = page_fault_is_write(error_code);
+ 	int fault, major = 0;
+-	bool store_update_sp = false;
++	bool must_retry = false;
+ 
+ 	if (notify_page_fault(regs))
+ 		return 0;
+@@ -439,9 +451,6 @@ static int __do_page_fault(struct pt_regs *regs, unsigned long address,
+ 	 * can result in fault, which will cause a deadlock when called with
+ 	 * mmap_sem held
+ 	 */
+-	if (is_write && is_user)
+-		store_update_sp = store_updates_sp(regs);
+-
+ 	if (is_user)
+ 		flags |= FAULT_FLAG_USER;
+ 	if (is_write)
+@@ -488,8 +497,17 @@ retry:
+ 		return bad_area(regs, address);
+ 
+ 	/* The stack is being expanded, check if it's valid */
+-	if (unlikely(bad_stack_expansion(regs, address, vma, store_update_sp)))
+-		return bad_area(regs, address);
++	if (unlikely(bad_stack_expansion(regs, address, vma, flags,
++					 &must_retry))) {
++		if (!must_retry)
++			return bad_area(regs, address);
++
++		up_read(&mm->mmap_sem);
++		if (fault_in_pages_readable((const char __user *)regs->nip,
++					    sizeof(unsigned int)))
++			return bad_area_nosemaphore(regs, address);
++		goto retry;
++	}
+ 
+ 	/* Try to expand it */
+ 	if (unlikely(expand_stack(vma, address)))
+-- 
+2.25.1
+
