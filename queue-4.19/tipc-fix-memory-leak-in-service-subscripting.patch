@@ -1,0 +1,76 @@
+From 9f664a79c018ae25a460c584fd2a4b4d2835d422 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 13 May 2020 19:33:17 +0700
+Subject: tipc: fix memory leak in service subscripting
+
+From: Tuong Lien <tuong.t.lien@dektech.com.au>
+
+[ Upstream commit 0771d7df819284d46cf5cfb57698621b503ec17f ]
+
+Upon receipt of a service subscription request from user via a topology
+connection, one 'sub' object will be allocated in kernel, so it will be
+able to send an event of the service if any to the user correspondingly
+then. Also, in case of any failure, the connection will be shutdown and
+all the pertaining 'sub' objects will be freed.
+
+However, there is a race condition as follows resulting in memory leak:
+
+       receive-work       connection        send-work
+              |                |                |
+        sub-1 |<------//-------|                |
+        sub-2 |<------//-------|                |
+              |                |<---------------| evt for sub-x
+        sub-3 |<------//-------|                |
+              :                :                :
+              :                :                :
+              |       /--------|                |
+              |       |        * peer closed    |
+              |       |        |                |
+              |       |        |<-------X-------| evt for sub-y
+              |       |        |<===============|
+        sub-n |<------/        X    shutdown    |
+    -> orphan |                                 |
+
+That is, the 'receive-work' may get the last subscription request while
+the 'send-work' is shutting down the connection due to peer close.
+
+We had a 'lock' on the connection, so the two actions cannot be carried
+out simultaneously. If the last subscription is allocated e.g. 'sub-n',
+before the 'send-work' closes the connection, there will be no issue at
+all, the 'sub' objects will be freed. In contrast the last subscription
+will become orphan since the connection was closed, and we released all
+references.
+
+This commit fixes the issue by simply adding one test if the connection
+remains in 'connected' state right after we obtain the connection lock,
+then a subscription object can be created as usual, otherwise we ignore
+it.
+
+Acked-by: Ying Xue <ying.xue@windriver.com>
+Acked-by: Jon Maloy <jmaloy@redhat.com>
+Reported-by: Thang Ngo <thang.h.ngo@dektech.com.au>
+Signed-off-by: Tuong Lien <tuong.t.lien@dektech.com.au>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ net/tipc/topsrv.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/net/tipc/topsrv.c b/net/tipc/topsrv.c
+index 41f4464ac6cc5..ec9a7137d2677 100644
+--- a/net/tipc/topsrv.c
++++ b/net/tipc/topsrv.c
+@@ -407,7 +407,9 @@ static int tipc_conn_rcv_from_sock(struct tipc_conn *con)
+ 		return -EWOULDBLOCK;
+ 	if (ret == sizeof(s)) {
+ 		read_lock_bh(&sk->sk_callback_lock);
+-		ret = tipc_conn_rcv_sub(srv, con, &s);
++		/* RACE: the connection can be closed in the meantime */
++		if (likely(connected(con)))
++			ret = tipc_conn_rcv_sub(srv, con, &s);
+ 		read_unlock_bh(&sk->sk_callback_lock);
+ 		if (!ret)
+ 			return 0;
+-- 
+2.25.1
+
