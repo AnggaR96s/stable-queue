@@ -1,0 +1,142 @@
+From 08d7ff74fda71376fa18ecb82af7247a7cfd89f1 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 8 Nov 2019 17:00:25 +0800
+Subject: x86/kdump: Always reserve the low 1M when the crashkernel option is
+ specified
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+From: Lianbo Jiang <lijiang@redhat.com>
+
+[ Upstream commit 6f599d84231fd27e42f4ca2a786a6641e8cddf00 ]
+
+On x86, purgatory() copies the first 640K of memory to a backup region
+because the kernel needs those first 640K for the real mode trampoline
+during boot, among others.
+
+However, when SME is enabled, the kernel cannot properly copy the old
+memory to the backup area but reads only its encrypted contents. The
+result is that the crash tool gets invalid pointers when parsing vmcore:
+
+  crash> kmem -s|grep -i invalid
+  kmem: dma-kmalloc-512: slab:ffffd77680001c00 invalid freepointer:a6086ac099f0c5a4
+  kmem: dma-kmalloc-512: slab:ffffd77680001c00 invalid freepointer:a6086ac099f0c5a4
+  crash>
+
+So reserve the remaining low 1M memory when the crashkernel option is
+specified (after reserving real mode memory) so that allocated memory
+does not fall into the low 1M area and thus the copying of the contents
+of the first 640k to a backup region in purgatory() can be avoided
+altogether.
+
+This way, it does not need to be included in crash dumps or used for
+anything except the trampolines that must live in the low 1M.
+
+ [ bp: Heavily rewrite commit message, flip check logic in
+   crash_reserve_low_1M().]
+
+Signed-off-by: Lianbo Jiang <lijiang@redhat.com>
+Signed-off-by: Borislav Petkov <bp@suse.de>
+Cc: bhe@redhat.com
+Cc: Dave Young <dyoung@redhat.com>
+Cc: d.hatayama@fujitsu.com
+Cc: dhowells@redhat.com
+Cc: ebiederm@xmission.com
+Cc: horms@verge.net.au
+Cc: "H. Peter Anvin" <hpa@zytor.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Jürgen Gross <jgross@suse.com>
+Cc: kexec@lists.infradead.org
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Tom Lendacky <thomas.lendacky@amd.com>
+Cc: vgoyal@redhat.com
+Cc: x86-ml <x86@kernel.org>
+Link: https://lkml.kernel.org/r/20191108090027.11082-2-lijiang@redhat.com
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=204793
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ arch/x86/include/asm/crash.h |  6 ++++++
+ arch/x86/kernel/crash.c      | 15 +++++++++++++++
+ arch/x86/realmode/init.c     |  2 ++
+ 3 files changed, 23 insertions(+)
+
+diff --git a/arch/x86/include/asm/crash.h b/arch/x86/include/asm/crash.h
+index ef5638f641f2b..88eadd08ad708 100644
+--- a/arch/x86/include/asm/crash.h
++++ b/arch/x86/include/asm/crash.h
+@@ -10,4 +10,10 @@ int crash_setup_memmap_entries(struct kimage *image,
+ 		struct boot_params *params);
+ void crash_smp_send_stop(void);
+ 
++#ifdef CONFIG_KEXEC_CORE
++void __init crash_reserve_low_1M(void);
++#else
++static inline void __init crash_reserve_low_1M(void) { }
++#endif
++
+ #endif /* _ASM_X86_CRASH_H */
+diff --git a/arch/x86/kernel/crash.c b/arch/x86/kernel/crash.c
+index eb651fbde92ac..ff25a2ea271cf 100644
+--- a/arch/x86/kernel/crash.c
++++ b/arch/x86/kernel/crash.c
+@@ -24,6 +24,7 @@
+ #include <linux/export.h>
+ #include <linux/slab.h>
+ #include <linux/vmalloc.h>
++#include <linux/memblock.h>
+ 
+ #include <asm/processor.h>
+ #include <asm/hardirq.h>
+@@ -39,6 +40,7 @@
+ #include <asm/virtext.h>
+ #include <asm/intel_pt.h>
+ #include <asm/crash.h>
++#include <asm/cmdline.h>
+ 
+ /* Used while preparing memory map entries for second kernel */
+ struct crash_memmap_data {
+@@ -68,6 +70,19 @@ static inline void cpu_crash_vmclear_loaded_vmcss(void)
+ 	rcu_read_unlock();
+ }
+ 
++/*
++ * When the crashkernel option is specified, only use the low
++ * 1M for the real mode trampoline.
++ */
++void __init crash_reserve_low_1M(void)
++{
++	if (cmdline_find_option(boot_command_line, "crashkernel", NULL, 0) < 0)
++		return;
++
++	memblock_reserve(0, 1<<20);
++	pr_info("Reserving the low 1M of memory for crashkernel\n");
++}
++
+ #if defined(CONFIG_SMP) && defined(CONFIG_X86_LOCAL_APIC)
+ 
+ static void kdump_nmi_callback(int cpu, struct pt_regs *regs)
+diff --git a/arch/x86/realmode/init.c b/arch/x86/realmode/init.c
+index 7dce39c8c034a..262f83cad3551 100644
+--- a/arch/x86/realmode/init.c
++++ b/arch/x86/realmode/init.c
+@@ -8,6 +8,7 @@
+ #include <asm/pgtable.h>
+ #include <asm/realmode.h>
+ #include <asm/tlbflush.h>
++#include <asm/crash.h>
+ 
+ struct real_mode_header *real_mode_header;
+ u32 *trampoline_cr4_features;
+@@ -34,6 +35,7 @@ void __init reserve_real_mode(void)
+ 
+ 	memblock_reserve(mem, size);
+ 	set_real_mode_mem(mem);
++	crash_reserve_low_1M();
+ }
+ 
+ static void __init setup_real_mode(void)
+-- 
+2.25.1
+

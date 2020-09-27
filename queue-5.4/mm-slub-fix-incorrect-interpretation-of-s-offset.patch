@@ -1,0 +1,147 @@
+From 3680ad09ddb03fb8bee877a3bf6a521a133b8ed4 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 7 May 2020 18:36:06 -0700
+Subject: mm/slub: fix incorrect interpretation of s->offset
+
+From: Waiman Long <longman@redhat.com>
+
+[ Upstream commit cbfc35a48609ceac978791e3ab9dde0c01f8cb20 ]
+
+In a couple of places in the slub memory allocator, the code uses
+"s->offset" as a check to see if the free pointer is put right after the
+object.  That check is no longer true with commit 3202fa62fb43 ("slub:
+relocate freelist pointer to middle of object").
+
+As a result, echoing "1" into the validate sysfs file, e.g.  of dentry,
+may cause a bunch of "Freepointer corrupt" error reports like the
+following to appear with the system in panic afterwards.
+
+  =============================================================================
+  BUG dentry(666:pmcd.service) (Tainted: G    B): Freepointer corrupt
+  -----------------------------------------------------------------------------
+
+To fix it, use the check "s->offset == s->inuse" in the new helper
+function freeptr_outside_object() instead.  Also add another helper
+function get_info_end() to return the end of info block (inuse + free
+pointer if not overlapping with object).
+
+Fixes: 3202fa62fb43 ("slub: relocate freelist pointer to middle of object")
+Signed-off-by: Waiman Long <longman@redhat.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Reviewed-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+Reviewed-by: Kees Cook <keescook@chromium.org>
+Acked-by: Rafael Aquini <aquini@redhat.com>
+Cc: Christoph Lameter <cl@linux.com>
+Cc: Vitaly Nikolenko <vnik@duasynt.com>
+Cc: Silvio Cesare <silvio.cesare@gmail.com>
+Cc: Pekka Enberg <penberg@kernel.org>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+Cc: Markus Elfring <Markus.Elfring@web.de>
+Cc: Changbin Du <changbin.du@gmail.com>
+Link: http://lkml.kernel.org/r/20200429135328.26976-1-longman@redhat.com
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ mm/slub.c | 45 ++++++++++++++++++++++++++++++---------------
+ 1 file changed, 30 insertions(+), 15 deletions(-)
+
+diff --git a/mm/slub.c b/mm/slub.c
+index 822ba07245291..d69934eac9e94 100644
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -533,15 +533,32 @@ static void print_section(char *level, char *text, u8 *addr,
+ 	metadata_access_disable();
+ }
+ 
++/*
++ * See comment in calculate_sizes().
++ */
++static inline bool freeptr_outside_object(struct kmem_cache *s)
++{
++	return s->offset >= s->inuse;
++}
++
++/*
++ * Return offset of the end of info block which is inuse + free pointer if
++ * not overlapping with object.
++ */
++static inline unsigned int get_info_end(struct kmem_cache *s)
++{
++	if (freeptr_outside_object(s))
++		return s->inuse + sizeof(void *);
++	else
++		return s->inuse;
++}
++
+ static struct track *get_track(struct kmem_cache *s, void *object,
+ 	enum track_item alloc)
+ {
+ 	struct track *p;
+ 
+-	if (s->offset)
+-		p = object + s->offset + sizeof(void *);
+-	else
+-		p = object + s->inuse;
++	p = object + get_info_end(s);
+ 
+ 	return p + alloc;
+ }
+@@ -682,10 +699,7 @@ static void print_trailer(struct kmem_cache *s, struct page *page, u8 *p)
+ 		print_section(KERN_ERR, "Redzone ", p + s->object_size,
+ 			s->inuse - s->object_size);
+ 
+-	if (s->offset)
+-		off = s->offset + sizeof(void *);
+-	else
+-		off = s->inuse;
++	off = get_info_end(s);
+ 
+ 	if (s->flags & SLAB_STORE_USER)
+ 		off += 2 * sizeof(struct track);
+@@ -776,7 +790,7 @@ static int check_bytes_and_report(struct kmem_cache *s, struct page *page,
+  * object address
+  * 	Bytes of the object to be managed.
+  * 	If the freepointer may overlay the object then the free
+- * 	pointer is the first word of the object.
++ *	pointer is at the middle of the object.
+  *
+  * 	Poisoning uses 0x6b (POISON_FREE) and the last byte is
+  * 	0xa5 (POISON_END)
+@@ -810,11 +824,7 @@ static int check_bytes_and_report(struct kmem_cache *s, struct page *page,
+ 
+ static int check_pad_bytes(struct kmem_cache *s, struct page *page, u8 *p)
+ {
+-	unsigned long off = s->inuse;	/* The end of info */
+-
+-	if (s->offset)
+-		/* Freepointer is placed after the object. */
+-		off += sizeof(void *);
++	unsigned long off = get_info_end(s);	/* The end of info */
+ 
+ 	if (s->flags & SLAB_STORE_USER)
+ 		/* We also have user information there */
+@@ -900,7 +910,7 @@ static int check_object(struct kmem_cache *s, struct page *page,
+ 		check_pad_bytes(s, page, p);
+ 	}
+ 
+-	if (!s->offset && val == SLUB_RED_ACTIVE)
++	if (!freeptr_outside_object(s) && val == SLUB_RED_ACTIVE)
+ 		/*
+ 		 * Object and freepointer overlap. Cannot check
+ 		 * freepointer while object is allocated.
+@@ -3585,6 +3595,11 @@ static int calculate_sizes(struct kmem_cache *s, int forced_order)
+ 		 *
+ 		 * This is the case if we do RCU, have a constructor or
+ 		 * destructor or are poisoning the objects.
++		 *
++		 * The assumption that s->offset >= s->inuse means free
++		 * pointer is outside of the object is used in the
++		 * freeptr_outside_object() function. If that is no
++		 * longer true, the function needs to be modified.
+ 		 */
+ 		s->offset = size;
+ 		size += sizeof(void *);
+-- 
+2.25.1
+
