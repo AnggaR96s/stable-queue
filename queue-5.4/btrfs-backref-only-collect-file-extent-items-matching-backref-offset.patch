@@ -1,0 +1,135 @@
+From 7ac8b88ee668a5b4743ebf3e9888fabac85c334a Mon Sep 17 00:00:00 2001
+From: ethanwu <ethanwu@synology.com>
+Date: Fri, 7 Feb 2020 17:38:15 +0800
+Subject: btrfs: backref, only collect file extent items matching backref offset
+
+From: ethanwu <ethanwu@synology.com>
+
+commit 7ac8b88ee668a5b4743ebf3e9888fabac85c334a upstream.
+
+When resolving one backref of type EXTENT_DATA_REF, we collect all
+references that simply reference the EXTENT_ITEM even though their
+(file_pos - file_extent_item::offset) are not the same as the
+btrfs_extent_data_ref::offset we are searching for.
+
+This patch adds additional check so that we only collect references whose
+(file_pos - file_extent_item::offset) == btrfs_extent_data_ref::offset.
+
+Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+Reviewed-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+Signed-off-by: ethanwu <ethanwu@synology.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/btrfs/backref.c |   63 +++++++++++++++++++++++++++--------------------------
+ 1 file changed, 33 insertions(+), 30 deletions(-)
+
+--- a/fs/btrfs/backref.c
++++ b/fs/btrfs/backref.c
+@@ -347,33 +347,10 @@ static int add_prelim_ref(const struct b
+ 		return -ENOMEM;
+ 
+ 	ref->root_id = root_id;
+-	if (key) {
++	if (key)
+ 		ref->key_for_search = *key;
+-		/*
+-		 * We can often find data backrefs with an offset that is too
+-		 * large (>= LLONG_MAX, maximum allowed file offset) due to
+-		 * underflows when subtracting a file's offset with the data
+-		 * offset of its corresponding extent data item. This can
+-		 * happen for example in the clone ioctl.
+-		 * So if we detect such case we set the search key's offset to
+-		 * zero to make sure we will find the matching file extent item
+-		 * at add_all_parents(), otherwise we will miss it because the
+-		 * offset taken form the backref is much larger then the offset
+-		 * of the file extent item. This can make us scan a very large
+-		 * number of file extent items, but at least it will not make
+-		 * us miss any.
+-		 * This is an ugly workaround for a behaviour that should have
+-		 * never existed, but it does and a fix for the clone ioctl
+-		 * would touch a lot of places, cause backwards incompatibility
+-		 * and would not fix the problem for extents cloned with older
+-		 * kernels.
+-		 */
+-		if (ref->key_for_search.type == BTRFS_EXTENT_DATA_KEY &&
+-		    ref->key_for_search.offset >= LLONG_MAX)
+-			ref->key_for_search.offset = 0;
+-	} else {
++	else
+ 		memset(&ref->key_for_search, 0, sizeof(ref->key_for_search));
+-	}
+ 
+ 	ref->inode_list = NULL;
+ 	ref->level = level;
+@@ -424,6 +401,7 @@ static int add_all_parents(struct btrfs_
+ 	u64 disk_byte;
+ 	u64 wanted_disk_byte = ref->wanted_disk_byte;
+ 	u64 count = 0;
++	u64 data_offset;
+ 
+ 	if (level != 0) {
+ 		eb = path->nodes[level];
+@@ -457,11 +435,15 @@ static int add_all_parents(struct btrfs_
+ 
+ 		fi = btrfs_item_ptr(eb, slot, struct btrfs_file_extent_item);
+ 		disk_byte = btrfs_file_extent_disk_bytenr(eb, fi);
++		data_offset = btrfs_file_extent_offset(eb, fi);
+ 
+ 		if (disk_byte == wanted_disk_byte) {
+ 			eie = NULL;
+ 			old = NULL;
+-			count++;
++			if (ref->key_for_search.offset == key.offset - data_offset)
++				count++;
++			else
++				goto next;
+ 			if (extent_item_pos) {
+ 				ret = check_extent_in_eb(&key, eb, fi,
+ 						*extent_item_pos,
+@@ -513,6 +495,7 @@ static int resolve_indirect_ref(struct b
+ 	int root_level;
+ 	int level = ref->level;
+ 	int index;
++	struct btrfs_key search_key = ref->key_for_search;
+ 
+ 	root_key.objectid = ref->root_id;
+ 	root_key.type = BTRFS_ROOT_ITEM_KEY;
+@@ -545,13 +528,33 @@ static int resolve_indirect_ref(struct b
+ 		goto out;
+ 	}
+ 
++	/*
++	 * We can often find data backrefs with an offset that is too large
++	 * (>= LLONG_MAX, maximum allowed file offset) due to underflows when
++	 * subtracting a file's offset with the data offset of its
++	 * corresponding extent data item. This can happen for example in the
++	 * clone ioctl.
++	 *
++	 * So if we detect such case we set the search key's offset to zero to
++	 * make sure we will find the matching file extent item at
++	 * add_all_parents(), otherwise we will miss it because the offset
++	 * taken form the backref is much larger then the offset of the file
++	 * extent item. This can make us scan a very large number of file
++	 * extent items, but at least it will not make us miss any.
++	 *
++	 * This is an ugly workaround for a behaviour that should have never
++	 * existed, but it does and a fix for the clone ioctl would touch a lot
++	 * of places, cause backwards incompatibility and would not fix the
++	 * problem for extents cloned with older kernels.
++	 */
++	if (search_key.type == BTRFS_EXTENT_DATA_KEY &&
++	    search_key.offset >= LLONG_MAX)
++		search_key.offset = 0;
+ 	path->lowest_level = level;
+ 	if (time_seq == SEQ_LAST)
+-		ret = btrfs_search_slot(NULL, root, &ref->key_for_search, path,
+-					0, 0);
++		ret = btrfs_search_slot(NULL, root, &search_key, path, 0, 0);
+ 	else
+-		ret = btrfs_search_old_slot(root, &ref->key_for_search, path,
+-					    time_seq);
++		ret = btrfs_search_old_slot(root, &search_key, path, time_seq);
+ 
+ 	/* root node has been locked, we can release @subvol_srcu safely here */
+ 	srcu_read_unlock(&fs_info->subvol_srcu, index);
