@@ -1,0 +1,94 @@
+From foo@baz Wed Feb 10 03:08:13 PM CET 2021
+From: Pavel Begunkov <asml.silence@gmail.com>
+Date: Tue,  9 Feb 2021 04:47:41 +0000
+Subject: io_uring: account io_uring internal files as REQ_F_INFLIGHT
+To: stable@vger.kernel.org
+Cc: Jens Axboe <axboe@kernel.dk>
+Message-ID: <9c1d1608c20fad5b92196b550ec0b7463046590f.1612845821.git.asml.silence@gmail.com>
+
+From: Jens Axboe <axboe@kernel.dk>
+
+[ Upstream commit 02a13674fa0e8dd326de8b9f4514b41b03d99003 ]
+
+We need to actively cancel anything that introduces a potential circular
+loop, where io_uring holds a reference to itself. If the file in question
+is an io_uring file, then add the request to the inflight list.
+
+Cc: stable@vger.kernel.org # 5.9+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Pavel Begunkov <asml.silence@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/io_uring.c |   32 ++++++++++++++++++++++++--------
+ 1 file changed, 24 insertions(+), 8 deletions(-)
+
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@ -1000,6 +1000,9 @@ static inline void io_clean_op(struct io
+ static inline bool __io_match_files(struct io_kiocb *req,
+ 				    struct files_struct *files)
+ {
++	if (req->file && req->file->f_op == &io_uring_fops)
++		return true;
++
+ 	return ((req->flags & REQ_F_WORK_INITIALIZED) &&
+ 	        (req->work.flags & IO_WQ_WORK_FILES)) &&
+ 		req->work.identity->files == files;
+@@ -1398,11 +1401,14 @@ static bool io_grab_identity(struct io_k
+ 			return false;
+ 		atomic_inc(&id->files->count);
+ 		get_nsproxy(id->nsproxy);
+-		req->flags |= REQ_F_INFLIGHT;
+ 
+-		spin_lock_irq(&ctx->inflight_lock);
+-		list_add(&req->inflight_entry, &ctx->inflight_list);
+-		spin_unlock_irq(&ctx->inflight_lock);
++		if (!(req->flags & REQ_F_INFLIGHT)) {
++			req->flags |= REQ_F_INFLIGHT;
++
++			spin_lock_irq(&ctx->inflight_lock);
++			list_add(&req->inflight_entry, &ctx->inflight_list);
++			spin_unlock_irq(&ctx->inflight_lock);
++		}
+ 		req->work.flags |= IO_WQ_WORK_FILES;
+ 	}
+ 	if (!(req->work.flags & IO_WQ_WORK_MM) &&
+@@ -5886,8 +5892,10 @@ static void io_req_drop_files(struct io_
+ 	struct io_ring_ctx *ctx = req->ctx;
+ 	unsigned long flags;
+ 
+-	put_files_struct(req->work.identity->files);
+-	put_nsproxy(req->work.identity->nsproxy);
++	if (req->work.flags & IO_WQ_WORK_FILES) {
++		put_files_struct(req->work.identity->files);
++		put_nsproxy(req->work.identity->nsproxy);
++	}
+ 	spin_lock_irqsave(&ctx->inflight_lock, flags);
+ 	list_del(&req->inflight_entry);
+ 	spin_unlock_irqrestore(&ctx->inflight_lock, flags);
+@@ -6159,6 +6167,15 @@ static struct file *io_file_get(struct i
+ 		file = __io_file_get(state, fd);
+ 	}
+ 
++	if (file && file->f_op == &io_uring_fops) {
++		io_req_init_async(req);
++		req->flags |= REQ_F_INFLIGHT;
++
++		spin_lock_irq(&ctx->inflight_lock);
++		list_add(&req->inflight_entry, &ctx->inflight_list);
++		spin_unlock_irq(&ctx->inflight_lock);
++	}
++
+ 	return file;
+ }
+ 
+@@ -8578,8 +8595,7 @@ static void io_uring_cancel_files(struct
+ 
+ 		spin_lock_irq(&ctx->inflight_lock);
+ 		list_for_each_entry(req, &ctx->inflight_list, inflight_entry) {
+-			if (req->task != task ||
+-			    req->work.identity->files != files)
++			if (!io_match_task(req, task, files))
+ 				continue;
+ 			found = true;
+ 			break;
