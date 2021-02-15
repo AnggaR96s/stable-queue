@@ -1,0 +1,140 @@
+From 52cbd23a119c6ebf40a527e53f3402d2ea38eccb Mon Sep 17 00:00:00 2001
+From: Willem de Bruijn <willemb@google.com>
+Date: Wed, 3 Feb 2021 14:29:52 -0500
+Subject: udp: fix skb_copy_and_csum_datagram with odd segment sizes
+
+From: Willem de Bruijn <willemb@google.com>
+
+commit 52cbd23a119c6ebf40a527e53f3402d2ea38eccb upstream.
+
+When iteratively computing a checksum with csum_block_add, track the
+offset "pos" to correctly rotate in csum_block_add when offset is odd.
+
+The open coded implementation of skb_copy_and_csum_datagram did this.
+With the switch to __skb_datagram_iter calling csum_and_copy_to_iter,
+pos was reinitialized to 0 on each call.
+
+Bring back the pos by passing it along with the csum to the callback.
+
+Changes v1->v2
+  - pass csum value, instead of csump pointer (Alexander Duyck)
+
+Link: https://lore.kernel.org/netdev/20210128152353.GB27281@optiplex/
+Fixes: 950fcaecd5cc ("datagram: consolidate datagram copy to iter helpers")
+Reported-by: Oliver Graute <oliver.graute@gmail.com>
+Signed-off-by: Willem de Bruijn <willemb@google.com>
+Reviewed-by: Alexander Duyck <alexanderduyck@fb.com>
+Reviewed-by: Eric Dumazet <edumazet@google.com>
+Link: https://lore.kernel.org/r/20210203192952.1849843-1-willemdebruijn.kernel@gmail.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/linux/uio.h |    8 +++++++-
+ lib/iov_iter.c      |   24 ++++++++++++++----------
+ net/core/datagram.c |   12 ++++++++++--
+ 3 files changed, 31 insertions(+), 13 deletions(-)
+
+--- a/include/linux/uio.h
++++ b/include/linux/uio.h
+@@ -260,7 +260,13 @@ static inline void iov_iter_reexpand(str
+ {
+ 	i->count = count;
+ }
+-size_t csum_and_copy_to_iter(const void *addr, size_t bytes, void *csump, struct iov_iter *i);
++
++struct csum_state {
++	__wsum csum;
++	size_t off;
++};
++
++size_t csum_and_copy_to_iter(const void *addr, size_t bytes, void *csstate, struct iov_iter *i);
+ size_t csum_and_copy_from_iter(void *addr, size_t bytes, __wsum *csum, struct iov_iter *i);
+ bool csum_and_copy_from_iter_full(void *addr, size_t bytes, __wsum *csum, struct iov_iter *i);
+ size_t hash_and_copy_to_iter(const void *addr, size_t bytes, void *hashp,
+--- a/lib/iov_iter.c
++++ b/lib/iov_iter.c
+@@ -592,14 +592,15 @@ static __wsum csum_and_memcpy(void *to,
+ }
+ 
+ static size_t csum_and_copy_to_pipe_iter(const void *addr, size_t bytes,
+-				__wsum *csum, struct iov_iter *i)
++					 struct csum_state *csstate,
++					 struct iov_iter *i)
+ {
+ 	struct pipe_inode_info *pipe = i->pipe;
+ 	unsigned int p_mask = pipe->ring_size - 1;
++	__wsum sum = csstate->csum;
++	size_t off = csstate->off;
+ 	unsigned int i_head;
+ 	size_t n, r;
+-	size_t off = 0;
+-	__wsum sum = *csum;
+ 
+ 	if (!sanity(i))
+ 		return 0;
+@@ -621,7 +622,8 @@ static size_t csum_and_copy_to_pipe_iter
+ 		i_head++;
+ 	} while (n);
+ 	i->count -= bytes;
+-	*csum = sum;
++	csstate->csum = sum;
++	csstate->off = off;
+ 	return bytes;
+ }
+ 
+@@ -1522,18 +1524,19 @@ bool csum_and_copy_from_iter_full(void *
+ }
+ EXPORT_SYMBOL(csum_and_copy_from_iter_full);
+ 
+-size_t csum_and_copy_to_iter(const void *addr, size_t bytes, void *csump,
++size_t csum_and_copy_to_iter(const void *addr, size_t bytes, void *_csstate,
+ 			     struct iov_iter *i)
+ {
++	struct csum_state *csstate = _csstate;
+ 	const char *from = addr;
+-	__wsum *csum = csump;
+ 	__wsum sum, next;
+-	size_t off = 0;
++	size_t off;
+ 
+ 	if (unlikely(iov_iter_is_pipe(i)))
+-		return csum_and_copy_to_pipe_iter(addr, bytes, csum, i);
++		return csum_and_copy_to_pipe_iter(addr, bytes, _csstate, i);
+ 
+-	sum = *csum;
++	sum = csstate->csum;
++	off = csstate->off;
+ 	if (unlikely(iov_iter_is_discard(i))) {
+ 		WARN_ON(1);	/* for now */
+ 		return 0;
+@@ -1561,7 +1564,8 @@ size_t csum_and_copy_to_iter(const void
+ 		off += v.iov_len;
+ 	})
+ 	)
+-	*csum = sum;
++	csstate->csum = sum;
++	csstate->off = off;
+ 	return bytes;
+ }
+ EXPORT_SYMBOL(csum_and_copy_to_iter);
+--- a/net/core/datagram.c
++++ b/net/core/datagram.c
+@@ -721,8 +721,16 @@ static int skb_copy_and_csum_datagram(co
+ 				      struct iov_iter *to, int len,
+ 				      __wsum *csump)
+ {
+-	return __skb_datagram_iter(skb, offset, to, len, true,
+-			csum_and_copy_to_iter, csump);
++	struct csum_state csdata = { .csum = *csump };
++	int ret;
++
++	ret = __skb_datagram_iter(skb, offset, to, len, true,
++				  csum_and_copy_to_iter, &csdata);
++	if (ret)
++		return ret;
++
++	*csump = csdata.csum;
++	return 0;
+ }
+ 
+ /**
