@@ -1,0 +1,134 @@
+From foo@baz Sat Apr  3 10:50:40 AM CEST 2021
+From: Frank van der Linden <fllinden@amazon.com>
+Date: Tue, 30 Mar 2021 18:19:09 +0000
+Subject: mm: fix oom_kill event handling
+To: <stable@vger.kernel.org>
+Cc: <fllinden@amazon.com>
+Message-ID: <20210330181910.15378-5-fllinden@amazon.com>
+
+From: Frank van der Linden <fllinden@amazon.com>
+
+From: Roman Gushchin <guro@fb.com>
+
+commit fe6bdfc8e1e131720abbe77a2eb990c94c9024cb upstream.
+
+Commit e27be240df53 ("mm: memcg: make sure memory.events is uptodate
+when waking pollers") converted most of memcg event counters to
+per-memcg atomics, which made them less confusing for a user.  The
+"oom_kill" counter remained untouched, so now it behaves differently
+than other counters (including "oom").  This adds nothing but confusion.
+
+Let's fix this by adding the MEMCG_OOM_KILL event, and follow the
+MEMCG_OOM approach.
+
+This also removes a hack from count_memcg_event_mm(), introduced earlier
+specially for the OOM_KILL counter.
+
+[akpm@linux-foundation.org: fix for droppage of memcg-replace-mm-owner-with-mm-memcg.patch]
+Link: http://lkml.kernel.org/r/20180508124637.29984-1-guro@fb.com
+Signed-off-by: Roman Gushchin <guro@fb.com>
+Acked-by: Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Cc: Vladimir Davydov <vdavydov.dev@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+[fllinden@amazon.com: backport to 4.14, minor contextual changes]
+Signed-off-by: Frank van der Linden <fllinden@amazon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/linux/memcontrol.h |   26 ++++++++++++++++++++++----
+ mm/memcontrol.c            |    6 ++++--
+ mm/oom_kill.c              |    2 +-
+ 3 files changed, 27 insertions(+), 7 deletions(-)
+
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -53,6 +53,7 @@ enum memcg_memory_event {
+ 	MEMCG_HIGH,
+ 	MEMCG_MAX,
+ 	MEMCG_OOM,
++	MEMCG_OOM_KILL,
+ 	MEMCG_NR_MEMORY_EVENTS,
+ };
+ 
+@@ -706,11 +707,8 @@ static inline void count_memcg_event_mm(
+ 
+ 	rcu_read_lock();
+ 	memcg = mem_cgroup_from_task(rcu_dereference(mm->owner));
+-	if (likely(memcg)) {
++	if (likely(memcg))
+ 		count_memcg_events(memcg, idx, 1);
+-		if (idx == OOM_KILL)
+-			cgroup_file_notify(&memcg->events_file);
+-	}
+ 	rcu_read_unlock();
+ }
+ 
+@@ -721,6 +719,21 @@ static inline void memcg_memory_event(st
+ 	cgroup_file_notify(&memcg->events_file);
+ }
+ 
++static inline void memcg_memory_event_mm(struct mm_struct *mm,
++					 enum memcg_memory_event event)
++{
++	struct mem_cgroup *memcg;
++
++	if (mem_cgroup_disabled())
++		return;
++
++	rcu_read_lock();
++	memcg = mem_cgroup_from_task(rcu_dereference(mm->owner));
++	if (likely(memcg))
++		memcg_memory_event(memcg, event);
++	rcu_read_unlock();
++}
++
+ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ void mem_cgroup_split_huge_fixup(struct page *head);
+ #endif
+@@ -742,6 +755,11 @@ static inline void memcg_memory_event(st
+ {
+ }
+ 
++static inline void memcg_memory_event_mm(struct mm_struct *mm,
++					 enum memcg_memory_event event)
++{
++}
++
+ static inline bool mem_cgroup_low(struct mem_cgroup *root,
+ 				  struct mem_cgroup *memcg)
+ {
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -3648,7 +3648,8 @@ static int mem_cgroup_oom_control_read(s
+ 
+ 	seq_printf(sf, "oom_kill_disable %d\n", memcg->oom_kill_disable);
+ 	seq_printf(sf, "under_oom %d\n", (bool)memcg->under_oom);
+-	seq_printf(sf, "oom_kill %lu\n", memcg_sum_events(memcg, OOM_KILL));
++	seq_printf(sf, "oom_kill %lu\n",
++		   atomic_long_read(&memcg->memory_events[MEMCG_OOM_KILL]));
+ 	return 0;
+ }
+ 
+@@ -5320,7 +5321,8 @@ static int memory_events_show(struct seq
+ 		   atomic_long_read(&memcg->memory_events[MEMCG_MAX]));
+ 	seq_printf(m, "oom %lu\n",
+ 		   atomic_long_read(&memcg->memory_events[MEMCG_OOM]));
+-	seq_printf(m, "oom_kill %lu\n", memcg_sum_events(memcg, OOM_KILL));
++	seq_printf(m, "oom_kill %lu\n",
++		   atomic_long_read(&memcg->memory_events[MEMCG_OOM_KILL]));
+ 
+ 	return 0;
+ }
+--- a/mm/oom_kill.c
++++ b/mm/oom_kill.c
+@@ -917,7 +917,7 @@ static void oom_kill_process(struct oom_
+ 
+ 	/* Raise event before sending signal: task reaper must see this */
+ 	count_vm_event(OOM_KILL);
+-	count_memcg_event_mm(mm, OOM_KILL);
++	memcg_memory_event_mm(mm, MEMCG_OOM_KILL);
+ 
+ 	/*
+ 	 * We should send SIGKILL before granting access to memory reserves
