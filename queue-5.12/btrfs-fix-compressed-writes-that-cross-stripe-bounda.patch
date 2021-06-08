@@ -1,0 +1,127 @@
+From 6ac90347d410797dff70ea412aacb446f898b366 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 25 May 2021 13:52:43 +0800
+Subject: btrfs: fix compressed writes that cross stripe boundary
+
+From: Qu Wenruo <wqu@suse.com>
+
+[ Upstream commit 4c80a97d7b02cf68e169118ef2bda0725fc87f6f ]
+
+[BUG]
+When running btrfs/027 with "-o compress" mount option, it always
+crashes with the following call trace:
+
+  BTRFS critical (device dm-4): mapping failed logical 298901504 bio len 12288 len 8192
+  ------------[ cut here ]------------
+  kernel BUG at fs/btrfs/volumes.c:6651!
+  invalid opcode: 0000 [#1] PREEMPT SMP NOPTI
+  CPU: 5 PID: 31089 Comm: kworker/u24:10 Tainted: G           OE     5.13.0-rc2-custom+ #26
+  Hardware name: QEMU Standard PC (Q35 + ICH9, 2009), BIOS 0.0.0 02/06/2015
+  Workqueue: btrfs-delalloc btrfs_work_helper [btrfs]
+  RIP: 0010:btrfs_map_bio.cold+0x58/0x5a [btrfs]
+  Call Trace:
+   btrfs_submit_compressed_write+0x2d7/0x470 [btrfs]
+   submit_compressed_extents+0x3b0/0x470 [btrfs]
+   ? mark_held_locks+0x49/0x70
+   btrfs_work_helper+0x131/0x3e0 [btrfs]
+   process_one_work+0x28f/0x5d0
+   worker_thread+0x55/0x3c0
+   ? process_one_work+0x5d0/0x5d0
+   kthread+0x141/0x160
+   ? __kthread_bind_mask+0x60/0x60
+   ret_from_fork+0x22/0x30
+  ---[ end trace 63113a3a91f34e68 ]---
+
+[CAUSE]
+The critical message before the crash means we have a bio at logical
+bytenr 298901504 length 12288, but only 8192 bytes can fit into one
+stripe, the remaining 4096 bytes go to another stripe.
+
+In btrfs, all bios are properly split to avoid cross stripe boundary,
+but commit 764c7c9a464b ("btrfs: zoned: fix parallel compressed writes")
+changed the behavior for compressed writes.
+
+Previously if we find our new page can't be fitted into current stripe,
+ie. "submit == 1" case, we submit current bio without adding current
+page.
+
+       submit = btrfs_bio_fits_in_stripe(page, PAGE_SIZE, bio, 0);
+
+   page->mapping = NULL;
+   if (submit || bio_add_page(bio, page, PAGE_SIZE, 0) <
+       PAGE_SIZE) {
+
+But after the modification, we will add the page no matter if it crosses
+stripe boundary, leading to the above crash.
+
+       submit = btrfs_bio_fits_in_stripe(page, PAGE_SIZE, bio, 0);
+
+   if (pg_index == 0 && use_append)
+           len = bio_add_zone_append_page(bio, page, PAGE_SIZE, 0);
+   else
+           len = bio_add_page(bio, page, PAGE_SIZE, 0);
+
+   page->mapping = NULL;
+   if (submit || len < PAGE_SIZE) {
+
+[FIX]
+It's no longer possible to revert to the original code style as we have
+two different bio_add_*_page() calls now.
+
+The new fix is to skip the bio_add_*_page() call if @submit is true.
+
+Also to avoid @len to be uninitialized, always initialize it to zero.
+
+If @submit is true, @len will not be checked.
+If @submit is not true, @len will be the return value of
+bio_add_*_page() call.
+Either way, the behavior is still the same as the old code.
+
+Reported-by: Josef Bacik <josef@toxicpanda.com>
+Fixes: 764c7c9a464b ("btrfs: zoned: fix parallel compressed writes")
+Reviewed-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+Signed-off-by: Qu Wenruo <wqu@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/btrfs/compression.c | 17 ++++++++++++-----
+ 1 file changed, 12 insertions(+), 5 deletions(-)
+
+diff --git a/fs/btrfs/compression.c b/fs/btrfs/compression.c
+index fe0ec3d321b8..752b3cffe226 100644
+--- a/fs/btrfs/compression.c
++++ b/fs/btrfs/compression.c
+@@ -457,7 +457,7 @@ blk_status_t btrfs_submit_compressed_write(struct btrfs_inode *inode, u64 start,
+ 	bytes_left = compressed_len;
+ 	for (pg_index = 0; pg_index < cb->nr_pages; pg_index++) {
+ 		int submit = 0;
+-		int len;
++		int len = 0;
+ 
+ 		page = compressed_pages[pg_index];
+ 		page->mapping = inode->vfs_inode.i_mapping;
+@@ -465,10 +465,17 @@ blk_status_t btrfs_submit_compressed_write(struct btrfs_inode *inode, u64 start,
+ 			submit = btrfs_bio_fits_in_stripe(page, PAGE_SIZE, bio,
+ 							  0);
+ 
+-		if (pg_index == 0 && use_append)
+-			len = bio_add_zone_append_page(bio, page, PAGE_SIZE, 0);
+-		else
+-			len = bio_add_page(bio, page, PAGE_SIZE, 0);
++		/*
++		 * Page can only be added to bio if the current bio fits in
++		 * stripe.
++		 */
++		if (!submit) {
++			if (pg_index == 0 && use_append)
++				len = bio_add_zone_append_page(bio, page,
++							       PAGE_SIZE, 0);
++			else
++				len = bio_add_page(bio, page, PAGE_SIZE, 0);
++		}
+ 
+ 		page->mapping = NULL;
+ 		if (submit || len < PAGE_SIZE) {
+-- 
+2.30.2
+
