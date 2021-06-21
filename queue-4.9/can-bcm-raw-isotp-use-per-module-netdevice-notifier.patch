@@ -1,0 +1,303 @@
+From 8d0caedb759683041d9db82069937525999ada53 Mon Sep 17 00:00:00 2001
+From: Tetsuo Handa <penguin-kernel@i-love.sakura.ne.jp>
+Date: Sat, 5 Jun 2021 19:26:35 +0900
+Subject: can: bcm/raw/isotp: use per module netdevice notifier
+
+From: Tetsuo Handa <penguin-kernel@i-love.sakura.ne.jp>
+
+commit 8d0caedb759683041d9db82069937525999ada53 upstream.
+
+syzbot is reporting hung task at register_netdevice_notifier() [1] and
+unregister_netdevice_notifier() [2], for cleanup_net() might perform
+time consuming operations while CAN driver's raw/bcm/isotp modules are
+calling {register,unregister}_netdevice_notifier() on each socket.
+
+Change raw/bcm/isotp modules to call register_netdevice_notifier() from
+module's __init function and call unregister_netdevice_notifier() from
+module's __exit function, as with gw/j1939 modules are doing.
+
+Link: https://syzkaller.appspot.com/bug?id=391b9498827788b3cc6830226d4ff5be87107c30 [1]
+Link: https://syzkaller.appspot.com/bug?id=1724d278c83ca6e6df100a2e320c10d991cf2bce [2]
+Link: https://lore.kernel.org/r/54a5f451-05ed-f977-8534-79e7aa2bcc8f@i-love.sakura.ne.jp
+Cc: linux-stable <stable@vger.kernel.org>
+Reported-by: syzbot <syzbot+355f8edb2ff45d5f95fa@syzkaller.appspotmail.com>
+Reported-by: syzbot <syzbot+0f1827363a305f74996f@syzkaller.appspotmail.com>
+Reviewed-by: Kirill Tkhai <ktkhai@virtuozzo.com>
+Tested-by: syzbot <syzbot+355f8edb2ff45d5f95fa@syzkaller.appspotmail.com>
+Tested-by: Oliver Hartkopp <socketcan@hartkopp.net>
+Signed-off-by: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+Signed-off-by: Marc Kleine-Budde <mkl@pengutronix.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+---
+ net/can/bcm.c |   61 ++++++++++++++++++++++++++++++++++++++++++++-------------
+ net/can/raw.c |   62 ++++++++++++++++++++++++++++++++++++++++++++--------------
+ 2 files changed, 96 insertions(+), 27 deletions(-)
+
+--- a/net/can/bcm.c
++++ b/net/can/bcm.c
+@@ -127,7 +127,7 @@ struct bcm_sock {
+ 	struct sock sk;
+ 	int bound;
+ 	int ifindex;
+-	struct notifier_block notifier;
++	struct list_head notifier;
+ 	struct list_head rx_ops;
+ 	struct list_head tx_ops;
+ 	unsigned long dropped_usr_msgs;
+@@ -135,6 +135,10 @@ struct bcm_sock {
+ 	char procname [32]; /* inode number in decimal with \0 */
+ };
+ 
++static LIST_HEAD(bcm_notifier_list);
++static DEFINE_SPINLOCK(bcm_notifier_lock);
++static struct bcm_sock *bcm_busy_notifier;
++
+ static inline struct bcm_sock *bcm_sk(const struct sock *sk)
+ {
+ 	return (struct bcm_sock *)sk;
+@@ -1439,20 +1443,15 @@ static int bcm_sendmsg(struct socket *so
+ /*
+  * notification handler for netdevice status changes
+  */
+-static int bcm_notifier(struct notifier_block *nb, unsigned long msg,
+-			void *ptr)
++static void bcm_notify(struct bcm_sock *bo, unsigned long msg,
++		       struct net_device *dev)
+ {
+-	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+-	struct bcm_sock *bo = container_of(nb, struct bcm_sock, notifier);
+ 	struct sock *sk = &bo->sk;
+ 	struct bcm_op *op;
+ 	int notify_enodev = 0;
+ 
+ 	if (!net_eq(dev_net(dev), &init_net))
+-		return NOTIFY_DONE;
+-
+-	if (dev->type != ARPHRD_CAN)
+-		return NOTIFY_DONE;
++		return;
+ 
+ 	switch (msg) {
+ 
+@@ -1487,7 +1486,28 @@ static int bcm_notifier(struct notifier_
+ 				sk->sk_error_report(sk);
+ 		}
+ 	}
++}
+ 
++static int bcm_notifier(struct notifier_block *nb, unsigned long msg,
++			void *ptr)
++{
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
++
++	if (dev->type != ARPHRD_CAN)
++		return NOTIFY_DONE;
++	if (msg != NETDEV_UNREGISTER && msg != NETDEV_DOWN)
++		return NOTIFY_DONE;
++	if (unlikely(bcm_busy_notifier)) /* Check for reentrant bug. */
++		return NOTIFY_DONE;
++
++	spin_lock(&bcm_notifier_lock);
++	list_for_each_entry(bcm_busy_notifier, &bcm_notifier_list, notifier) {
++		spin_unlock(&bcm_notifier_lock);
++		bcm_notify(bcm_busy_notifier, msg, dev);
++		spin_lock(&bcm_notifier_lock);
++	}
++	bcm_busy_notifier = NULL;
++	spin_unlock(&bcm_notifier_lock);
+ 	return NOTIFY_DONE;
+ }
+ 
+@@ -1507,9 +1527,9 @@ static int bcm_init(struct sock *sk)
+ 	INIT_LIST_HEAD(&bo->rx_ops);
+ 
+ 	/* set notifier */
+-	bo->notifier.notifier_call = bcm_notifier;
+-
+-	register_netdevice_notifier(&bo->notifier);
++	spin_lock(&bcm_notifier_lock);
++	list_add_tail(&bo->notifier, &bcm_notifier_list);
++	spin_unlock(&bcm_notifier_lock);
+ 
+ 	return 0;
+ }
+@@ -1530,7 +1550,14 @@ static int bcm_release(struct socket *so
+ 
+ 	/* remove bcm_ops, timer, rx_unregister(), etc. */
+ 
+-	unregister_netdevice_notifier(&bo->notifier);
++	spin_lock(&bcm_notifier_lock);
++	while (bcm_busy_notifier == bo) {
++		spin_unlock(&bcm_notifier_lock);
++		schedule_timeout_uninterruptible(1);
++		spin_lock(&bcm_notifier_lock);
++	}
++	list_del(&bo->notifier);
++	spin_unlock(&bcm_notifier_lock);
+ 
+ 	lock_sock(sk);
+ 
+@@ -1716,6 +1743,10 @@ static const struct can_proto bcm_can_pr
+ 	.prot       = &bcm_proto,
+ };
+ 
++static struct notifier_block canbcm_notifier = {
++	.notifier_call = bcm_notifier
++};
++
+ static int __init bcm_module_init(void)
+ {
+ 	int err;
+@@ -1730,6 +1761,8 @@ static int __init bcm_module_init(void)
+ 
+ 	/* create /proc/net/can-bcm directory */
+ 	proc_dir = proc_mkdir("can-bcm", init_net.proc_net);
++	register_netdevice_notifier(&canbcm_notifier);
++
+ 	return 0;
+ }
+ 
+@@ -1739,6 +1772,8 @@ static void __exit bcm_module_exit(void)
+ 
+ 	if (proc_dir)
+ 		remove_proc_entry("can-bcm", init_net.proc_net);
++
++	unregister_netdevice_notifier(&canbcm_notifier);
+ }
+ 
+ module_init(bcm_module_init);
+--- a/net/can/raw.c
++++ b/net/can/raw.c
+@@ -84,7 +84,7 @@ struct raw_sock {
+ 	struct sock sk;
+ 	int bound;
+ 	int ifindex;
+-	struct notifier_block notifier;
++	struct list_head notifier;
+ 	int loopback;
+ 	int recv_own_msgs;
+ 	int fd_frames;
+@@ -96,6 +96,10 @@ struct raw_sock {
+ 	struct uniqframe __percpu *uniq;
+ };
+ 
++static LIST_HEAD(raw_notifier_list);
++static DEFINE_SPINLOCK(raw_notifier_lock);
++static struct raw_sock *raw_busy_notifier;
++
+ /*
+  * Return pointer to store the extra msg flags for raw_recvmsg().
+  * We use the space of one unsigned int beyond the 'struct sockaddr_can'
+@@ -260,21 +264,16 @@ static int raw_enable_allfilters(struct
+ 	return err;
+ }
+ 
+-static int raw_notifier(struct notifier_block *nb,
+-			unsigned long msg, void *ptr)
++static void raw_notify(struct raw_sock *ro, unsigned long msg,
++		       struct net_device *dev)
+ {
+-	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+-	struct raw_sock *ro = container_of(nb, struct raw_sock, notifier);
+ 	struct sock *sk = &ro->sk;
+ 
+ 	if (!net_eq(dev_net(dev), &init_net))
+-		return NOTIFY_DONE;
+-
+-	if (dev->type != ARPHRD_CAN)
+-		return NOTIFY_DONE;
++		return;
+ 
+ 	if (ro->ifindex != dev->ifindex)
+-		return NOTIFY_DONE;
++		return;
+ 
+ 	switch (msg) {
+ 
+@@ -303,7 +302,28 @@ static int raw_notifier(struct notifier_
+ 			sk->sk_error_report(sk);
+ 		break;
+ 	}
++}
++
++static int raw_notifier(struct notifier_block *nb, unsigned long msg,
++			void *ptr)
++{
++	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
++
++	if (dev->type != ARPHRD_CAN)
++		return NOTIFY_DONE;
++	if (msg != NETDEV_UNREGISTER && msg != NETDEV_DOWN)
++		return NOTIFY_DONE;
++	if (unlikely(raw_busy_notifier)) /* Check for reentrant bug. */
++		return NOTIFY_DONE;
+ 
++	spin_lock(&raw_notifier_lock);
++	list_for_each_entry(raw_busy_notifier, &raw_notifier_list, notifier) {
++		spin_unlock(&raw_notifier_lock);
++		raw_notify(raw_busy_notifier, msg, dev);
++		spin_lock(&raw_notifier_lock);
++	}
++	raw_busy_notifier = NULL;
++	spin_unlock(&raw_notifier_lock);
+ 	return NOTIFY_DONE;
+ }
+ 
+@@ -332,9 +352,9 @@ static int raw_init(struct sock *sk)
+ 		return -ENOMEM;
+ 
+ 	/* set notifier */
+-	ro->notifier.notifier_call = raw_notifier;
+-
+-	register_netdevice_notifier(&ro->notifier);
++	spin_lock(&raw_notifier_lock);
++	list_add_tail(&ro->notifier, &raw_notifier_list);
++	spin_unlock(&raw_notifier_lock);
+ 
+ 	return 0;
+ }
+@@ -349,7 +369,14 @@ static int raw_release(struct socket *so
+ 
+ 	ro = raw_sk(sk);
+ 
+-	unregister_netdevice_notifier(&ro->notifier);
++	spin_lock(&raw_notifier_lock);
++	while (raw_busy_notifier == ro) {
++		spin_unlock(&raw_notifier_lock);
++		schedule_timeout_uninterruptible(1);
++		spin_lock(&raw_notifier_lock);
++	}
++	list_del(&ro->notifier);
++	spin_unlock(&raw_notifier_lock);
+ 
+ 	lock_sock(sk);
+ 
+@@ -857,6 +884,10 @@ static const struct can_proto raw_can_pr
+ 	.prot       = &raw_proto,
+ };
+ 
++static struct notifier_block canraw_notifier = {
++	.notifier_call = raw_notifier
++};
++
+ static __init int raw_module_init(void)
+ {
+ 	int err;
+@@ -866,6 +897,8 @@ static __init int raw_module_init(void)
+ 	err = can_proto_register(&raw_can_proto);
+ 	if (err < 0)
+ 		printk(KERN_ERR "can: registration of raw protocol failed\n");
++	else
++		register_netdevice_notifier(&canraw_notifier);
+ 
+ 	return err;
+ }
+@@ -873,6 +906,7 @@ static __init int raw_module_init(void)
+ static __exit void raw_module_exit(void)
+ {
+ 	can_proto_unregister(&raw_can_proto);
++	unregister_netdevice_notifier(&canraw_notifier);
+ }
+ 
+ module_init(raw_module_init);
