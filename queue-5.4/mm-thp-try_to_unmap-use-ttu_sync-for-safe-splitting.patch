@@ -1,0 +1,148 @@
+From foo@baz Mon Jun 28 01:37:10 PM CEST 2021
+From: Hugh Dickins <hughd@google.com>
+Date: Tue, 15 Jun 2021 18:23:53 -0700
+Subject: mm/thp: try_to_unmap() use TTU_SYNC for safe splitting
+
+From: Hugh Dickins <hughd@google.com>
+
+[ Upstream commit 732ed55823fc3ad998d43b86bf771887bcc5ec67 ]
+
+Stressing huge tmpfs often crashed on unmap_page()'s VM_BUG_ON_PAGE
+(!unmap_success): with dump_page() showing mapcount:1, but then its raw
+struct page output showing _mapcount ffffffff i.e.  mapcount 0.
+
+And even if that particular VM_BUG_ON_PAGE(!unmap_success) is removed,
+it is immediately followed by a VM_BUG_ON_PAGE(compound_mapcount(head)),
+and further down an IS_ENABLED(CONFIG_DEBUG_VM) total_mapcount BUG():
+all indicative of some mapcount difficulty in development here perhaps.
+But the !CONFIG_DEBUG_VM path handles the failures correctly and
+silently.
+
+I believe the problem is that once a racing unmap has cleared pte or
+pmd, try_to_unmap_one() may skip taking the page table lock, and emerge
+from try_to_unmap() before the racing task has reached decrementing
+mapcount.
+
+Instead of abandoning the unsafe VM_BUG_ON_PAGE(), and the ones that
+follow, use PVMW_SYNC in try_to_unmap_one() in this case: adding
+TTU_SYNC to the options, and passing that from unmap_page().
+
+When CONFIG_DEBUG_VM, or for non-debug too? Consensus is to do the same
+for both: the slight overhead added should rarely matter, except perhaps
+if splitting sparsely-populated multiply-mapped shmem.  Once confident
+that bugs are fixed, TTU_SYNC here can be removed, and the race
+tolerated.
+
+Link: https://lkml.kernel.org/r/c1e95853-8bcd-d8fd-55fa-e7f2488e78f@google.com
+Fixes: fec89c109f3a ("thp: rewrite freeze_page()/unfreeze_page() with generic rmap walkers")
+Signed-off-by: Hugh Dickins <hughd@google.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Jue Wang <juew@google.com>
+Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: "Matthew Wilcox (Oracle)" <willy@infradead.org>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: Naoya Horiguchi <naoya.horiguchi@nec.com>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Ralph Campbell <rcampbell@nvidia.com>
+Cc: Shakeel Butt <shakeelb@google.com>
+Cc: Wang Yugui <wangyugui@e16-tech.com>
+Cc: Yang Shi <shy828301@gmail.com>
+Cc: Zi Yan <ziy@nvidia.com>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+Note on stable backport: upstream TTU_SYNC 0x10 takes the value which
+5.11 commit 013339df116c ("mm/rmap: always do TTU_IGNORE_ACCESS") freed.
+It is very tempting to backport that commit (as 5.10 already did) and
+make no change here; but on reflection, good as that commit is, I'm
+reluctant to include any possible side-effect of it in this series.
+
+Signed-off-by: Hugh Dickins <hughd@google.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/linux/rmap.h |    3 ++-
+ mm/huge_memory.c     |    2 +-
+ mm/page_vma_mapped.c |   11 +++++++++++
+ mm/rmap.c            |   17 ++++++++++++++++-
+ 4 files changed, 30 insertions(+), 3 deletions(-)
+
+--- a/include/linux/rmap.h
++++ b/include/linux/rmap.h
+@@ -98,7 +98,8 @@ enum ttu_flags {
+ 					 * do a final flush if necessary */
+ 	TTU_RMAP_LOCKED		= 0x80,	/* do not grab rmap lock:
+ 					 * caller holds it */
+-	TTU_SPLIT_FREEZE	= 0x100,		/* freeze pte under splitting thp */
++	TTU_SPLIT_FREEZE	= 0x100, /* freeze pte under splitting thp */
++	TTU_SYNC		= 0x200, /* avoid racy checks with PVMW_SYNC */
+ };
+ 
+ #ifdef CONFIG_MMU
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -2449,7 +2449,7 @@ void vma_adjust_trans_huge(struct vm_are
+ static void unmap_page(struct page *page)
+ {
+ 	enum ttu_flags ttu_flags = TTU_IGNORE_MLOCK | TTU_IGNORE_ACCESS |
+-		TTU_RMAP_LOCKED | TTU_SPLIT_HUGE_PMD;
++		TTU_RMAP_LOCKED | TTU_SPLIT_HUGE_PMD | TTU_SYNC;
+ 	bool unmap_success;
+ 
+ 	VM_BUG_ON_PAGE(!PageHead(page), page);
+--- a/mm/page_vma_mapped.c
++++ b/mm/page_vma_mapped.c
+@@ -207,6 +207,17 @@ restart:
+ 			pvmw->ptl = NULL;
+ 		}
+ 	} else if (!pmd_present(pmde)) {
++		/*
++		 * If PVMW_SYNC, take and drop THP pmd lock so that we
++		 * cannot return prematurely, while zap_huge_pmd() has
++		 * cleared *pmd but not decremented compound_mapcount().
++		 */
++		if ((pvmw->flags & PVMW_SYNC) &&
++		    PageTransCompound(pvmw->page)) {
++			spinlock_t *ptl = pmd_lock(mm, pvmw->pmd);
++
++			spin_unlock(ptl);
++		}
+ 		return false;
+ 	}
+ 	if (!map_pte(pvmw))
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -1353,6 +1353,15 @@ static bool try_to_unmap_one(struct page
+ 	struct mmu_notifier_range range;
+ 	enum ttu_flags flags = (enum ttu_flags)arg;
+ 
++	/*
++	 * When racing against e.g. zap_pte_range() on another cpu,
++	 * in between its ptep_get_and_clear_full() and page_remove_rmap(),
++	 * try_to_unmap() may return false when it is about to become true,
++	 * if page table locking is skipped: use TTU_SYNC to wait for that.
++	 */
++	if (flags & TTU_SYNC)
++		pvmw.flags = PVMW_SYNC;
++
+ 	/* munlock has nothing to gain from examining un-locked vmas */
+ 	if ((flags & TTU_MUNLOCK) && !(vma->vm_flags & VM_LOCKED))
+ 		return true;
+@@ -1731,7 +1740,13 @@ bool try_to_unmap(struct page *page, enu
+ 	else
+ 		rmap_walk(page, &rwc);
+ 
+-	return !page_mapcount(page) ? true : false;
++	/*
++	 * When racing against e.g. zap_pte_range() on another cpu,
++	 * in between its ptep_get_and_clear_full() and page_remove_rmap(),
++	 * try_to_unmap() may return false when it is about to become true,
++	 * if page table locking is skipped: use TTU_SYNC to wait for that.
++	 */
++	return !page_mapcount(page);
+ }
+ 
+ static int page_not_mapped(struct page *page)
