@@ -1,0 +1,131 @@
+From foo@baz Mon Aug 16 09:21:03 PM CEST 2021
+From: Ben Hutchings <ben.hutchings@mind.be>
+Date: Mon, 16 Aug 2021 20:09:31 +0200
+Subject: net: dsa: microchip: ksz8795: Reject unsupported VLAN configuration
+To: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: linux-kernel@vger.kernel.org, stable@vger.kernel.org, "David S. Miller" <davem@davemloft.net>, Sasha Levin <sashal@kernel.org>
+Message-ID: <20210816180930.GG18930@cephalopod>
+Content-Disposition: inline
+
+From: Ben Hutchings <ben.hutchings@mind.be>
+
+commit 8f4f58f88fe0d9bd591f21f53de7dbd42baeb3fa upstream.
+
+The switches supported by ksz8795 only have a per-port flag for Tag
+Removal.  This means it is not possible to support both tagged and
+untagged VLANs on the same port.  Reject attempts to add a VLAN that
+requires the flag to be changed, unless there are no VLANs currently
+configured.
+
+VID 0 is excluded from this check since it is untagged regardless of
+the state of the flag.
+
+On the CPU port we could support tagged and untagged VLANs at the same
+time.  This will be enabled by a later patch.
+
+Fixes: e66f840c08a2 ("net: dsa: ksz: Add Microchip KSZ8795 DSA driver")
+Signed-off-by: Ben Hutchings <ben.hutchings@mind.be>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+[bwh: Backport to 5.10:
+ - This configuration has to be detected and rejected in the
+   port_vlan_prepare operation
+ - ksz8795_port_vlan_add() has to check again to decide whether to
+   change the Tag Removal flag, so put the common condition in a
+   separate function
+ - Handle VID ranges]
+Signed-off-by: Ben Hutchings <ben.hutchings@mind.be>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/dsa/microchip/ksz8795.c    |   55 +++++++++++++++++++++++++++++++--
+ drivers/net/dsa/microchip/ksz_common.h |    1 
+ 2 files changed, 54 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/dsa/microchip/ksz8795.c
++++ b/drivers/net/dsa/microchip/ksz8795.c
+@@ -801,15 +801,66 @@ static int ksz8795_port_vlan_filtering(s
+ 	return 0;
+ }
+ 
++static bool ksz8795_port_vlan_changes_remove_tag(
++	struct dsa_switch *ds, int port,
++	const struct switchdev_obj_port_vlan *vlan)
++{
++	bool untagged = vlan->flags & BRIDGE_VLAN_INFO_UNTAGGED;
++	struct ksz_device *dev = ds->priv;
++	struct ksz_port *p = &dev->ports[port];
++
++	/* If a VLAN is added with untagged flag different from the
++	 * port's Remove Tag flag, we need to change the latter.
++	 * Ignore VID 0, which is always untagged.
++	 */
++	return untagged != p->remove_tag &&
++		!(vlan->vid_begin == 0 && vlan->vid_end == 0);
++}
++
++int ksz8795_port_vlan_prepare(struct dsa_switch *ds, int port,
++			      const struct switchdev_obj_port_vlan *vlan)
++{
++	struct ksz_device *dev = ds->priv;
++
++	/* Reject attempts to add a VLAN that requires the Remove Tag
++	 * flag to be changed, unless there are no other VLANs
++	 * currently configured.
++	 */
++	if (ksz8795_port_vlan_changes_remove_tag(ds, port, vlan)) {
++		unsigned int vid;
++
++		for (vid = 1; vid < dev->num_vlans; ++vid) {
++			u8 fid, member, valid;
++
++			/* Skip the VIDs we are going to add or reconfigure */
++			if (vid == vlan->vid_begin) {
++				vid = vlan->vid_end;
++				continue;
++			}
++
++			ksz8795_from_vlan(dev->vlan_cache[vid].table[0],
++					  &fid, &member, &valid);
++			if (valid && (member & BIT(port)))
++				return -EINVAL;
++		}
++	}
++
++	return ksz_port_vlan_prepare(ds, port, vlan);
++}
++
+ static void ksz8795_port_vlan_add(struct dsa_switch *ds, int port,
+ 				  const struct switchdev_obj_port_vlan *vlan)
+ {
+ 	bool untagged = vlan->flags & BRIDGE_VLAN_INFO_UNTAGGED;
+ 	struct ksz_device *dev = ds->priv;
++	struct ksz_port *p = &dev->ports[port];
+ 	u16 data, vid, new_pvid = 0;
+ 	u8 fid, member, valid;
+ 
+-	ksz_port_cfg(dev, port, P_TAG_CTRL, PORT_REMOVE_TAG, untagged);
++	if (ksz8795_port_vlan_changes_remove_tag(ds, port, vlan)) {
++		ksz_port_cfg(dev, port, P_TAG_CTRL, PORT_REMOVE_TAG, untagged);
++		p->remove_tag = untagged;
++	}
+ 
+ 	for (vid = vlan->vid_begin; vid <= vlan->vid_end; vid++) {
+ 		ksz8795_r_vlan_table(dev, vid, &data);
+@@ -1128,7 +1179,7 @@ static const struct dsa_switch_ops ksz87
+ 	.port_stp_state_set	= ksz8795_port_stp_state_set,
+ 	.port_fast_age		= ksz_port_fast_age,
+ 	.port_vlan_filtering	= ksz8795_port_vlan_filtering,
+-	.port_vlan_prepare	= ksz_port_vlan_prepare,
++	.port_vlan_prepare	= ksz8795_port_vlan_prepare,
+ 	.port_vlan_add		= ksz8795_port_vlan_add,
+ 	.port_vlan_del		= ksz8795_port_vlan_del,
+ 	.port_fdb_dump		= ksz_port_fdb_dump,
+--- a/drivers/net/dsa/microchip/ksz_common.h
++++ b/drivers/net/dsa/microchip/ksz_common.h
+@@ -27,6 +27,7 @@ struct ksz_port_mib {
+ struct ksz_port {
+ 	u16 member;
+ 	u16 vid_member;
++	bool remove_tag;		/* Remove Tag flag set, for ksz8795 only */
+ 	int stp_state;
+ 	struct phy_device phydev;
+ 
