@@ -1,0 +1,127 @@
+From foo@baz Mon Sep 13 10:58:36 AM CEST 2021
+From: Ovidiu Panait <ovidiu.panait@windriver.com>
+Date: Tue,  7 Sep 2021 16:17:01 +0300
+Subject: bpf: Fix pointer arithmetic mask tightening under state pruning
+To: stable@vger.kernel.org
+Cc: bpf@vger.kernel.org, daniel@iogearbox.net
+Message-ID: <20210907131701.1910024-5-ovidiu.panait@windriver.com>
+
+From: Daniel Borkmann <daniel@iogearbox.net>
+
+commit e042aa532c84d18ff13291d00620502ce7a38dda upstream.
+
+In 7fedb63a8307 ("bpf: Tighten speculative pointer arithmetic mask") we
+narrowed the offset mask for unprivileged pointer arithmetic in order to
+mitigate a corner case where in the speculative domain it is possible to
+advance, for example, the map value pointer by up to value_size-1 out-of-
+bounds in order to leak kernel memory via side-channel to user space.
+
+The verifier's state pruning for scalars leaves one corner case open
+where in the first verification path R_x holds an unknown scalar with an
+aux->alu_limit of e.g. 7, and in a second verification path that same
+register R_x, here denoted as R_x', holds an unknown scalar which has
+tighter bounds and would thus satisfy range_within(R_x, R_x') as well as
+tnum_in(R_x, R_x') for state pruning, yielding an aux->alu_limit of 3:
+Given the second path fits the register constraints for pruning, the final
+generated mask from aux->alu_limit will remain at 7. While technically
+not wrong for the non-speculative domain, it would however be possible
+to craft similar cases where the mask would be too wide as in 7fedb63a8307.
+
+One way to fix it is to detect the presence of unknown scalar map pointer
+arithmetic and force a deeper search on unknown scalars to ensure that
+we do not run into a masking mismatch.
+
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Acked-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+[OP: adjusted context in include/linux/bpf_verifier.h for 5.4]
+Signed-off-by: Ovidiu Panait <ovidiu.panait@windriver.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/linux/bpf_verifier.h |    1 +
+ kernel/bpf/verifier.c        |   27 +++++++++++++++++----------
+ 2 files changed, 18 insertions(+), 10 deletions(-)
+
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@ -371,6 +371,7 @@ struct bpf_verifier_env {
+ 	struct bpf_map *used_maps[MAX_USED_MAPS]; /* array of map's used by eBPF program */
+ 	u32 used_map_cnt;		/* number of used maps */
+ 	u32 id_gen;			/* used to generate unique reg IDs */
++	bool explore_alu_limits;
+ 	bool allow_ptr_leaks;
+ 	bool seen_direct_write;
+ 	struct bpf_insn_aux_data *insn_aux_data; /* array of per-insn state */
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -4449,6 +4449,12 @@ static int sanitize_ptr_alu(struct bpf_v
+ 		alu_state |= off_is_imm ? BPF_ALU_IMMEDIATE : 0;
+ 		alu_state |= ptr_is_dst_reg ?
+ 			     BPF_ALU_SANITIZE_SRC : BPF_ALU_SANITIZE_DST;
++
++		/* Limit pruning on unknown scalars to enable deep search for
++		 * potential masking differences from other program paths.
++		 */
++		if (!off_is_imm)
++			env->explore_alu_limits = true;
+ 	}
+ 
+ 	err = update_alu_sanitation_state(aux, alu_state, alu_limit);
+@@ -7102,8 +7108,8 @@ next:
+ }
+ 
+ /* Returns true if (rold safe implies rcur safe) */
+-static bool regsafe(struct bpf_reg_state *rold, struct bpf_reg_state *rcur,
+-		    struct bpf_id_pair *idmap)
++static bool regsafe(struct bpf_verifier_env *env, struct bpf_reg_state *rold,
++		    struct bpf_reg_state *rcur, struct bpf_id_pair *idmap)
+ {
+ 	bool equal;
+ 
+@@ -7129,6 +7135,8 @@ static bool regsafe(struct bpf_reg_state
+ 		return false;
+ 	switch (rold->type) {
+ 	case SCALAR_VALUE:
++		if (env->explore_alu_limits)
++			return false;
+ 		if (rcur->type == SCALAR_VALUE) {
+ 			if (!rold->precise && !rcur->precise)
+ 				return true;
+@@ -7218,9 +7226,8 @@ static bool regsafe(struct bpf_reg_state
+ 	return false;
+ }
+ 
+-static bool stacksafe(struct bpf_func_state *old,
+-		      struct bpf_func_state *cur,
+-		      struct bpf_id_pair *idmap)
++static bool stacksafe(struct bpf_verifier_env *env, struct bpf_func_state *old,
++		      struct bpf_func_state *cur, struct bpf_id_pair *idmap)
+ {
+ 	int i, spi;
+ 
+@@ -7265,9 +7272,8 @@ static bool stacksafe(struct bpf_func_st
+ 			continue;
+ 		if (old->stack[spi].slot_type[0] != STACK_SPILL)
+ 			continue;
+-		if (!regsafe(&old->stack[spi].spilled_ptr,
+-			     &cur->stack[spi].spilled_ptr,
+-			     idmap))
++		if (!regsafe(env, &old->stack[spi].spilled_ptr,
++			     &cur->stack[spi].spilled_ptr, idmap))
+ 			/* when explored and current stack slot are both storing
+ 			 * spilled registers, check that stored pointers types
+ 			 * are the same as well.
+@@ -7324,10 +7330,11 @@ static bool func_states_equal(struct bpf
+ 
+ 	memset(env->idmap_scratch, 0, sizeof(env->idmap_scratch));
+ 	for (i = 0; i < MAX_BPF_REG; i++)
+-		if (!regsafe(&old->regs[i], &cur->regs[i], env->idmap_scratch))
++		if (!regsafe(env, &old->regs[i], &cur->regs[i],
++			     env->idmap_scratch))
+ 			return false;
+ 
+-	if (!stacksafe(old, cur, env->idmap_scratch))
++	if (!stacksafe(env, old, cur, env->idmap_scratch))
+ 		return false;
+ 
+ 	if (!refsafe(old, cur))
