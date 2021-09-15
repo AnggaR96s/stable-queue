@@ -1,0 +1,118 @@
+From foo@baz Wed Sep 15 02:37:47 PM CEST 2021
+From: Ovidiu Panait <ovidiu.panait@windriver.com>
+Date: Mon, 13 Sep 2021 18:35:26 +0300
+Subject: bpf: correct slot_type marking logic to allow more stack slot sharing
+To: stable@vger.kernel.org
+Cc: bpf@vger.kernel.org, daniel@iogearbox.net
+Message-ID: <20210913153537.2162465-3-ovidiu.panait@windriver.com>
+
+From: Jiong Wang <jiong.wang@netronome.com>
+
+commit 0bae2d4d62d523f06ff1a8e88ce38b45400acd28 upstream.
+
+Verifier is supposed to support sharing stack slot allocated to ptr with
+SCALAR_VALUE for privileged program. However this doesn't happen for some
+cases.
+
+The reason is verifier is not clearing slot_type STACK_SPILL for all bytes,
+it only clears part of them, while verifier is using:
+
+  slot_type[0] == STACK_SPILL
+
+as a convention to check one slot is ptr type.
+
+So, the consequence of partial clearing slot_type is verifier could treat a
+partially overridden ptr slot, which should now be a SCALAR_VALUE slot,
+still as ptr slot, and rejects some valid programs.
+
+Before this patch, test_xdp_noinline.o under bpf selftests, bpf_lxc.o and
+bpf_netdev.o under Cilium bpf repo, when built with -mattr=+alu32 are
+rejected due to this issue. After this patch, they all accepted.
+
+There is no processed insn number change before and after this patch on
+Cilium bpf programs.
+
+Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+Signed-off-by: Jiong Wang <jiong.wang@netronome.com>
+Reviewed-by: Daniel Borkmann <daniel@iogearbox.net>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+[OP: adjusted context for 4.19]
+Signed-off-by: Ovidiu Panait <ovidiu.panait@windriver.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ kernel/bpf/verifier.c                       |    5 ++++
+ tools/testing/selftests/bpf/test_verifier.c |   34 ++++++++++++++++++++++++++--
+ 2 files changed, 37 insertions(+), 2 deletions(-)
+
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -1039,6 +1039,10 @@ static int check_stack_write(struct bpf_
+ 
+ 		/* regular write of data into stack destroys any spilled ptr */
+ 		state->stack[spi].spilled_ptr.type = NOT_INIT;
++		/* Mark slots as STACK_MISC if they belonged to spilled ptr. */
++		if (state->stack[spi].slot_type[0] == STACK_SPILL)
++			for (i = 0; i < BPF_REG_SIZE; i++)
++				state->stack[spi].slot_type[i] = STACK_MISC;
+ 
+ 		/* only mark the slot as written if all 8 bytes were written
+ 		 * otherwise read propagation may incorrectly stop too soon
+@@ -1056,6 +1060,7 @@ static int check_stack_write(struct bpf_
+ 		    register_is_null(&cur->regs[value_regno]))
+ 			type = STACK_ZERO;
+ 
++		/* Mark slots affected by this stack write. */
+ 		for (i = 0; i < size; i++)
+ 			state->stack[spi].slot_type[(slot - i) % BPF_REG_SIZE] =
+ 				type;
+--- a/tools/testing/selftests/bpf/test_verifier.c
++++ b/tools/testing/selftests/bpf/test_verifier.c
+@@ -956,16 +956,46 @@ static struct bpf_test tests[] = {
+ 			BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, -8),
+ 			/* mess up with R1 pointer on stack */
+ 			BPF_ST_MEM(BPF_B, BPF_REG_10, -7, 0x23),
+-			/* fill back into R0 should fail */
++			/* fill back into R0 is fine for priv.
++			 * R0 now becomes SCALAR_VALUE.
++			 */
+ 			BPF_LDX_MEM(BPF_DW, BPF_REG_0, BPF_REG_10, -8),
++			/* Load from R0 should fail. */
++			BPF_LDX_MEM(BPF_DW, BPF_REG_0, BPF_REG_0, 8),
+ 			BPF_EXIT_INSN(),
+ 		},
+ 		.errstr_unpriv = "attempt to corrupt spilled",
+-		.errstr = "corrupted spill",
++		.errstr = "R0 invalid mem access 'inv",
+ 		.result = REJECT,
+ 		.flags = F_NEEDS_EFFICIENT_UNALIGNED_ACCESS,
+ 	},
+ 	{
++		"check corrupted spill/fill, LSB",
++		.insns = {
++			BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, -8),
++			BPF_ST_MEM(BPF_H, BPF_REG_10, -8, 0xcafe),
++			BPF_LDX_MEM(BPF_DW, BPF_REG_0, BPF_REG_10, -8),
++			BPF_EXIT_INSN(),
++		},
++		.errstr_unpriv = "attempt to corrupt spilled",
++		.result_unpriv = REJECT,
++		.result = ACCEPT,
++		.retval = POINTER_VALUE,
++	},
++	{
++		"check corrupted spill/fill, MSB",
++		.insns = {
++			BPF_STX_MEM(BPF_DW, BPF_REG_10, BPF_REG_1, -8),
++			BPF_ST_MEM(BPF_W, BPF_REG_10, -4, 0x12345678),
++			BPF_LDX_MEM(BPF_DW, BPF_REG_0, BPF_REG_10, -8),
++			BPF_EXIT_INSN(),
++		},
++		.errstr_unpriv = "attempt to corrupt spilled",
++		.result_unpriv = REJECT,
++		.result = ACCEPT,
++		.retval = POINTER_VALUE,
++	},
++	{
+ 		"invalid src register in STX",
+ 		.insns = {
+ 			BPF_STX_MEM(BPF_B, BPF_REG_10, -1, -1),
