@@ -1,0 +1,149 @@
+From cad439fc040efe5f4381e3a7d583c5c200dbc186 Mon Sep 17 00:00:00 2001
+From: Herbert Xu <herbert@gondor.apana.org.au>
+Date: Tue, 19 Oct 2021 21:28:02 +0800
+Subject: crypto: api - Do not create test larvals if manager is disabled
+
+From: Herbert Xu <herbert@gondor.apana.org.au>
+
+commit cad439fc040efe5f4381e3a7d583c5c200dbc186 upstream.
+
+The delayed boot-time testing patch created a dependency loop
+between api.c and algapi.c because it added a crypto_alg_tested
+call to the former when the crypto manager is disabled.
+
+We could instead avoid creating the test larvals if the crypto
+manager is disabled.  This avoids the dependency loop as well
+as saving some unnecessary work, albeit in a very unlikely case.
+
+Reported-by: Nathan Chancellor <nathan@kernel.org>
+Reported-by: Naresh Kamboju <naresh.kamboju@linaro.org>
+Reported-by: kernel test robot <lkp@intel.com>
+Fixes: adad556efcdd ("crypto: api - Fix built-in testing dependency failures")
+Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ crypto/algapi.c |   56 ++++++++++++++++++++++++++++++++++++--------------------
+ crypto/api.c    |    7 ++-----
+ 2 files changed, 38 insertions(+), 25 deletions(-)
+
+--- a/crypto/algapi.c
++++ b/crypto/algapi.c
+@@ -216,6 +216,32 @@ void crypto_remove_spawns(struct crypto_
+ }
+ EXPORT_SYMBOL_GPL(crypto_remove_spawns);
+ 
++static struct crypto_larval *crypto_alloc_test_larval(struct crypto_alg *alg)
++{
++	struct crypto_larval *larval;
++
++	if (!IS_ENABLED(CONFIG_CRYPTO_MANAGER))
++		return NULL;
++
++	larval = crypto_larval_alloc(alg->cra_name,
++				     alg->cra_flags | CRYPTO_ALG_TESTED, 0);
++	if (IS_ERR(larval))
++		return larval;
++
++	larval->adult = crypto_mod_get(alg);
++	if (!larval->adult) {
++		kfree(larval);
++		return ERR_PTR(-ENOENT);
++	}
++
++	refcount_set(&larval->alg.cra_refcnt, 1);
++	memcpy(larval->alg.cra_driver_name, alg->cra_driver_name,
++	       CRYPTO_MAX_ALG_NAME);
++	larval->alg.cra_priority = alg->cra_priority;
++
++	return larval;
++}
++
+ static struct crypto_larval *__crypto_register_alg(struct crypto_alg *alg)
+ {
+ 	struct crypto_alg *q;
+@@ -250,31 +276,20 @@ static struct crypto_larval *__crypto_re
+ 			goto err;
+ 	}
+ 
+-	larval = crypto_larval_alloc(alg->cra_name,
+-				     alg->cra_flags | CRYPTO_ALG_TESTED, 0);
++	larval = crypto_alloc_test_larval(alg);
+ 	if (IS_ERR(larval))
+ 		goto out;
+ 
+-	ret = -ENOENT;
+-	larval->adult = crypto_mod_get(alg);
+-	if (!larval->adult)
+-		goto free_larval;
+-
+-	refcount_set(&larval->alg.cra_refcnt, 1);
+-	memcpy(larval->alg.cra_driver_name, alg->cra_driver_name,
+-	       CRYPTO_MAX_ALG_NAME);
+-	larval->alg.cra_priority = alg->cra_priority;
+-
+ 	list_add(&alg->cra_list, &crypto_alg_list);
+-	list_add(&larval->alg.cra_list, &crypto_alg_list);
++
++	if (larval)
++		list_add(&larval->alg.cra_list, &crypto_alg_list);
+ 
+ 	crypto_stats_init(alg);
+ 
+ out:
+ 	return larval;
+ 
+-free_larval:
+-	kfree(larval);
+ err:
+ 	larval = ERR_PTR(ret);
+ 	goto out;
+@@ -403,10 +418,11 @@ int crypto_register_alg(struct crypto_al
+ 	down_write(&crypto_alg_sem);
+ 	larval = __crypto_register_alg(alg);
+ 	test_started = static_key_enabled(&crypto_boot_test_finished);
+-	larval->test_started = test_started;
++	if (!IS_ERR_OR_NULL(larval))
++		larval->test_started = test_started;
+ 	up_write(&crypto_alg_sem);
+ 
+-	if (IS_ERR(larval))
++	if (IS_ERR_OR_NULL(larval))
+ 		return PTR_ERR(larval);
+ 
+ 	if (test_started)
+@@ -616,8 +632,8 @@ int crypto_register_instance(struct cryp
+ 	larval = __crypto_register_alg(&inst->alg);
+ 	if (IS_ERR(larval))
+ 		goto unlock;
+-
+-	larval->test_started = true;
++	else if (larval)
++		larval->test_started = true;
+ 
+ 	hlist_add_head(&inst->list, &tmpl->instances);
+ 	inst->tmpl = tmpl;
+@@ -626,7 +642,7 @@ unlock:
+ 	up_write(&crypto_alg_sem);
+ 
+ 	err = PTR_ERR(larval);
+-	if (IS_ERR(larval))
++	if (IS_ERR_OR_NULL(larval))
+ 		goto err;
+ 
+ 	crypto_wait_for_test(larval);
+--- a/crypto/api.c
++++ b/crypto/api.c
+@@ -167,11 +167,8 @@ void crypto_wait_for_test(struct crypto_
+ 	int err;
+ 
+ 	err = crypto_probing_notify(CRYPTO_MSG_ALG_REGISTER, larval->adult);
+-	if (err != NOTIFY_STOP) {
+-		if (WARN_ON(err != NOTIFY_DONE))
+-			goto out;
+-		crypto_alg_tested(larval->alg.cra_driver_name, 0);
+-	}
++	if (WARN_ON_ONCE(err != NOTIFY_STOP))
++		goto out;
+ 
+ 	err = wait_for_completion_killable(&larval->completion);
+ 	WARN_ON(err);
