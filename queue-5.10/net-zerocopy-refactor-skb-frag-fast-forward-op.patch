@@ -1,0 +1,99 @@
+From 6f23b1624849f1cdea558ced7f77126b0be763c1 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 2 Dec 2020 14:53:44 -0800
+Subject: net-zerocopy: Refactor skb frag fast-forward op.
+
+From: Arjun Roy <arjunroy@google.com>
+
+[ Upstream commit 7fba5309efe24e4f0284ef4b8663cdf401035e72 ]
+
+Refactor skb frag fast-forwarding for tcp receive zerocopy. This is
+part of a patch set that introduces short-circuited hybrid copies
+for small receive operations, which results in roughly 33% fewer
+syscalls for small RPC scenarios.
+
+skb_advance_to_frag(), given a skb and an offset into the skb,
+iterates from the first frag for the skb until we're at the frag
+specified by the offset. Assuming the offset provided refers to how
+many bytes in the skb are already read, the returned frag points to
+the next frag we may read from, while offset_frag is set to the number
+of bytes from this frag that we have already read.
+
+If frag is not null and offset_frag is equal to 0, then we may be able
+to map this frag's page into the process address space with
+vm_insert_page(). However, if offset_frag is not equal to 0, then we
+cannot do so.
+
+Signed-off-by: Arjun Roy <arjunroy@google.com>
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Signed-off-by: Soheil Hassas Yeganeh <soheil@google.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ net/ipv4/tcp.c | 35 ++++++++++++++++++++++++++---------
+ 1 file changed, 26 insertions(+), 9 deletions(-)
+
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index ba6e4c6db3b0a..b3721cff45023 100644
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -1746,6 +1746,28 @@ int tcp_mmap(struct file *file, struct socket *sock,
+ }
+ EXPORT_SYMBOL(tcp_mmap);
+ 
++static skb_frag_t *skb_advance_to_frag(struct sk_buff *skb, u32 offset_skb,
++				       u32 *offset_frag)
++{
++	skb_frag_t *frag;
++
++	offset_skb -= skb_headlen(skb);
++	if ((int)offset_skb < 0 || skb_has_frag_list(skb))
++		return NULL;
++
++	frag = skb_shinfo(skb)->frags;
++	while (offset_skb) {
++		if (skb_frag_size(frag) > offset_skb) {
++			*offset_frag = offset_skb;
++			return frag;
++		}
++		offset_skb -= skb_frag_size(frag);
++		++frag;
++	}
++	*offset_frag = 0;
++	return frag;
++}
++
+ static int tcp_copy_straggler_data(struct tcp_zerocopy_receive *zc,
+ 				   struct sk_buff *skb, u32 copylen,
+ 				   u32 *offset, u32 *seq)
+@@ -1872,6 +1894,8 @@ static int tcp_zerocopy_receive(struct sock *sk,
+ 	curr_addr = address;
+ 	while (length + PAGE_SIZE <= zc->length) {
+ 		if (zc->recv_skip_hint < PAGE_SIZE) {
++			u32 offset_frag;
++
+ 			/* If we're here, finish the current batch. */
+ 			if (pg_idx) {
+ 				ret = tcp_zerocopy_vm_insert_batch(vma, pages,
+@@ -1892,16 +1916,9 @@ static int tcp_zerocopy_receive(struct sock *sk,
+ 				skb = tcp_recv_skb(sk, seq, &offset);
+ 			}
+ 			zc->recv_skip_hint = skb->len - offset;
+-			offset -= skb_headlen(skb);
+-			if ((int)offset < 0 || skb_has_frag_list(skb))
++			frags = skb_advance_to_frag(skb, offset, &offset_frag);
++			if (!frags || offset_frag)
+ 				break;
+-			frags = skb_shinfo(skb)->frags;
+-			while (offset) {
+-				if (skb_frag_size(frags) > offset)
+-					goto out;
+-				offset -= skb_frag_size(frags);
+-				frags++;
+-			}
+ 		}
+ 		if (skb_frag_size(frags) != PAGE_SIZE || skb_frag_off(frags)) {
+ 			int remaining = zc->recv_skip_hint;
+-- 
+2.33.0
+
