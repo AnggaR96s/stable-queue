@@ -1,0 +1,146 @@
+From dff11abe280b47c21b804a8ace318e0638bb9a49 Mon Sep 17 00:00:00 2001
+From: Mike Kravetz <mike.kravetz@oracle.com>
+Date: Fri, 5 Oct 2018 15:51:33 -0700
+Subject: hugetlb: take PMD sharing into account when flushing tlb/caches
+
+From: Mike Kravetz <mike.kravetz@oracle.com>
+
+commit dff11abe280b47c21b804a8ace318e0638bb9a49 upstream.
+
+When fixing an issue with PMD sharing and migration, it was discovered via
+code inspection that other callers of huge_pmd_unshare potentially have an
+issue with cache and tlb flushing.
+
+Use the routine adjust_range_if_pmd_sharing_possible() to calculate worst
+case ranges for mmu notifiers.  Ensure that this range is flushed if
+huge_pmd_unshare succeeds and unmaps a PUD_SUZE area.
+
+Link: http://lkml.kernel.org/r/20180823205917.16297-3-mike.kravetz@oracle.com
+Signed-off-by: Mike Kravetz <mike.kravetz@oracle.com>
+Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Reviewed-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Davidlohr Bueso <dave@stgolabs.net>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Jerome Glisse <jglisse@redhat.com>
+Cc: Mike Kravetz <mike.kravetz@oracle.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Cc: Nadav Amit <namit@vmware.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ mm/hugetlb.c |   53 ++++++++++++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 44 insertions(+), 9 deletions(-)
+
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -3393,14 +3393,19 @@ void __unmap_hugepage_range(struct mmu_g
+ 	struct page *page;
+ 	struct hstate *h = hstate_vma(vma);
+ 	unsigned long sz = huge_page_size(h);
+-	const unsigned long mmun_start = start;	/* For mmu_notifiers */
+-	const unsigned long mmun_end   = end;	/* For mmu_notifiers */
++	unsigned long mmun_start = start;	/* For mmu_notifiers */
++	unsigned long mmun_end   = end;		/* For mmu_notifiers */
+ 
+ 	WARN_ON(!is_vm_hugetlb_page(vma));
+ 	BUG_ON(start & ~huge_page_mask(h));
+ 	BUG_ON(end & ~huge_page_mask(h));
+ 
+ 	tlb_start_vma(tlb, vma);
++
++	/*
++	 * If sharing possible, alert mmu notifiers of worst case.
++	 */
++	adjust_range_if_pmd_sharing_possible(vma, &mmun_start, &mmun_end);
+ 	mmu_notifier_invalidate_range_start(mm, mmun_start, mmun_end);
+ 	address = start;
+ 	for (; address < end; address += sz) {
+@@ -3411,6 +3416,10 @@ void __unmap_hugepage_range(struct mmu_g
+ 		ptl = huge_pte_lock(h, mm, ptep);
+ 		if (huge_pmd_unshare(mm, &address, ptep)) {
+ 			spin_unlock(ptl);
++			/*
++			 * We just unmapped a page of PMDs by clearing a PUD.
++			 * The caller's TLB flush range should cover this area.
++			 */
+ 			continue;
+ 		}
+ 
+@@ -3493,12 +3502,23 @@ void unmap_hugepage_range(struct vm_area
+ {
+ 	struct mm_struct *mm;
+ 	struct mmu_gather tlb;
++	unsigned long tlb_start = start;
++	unsigned long tlb_end = end;
++
++	/*
++	 * If shared PMDs were possibly used within this vma range, adjust
++	 * start/end for worst case tlb flushing.
++	 * Note that we can not be sure if PMDs are shared until we try to
++	 * unmap pages.  However, we want to make sure TLB flushing covers
++	 * the largest possible range.
++	 */
++	adjust_range_if_pmd_sharing_possible(vma, &tlb_start, &tlb_end);
+ 
+ 	mm = vma->vm_mm;
+ 
+-	tlb_gather_mmu(&tlb, mm, start, end);
++	tlb_gather_mmu(&tlb, mm, tlb_start, tlb_end);
+ 	__unmap_hugepage_range(&tlb, vma, start, end, ref_page);
+-	tlb_finish_mmu(&tlb, start, end);
++	tlb_finish_mmu(&tlb, tlb_start, tlb_end);
+ }
+ 
+ /*
+@@ -4186,11 +4206,21 @@ unsigned long hugetlb_change_protection(
+ 	pte_t pte;
+ 	struct hstate *h = hstate_vma(vma);
+ 	unsigned long pages = 0;
++	unsigned long f_start = start;
++	unsigned long f_end = end;
++	bool shared_pmd = false;
++
++	/*
++	 * In the case of shared PMDs, the area to flush could be beyond
++	 * start/end.  Set f_start/f_end to cover the maximum possible
++	 * range if PMD sharing is possible.
++	 */
++	adjust_range_if_pmd_sharing_possible(vma, &f_start, &f_end);
+ 
+ 	BUG_ON(address >= end);
+-	flush_cache_range(vma, address, end);
++	flush_cache_range(vma, f_start, f_end);
+ 
+-	mmu_notifier_invalidate_range_start(mm, start, end);
++	mmu_notifier_invalidate_range_start(mm, f_start, f_end);
+ 	i_mmap_lock_write(vma->vm_file->f_mapping);
+ 	for (; address < end; address += huge_page_size(h)) {
+ 		spinlock_t *ptl;
+@@ -4201,6 +4231,7 @@ unsigned long hugetlb_change_protection(
+ 		if (huge_pmd_unshare(mm, &address, ptep)) {
+ 			pages++;
+ 			spin_unlock(ptl);
++			shared_pmd = true;
+ 			continue;
+ 		}
+ 		pte = huge_ptep_get(ptep);
+@@ -4235,12 +4266,16 @@ unsigned long hugetlb_change_protection(
+ 	 * Must flush TLB before releasing i_mmap_rwsem: x86's huge_pmd_unshare
+ 	 * may have cleared our pud entry and done put_page on the page table:
+ 	 * once we release i_mmap_rwsem, another task can do the final put_page
+-	 * and that page table be reused and filled with junk.
++	 * and that page table be reused and filled with junk.  If we actually
++	 * did unshare a page of pmds, flush the range corresponding to the pud.
+ 	 */
+-	flush_hugetlb_tlb_range(vma, start, end);
++	if (shared_pmd)
++		flush_hugetlb_tlb_range(vma, f_start, f_end);
++	else
++		flush_hugetlb_tlb_range(vma, start, end);
+ 	mmu_notifier_invalidate_range(mm, start, end);
+ 	i_mmap_unlock_write(vma->vm_file->f_mapping);
+-	mmu_notifier_invalidate_range_end(mm, start, end);
++	mmu_notifier_invalidate_range_end(mm, f_start, f_end);
+ 
+ 	return pages << h->order;
+ }
