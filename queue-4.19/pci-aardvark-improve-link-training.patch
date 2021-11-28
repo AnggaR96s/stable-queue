@@ -1,0 +1,210 @@
+From foo@baz Sun Nov 28 02:10:56 PM CET 2021
+From: "Marek Behún" <kabel@kernel.org>
+Date: Thu, 25 Nov 2021 00:04:44 +0100
+Subject: PCI: aardvark: Improve link training
+To: Greg Kroah-Hartman <gregkh@linuxfoundation.org>, Sasha Levin <sashal@kernel.org>
+Cc: pali@kernel.org, stable@vger.kernel.org, "Marek Behún" <marek.behun@nic.cz>, "Tomasz Maciej Nowak" <tmn505@gmail.com>, "Lorenzo Pieralisi" <lorenzo.pieralisi@arm.com>, "Rob Herring" <robh@kernel.org>, "Thomas Petazzoni" <thomas.petazzoni@bootlin.com>, "Marek Behún" <kabel@kernel.org>
+Message-ID: <20211124230500.27109-5-kabel@kernel.org>
+
+From: Marek BehÃºn <marek.behun@nic.cz>
+
+commit 43fc679ced18006b12d918d7a8a4af392b7fbfe7 upstream.
+
+Currently the aardvark driver trains link in PCIe gen2 mode. This may
+cause some buggy gen1 cards (such as Compex WLE900VX) to be unstable or
+even not detected. Moreover when ASPM code tries to retrain link second
+time, these cards may stop responding and link goes down. If gen1 is
+used this does not happen.
+
+Unconditionally forcing gen1 is not a good solution since it may have
+performance impact on gen2 cards.
+
+To overcome this, read 'max-link-speed' property (as defined in PCI
+device tree bindings) and use this as max gen mode. Then iteratively try
+link training at this mode or lower until successful. After successful
+link training choose final controller gen based on Negotiated Link Speed
+from Link Status register, which should match card speed.
+
+Link: https://lore.kernel.org/r/20200430080625.26070-5-pali@kernel.org
+Tested-by: Tomasz Maciej Nowak <tmn505@gmail.com>
+Signed-off-by: Pali RohÃ¡r <pali@kernel.org>
+Signed-off-by: Marek BehÃºn <marek.behun@nic.cz>
+Signed-off-by: Lorenzo Pieralisi <lorenzo.pieralisi@arm.com>
+Reviewed-by: Rob Herring <robh@kernel.org>
+Acked-by: Thomas Petazzoni <thomas.petazzoni@bootlin.com>
+Signed-off-by: Marek BehÃºn <kabel@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/pci/controller/pci-aardvark.c |  114 ++++++++++++++++++++++++++--------
+ 1 file changed, 89 insertions(+), 25 deletions(-)
+
+--- a/drivers/pci/controller/pci-aardvark.c
++++ b/drivers/pci/controller/pci-aardvark.c
+@@ -35,6 +35,7 @@
+ #define PCIE_CORE_LINK_CTRL_STAT_REG				0xd0
+ #define     PCIE_CORE_LINK_L0S_ENTRY				BIT(0)
+ #define     PCIE_CORE_LINK_TRAINING				BIT(5)
++#define     PCIE_CORE_LINK_SPEED_SHIFT				16
+ #define     PCIE_CORE_LINK_WIDTH_SHIFT				20
+ #define PCIE_CORE_ERR_CAPCTL_REG				0x118
+ #define     PCIE_CORE_ERR_CAPCTL_ECRC_CHK_TX			BIT(5)
+@@ -193,6 +194,7 @@ struct advk_pcie {
+ 	struct mutex msi_used_lock;
+ 	u16 msi_msg;
+ 	int root_bus_nr;
++	int link_gen;
+ };
+ 
+ static inline void advk_writel(struct advk_pcie *pcie, u32 val, u64 reg)
+@@ -216,23 +218,98 @@ static int advk_pcie_link_up(struct advk
+ 
+ static int advk_pcie_wait_for_link(struct advk_pcie *pcie)
+ {
+-	struct device *dev = &pcie->pdev->dev;
+ 	int retries;
+ 
+ 	/* check if the link is up or not */
+ 	for (retries = 0; retries < LINK_WAIT_MAX_RETRIES; retries++) {
+-		if (advk_pcie_link_up(pcie)) {
+-			dev_info(dev, "link up\n");
++		if (advk_pcie_link_up(pcie))
+ 			return 0;
+-		}
+ 
+ 		usleep_range(LINK_WAIT_USLEEP_MIN, LINK_WAIT_USLEEP_MAX);
+ 	}
+ 
+-	dev_err(dev, "link never came up\n");
+ 	return -ETIMEDOUT;
+ }
+ 
++static int advk_pcie_train_at_gen(struct advk_pcie *pcie, int gen)
++{
++	int ret, neg_gen;
++	u32 reg;
++
++	/* Setup link speed */
++	reg = advk_readl(pcie, PCIE_CORE_CTRL0_REG);
++	reg &= ~PCIE_GEN_SEL_MSK;
++	if (gen == 3)
++		reg |= SPEED_GEN_3;
++	else if (gen == 2)
++		reg |= SPEED_GEN_2;
++	else
++		reg |= SPEED_GEN_1;
++	advk_writel(pcie, reg, PCIE_CORE_CTRL0_REG);
++
++	/*
++	 * Enable link training. This is not needed in every call to this
++	 * function, just once suffices, but it does not break anything either.
++	 */
++	reg = advk_readl(pcie, PCIE_CORE_CTRL0_REG);
++	reg |= LINK_TRAINING_EN;
++	advk_writel(pcie, reg, PCIE_CORE_CTRL0_REG);
++
++	/*
++	 * Start link training immediately after enabling it.
++	 * This solves problems for some buggy cards.
++	 */
++	reg = advk_readl(pcie, PCIE_CORE_LINK_CTRL_STAT_REG);
++	reg |= PCIE_CORE_LINK_TRAINING;
++	advk_writel(pcie, reg, PCIE_CORE_LINK_CTRL_STAT_REG);
++
++	ret = advk_pcie_wait_for_link(pcie);
++	if (ret)
++		return ret;
++
++	reg = advk_readl(pcie, PCIE_CORE_LINK_CTRL_STAT_REG);
++	neg_gen = (reg >> PCIE_CORE_LINK_SPEED_SHIFT) & 0xf;
++
++	return neg_gen;
++}
++
++static void advk_pcie_train_link(struct advk_pcie *pcie)
++{
++	struct device *dev = &pcie->pdev->dev;
++	int neg_gen = -1, gen;
++
++	/*
++	 * Try link training at link gen specified by device tree property
++	 * 'max-link-speed'. If this fails, iteratively train at lower gen.
++	 */
++	for (gen = pcie->link_gen; gen > 0; --gen) {
++		neg_gen = advk_pcie_train_at_gen(pcie, gen);
++		if (neg_gen > 0)
++			break;
++	}
++
++	if (neg_gen < 0)
++		goto err;
++
++	/*
++	 * After successful training if negotiated gen is lower than requested,
++	 * train again on negotiated gen. This solves some stability issues for
++	 * some buggy gen1 cards.
++	 */
++	if (neg_gen < gen) {
++		gen = neg_gen;
++		neg_gen = advk_pcie_train_at_gen(pcie, gen);
++	}
++
++	if (neg_gen == gen) {
++		dev_info(dev, "link up at gen %i\n", gen);
++		return;
++	}
++
++err:
++	dev_err(dev, "link never came up\n");
++}
++
+ static void advk_pcie_setup_hw(struct advk_pcie *pcie)
+ {
+ 	u32 reg;
+@@ -268,12 +345,6 @@ static void advk_pcie_setup_hw(struct ad
+ 		PCIE_CORE_CTRL2_TD_ENABLE;
+ 	advk_writel(pcie, reg, PCIE_CORE_CTRL2_REG);
+ 
+-	/* Set GEN2 */
+-	reg = advk_readl(pcie, PCIE_CORE_CTRL0_REG);
+-	reg &= ~PCIE_GEN_SEL_MSK;
+-	reg |= SPEED_GEN_2;
+-	advk_writel(pcie, reg, PCIE_CORE_CTRL0_REG);
+-
+ 	/* Set lane X1 */
+ 	reg = advk_readl(pcie, PCIE_CORE_CTRL0_REG);
+ 	reg &= ~LANE_CNT_MSK;
+@@ -321,20 +392,7 @@ static void advk_pcie_setup_hw(struct ad
+ 	 */
+ 	msleep(PCI_PM_D3COLD_WAIT);
+ 
+-	/* Enable link training */
+-	reg = advk_readl(pcie, PCIE_CORE_CTRL0_REG);
+-	reg |= LINK_TRAINING_EN;
+-	advk_writel(pcie, reg, PCIE_CORE_CTRL0_REG);
+-
+-	/*
+-	 * Start link training immediately after enabling it.
+-	 * This solves problems for some buggy cards.
+-	 */
+-	reg = advk_readl(pcie, PCIE_CORE_LINK_CTRL_STAT_REG);
+-	reg |= PCIE_CORE_LINK_TRAINING;
+-	advk_writel(pcie, reg, PCIE_CORE_LINK_CTRL_STAT_REG);
+-
+-	advk_pcie_wait_for_link(pcie);
++	advk_pcie_train_link(pcie);
+ 
+ 	reg = advk_readl(pcie, PCIE_CORE_CMD_STATUS_REG);
+ 	reg |= PCIE_CORE_CMD_MEM_ACCESS_EN |
+@@ -968,6 +1026,12 @@ static int advk_pcie_probe(struct platfo
+ 		return ret;
+ 	}
+ 
++	ret = of_pci_get_max_link_speed(dev->of_node);
++	if (ret <= 0 || ret > 3)
++		pcie->link_gen = 3;
++	else
++		pcie->link_gen = ret;
++
+ 	advk_pcie_setup_hw(pcie);
+ 
+ 	ret = advk_pcie_init_irq_domain(pcie);
