@@ -1,0 +1,140 @@
+From foo@baz Wed Dec 22 01:08:34 PM CET 2021
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Tue, 21 Dec 2021 19:38:49 +0800
+Subject: block, bfq: fix use after free in bfq_bfqq_expire
+To: <jack@suse.cz>, <gregkh@linuxfoundation.org>, <paolo.valente@linaro.org>, <axboe@kernel.dk>
+Cc: <linux-block@vger.kernel.org>, <linux-kernel@vger.kernel.org>, <yukuai3@huawei.com>, <yi.zhang@huawei.com>
+Message-ID: <20211221113849.2219126-6-yukuai3@huawei.com>
+
+From: Paolo Valente <paolo.valente@linaro.org>
+
+commit eed47d19d9362bdd958e4ab56af480b9dbf6b2b6 upstream.
+
+The function bfq_bfqq_expire() invokes the function
+__bfq_bfqq_expire(), and the latter may free the in-service bfq-queue.
+If this happens, then no other instruction of bfq_bfqq_expire() must
+be executed, or a use-after-free will occur.
+
+Basing on the assumption that __bfq_bfqq_expire() invokes
+bfq_put_queue() on the in-service bfq-queue exactly once, the queue is
+assumed to be freed if its refcounter is equal to one right before
+invoking __bfq_bfqq_expire().
+
+But, since commit 9dee8b3b057e ("block, bfq: fix queue removal from
+weights tree") this assumption is false. __bfq_bfqq_expire() may also
+invoke bfq_weights_tree_remove() and, since commit 9dee8b3b057e
+("block, bfq: fix queue removal from weights tree"), also
+the latter function may invoke bfq_put_queue(). So __bfq_bfqq_expire()
+may invoke bfq_put_queue() twice, and this is the actual case where
+the in-service queue may happen to be freed.
+
+To address this issue, this commit moves the check on the refcounter
+of the queue right around the last bfq_put_queue() that may be invoked
+on the queue.
+
+Fixes: 9dee8b3b057e ("block, bfq: fix queue removal from weights tree")
+Reported-by: Dmitrii Tcvetkov <demfloro@demfloro.ru>
+Reported-by: Douglas Anderson <dianders@chromium.org>
+Tested-by: Dmitrii Tcvetkov <demfloro@demfloro.ru>
+Tested-by: Douglas Anderson <dianders@chromium.org>
+Signed-off-by: Paolo Valente <paolo.valente@linaro.org>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ block/bfq-iosched.c |   15 +++++++--------
+ block/bfq-iosched.h |    2 +-
+ block/bfq-wf2q.c    |   17 +++++++++++++++--
+ 3 files changed, 23 insertions(+), 11 deletions(-)
+
+--- a/block/bfq-iosched.c
++++ b/block/bfq-iosched.c
+@@ -2816,7 +2816,7 @@ static void bfq_dispatch_remove(struct r
+ 	bfq_remove_request(q, rq);
+ }
+ 
+-static void __bfq_bfqq_expire(struct bfq_data *bfqd, struct bfq_queue *bfqq)
++static bool __bfq_bfqq_expire(struct bfq_data *bfqd, struct bfq_queue *bfqq)
+ {
+ 	/*
+ 	 * If this bfqq is shared between multiple processes, check
+@@ -2849,9 +2849,11 @@ static void __bfq_bfqq_expire(struct bfq
+ 	/*
+ 	 * All in-service entities must have been properly deactivated
+ 	 * or requeued before executing the next function, which
+-	 * resets all in-service entites as no more in service.
++	 * resets all in-service entities as no more in service. This
++	 * may cause bfqq to be freed. If this happens, the next
++	 * function returns true.
+ 	 */
+-	__bfq_bfqd_reset_in_service(bfqd);
++	return __bfq_bfqd_reset_in_service(bfqd);
+ }
+ 
+ /**
+@@ -3256,7 +3258,6 @@ void bfq_bfqq_expire(struct bfq_data *bf
+ 	bool slow;
+ 	unsigned long delta = 0;
+ 	struct bfq_entity *entity = &bfqq->entity;
+-	int ref;
+ 
+ 	/*
+ 	 * Check whether the process is slow (see bfq_bfqq_is_slow).
+@@ -3325,10 +3326,8 @@ void bfq_bfqq_expire(struct bfq_data *bf
+ 	 * reason.
+ 	 */
+ 	__bfq_bfqq_recalc_budget(bfqd, bfqq, reason);
+-	ref = bfqq->ref;
+-	__bfq_bfqq_expire(bfqd, bfqq);
+-
+-	if (ref == 1) /* bfqq is gone, no more actions on it */
++	if (__bfq_bfqq_expire(bfqd, bfqq))
++		/* bfqq is gone, no more actions on it */
+ 		return;
+ 
+ 	bfqq->injected_service = 0;
+--- a/block/bfq-iosched.h
++++ b/block/bfq-iosched.h
+@@ -993,7 +993,7 @@ bool __bfq_deactivate_entity(struct bfq_
+ 			     bool ins_into_idle_tree);
+ bool next_queue_may_preempt(struct bfq_data *bfqd);
+ struct bfq_queue *bfq_get_next_queue(struct bfq_data *bfqd);
+-void __bfq_bfqd_reset_in_service(struct bfq_data *bfqd);
++bool __bfq_bfqd_reset_in_service(struct bfq_data *bfqd);
+ void bfq_deactivate_bfqq(struct bfq_data *bfqd, struct bfq_queue *bfqq,
+ 			 bool ins_into_idle_tree, bool expiration);
+ void bfq_activate_bfqq(struct bfq_data *bfqd, struct bfq_queue *bfqq);
+--- a/block/bfq-wf2q.c
++++ b/block/bfq-wf2q.c
+@@ -1600,7 +1600,8 @@ struct bfq_queue *bfq_get_next_queue(str
+ 	return bfqq;
+ }
+ 
+-void __bfq_bfqd_reset_in_service(struct bfq_data *bfqd)
++/* returns true if the in-service queue gets freed */
++bool __bfq_bfqd_reset_in_service(struct bfq_data *bfqd)
+ {
+ 	struct bfq_queue *in_serv_bfqq = bfqd->in_service_queue;
+ 	struct bfq_entity *in_serv_entity = &in_serv_bfqq->entity;
+@@ -1624,8 +1625,20 @@ void __bfq_bfqd_reset_in_service(struct
+ 	 * service tree either, then release the service reference to
+ 	 * the queue it represents (taken with bfq_get_entity).
+ 	 */
+-	if (!in_serv_entity->on_st)
++	if (!in_serv_entity->on_st) {
++		/*
++		 * If no process is referencing in_serv_bfqq any
++		 * longer, then the service reference may be the only
++		 * reference to the queue. If this is the case, then
++		 * bfqq gets freed here.
++		 */
++		int ref = in_serv_bfqq->ref;
+ 		bfq_put_queue(in_serv_bfqq);
++		if (ref == 1)
++			return true;
++	}
++
++	return false;
+ }
+ 
+ void bfq_deactivate_bfqq(struct bfq_data *bfqd, struct bfq_queue *bfqq,
