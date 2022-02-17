@@ -1,0 +1,149 @@
+From 921ca574cd382142add8b12d0a7117f495510de5 Mon Sep 17 00:00:00 2001
+From: Oliver Hartkopp <socketcan@hartkopp.net>
+Date: Sun, 6 Dec 2020 15:47:31 +0100
+Subject: can: isotp: add SF_BROADCAST support for functional addressing
+
+From: Oliver Hartkopp <socketcan@hartkopp.net>
+
+commit 921ca574cd382142add8b12d0a7117f495510de5 upstream.
+
+When CAN_ISOTP_SF_BROADCAST is set in the CAN_ISOTP_OPTS flags the CAN_ISOTP
+socket is switched into functional addressing mode, where only single frame
+(SF) protocol data units can be send on the specified CAN interface and the
+given tp.tx_id after bind().
+
+In opposite to normal and extended addressing this socket does not register a
+CAN-ID for reception which would be needed for a 1-to-1 ISOTP connection with a
+segmented bi-directional data transfer.
+
+Sending SFs on this socket is therefore a TX-only 'broadcast' operation.
+
+Signed-off-by: Oliver Hartkopp <socketcan@hartkopp.net>
+Signed-off-by: Thomas Wagner <thwa1@web.de>
+Link: https://lore.kernel.org/r/20201206144731.4609-1-socketcan@hartkopp.net
+Signed-off-by: Marc Kleine-Budde <mkl@pengutronix.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/uapi/linux/can/isotp.h |    2 -
+ net/can/isotp.c                |   50 +++++++++++++++++++++++++++++------------
+ 2 files changed, 37 insertions(+), 15 deletions(-)
+
+--- a/include/uapi/linux/can/isotp.h
++++ b/include/uapi/linux/can/isotp.h
+@@ -135,7 +135,7 @@ struct can_isotp_ll_options {
+ #define CAN_ISOTP_FORCE_RXSTMIN	0x100	/* ignore CFs depending on rx stmin */
+ #define CAN_ISOTP_RX_EXT_ADDR	0x200	/* different rx extended addressing */
+ #define CAN_ISOTP_WAIT_TX_DONE	0x400	/* wait for tx completion */
+-
++#define CAN_ISOTP_SF_BROADCAST	0x800	/* 1-to-N functional addressing */
+ 
+ /* default values */
+ 
+--- a/net/can/isotp.c
++++ b/net/can/isotp.c
+@@ -888,6 +888,16 @@ static int isotp_sendmsg(struct socket *
+ 		goto err_out_drop;
+ 	}
+ 
++	/* take care of a potential SF_DL ESC offset for TX_DL > 8 */
++	off = (so->tx.ll_dl > CAN_MAX_DLEN) ? 1 : 0;
++
++	/* does the given data fit into a single frame for SF_BROADCAST? */
++	if ((so->opt.flags & CAN_ISOTP_SF_BROADCAST) &&
++	    (size > so->tx.ll_dl - SF_PCI_SZ4 - ae - off)) {
++		err = -EINVAL;
++		goto err_out_drop;
++	}
++
+ 	err = memcpy_from_msg(so->tx.buf, msg, size);
+ 	if (err < 0)
+ 		goto err_out_drop;
+@@ -915,9 +925,6 @@ static int isotp_sendmsg(struct socket *
+ 	cf = (struct canfd_frame *)skb->data;
+ 	skb_put_zero(skb, so->ll.mtu);
+ 
+-	/* take care of a potential SF_DL ESC offset for TX_DL > 8 */
+-	off = (so->tx.ll_dl > CAN_MAX_DLEN) ? 1 : 0;
+-
+ 	/* check for single frame transmission depending on TX_DL */
+ 	if (size <= so->tx.ll_dl - SF_PCI_SZ4 - ae - off) {
+ 		/* The message size generally fits into a SingleFrame - good.
+@@ -1057,7 +1064,7 @@ static int isotp_release(struct socket *
+ 	lock_sock(sk);
+ 
+ 	/* remove current filters & unregister */
+-	if (so->bound) {
++	if (so->bound && (!(so->opt.flags & CAN_ISOTP_SF_BROADCAST))) {
+ 		if (so->ifindex) {
+ 			struct net_device *dev;
+ 
+@@ -1097,15 +1104,12 @@ static int isotp_bind(struct socket *soc
+ 	struct net_device *dev;
+ 	int err = 0;
+ 	int notify_enetdown = 0;
++	int do_rx_reg = 1;
+ 
+ 	if (len < ISOTP_MIN_NAMELEN)
+ 		return -EINVAL;
+ 
+-	if (addr->can_addr.tp.rx_id == addr->can_addr.tp.tx_id)
+-		return -EADDRNOTAVAIL;
+-
+-	if ((addr->can_addr.tp.rx_id | addr->can_addr.tp.tx_id) &
+-	    (CAN_ERR_FLAG | CAN_RTR_FLAG))
++	if (addr->can_addr.tp.tx_id & (CAN_ERR_FLAG | CAN_RTR_FLAG))
+ 		return -EADDRNOTAVAIL;
+ 
+ 	if (!addr->can_ifindex)
+@@ -1113,6 +1117,23 @@ static int isotp_bind(struct socket *soc
+ 
+ 	lock_sock(sk);
+ 
++	/* do not register frame reception for functional addressing */
++	if (so->opt.flags & CAN_ISOTP_SF_BROADCAST)
++		do_rx_reg = 0;
++
++	/* do not validate rx address for functional addressing */
++	if (do_rx_reg) {
++		if (addr->can_addr.tp.rx_id == addr->can_addr.tp.tx_id) {
++			err = -EADDRNOTAVAIL;
++			goto out;
++		}
++
++		if (addr->can_addr.tp.rx_id & (CAN_ERR_FLAG | CAN_RTR_FLAG)) {
++			err = -EADDRNOTAVAIL;
++			goto out;
++		}
++	}
++
+ 	if (so->bound && addr->can_ifindex == so->ifindex &&
+ 	    addr->can_addr.tp.rx_id == so->rxid &&
+ 	    addr->can_addr.tp.tx_id == so->txid)
+@@ -1138,13 +1159,14 @@ static int isotp_bind(struct socket *soc
+ 
+ 	ifindex = dev->ifindex;
+ 
+-	can_rx_register(net, dev, addr->can_addr.tp.rx_id,
+-			SINGLE_MASK(addr->can_addr.tp.rx_id), isotp_rcv, sk,
+-			"isotp", sk);
++	if (do_rx_reg)
++		can_rx_register(net, dev, addr->can_addr.tp.rx_id,
++				SINGLE_MASK(addr->can_addr.tp.rx_id),
++				isotp_rcv, sk, "isotp", sk);
+ 
+ 	dev_put(dev);
+ 
+-	if (so->bound) {
++	if (so->bound && do_rx_reg) {
+ 		/* unregister old filter */
+ 		if (so->ifindex) {
+ 			dev = dev_get_by_index(net, so->ifindex);
+@@ -1357,7 +1379,7 @@ static void isotp_notify(struct isotp_so
+ 	case NETDEV_UNREGISTER:
+ 		lock_sock(sk);
+ 		/* remove current filters & unregister */
+-		if (so->bound)
++		if (so->bound && (!(so->opt.flags & CAN_ISOTP_SF_BROADCAST)))
+ 			can_rx_unregister(dev_net(dev), dev, so->rxid,
+ 					  SINGLE_MASK(so->rxid),
+ 					  isotp_rcv, sk);
