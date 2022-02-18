@@ -1,0 +1,168 @@
+From a1326b17ac03a9012cb3d01e434aacb4d67a416c Mon Sep 17 00:00:00 2001
+From: Mark Rutland <mark.rutland@arm.com>
+Date: Wed, 16 Oct 2019 18:17:11 +0100
+Subject: module/ftrace: handle patchable-function-entry
+
+From: Mark Rutland <mark.rutland@arm.com>
+
+commit a1326b17ac03a9012cb3d01e434aacb4d67a416c upstream.
+
+When using patchable-function-entry, the compiler will record the
+callsites into a section named "__patchable_function_entries" rather
+than "__mcount_loc". Let's abstract this difference behind a new
+FTRACE_CALLSITE_SECTION, so that architectures don't have to handle this
+explicitly (e.g. with custom module linker scripts).
+
+As parisc currently handles this explicitly, it is fixed up accordingly,
+with its custom linker script removed. Since FTRACE_CALLSITE_SECTION is
+only defined when DYNAMIC_FTRACE is selected, the parisc module loading
+code is updated to only use the definition in that case. When
+DYNAMIC_FTRACE is not selected, modules shouldn't have this section, so
+this removes some redundant work in that case.
+
+To make sure that this is keep up-to-date for modules and the main
+kernel, a comment is added to vmlinux.lds.h, with the existing ifdeffery
+simplified for legibility.
+
+I built parisc generic-{32,64}bit_defconfig with DYNAMIC_FTRACE enabled,
+and verified that the section made it into the .ko files for modules.
+
+Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+Acked-by: Helge Deller <deller@gmx.de>
+Acked-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+Reviewed-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+Reviewed-by: Torsten Duwe <duwe@suse.de>
+Tested-by: Amit Daniel Kachhap <amit.kachhap@arm.com>
+Tested-by: Sven Schnelle <svens@stackframe.org>
+Tested-by: Torsten Duwe <duwe@suse.de>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: James E.J. Bottomley <James.Bottomley@HansenPartnership.com>
+Cc: Jessica Yu <jeyu@kernel.org>
+Cc: linux-parisc@vger.kernel.org
+Cc: Stephen Boyd <swboyd@chromium.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/parisc/Makefile              |    1 -
+ arch/parisc/kernel/module.c       |   10 +++++++---
+ arch/parisc/kernel/module.lds     |    7 -------
+ include/asm-generic/vmlinux.lds.h |   14 +++++++-------
+ include/linux/ftrace.h            |    5 +++++
+ kernel/module.c                   |    2 +-
+ 6 files changed, 20 insertions(+), 19 deletions(-)
+ delete mode 100644 arch/parisc/kernel/module.lds
+
+--- a/arch/parisc/Makefile
++++ b/arch/parisc/Makefile
+@@ -65,7 +65,6 @@ KBUILD_CFLAGS += -DCC_USING_PATCHABLE_FU
+ 		 -DFTRACE_PATCHABLE_FUNCTION_SIZE=$(NOP_COUNT)
+ 
+ CC_FLAGS_FTRACE := -fpatchable-function-entry=$(NOP_COUNT),$(shell echo $$(($(NOP_COUNT)-1)))
+-KBUILD_LDS_MODULE += $(srctree)/arch/parisc/kernel/module.lds
+ endif
+ 
+ OBJCOPY_FLAGS =-O binary -R .note -R .comment -S
+--- a/arch/parisc/kernel/module.c
++++ b/arch/parisc/kernel/module.c
+@@ -43,6 +43,7 @@
+ #include <linux/elf.h>
+ #include <linux/vmalloc.h>
+ #include <linux/fs.h>
++#include <linux/ftrace.h>
+ #include <linux/string.h>
+ #include <linux/kernel.h>
+ #include <linux/bug.h>
+@@ -862,7 +863,7 @@ int module_finalize(const Elf_Ehdr *hdr,
+ 	const char *strtab = NULL;
+ 	const Elf_Shdr *s;
+ 	char *secstrings;
+-	int err, symindex = -1;
++	int symindex = -1;
+ 	Elf_Sym *newptr, *oldptr;
+ 	Elf_Shdr *symhdr = NULL;
+ #ifdef DEBUG
+@@ -946,11 +947,13 @@ int module_finalize(const Elf_Ehdr *hdr,
+ 			/* patch .altinstructions */
+ 			apply_alternatives(aseg, aseg + s->sh_size, me->name);
+ 
++#ifdef CONFIG_DYNAMIC_FTRACE
+ 		/* For 32 bit kernels we're compiling modules with
+ 		 * -ffunction-sections so we must relocate the addresses in the
+-		 *__mcount_loc section.
++		 *  ftrace callsite section.
+ 		 */
+-		if (symindex != -1 && !strcmp(secname, "__mcount_loc")) {
++		if (symindex != -1 && !strcmp(secname, FTRACE_CALLSITE_SECTION)) {
++			int err;
+ 			if (s->sh_type == SHT_REL)
+ 				err = apply_relocate((Elf_Shdr *)sechdrs,
+ 							strtab, symindex,
+@@ -962,6 +965,7 @@ int module_finalize(const Elf_Ehdr *hdr,
+ 			if (err)
+ 				return err;
+ 		}
++#endif
+ 	}
+ 	return 0;
+ }
+--- a/arch/parisc/kernel/module.lds
++++ /dev/null
+@@ -1,7 +0,0 @@
+-/* SPDX-License-Identifier: GPL-2.0 */
+-
+-SECTIONS {
+-	__mcount_loc : {
+-		*(__patchable_function_entries)
+-	}
+-}
+--- a/include/asm-generic/vmlinux.lds.h
++++ b/include/asm-generic/vmlinux.lds.h
+@@ -110,17 +110,17 @@
+ #endif
+ 
+ #ifdef CONFIG_FTRACE_MCOUNT_RECORD
+-#ifdef CC_USING_PATCHABLE_FUNCTION_ENTRY
+-#define MCOUNT_REC()	. = ALIGN(8);				\
+-			__start_mcount_loc = .;			\
+-			KEEP(*(__patchable_function_entries))	\
+-			__stop_mcount_loc = .;
+-#else
++/*
++ * The ftrace call sites are logged to a section whose name depends on the
++ * compiler option used. A given kernel image will only use one, AKA
++ * FTRACE_CALLSITE_SECTION. We capture all of them here to avoid header
++ * dependencies for FTRACE_CALLSITE_SECTION's definition.
++ */
+ #define MCOUNT_REC()	. = ALIGN(8);				\
+ 			__start_mcount_loc = .;			\
+ 			KEEP(*(__mcount_loc))			\
++			KEEP(*(__patchable_function_entries))	\
+ 			__stop_mcount_loc = .;
+-#endif
+ #else
+ #define MCOUNT_REC()
+ #endif
+--- a/include/linux/ftrace.h
++++ b/include/linux/ftrace.h
+@@ -738,6 +738,11 @@ static inline unsigned long get_lock_par
+ 
+ #ifdef CONFIG_FTRACE_MCOUNT_RECORD
+ extern void ftrace_init(void);
++#ifdef CC_USING_PATCHABLE_FUNCTION_ENTRY
++#define FTRACE_CALLSITE_SECTION	"__patchable_function_entries"
++#else
++#define FTRACE_CALLSITE_SECTION	"__mcount_loc"
++#endif
+ #else
+ static inline void ftrace_init(void) { }
+ #endif
+--- a/kernel/module.c
++++ b/kernel/module.c
+@@ -3377,7 +3377,7 @@ static int find_module_sections(struct m
+ #endif
+ #ifdef CONFIG_FTRACE_MCOUNT_RECORD
+ 	/* sechdrs[0].sh_size is always zero */
+-	mod->ftrace_callsites = section_objs(info, "__mcount_loc",
++	mod->ftrace_callsites = section_objs(info, FTRACE_CALLSITE_SECTION,
+ 					     sizeof(*mod->ftrace_callsites),
+ 					     &mod->num_ftrace_callsites);
+ #endif
