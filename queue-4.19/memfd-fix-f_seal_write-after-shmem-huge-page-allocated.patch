@@ -1,0 +1,119 @@
+From f2b277c4d1c63a85127e8aa2588e9cc3bd21cb99 Mon Sep 17 00:00:00 2001
+From: Hugh Dickins <hughd@google.com>
+Date: Fri, 4 Mar 2022 20:29:01 -0800
+Subject: memfd: fix F_SEAL_WRITE after shmem huge page allocated
+
+From: Hugh Dickins <hughd@google.com>
+
+commit f2b277c4d1c63a85127e8aa2588e9cc3bd21cb99 upstream.
+
+Wangyong reports: after enabling tmpfs filesystem to support transparent
+hugepage with the following command:
+
+  echo always > /sys/kernel/mm/transparent_hugepage/shmem_enabled
+
+the docker program tries to add F_SEAL_WRITE through the following
+command, but it fails unexpectedly with errno EBUSY:
+
+  fcntl(5, F_ADD_SEALS, F_SEAL_WRITE) = -1.
+
+That is because memfd_tag_pins() and memfd_wait_for_pins() were never
+updated for shmem huge pages: checking page_mapcount() against
+page_count() is hopeless on THP subpages - they need to check
+total_mapcount() against page_count() on THP heads only.
+
+Make memfd_tag_pins() (compared > 1) as strict as memfd_wait_for_pins()
+(compared != 1): either can be justified, but given the non-atomic
+total_mapcount() calculation, it is better now to be strict.  Bear in
+mind that total_mapcount() itself scans all of the THP subpages, when
+choosing to take an XA_CHECK_SCHED latency break.
+
+Also fix the unlikely xa_is_value() case in memfd_wait_for_pins(): if a
+page has been swapped out since memfd_tag_pins(), then its refcount must
+have fallen, and so it can safely be untagged.
+
+Link: https://lkml.kernel.org/r/a4f79248-df75-2c8c-3df-ba3317ccb5da@google.com
+Signed-off-by: Hugh Dickins <hughd@google.com>
+Reported-by: Zeal Robot <zealci@zte.com.cn>
+Reported-by: wangyong <wang.yong12@zte.com.cn>
+Cc: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: CGEL ZTE <cgel.zte@gmail.com>
+Cc: Kirill A. Shutemov <kirill@shutemov.name>
+Cc: Song Liu <songliubraving@fb.com>
+Cc: Yang Yang <yang.yang29@zte.com.cn>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ mm/memfd.c |   30 ++++++++++++++++++++++--------
+ 1 file changed, 22 insertions(+), 8 deletions(-)
+
+--- a/mm/memfd.c
++++ b/mm/memfd.c
+@@ -34,26 +34,35 @@ static void memfd_tag_pins(struct addres
+ 	void __rcu **slot;
+ 	pgoff_t start;
+ 	struct page *page;
+-	unsigned int tagged = 0;
++	int latency = 0;
++	int cache_count;
+ 
+ 	lru_add_drain();
+ 	start = 0;
+ 
+ 	xa_lock_irq(&mapping->i_pages);
+ 	radix_tree_for_each_slot(slot, &mapping->i_pages, &iter, start) {
++		cache_count = 1;
+ 		page = radix_tree_deref_slot_protected(slot, &mapping->i_pages.xa_lock);
+-		if (!page || radix_tree_exception(page)) {
++		if (!page || radix_tree_exception(page) || PageTail(page)) {
+ 			if (radix_tree_deref_retry(page)) {
+ 				slot = radix_tree_iter_retry(&iter);
+ 				continue;
+ 			}
+-		} else if (page_count(page) - page_mapcount(page) > 1) {
+-			radix_tree_tag_set(&mapping->i_pages, iter.index,
+-					   MEMFD_TAG_PINNED);
++		} else {
++			if (PageTransHuge(page) && !PageHuge(page))
++				cache_count = HPAGE_PMD_NR;
++			if (cache_count !=
++			    page_count(page) - total_mapcount(page)) {
++				radix_tree_tag_set(&mapping->i_pages,
++						iter.index, MEMFD_TAG_PINNED);
++			}
+ 		}
+ 
+-		if (++tagged % 1024)
++		latency += cache_count;
++		if (latency < 1024)
+ 			continue;
++		latency = 0;
+ 
+ 		slot = radix_tree_iter_resume(slot, &iter);
+ 		xa_unlock_irq(&mapping->i_pages);
+@@ -79,6 +88,7 @@ static int memfd_wait_for_pins(struct ad
+ 	pgoff_t start;
+ 	struct page *page;
+ 	int error, scan;
++	int cache_count;
+ 
+ 	memfd_tag_pins(mapping);
+ 
+@@ -107,8 +117,12 @@ static int memfd_wait_for_pins(struct ad
+ 				page = NULL;
+ 			}
+ 
+-			if (page &&
+-			    page_count(page) - page_mapcount(page) != 1) {
++			cache_count = 1;
++			if (page && PageTransHuge(page) && !PageHuge(page))
++				cache_count = HPAGE_PMD_NR;
++
++			if (page && cache_count !=
++			    page_count(page) - total_mapcount(page)) {
+ 				if (scan < LAST_SCAN)
+ 					goto continue_resched;
+ 
