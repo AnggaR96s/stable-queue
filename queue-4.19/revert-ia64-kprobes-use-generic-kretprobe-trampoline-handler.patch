@@ -1,0 +1,118 @@
+From foo@baz Fri Apr 29 10:57:56 AM CEST 2022
+From: Masami Hiramatsu <mhiramat@kernel.org>
+Date: Tue, 26 Apr 2022 23:26:14 +0900
+Subject: Revert "ia64: kprobes: Use generic kretprobe trampoline handler"
+To: stable@vger.kernel.org, Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: mhiramat@kernel.org, linux-kernel@vger.kernel.org, Ingo Molnar <mingo@kernel.org>, Sasha Levin <sashal@kernel.org>
+Message-ID: <165098317414.1366179.8363938856817159557.stgit@devnote2>
+
+From: Masami Hiramatsu <mhiramat@kernel.org>
+
+This reverts commit d3380de483d55d904fb94a241406b34ed2fada7d.
+
+Since this commit is a part of generic kretprobe trampoline
+handler series, without the other patches in that series, this
+causes a build error on ia64.
+
+Reported-by: kernel test robot <lkp@intel.com>
+Signed-off-by: Masami Hiramatsu <mhiramat@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/ia64/kernel/kprobes.c |   77 +++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 75 insertions(+), 2 deletions(-)
+
+--- a/arch/ia64/kernel/kprobes.c
++++ b/arch/ia64/kernel/kprobes.c
+@@ -409,9 +409,83 @@ static void kretprobe_trampoline(void)
+ {
+ }
+ 
++/*
++ * At this point the target function has been tricked into
++ * returning into our trampoline.  Lookup the associated instance
++ * and then:
++ *    - call the handler function
++ *    - cleanup by marking the instance as unused
++ *    - long jump back to the original return address
++ */
+ int __kprobes trampoline_probe_handler(struct kprobe *p, struct pt_regs *regs)
+ {
+-	regs->cr_iip = __kretprobe_trampoline_handler(regs, kretprobe_trampoline, NULL);
++	struct kretprobe_instance *ri = NULL;
++	struct hlist_head *head, empty_rp;
++	struct hlist_node *tmp;
++	unsigned long flags, orig_ret_address = 0;
++	unsigned long trampoline_address =
++		((struct fnptr *)kretprobe_trampoline)->ip;
++
++	INIT_HLIST_HEAD(&empty_rp);
++	kretprobe_hash_lock(current, &head, &flags);
++
++	/*
++	 * It is possible to have multiple instances associated with a given
++	 * task either because an multiple functions in the call path
++	 * have a return probe installed on them, and/or more than one return
++	 * return probe was registered for a target function.
++	 *
++	 * We can handle this because:
++	 *     - instances are always inserted at the head of the list
++	 *     - when multiple return probes are registered for the same
++	 *       function, the first instance's ret_addr will point to the
++	 *       real return address, and all the rest will point to
++	 *       kretprobe_trampoline
++	 */
++	hlist_for_each_entry_safe(ri, tmp, head, hlist) {
++		if (ri->task != current)
++			/* another task is sharing our hash bucket */
++			continue;
++
++		orig_ret_address = (unsigned long)ri->ret_addr;
++		if (orig_ret_address != trampoline_address)
++			/*
++			 * This is the real return address. Any other
++			 * instances associated with this task are for
++			 * other calls deeper on the call stack
++			 */
++			break;
++	}
++
++	regs->cr_iip = orig_ret_address;
++
++	hlist_for_each_entry_safe(ri, tmp, head, hlist) {
++		if (ri->task != current)
++			/* another task is sharing our hash bucket */
++			continue;
++
++		if (ri->rp && ri->rp->handler)
++			ri->rp->handler(ri, regs);
++
++		orig_ret_address = (unsigned long)ri->ret_addr;
++		recycle_rp_inst(ri, &empty_rp);
++
++		if (orig_ret_address != trampoline_address)
++			/*
++			 * This is the real return address. Any other
++			 * instances associated with this task are for
++			 * other calls deeper on the call stack
++			 */
++			break;
++	}
++	kretprobe_assert(ri, orig_ret_address, trampoline_address);
++
++	kretprobe_hash_unlock(current, &flags);
++
++	hlist_for_each_entry_safe(ri, tmp, &empty_rp, hlist) {
++		hlist_del(&ri->hlist);
++		kfree(ri);
++	}
+ 	/*
+ 	 * By returning a non-zero value, we are telling
+ 	 * kprobe_handler() that we don't want the post_handler
+@@ -424,7 +498,6 @@ void __kprobes arch_prepare_kretprobe(st
+ 				      struct pt_regs *regs)
+ {
+ 	ri->ret_addr = (kprobe_opcode_t *)regs->b0;
+-	ri->fp = NULL;
+ 
+ 	/* Replace the return addr with trampoline addr */
+ 	regs->b0 = ((struct fnptr *)kretprobe_trampoline)->ip;
