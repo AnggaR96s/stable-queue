@@ -1,0 +1,170 @@
+From 4a98275d478d681564c73f10a1173a255928dc15 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Sat, 4 Dec 2021 14:43:43 +0100
+Subject: x86/alternative: Relax text_poke_bp() constraint
+
+From: Peter Zijlstra <peterz@infradead.org>
+
+[ Upstream commit 26c44b776dba4ac692a0bf5a3836feb8a63fea6b ]
+
+Currently, text_poke_bp() is very strict to only allow patching a
+single instruction; however with straight-line-speculation it will be
+required to patch: ret; int3, which is two instructions.
+
+As such, relax the constraints a little to allow int3 padding for all
+instructions that do not imply the execution of the next instruction,
+ie: RET, JMP.d8 and JMP.d32.
+
+While there, rename the text_poke_loc::rel32 field to ::disp.
+
+Note: this fills up the text_poke_loc structure which is now a round
+  16 bytes big.
+
+  [ bp: Put comments ontop instead of on the side. ]
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lore.kernel.org/r/20211204134908.082342723@infradead.org
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/x86/kernel/alternative.c |   49 +++++++++++++++++++++++++++++-------------
+ 1 file changed, 34 insertions(+), 15 deletions(-)
+
+--- a/arch/x86/kernel/alternative.c
++++ b/arch/x86/kernel/alternative.c
+@@ -930,10 +930,13 @@ void text_poke_sync(void)
+ }
+ 
+ struct text_poke_loc {
+-	s32 rel_addr; /* addr := _stext + rel_addr */
+-	s32 rel32;
++	/* addr := _stext + rel_addr */
++	s32 rel_addr;
++	s32 disp;
++	u8 len;
+ 	u8 opcode;
+ 	const u8 text[POKE_MAX_OPCODE_SIZE];
++	/* see text_poke_bp_batch() */
+ 	u8 old;
+ };
+ 
+@@ -948,7 +951,8 @@ static struct bp_patching_desc *bp_desc;
+ static __always_inline
+ struct bp_patching_desc *try_get_desc(struct bp_patching_desc **descp)
+ {
+-	struct bp_patching_desc *desc = __READ_ONCE(*descp); /* rcu_dereference */
++	/* rcu_dereference */
++	struct bp_patching_desc *desc = __READ_ONCE(*descp);
+ 
+ 	if (!desc || !arch_atomic_inc_not_zero(&desc->refs))
+ 		return NULL;
+@@ -982,7 +986,7 @@ noinstr int poke_int3_handler(struct pt_
+ {
+ 	struct bp_patching_desc *desc;
+ 	struct text_poke_loc *tp;
+-	int len, ret = 0;
++	int ret = 0;
+ 	void *ip;
+ 
+ 	if (user_mode(regs))
+@@ -1022,8 +1026,7 @@ noinstr int poke_int3_handler(struct pt_
+ 			goto out_put;
+ 	}
+ 
+-	len = text_opcode_size(tp->opcode);
+-	ip += len;
++	ip += tp->len;
+ 
+ 	switch (tp->opcode) {
+ 	case INT3_INSN_OPCODE:
+@@ -1038,12 +1041,12 @@ noinstr int poke_int3_handler(struct pt_
+ 		break;
+ 
+ 	case CALL_INSN_OPCODE:
+-		int3_emulate_call(regs, (long)ip + tp->rel32);
++		int3_emulate_call(regs, (long)ip + tp->disp);
+ 		break;
+ 
+ 	case JMP32_INSN_OPCODE:
+ 	case JMP8_INSN_OPCODE:
+-		int3_emulate_jmp(regs, (long)ip + tp->rel32);
++		int3_emulate_jmp(regs, (long)ip + tp->disp);
+ 		break;
+ 
+ 	default:
+@@ -1118,7 +1121,7 @@ static void text_poke_bp_batch(struct te
+ 	 */
+ 	for (do_sync = 0, i = 0; i < nr_entries; i++) {
+ 		u8 old[POKE_MAX_OPCODE_SIZE] = { tp[i].old, };
+-		int len = text_opcode_size(tp[i].opcode);
++		int len = tp[i].len;
+ 
+ 		if (len - INT3_INSN_SIZE > 0) {
+ 			memcpy(old + INT3_INSN_SIZE,
+@@ -1195,21 +1198,37 @@ static void text_poke_loc_init(struct te
+ 			       const void *opcode, size_t len, const void *emulate)
+ {
+ 	struct insn insn;
+-	int ret;
++	int ret, i;
+ 
+ 	memcpy((void *)tp->text, opcode, len);
+ 	if (!emulate)
+ 		emulate = opcode;
+ 
+ 	ret = insn_decode_kernel(&insn, emulate);
+-
+ 	BUG_ON(ret < 0);
+-	BUG_ON(len != insn.length);
+ 
+ 	tp->rel_addr = addr - (void *)_stext;
++	tp->len = len;
+ 	tp->opcode = insn.opcode.bytes[0];
+ 
+ 	switch (tp->opcode) {
++	case RET_INSN_OPCODE:
++	case JMP32_INSN_OPCODE:
++	case JMP8_INSN_OPCODE:
++		/*
++		 * Control flow instructions without implied execution of the
++		 * next instruction can be padded with INT3.
++		 */
++		for (i = insn.length; i < len; i++)
++			BUG_ON(tp->text[i] != INT3_INSN_OPCODE);
++		break;
++
++	default:
++		BUG_ON(len != insn.length);
++	};
++
++
++	switch (tp->opcode) {
+ 	case INT3_INSN_OPCODE:
+ 	case RET_INSN_OPCODE:
+ 		break;
+@@ -1217,7 +1236,7 @@ static void text_poke_loc_init(struct te
+ 	case CALL_INSN_OPCODE:
+ 	case JMP32_INSN_OPCODE:
+ 	case JMP8_INSN_OPCODE:
+-		tp->rel32 = insn.immediate.value;
++		tp->disp = insn.immediate.value;
+ 		break;
+ 
+ 	default: /* assume NOP */
+@@ -1225,13 +1244,13 @@ static void text_poke_loc_init(struct te
+ 		case 2: /* NOP2 -- emulate as JMP8+0 */
+ 			BUG_ON(memcmp(emulate, x86_nops[len], len));
+ 			tp->opcode = JMP8_INSN_OPCODE;
+-			tp->rel32 = 0;
++			tp->disp = 0;
+ 			break;
+ 
+ 		case 5: /* NOP5 -- emulate as JMP32+0 */
+ 			BUG_ON(memcmp(emulate, x86_nops[len], len));
+ 			tp->opcode = JMP32_INSN_OPCODE;
+-			tp->rel32 = 0;
++			tp->disp = 0;
+ 			break;
+ 
+ 		default: /* unknown instruction */
