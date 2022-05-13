@@ -1,0 +1,80 @@
+From chenxiaosong2@huawei.com  Fri May 13 16:02:28 2022
+From: ChenXiaoSong <chenxiaosong2@huawei.com>
+Date: Tue, 2 Nov 2021 22:22:06 +0800
+Subject: VFS: Fix memory leak caused by concurrently mounting fs with subtype
+To: <viro@zeniv.linux.org.uk>, <stable@vger.kernel.org>, <gregkh@linuxfoundation.org>
+Cc: <linux-fsdevel@vger.kernel.org>, <linux-kernel@vger.kernel.org>, <dhowells@redhat.com>, <yukuai3@huawei.com>, <yi.zhang@huawei.com>, <zhangxiaoxu5@huawei.com>, <chenxiaosong2@huawei.com>
+Message-ID: <20211102142206.3972465-1-chenxiaosong2@huawei.com>
+
+From: ChenXiaoSong <chenxiaosong2@huawei.com>
+
+If two processes mount same superblock, memory leak occurs:
+
+CPU0               |  CPU1
+do_new_mount       |  do_new_mount
+  fs_set_subtype   |    fs_set_subtype
+    kstrdup        |
+                   |      kstrdup
+    memrory leak   |
+
+The following reproducer triggers the problem:
+
+1. shell command: mount -t ntfs /dev/sda1 /mnt &
+2. c program: mount("/dev/sda1", "/mnt", "fuseblk", 0, "...")
+
+with kmemleak report being along the lines of
+
+unreferenced object 0xffff888235f1a5c0 (size 8):
+  comm "mount.ntfs", pid 2860, jiffies 4295757824 (age 43.423s)
+  hex dump (first 8 bytes):
+    00 a5 f1 35 82 88 ff ff                          ...5....
+  backtrace:
+    [<00000000656e30cc>] __kmalloc_track_caller+0x16e/0x430
+    [<000000008e591727>] kstrdup+0x3e/0x90
+    [<000000008430d12b>] do_mount.cold+0x7b/0xd9
+    [<0000000078d639cd>] ksys_mount+0xb2/0x150
+    [<000000006015988d>] __x64_sys_mount+0x29/0x40
+    [<00000000e0a7c118>] do_syscall_64+0xc1/0x1d0
+    [<00000000bcea7df5>] entry_SYSCALL_64_after_hwframe+0x44/0xa9
+    [<00000000803a4067>] 0xffffffffffffffff
+
+Linus's tree already have refactoring patchset [1], one of them can fix this bug:
+        c30da2e981a7 ("fuse: convert to use the new mount API")
+After refactoring, init super_block->s_subtype in fuse_fill_super.
+
+Since we did not merge the refactoring patchset in this branch, I create this patch.
+This patch fix this by adding a write lock while calling fs_set_subtype.
+
+[1] https://patchwork.kernel.org/project/linux-fsdevel/patch/20190903113640.7984-3-mszeredi@redhat.com/
+
+Fixes: 79c0b2df79eb ("add filesystem subtype support")
+Cc: David Howells <dhowells@redhat.com>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: ChenXiaoSong <chenxiaosong2@huawei.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+v1: Can not mount sshfs ([PATCH linux-4.19.y] VFS: Fix fuseblk memory leak caused by mount concurrency)
+v2: Use write lock while writing superblock ([PATCH 4.19,v2] VFS: Fix fuseblk memory leak caused by mount concurrency)
+v3: Update commit message
+
+ fs/namespace.c |    9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -2490,9 +2490,12 @@ static int do_new_mount(struct path *pat
+ 		return -ENODEV;
+ 
+ 	mnt = vfs_kern_mount(type, sb_flags, name, data);
+-	if (!IS_ERR(mnt) && (type->fs_flags & FS_HAS_SUBTYPE) &&
+-	    !mnt->mnt_sb->s_subtype)
+-		mnt = fs_set_subtype(mnt, fstype);
++	if (!IS_ERR(mnt) && (type->fs_flags & FS_HAS_SUBTYPE)) {
++		down_write(&mnt->mnt_sb->s_umount);
++		if (!mnt->mnt_sb->s_subtype)
++			mnt = fs_set_subtype(mnt, fstype);
++		up_write(&mnt->mnt_sb->s_umount);
++	}
+ 
+ 	put_filesystem(type);
+ 	if (IS_ERR(mnt))
