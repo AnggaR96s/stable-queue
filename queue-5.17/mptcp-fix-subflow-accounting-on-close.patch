@@ -1,0 +1,117 @@
+From 45cb208a5cd6f0e32e06789c20f0349c3aa5fc8a Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 12 May 2022 16:26:41 -0700
+Subject: mptcp: fix subflow accounting on close
+
+From: Paolo Abeni <pabeni@redhat.com>
+
+[ Upstream commit 95d686517884a403412b000361cee2b08b2ed1e6 ]
+
+If the PM closes a fully established MPJ subflow or the subflow
+creation errors out in it's early stage the subflows counter is
+not bumped accordingly.
+
+This change adds the missing accounting, additionally taking care
+of updating accordingly the 'accept_subflow' flag.
+
+Fixes: a88c9e496937 ("mptcp: do not block subflows creation on errors")
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ net/mptcp/pm.c       |  5 ++---
+ net/mptcp/protocol.h | 14 ++++++++++++++
+ net/mptcp/subflow.c  | 12 +++++++++---
+ 3 files changed, 25 insertions(+), 6 deletions(-)
+
+diff --git a/net/mptcp/pm.c b/net/mptcp/pm.c
+index 7bea318ac5f2..1eb83cbe8aae 100644
+--- a/net/mptcp/pm.c
++++ b/net/mptcp/pm.c
+@@ -178,14 +178,13 @@ void mptcp_pm_subflow_check_next(struct mptcp_sock *msk, const struct sock *ssk,
+ 	struct mptcp_pm_data *pm = &msk->pm;
+ 	bool update_subflows;
+ 
+-	update_subflows = (ssk->sk_state == TCP_CLOSE) &&
+-			  (subflow->request_join || subflow->mp_join);
++	update_subflows = subflow->request_join || subflow->mp_join;
+ 	if (!READ_ONCE(pm->work_pending) && !update_subflows)
+ 		return;
+ 
+ 	spin_lock_bh(&pm->lock);
+ 	if (update_subflows)
+-		pm->subflows--;
++		__mptcp_pm_close_subflow(msk);
+ 
+ 	/* Even if this subflow is not really established, tell the PM to try
+ 	 * to pick the next ones, if possible.
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+index 85317ce38e3f..a1c845eb47bd 100644
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -835,6 +835,20 @@ unsigned int mptcp_pm_get_add_addr_accept_max(struct mptcp_sock *msk);
+ unsigned int mptcp_pm_get_subflows_max(struct mptcp_sock *msk);
+ unsigned int mptcp_pm_get_local_addr_max(struct mptcp_sock *msk);
+ 
++/* called under PM lock */
++static inline void __mptcp_pm_close_subflow(struct mptcp_sock *msk)
++{
++	if (--msk->pm.subflows < mptcp_pm_get_subflows_max(msk))
++		WRITE_ONCE(msk->pm.accept_subflow, true);
++}
++
++static inline void mptcp_pm_close_subflow(struct mptcp_sock *msk)
++{
++	spin_lock_bh(&msk->pm.lock);
++	__mptcp_pm_close_subflow(msk);
++	spin_unlock_bh(&msk->pm.lock);
++}
++
+ void mptcp_sockopt_sync(struct mptcp_sock *msk, struct sock *ssk);
+ void mptcp_sockopt_sync_locked(struct mptcp_sock *msk, struct sock *ssk);
+ 
+diff --git a/net/mptcp/subflow.c b/net/mptcp/subflow.c
+index bea47a1180dc..1d4d84efe8f5 100644
+--- a/net/mptcp/subflow.c
++++ b/net/mptcp/subflow.c
+@@ -1380,20 +1380,20 @@ int __mptcp_subflow_connect(struct sock *sk, const struct mptcp_addr_info *loc,
+ 	struct sockaddr_storage addr;
+ 	int remote_id = remote->id;
+ 	int local_id = loc->id;
++	int err = -ENOTCONN;
+ 	struct socket *sf;
+ 	struct sock *ssk;
+ 	u32 remote_token;
+ 	int addrlen;
+ 	int ifindex;
+ 	u8 flags;
+-	int err;
+ 
+ 	if (!mptcp_is_fully_established(sk))
+-		return -ENOTCONN;
++		goto err_out;
+ 
+ 	err = mptcp_subflow_create_socket(sk, &sf);
+ 	if (err)
+-		return err;
++		goto err_out;
+ 
+ 	ssk = sf->sk;
+ 	subflow = mptcp_subflow_ctx(ssk);
+@@ -1456,6 +1456,12 @@ int __mptcp_subflow_connect(struct sock *sk, const struct mptcp_addr_info *loc,
+ failed:
+ 	subflow->disposable = 1;
+ 	sock_release(sf);
++
++err_out:
++	/* we account subflows before the creation, and this failures will not
++	 * be caught by sk_state_change()
++	 */
++	mptcp_pm_close_subflow(msk);
+ 	return err;
+ }
+ 
+-- 
+2.35.1
+
