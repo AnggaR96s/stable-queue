@@ -1,0 +1,146 @@
+From foo@baz Thu May 26 06:53:54 PM CEST 2022
+From: Eric Biggers <ebiggers@google.com>
+Date: Wed, 23 Dec 2020 00:09:53 -0800
+Subject: crypto: blake2s - move update and final logic to internal/blake2s.h
+
+From: Eric Biggers <ebiggers@google.com>
+
+commit 057edc9c8bb2d5ff5b058b521792c392428a0714 upstream.
+
+Move most of blake2s_update() and blake2s_final() into new inline
+functions __blake2s_update() and __blake2s_final() in
+include/crypto/internal/blake2s.h so that this logic can be shared by
+the shash helper functions.  This will avoid duplicating this logic
+between the library and shash implementations.
+
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+Acked-by: Ard Biesheuvel <ardb@kernel.org>
+Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+Signed-off-by: Jason A. Donenfeld <Jason@zx2c4.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/crypto/internal/blake2s.h |   41 ++++++++++++++++++++++++++++++++
+ lib/crypto/blake2s.c              |   48 ++++++--------------------------------
+ 2 files changed, 49 insertions(+), 40 deletions(-)
+
+--- a/include/crypto/internal/blake2s.h
++++ b/include/crypto/internal/blake2s.h
+@@ -4,6 +4,7 @@
+ #define BLAKE2S_INTERNAL_H
+ 
+ #include <crypto/blake2s.h>
++#include <linux/string.h>
+ 
+ struct blake2s_tfm_ctx {
+ 	u8 key[BLAKE2S_KEY_SIZE];
+@@ -23,4 +24,44 @@ static inline void blake2s_set_lastblock
+ 	state->f[0] = -1;
+ }
+ 
++typedef void (*blake2s_compress_t)(struct blake2s_state *state,
++				   const u8 *block, size_t nblocks, u32 inc);
++
++static inline void __blake2s_update(struct blake2s_state *state,
++				    const u8 *in, size_t inlen,
++				    blake2s_compress_t compress)
++{
++	const size_t fill = BLAKE2S_BLOCK_SIZE - state->buflen;
++
++	if (unlikely(!inlen))
++		return;
++	if (inlen > fill) {
++		memcpy(state->buf + state->buflen, in, fill);
++		(*compress)(state, state->buf, 1, BLAKE2S_BLOCK_SIZE);
++		state->buflen = 0;
++		in += fill;
++		inlen -= fill;
++	}
++	if (inlen > BLAKE2S_BLOCK_SIZE) {
++		const size_t nblocks = DIV_ROUND_UP(inlen, BLAKE2S_BLOCK_SIZE);
++		/* Hash one less (full) block than strictly possible */
++		(*compress)(state, in, nblocks - 1, BLAKE2S_BLOCK_SIZE);
++		in += BLAKE2S_BLOCK_SIZE * (nblocks - 1);
++		inlen -= BLAKE2S_BLOCK_SIZE * (nblocks - 1);
++	}
++	memcpy(state->buf + state->buflen, in, inlen);
++	state->buflen += inlen;
++}
++
++static inline void __blake2s_final(struct blake2s_state *state, u8 *out,
++				   blake2s_compress_t compress)
++{
++	blake2s_set_lastblock(state);
++	memset(state->buf + state->buflen, 0,
++	       BLAKE2S_BLOCK_SIZE - state->buflen); /* Padding */
++	(*compress)(state, state->buf, 1, state->buflen);
++	cpu_to_le32_array(state->h, ARRAY_SIZE(state->h));
++	memcpy(out, state->h, state->outlen);
++}
++
+ #endif /* BLAKE2S_INTERNAL_H */
+--- a/lib/crypto/blake2s.c
++++ b/lib/crypto/blake2s.c
+@@ -15,55 +15,23 @@
+ #include <linux/module.h>
+ #include <linux/init.h>
+ #include <linux/bug.h>
+-#include <asm/unaligned.h>
++
++#if IS_ENABLED(CONFIG_CRYPTO_ARCH_HAVE_LIB_BLAKE2S)
++#  define blake2s_compress blake2s_compress_arch
++#else
++#  define blake2s_compress blake2s_compress_generic
++#endif
+ 
+ void blake2s_update(struct blake2s_state *state, const u8 *in, size_t inlen)
+ {
+-	const size_t fill = BLAKE2S_BLOCK_SIZE - state->buflen;
+-
+-	if (unlikely(!inlen))
+-		return;
+-	if (inlen > fill) {
+-		memcpy(state->buf + state->buflen, in, fill);
+-		if (IS_ENABLED(CONFIG_CRYPTO_ARCH_HAVE_LIB_BLAKE2S))
+-			blake2s_compress_arch(state, state->buf, 1,
+-					      BLAKE2S_BLOCK_SIZE);
+-		else
+-			blake2s_compress_generic(state, state->buf, 1,
+-						 BLAKE2S_BLOCK_SIZE);
+-		state->buflen = 0;
+-		in += fill;
+-		inlen -= fill;
+-	}
+-	if (inlen > BLAKE2S_BLOCK_SIZE) {
+-		const size_t nblocks = DIV_ROUND_UP(inlen, BLAKE2S_BLOCK_SIZE);
+-		/* Hash one less (full) block than strictly possible */
+-		if (IS_ENABLED(CONFIG_CRYPTO_ARCH_HAVE_LIB_BLAKE2S))
+-			blake2s_compress_arch(state, in, nblocks - 1,
+-					      BLAKE2S_BLOCK_SIZE);
+-		else
+-			blake2s_compress_generic(state, in, nblocks - 1,
+-						 BLAKE2S_BLOCK_SIZE);
+-		in += BLAKE2S_BLOCK_SIZE * (nblocks - 1);
+-		inlen -= BLAKE2S_BLOCK_SIZE * (nblocks - 1);
+-	}
+-	memcpy(state->buf + state->buflen, in, inlen);
+-	state->buflen += inlen;
++	__blake2s_update(state, in, inlen, blake2s_compress);
+ }
+ EXPORT_SYMBOL(blake2s_update);
+ 
+ void blake2s_final(struct blake2s_state *state, u8 *out)
+ {
+ 	WARN_ON(IS_ENABLED(DEBUG) && !out);
+-	blake2s_set_lastblock(state);
+-	memset(state->buf + state->buflen, 0,
+-	       BLAKE2S_BLOCK_SIZE - state->buflen); /* Padding */
+-	if (IS_ENABLED(CONFIG_CRYPTO_ARCH_HAVE_LIB_BLAKE2S))
+-		blake2s_compress_arch(state, state->buf, 1, state->buflen);
+-	else
+-		blake2s_compress_generic(state, state->buf, 1, state->buflen);
+-	cpu_to_le32_array(state->h, ARRAY_SIZE(state->h));
+-	memcpy(out, state->h, state->outlen);
++	__blake2s_final(state, out, blake2s_compress);
+ 	memzero_explicit(state, sizeof(*state));
+ }
+ EXPORT_SYMBOL(blake2s_final);
