@@ -1,0 +1,98 @@
+From foo@baz Thu May 26 06:25:12 PM CEST 2022
+From: "Jason A. Donenfeld" <Jason@zx2c4.com>
+Date: Tue, 5 Apr 2022 16:40:51 +0200
+Subject: random: do not allow user to keep crng key around on stack
+
+From: "Jason A. Donenfeld" <Jason@zx2c4.com>
+
+commit aba120cc101788544aa3e2c30c8da88513892350 upstream.
+
+The fast key erasure RNG design relies on the key that's used to be used
+and then discarded. We do this, making judicious use of
+memzero_explicit().  However, reads to /dev/urandom and calls to
+getrandom() involve a copy_to_user(), and userspace can use FUSE or
+userfaultfd, or make a massive call, dynamically remap memory addresses
+as it goes, and set the process priority to idle, in order to keep a
+kernel stack alive indefinitely. By probing
+/proc/sys/kernel/random/entropy_avail to learn when the crng key is
+refreshed, a malicious userspace could mount this attack every 5 minutes
+thereafter, breaking the crng's forward secrecy.
+
+In order to fix this, we just overwrite the stack's key with the first
+32 bytes of the "free" fast key erasure output. If we're returning <= 32
+bytes to the user, then we can still return those bytes directly, so
+that short reads don't become slower. And for long reads, the difference
+is hopefully lost in the amortization, so it doesn't change much, with
+that amortization helping variously for medium reads.
+
+We don't need to do this for get_random_bytes() and the various
+kernel-space callers, and later, if we ever switch to always batching,
+this won't be necessary either, so there's no need to change the API of
+these functions.
+
+Cc: Theodore Ts'o <tytso@mit.edu>
+Reviewed-by: Jann Horn <jannh@google.com>
+Fixes: c92e040d575a ("random: add backtracking protection to the CRNG")
+Fixes: 186873c549df ("random: use simpler fast key erasure flow on per-cpu keys")
+Signed-off-by: Jason A. Donenfeld <Jason@zx2c4.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/char/random.c |   35 +++++++++++++++++++++++------------
+ 1 file changed, 23 insertions(+), 12 deletions(-)
+
+--- a/drivers/char/random.c
++++ b/drivers/char/random.c
+@@ -534,19 +534,29 @@ static ssize_t get_random_bytes_user(voi
+ 	if (!nbytes)
+ 		return 0;
+ 
+-	len = min_t(size_t, 32, nbytes);
+-	crng_make_state(chacha_state, output, len);
+-
+-	if (copy_to_user(buf, output, len))
+-		return -EFAULT;
+-	nbytes -= len;
+-	buf += len;
+-	ret += len;
++	/*
++	 * Immediately overwrite the ChaCha key at index 4 with random
++	 * bytes, in case userspace causes copy_to_user() below to sleep
++	 * forever, so that we still retain forward secrecy in that case.
++	 */
++	crng_make_state(chacha_state, (u8 *)&chacha_state[4], CHACHA_KEY_SIZE);
++	/*
++	 * However, if we're doing a read of len <= 32, we don't need to
++	 * use chacha_state after, so we can simply return those bytes to
++	 * the user directly.
++	 */
++	if (nbytes <= CHACHA_KEY_SIZE) {
++		ret = copy_to_user(buf, &chacha_state[4], nbytes) ? -EFAULT : nbytes;
++		goto out_zero_chacha;
++	}
+ 
+-	while (nbytes) {
++	do {
+ 		if (large_request && need_resched()) {
+-			if (signal_pending(current))
++			if (signal_pending(current)) {
++				if (!ret)
++					ret = -ERESTARTSYS;
+ 				break;
++			}
+ 			schedule();
+ 		}
+ 
+@@ -563,10 +573,11 @@ static ssize_t get_random_bytes_user(voi
+ 		nbytes -= len;
+ 		buf += len;
+ 		ret += len;
+-	}
++	} while (nbytes);
+ 
+-	memzero_explicit(chacha_state, sizeof(chacha_state));
+ 	memzero_explicit(output, sizeof(output));
++out_zero_chacha:
++	memzero_explicit(chacha_state, sizeof(chacha_state));
+ 	return ret;
+ }
+ 
