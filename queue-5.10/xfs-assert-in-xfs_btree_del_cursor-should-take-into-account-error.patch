@@ -1,0 +1,82 @@
+From foo@baz Mon Jun  6 07:00:47 PM CEST 2022
+From: Amir Goldstein <amir73il@gmail.com>
+Date: Mon,  6 Jun 2022 17:32:55 +0300
+Subject: xfs: assert in xfs_btree_del_cursor should take into account error
+To: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: Sasha Levin <sashal@kernel.org>, Dave Chinner <david@fromorbit.com>, "Darrick J . Wong" <djwong@kernel.org>, Christoph Hellwig <hch@lst.de>, Brian Foster <bfoster@redhat.com>, Christian Brauner <brauner@kernel.org>, Luis Chamberlain <mcgrof@kernel.org>, Leah Rumancik <leah.rumancik@gmail.com>, Adam Manzanares <a.manzanares@samsung.com>, linux-xfs@vger.kernel.org, stable@vger.kernel.org, Dave Chinner <dchinner@redhat.com>
+Message-ID: <20220606143255.685988-9-amir73il@gmail.com>
+
+From: Dave Chinner <dchinner@redhat.com>
+
+commit 56486f307100e8fc66efa2ebd8a71941fa10bf6f upstream.
+
+xfs/538 on a 1kB block filesystem failed with this assert:
+
+XFS: Assertion failed: cur->bc_btnum != XFS_BTNUM_BMAP || cur->bc_ino.allocated == 0 || xfs_is_shutdown(cur->bc_mp), file: fs/xfs/libxfs/xfs_btree.c, line: 448
+
+The problem was that an allocation failed unexpectedly in
+xfs_bmbt_alloc_block() after roughly 150,000 minlen allocation error
+injections, resulting in an EFSCORRUPTED error being returned to
+xfs_bmapi_write(). The error occurred on extent-to-btree format
+conversion allocating the new root block:
+
+ RIP: 0010:xfs_bmbt_alloc_block+0x177/0x210
+ Call Trace:
+  <TASK>
+  xfs_btree_new_iroot+0xdf/0x520
+  xfs_btree_make_block_unfull+0x10d/0x1c0
+  xfs_btree_insrec+0x364/0x790
+  xfs_btree_insert+0xaa/0x210
+  xfs_bmap_add_extent_hole_real+0x1fe/0x9a0
+  xfs_bmapi_allocate+0x34c/0x420
+  xfs_bmapi_write+0x53c/0x9c0
+  xfs_alloc_file_space+0xee/0x320
+  xfs_file_fallocate+0x36b/0x450
+  vfs_fallocate+0x148/0x340
+  __x64_sys_fallocate+0x3c/0x70
+  do_syscall_64+0x35/0x80
+  entry_SYSCALL_64_after_hwframe+0x44/0xa
+
+Why the allocation failed at this point is unknown, but is likely
+that we ran the transaction out of reserved space and filesystem out
+of space with bmbt blocks because of all the minlen allocations
+being done causing worst case fragmentation of a large allocation.
+
+Regardless of the cause, we've then called xfs_bmapi_finish() which
+calls xfs_btree_del_cursor(cur, error) to tear down the cursor.
+
+So we have a failed operation, error != 0, cur->bc_ino.allocated > 0
+and the filesystem is still up. The assert fails to take into
+account that allocation can fail with an error and the transaction
+teardown will shut the filesystem down if necessary. i.e. the
+assert needs to check "|| error != 0" as well, because at this point
+shutdown is pending because the current transaction is dirty....
+
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Dave Chinner <david@fromorbit.com>
+Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/xfs/libxfs/xfs_btree.c |    8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+--- a/fs/xfs/libxfs/xfs_btree.c
++++ b/fs/xfs/libxfs/xfs_btree.c
+@@ -372,8 +372,14 @@ xfs_btree_del_cursor(
+ 			break;
+ 	}
+ 
++	/*
++	 * If we are doing a BMBT update, the number of unaccounted blocks
++	 * allocated during this cursor life time should be zero. If it's not
++	 * zero, then we should be shut down or on our way to shutdown due to
++	 * cancelling a dirty transaction on error.
++	 */
+ 	ASSERT(cur->bc_btnum != XFS_BTNUM_BMAP || cur->bc_ino.allocated == 0 ||
+-	       XFS_FORCED_SHUTDOWN(cur->bc_mp));
++	       XFS_FORCED_SHUTDOWN(cur->bc_mp) || error != 0);
+ 	if (unlikely(cur->bc_flags & XFS_BTREE_STAGING))
+ 		kmem_free(cur->bc_ops);
+ 	kmem_cache_free(xfs_btree_cur_zone, cur);
