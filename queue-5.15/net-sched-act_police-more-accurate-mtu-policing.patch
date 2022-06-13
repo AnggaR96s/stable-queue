@@ -1,0 +1,130 @@
+From 4ddc844eb81da59bfb816d8d52089aba4e59e269 Mon Sep 17 00:00:00 2001
+From: Davide Caratti <dcaratti@redhat.com>
+Date: Thu, 10 Feb 2022 18:56:08 +0100
+Subject: net/sched: act_police: more accurate MTU policing
+
+From: Davide Caratti <dcaratti@redhat.com>
+
+commit 4ddc844eb81da59bfb816d8d52089aba4e59e269 upstream.
+
+in current Linux, MTU policing does not take into account that packets at
+the TC ingress have the L2 header pulled. Thus, the same TC police action
+(with the same value of tcfp_mtu) behaves differently for ingress/egress.
+In addition, the full GSO size is compared to tcfp_mtu: as a consequence,
+the policer drops GSO packets even when individual segments have the L2 +
+L3 + L4 + payload length below the configured valued of tcfp_mtu.
+
+Improve the accuracy of MTU policing as follows:
+ - account for mac_len for non-GSO packets at TC ingress.
+ - compare MTU threshold with the segmented size for GSO packets.
+Also, add a kselftest that verifies the correct behavior.
+
+Signed-off-by: Davide Caratti <dcaratti@redhat.com>
+Reviewed-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/sched/act_police.c                              |   16 +++++-
+ tools/testing/selftests/net/forwarding/tc_police.sh |   52 ++++++++++++++++++++
+ 2 files changed, 67 insertions(+), 1 deletion(-)
+
+--- a/net/sched/act_police.c
++++ b/net/sched/act_police.c
+@@ -239,6 +239,20 @@ release_idr:
+ 	return err;
+ }
+ 
++static bool tcf_police_mtu_check(struct sk_buff *skb, u32 limit)
++{
++	u32 len;
++
++	if (skb_is_gso(skb))
++		return skb_gso_validate_mac_len(skb, limit);
++
++	len = qdisc_pkt_len(skb);
++	if (skb_at_tc_ingress(skb))
++		len += skb->mac_len;
++
++	return len <= limit;
++}
++
+ static int tcf_police_act(struct sk_buff *skb, const struct tc_action *a,
+ 			  struct tcf_result *res)
+ {
+@@ -261,7 +275,7 @@ static int tcf_police_act(struct sk_buff
+ 			goto inc_overlimits;
+ 	}
+ 
+-	if (qdisc_pkt_len(skb) <= p->tcfp_mtu) {
++	if (tcf_police_mtu_check(skb, p->tcfp_mtu)) {
+ 		if (!p->rate_present && !p->pps_present) {
+ 			ret = p->tcfp_result;
+ 			goto end;
+--- a/tools/testing/selftests/net/forwarding/tc_police.sh
++++ b/tools/testing/selftests/net/forwarding/tc_police.sh
+@@ -37,6 +37,8 @@ ALL_TESTS="
+ 	police_tx_mirror_test
+ 	police_pps_rx_test
+ 	police_pps_tx_test
++	police_mtu_rx_test
++	police_mtu_tx_test
+ "
+ NUM_NETIFS=6
+ source tc_common.sh
+@@ -346,6 +348,56 @@ police_pps_tx_test()
+ 	tc filter del dev $rp2 egress protocol ip pref 1 handle 101 flower
+ }
+ 
++police_mtu_common_test() {
++	RET=0
++
++	local test_name=$1; shift
++	local dev=$1; shift
++	local direction=$1; shift
++
++	tc filter add dev $dev $direction protocol ip pref 1 handle 101 flower \
++		dst_ip 198.51.100.1 ip_proto udp dst_port 54321 \
++		action police mtu 1042 conform-exceed drop/ok
++
++	# to count "conform" packets
++	tc filter add dev $h2 ingress protocol ip pref 1 handle 101 flower \
++		dst_ip 198.51.100.1 ip_proto udp dst_port 54321 \
++		action drop
++
++	mausezahn $h1 -a own -b $(mac_get $rp1) -A 192.0.2.1 -B 198.51.100.1 \
++		-t udp sp=12345,dp=54321 -p 1001 -c 10 -q
++
++	mausezahn $h1 -a own -b $(mac_get $rp1) -A 192.0.2.1 -B 198.51.100.1 \
++		-t udp sp=12345,dp=54321 -p 1000 -c 3 -q
++
++	tc_check_packets "dev $dev $direction" 101 13
++	check_err $? "wrong packet counter"
++
++	# "exceed" packets
++	local overlimits_t0=$(tc_rule_stats_get ${dev} 1 ${direction} .overlimits)
++	test ${overlimits_t0} = 10
++	check_err $? "wrong overlimits, expected 10 got ${overlimits_t0}"
++
++	# "conform" packets
++	tc_check_packets "dev $h2 ingress" 101 3
++	check_err $? "forwarding error"
++
++	tc filter del dev $h2 ingress protocol ip pref 1 handle 101 flower
++	tc filter del dev $dev $direction protocol ip pref 1 handle 101 flower
++
++	log_test "$test_name"
++}
++
++police_mtu_rx_test()
++{
++	police_mtu_common_test "police mtu (rx)" $rp1 ingress
++}
++
++police_mtu_tx_test()
++{
++	police_mtu_common_test "police mtu (tx)" $rp2 egress
++}
++
+ setup_prepare()
+ {
+ 	h1=${NETIFS[p1]}
