@@ -1,0 +1,227 @@
+From f3eac426657d985b97c92fa5f7ae1d43f04721f3 Mon Sep 17 00:00:00 2001
+From: "Jason A. Donenfeld" <Jason@zx2c4.com>
+Date: Tue, 21 Jun 2022 16:08:49 +0200
+Subject: powerpc/powernv: wire up rng during setup_arch
+
+From: Jason A. Donenfeld <Jason@zx2c4.com>
+
+commit f3eac426657d985b97c92fa5f7ae1d43f04721f3 upstream.
+
+The platform's RNG must be available before random_init() in order to be
+useful for initial seeding, which in turn means that it needs to be
+called from setup_arch(), rather than from an init call.
+
+Complicating things, however, is that POWER8 systems need some per-cpu
+state and kmalloc, which isn't available at this stage. So we split
+things up into an early phase and a later opportunistic phase. This
+commit also removes some noisy log messages that don't add much.
+
+Fixes: a4da0d50b2a0 ("powerpc: Implement arch_get_random_long/int() for powernv")
+Cc: stable@vger.kernel.org # v3.13+
+Signed-off-by: Jason A. Donenfeld <Jason@zx2c4.com>
+Reviewed-by: Christophe Leroy <christophe.leroy@csgroup.eu>
+[mpe: Add of_node_put(), use pnv naming, minor change log editing]
+Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20220621140849.127227-1-Jason@zx2c4.com
+Signed-off-by: Jason A. Donenfeld <Jason@zx2c4.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/powerpc/include/asm/ppc-opcode.h    |    4 +
+ arch/powerpc/platforms/powernv/powernv.h |    2 
+ arch/powerpc/platforms/powernv/rng.c     |   91 ++++++++++++++++++++++++++-----
+ arch/powerpc/platforms/powernv/setup.c   |    2 
+ 4 files changed, 85 insertions(+), 14 deletions(-)
+
+--- a/arch/powerpc/include/asm/ppc-opcode.h
++++ b/arch/powerpc/include/asm/ppc-opcode.h
+@@ -134,6 +134,7 @@
+ #define PPC_INST_COPY			0x7c00060c
+ #define PPC_INST_COPY_FIRST		0x7c20060c
+ #define PPC_INST_CP_ABORT		0x7c00068c
++#define PPC_INST_DARN			0x7c0005e6
+ #define PPC_INST_DCBA			0x7c0005ec
+ #define PPC_INST_DCBA_MASK		0xfc0007fe
+ #define PPC_INST_DCBAL			0x7c2005ec
+@@ -328,6 +329,9 @@
+ 
+ /* Deal with instructions that older assemblers aren't aware of */
+ #define	PPC_CP_ABORT		stringify_in_c(.long PPC_INST_CP_ABORT)
++#define PPC_DARN(t, l)		stringify_in_c(.long PPC_INST_DARN |  \
++						___PPC_RT(t)	   |  \
++						(((l) & 0x3) << 16))
+ #define	PPC_DCBAL(a, b)		stringify_in_c(.long PPC_INST_DCBAL | \
+ 					__PPC_RA(a) | __PPC_RB(b))
+ #define	PPC_DCBZL(a, b)		stringify_in_c(.long PPC_INST_DCBZL | \
+--- a/arch/powerpc/platforms/powernv/powernv.h
++++ b/arch/powerpc/platforms/powernv/powernv.h
+@@ -27,4 +27,6 @@ extern void opal_event_shutdown(void);
+ 
+ bool cpu_core_split_required(void);
+ 
++void pnv_rng_init(void);
++
+ #endif /* _POWERNV_H */
+--- a/arch/powerpc/platforms/powernv/rng.c
++++ b/arch/powerpc/platforms/powernv/rng.c
+@@ -16,11 +16,14 @@
+ #include <linux/slab.h>
+ #include <linux/smp.h>
+ #include <asm/archrandom.h>
++#include <asm/cputable.h>
+ #include <asm/io.h>
+ #include <asm/prom.h>
+ #include <asm/machdep.h>
+ #include <asm/smp.h>
++#include "powernv.h"
+ 
++#define DARN_ERR 0xFFFFFFFFFFFFFFFFul
+ 
+ struct powernv_rng {
+ 	void __iomem *regs;
+@@ -30,7 +33,6 @@ struct powernv_rng {
+ 
+ static DEFINE_PER_CPU(struct powernv_rng *, powernv_rng);
+ 
+-
+ int powernv_hwrng_present(void)
+ {
+ 	struct powernv_rng *rng;
+@@ -45,7 +47,11 @@ static unsigned long rng_whiten(struct p
+ 	unsigned long parity;
+ 
+ 	/* Calculate the parity of the value */
+-	asm ("popcntd %0,%1" : "=r" (parity) : "r" (val));
++	asm (".machine push;   \
++	      .machine power7; \
++	      popcntd %0,%1;   \
++	      .machine pop;"
++	     : "=r" (parity) : "r" (val));
+ 
+ 	/* xor our value with the previous mask */
+ 	val ^= rng->mask;
+@@ -67,6 +73,38 @@ int powernv_get_random_real_mode(unsigne
+ 	return 1;
+ }
+ 
++static int powernv_get_random_darn(unsigned long *v)
++{
++	unsigned long val;
++
++	/* Using DARN with L=1 - 64-bit conditioned random number */
++	asm volatile(PPC_DARN(%0, 1) : "=r"(val));
++
++	if (val == DARN_ERR)
++		return 0;
++
++	*v = val;
++
++	return 1;
++}
++
++static int __init initialise_darn(void)
++{
++	unsigned long val;
++	int i;
++
++	if (!cpu_has_feature(CPU_FTR_ARCH_300))
++		return -ENODEV;
++
++	for (i = 0; i < 10; i++) {
++		if (powernv_get_random_darn(&val)) {
++			ppc_md.get_random_seed = powernv_get_random_darn;
++			return 0;
++		}
++	}
++	return -EIO;
++}
++
+ int powernv_get_random_long(unsigned long *v)
+ {
+ 	struct powernv_rng *rng;
+@@ -88,7 +126,7 @@ static __init void rng_init_per_cpu(stru
+ 
+ 	chip_id = of_get_ibm_chip_id(dn);
+ 	if (chip_id == -1)
+-		pr_warn("No ibm,chip-id found for %s.\n", dn->full_name);
++		pr_warn("No ibm,chip-id found for %pOF.\n", dn);
+ 
+ 	for_each_possible_cpu(cpu) {
+ 		if (per_cpu(powernv_rng, cpu) == NULL ||
+@@ -126,30 +164,55 @@ static __init int rng_create(struct devi
+ 
+ 	rng_init_per_cpu(rng, dn);
+ 
+-	pr_info_once("Registering arch random hook.\n");
+-
+ 	ppc_md.get_random_seed = powernv_get_random_long;
+ 
+ 	return 0;
+ }
+ 
+-static __init int rng_init(void)
++static int __init pnv_get_random_long_early(unsigned long *v)
+ {
+ 	struct device_node *dn;
+-	int rc;
++
++	if (!slab_is_available())
++		return 0;
++
++	if (cmpxchg(&ppc_md.get_random_seed, pnv_get_random_long_early,
++		    NULL) != pnv_get_random_long_early)
++		return 0;
+ 
+ 	for_each_compatible_node(dn, NULL, "ibm,power-rng") {
+-		rc = rng_create(dn);
+-		if (rc) {
+-			pr_err("Failed creating rng for %s (%d).\n",
+-				dn->full_name, rc);
++		if (rng_create(dn))
+ 			continue;
+-		}
+-
+ 		/* Create devices for hwrng driver */
+ 		of_platform_device_create(dn, NULL, NULL);
+ 	}
+ 
++	if (!ppc_md.get_random_seed)
++		return 0;
++	return ppc_md.get_random_seed(v);
++}
++
++void __init pnv_rng_init(void)
++{
++	struct device_node *dn;
++
++	/* Prefer darn over the rest. */
++	if (!initialise_darn())
++		return;
++
++	dn = of_find_compatible_node(NULL, NULL, "ibm,power-rng");
++	if (dn)
++		ppc_md.get_random_seed = pnv_get_random_long_early;
++
++	of_node_put(dn);
++}
++
++static int __init pnv_rng_late_init(void)
++{
++	unsigned long v;
++	/* In case it wasn't called during init for some other reason. */
++	if (ppc_md.get_random_seed == pnv_get_random_long_early)
++		pnv_get_random_long_early(&v);
+ 	return 0;
+ }
+-machine_subsys_initcall(powernv, rng_init);
++machine_subsys_initcall(powernv, pnv_rng_late_init);
+--- a/arch/powerpc/platforms/powernv/setup.c
++++ b/arch/powerpc/platforms/powernv/setup.c
+@@ -168,6 +168,8 @@ static void __init pnv_setup_arch(void)
+ 	powersave_nap = 1;
+ 
+ 	/* XXX PMCS */
++
++	pnv_rng_init();
+ }
+ 
+ static void __init pnv_init(void)
