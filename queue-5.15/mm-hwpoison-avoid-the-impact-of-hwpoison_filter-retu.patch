@@ -1,0 +1,145 @@
+From 2dfee9660b82b297bc639c30ea574745465511cf Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 22 Mar 2022 14:44:38 -0700
+Subject: mm/hwpoison: avoid the impact of hwpoison_filter() return value on
+ mce handler
+
+From: luofei <luofei@unicloud.com>
+
+[ Upstream commit d1fe111fb62a1cf0446a2919f5effbb33ad0702c ]
+
+When the hwpoison page meets the filter conditions, it should not be
+regarded as successful memory_failure() processing for mce handler, but
+should return a distinct value, otherwise mce handler regards the error
+page has been identified and isolated, which may lead to calling
+set_mce_nospec() to change page attribute, etc.
+
+Here memory_failure() return -EOPNOTSUPP to indicate that the error
+event is filtered, mce handler should not take any action for this
+situation and hwpoison injector should treat as correct.
+
+Link: https://lkml.kernel.org/r/20220223082135.2769649-1-luofei@unicloud.com
+Signed-off-by: luofei <luofei@unicloud.com>
+Acked-by: Borislav Petkov <bp@suse.de>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: H. Peter Anvin <hpa@zytor.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Naoya Horiguchi <naoya.horiguchi@nec.com>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Tony Luck <tony.luck@intel.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ arch/x86/kernel/cpu/mce/core.c | 8 +++++---
+ drivers/base/memory.c          | 2 ++
+ mm/hwpoison-inject.c           | 3 ++-
+ mm/madvise.c                   | 2 ++
+ mm/memory-failure.c            | 9 +++++++--
+ 5 files changed, 18 insertions(+), 6 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/mce/core.c b/arch/x86/kernel/cpu/mce/core.c
+index e23e74e2f928..848cfb013f58 100644
+--- a/arch/x86/kernel/cpu/mce/core.c
++++ b/arch/x86/kernel/cpu/mce/core.c
+@@ -1297,10 +1297,12 @@ static void kill_me_maybe(struct callback_head *cb)
+ 
+ 	/*
+ 	 * -EHWPOISON from memory_failure() means that it already sent SIGBUS
+-	 * to the current process with the proper error info, so no need to
+-	 * send SIGBUS here again.
++	 * to the current process with the proper error info,
++	 * -EOPNOTSUPP means hwpoison_filter() filtered the error event,
++	 *
++	 * In both cases, no further processing is required.
+ 	 */
+-	if (ret == -EHWPOISON)
++	if (ret == -EHWPOISON || ret == -EOPNOTSUPP)
+ 		return;
+ 
+ 	if (p->mce_vaddr != (void __user *)-1l) {
+diff --git a/drivers/base/memory.c b/drivers/base/memory.c
+index c0d501a3a714..c778d1df7455 100644
+--- a/drivers/base/memory.c
++++ b/drivers/base/memory.c
+@@ -555,6 +555,8 @@ static ssize_t hard_offline_page_store(struct device *dev,
+ 		return -EINVAL;
+ 	pfn >>= PAGE_SHIFT;
+ 	ret = memory_failure(pfn, 0);
++	if (ret == -EOPNOTSUPP)
++		ret = 0;
+ 	return ret ? ret : count;
+ }
+ 
+diff --git a/mm/hwpoison-inject.c b/mm/hwpoison-inject.c
+index aff4d27ec235..a1d6fc3c78b9 100644
+--- a/mm/hwpoison-inject.c
++++ b/mm/hwpoison-inject.c
+@@ -48,7 +48,8 @@ static int hwpoison_inject(void *data, u64 val)
+ 
+ inject:
+ 	pr_info("Injecting memory failure at pfn %#lx\n", pfn);
+-	return memory_failure(pfn, 0);
++	err = memory_failure(pfn, 0);
++	return (err == -EOPNOTSUPP) ? 0 : err;
+ }
+ 
+ static int hwpoison_unpoison(void *data, u64 val)
+diff --git a/mm/madvise.c b/mm/madvise.c
+index 8e5ca01a6cc0..882767d58c27 100644
+--- a/mm/madvise.c
++++ b/mm/madvise.c
+@@ -968,6 +968,8 @@ static int madvise_inject_error(int behavior,
+ 			pr_info("Injecting memory failure for pfn %#lx at process virtual address %#lx\n",
+ 				 pfn, start);
+ 			ret = memory_failure(pfn, MF_COUNT_INCREASED);
++			if (ret == -EOPNOTSUPP)
++				ret = 0;
+ 		}
+ 
+ 		if (ret)
+diff --git a/mm/memory-failure.c b/mm/memory-failure.c
+index e6425d959fa9..5664bafd5e77 100644
+--- a/mm/memory-failure.c
++++ b/mm/memory-failure.c
+@@ -1444,7 +1444,7 @@ static int memory_failure_hugetlb(unsigned long pfn, int flags)
+ 				if (TestClearPageHWPoison(head))
+ 					num_poisoned_pages_dec();
+ 				unlock_page(head);
+-				return 0;
++				return -EOPNOTSUPP;
+ 			}
+ 			unlock_page(head);
+ 			res = MF_FAILED;
+@@ -1525,7 +1525,7 @@ static int memory_failure_dev_pagemap(unsigned long pfn, int flags,
+ 		goto out;
+ 
+ 	if (hwpoison_filter(page)) {
+-		rc = 0;
++		rc = -EOPNOTSUPP;
+ 		goto unlock;
+ 	}
+ 
+@@ -1594,6 +1594,10 @@ static DEFINE_MUTEX(mf_mutex);
+  *
+  * Must run in process context (e.g. a work queue) with interrupts
+  * enabled and no spinlocks hold.
++ *
++ * Return: 0 for successfully handled the memory error,
++ *         -EOPNOTSUPP for memory_filter() filtered the error event,
++ *         < 0(except -EOPNOTSUPP) on failure.
+  */
+ int memory_failure(unsigned long pfn, int flags)
+ {
+@@ -1742,6 +1746,7 @@ int memory_failure(unsigned long pfn, int flags)
+ 			num_poisoned_pages_dec();
+ 		unlock_page(p);
+ 		put_page(p);
++		res = -EOPNOTSUPP;
+ 		goto unlock_mutex;
+ 	}
+ 
+-- 
+2.35.1
+
