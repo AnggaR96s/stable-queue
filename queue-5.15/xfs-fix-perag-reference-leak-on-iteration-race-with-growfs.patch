@@ -1,0 +1,90 @@
+From foo@baz Sat Jul 23 05:23:15 PM CEST 2022
+From: Leah Rumancik <leah.rumancik@gmail.com>
+Date: Thu, 21 Jul 2022 14:36:09 -0700
+Subject: xfs: fix perag reference leak on iteration race with growfs
+To: stable@vger.kernel.org, linux-xfs@vger.kernel.org
+Cc: amir73il@gmail.com, Brian Foster <bfoster@redhat.com>, Dave Chinner <dchinner@redhat.com>, "Darrick J . Wong" <djwong@kernel.org>, Leah Rumancik <leah.rumancik@gmail.com>
+Message-ID: <20220721213610.2794134-6-leah.rumancik@gmail.com>
+
+From: Brian Foster <bfoster@redhat.com>
+
+[ Upstream commit 892a666fafa19ab04b5e948f6c92f98f1dafb489 ]
+
+The for_each_perag*() set of macros are hacky in that some (i.e.
+those based on sb_agcount) rely on the assumption that perag
+iteration terminates naturally with a NULL perag at the specified
+end_agno. Others allow for the final AG to have a valid perag and
+require the calling function to clean up any potential leftover
+xfs_perag reference on termination of the loop.
+
+Aside from providing a subtly inconsistent interface, the former
+variant is racy with growfs because growfs can create discoverable
+post-eofs perags before the final superblock update that completes
+the grow operation and increases sb_agcount. This leads to the
+following assert failure (reproduced by xfs/104) in the perag free
+path during unmount:
+
+ XFS: Assertion failed: atomic_read(&pag->pag_ref) == 0, file: fs/xfs/libxfs/xfs_ag.c, line: 195
+
+This occurs because one of the many for_each_perag() loops in the
+code that is expected to terminate with a NULL pag (and thus has no
+post-loop xfs_perag_put() check) raced with a growfs and found a
+non-NULL post-EOFS perag, but terminated naturally based on the
+end_agno check without releasing the post-EOFS perag.
+
+Rework the iteration logic to lift the agno check from the main for
+loop conditional to the iteration helper function. The for loop now
+purely terminates on a NULL pag and xfs_perag_next() avoids taking a
+reference to any perag beyond end_agno in the first place.
+
+Fixes: f250eedcf762 ("xfs: make for_each_perag... a first class citizen")
+Signed-off-by: Brian Foster <bfoster@redhat.com>
+Reviewed-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Signed-off-by: Leah Rumancik <leah.rumancik@gmail.com>
+Acked-by: Darrick J. Wong <djwong@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/xfs/libxfs/xfs_ag.h |   16 ++++++----------
+ 1 file changed, 6 insertions(+), 10 deletions(-)
+
+--- a/fs/xfs/libxfs/xfs_ag.h
++++ b/fs/xfs/libxfs/xfs_ag.h
+@@ -116,30 +116,26 @@ void xfs_perag_put(struct xfs_perag *pag
+ 
+ /*
+  * Perag iteration APIs
+- *
+- * XXX: for_each_perag_range() usage really needs an iterator to clean up when
+- * we terminate at end_agno because we may have taken a reference to the perag
+- * beyond end_agno. Right now callers have to be careful to catch and clean that
+- * up themselves. This is not necessary for the callers of for_each_perag() and
+- * for_each_perag_from() because they terminate at sb_agcount where there are
+- * no perag structures in tree beyond end_agno.
+  */
+ static inline struct xfs_perag *
+ xfs_perag_next(
+ 	struct xfs_perag	*pag,
+-	xfs_agnumber_t		*agno)
++	xfs_agnumber_t		*agno,
++	xfs_agnumber_t		end_agno)
+ {
+ 	struct xfs_mount	*mp = pag->pag_mount;
+ 
+ 	*agno = pag->pag_agno + 1;
+ 	xfs_perag_put(pag);
++	if (*agno > end_agno)
++		return NULL;
+ 	return xfs_perag_get(mp, *agno);
+ }
+ 
+ #define for_each_perag_range(mp, agno, end_agno, pag) \
+ 	for ((pag) = xfs_perag_get((mp), (agno)); \
+-		(pag) != NULL && (agno) <= (end_agno); \
+-		(pag) = xfs_perag_next((pag), &(agno)))
++		(pag) != NULL; \
++		(pag) = xfs_perag_next((pag), &(agno), (end_agno)))
+ 
+ #define for_each_perag_from(mp, agno, pag) \
+ 	for_each_perag_range((mp), (agno), (mp)->m_sb.sb_agcount - 1, (pag))
