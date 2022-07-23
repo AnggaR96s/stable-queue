@@ -1,0 +1,117 @@
+From foo@baz Sat Jul 23 05:03:39 PM CEST 2022
+From: Fedor Pchelkin <pchelkin@ispras.ru>
+Date: Fri, 15 Jul 2022 19:26:27 +0300
+Subject: net: make free_netdev() more lenient with unregistering devices
+To: stable@vger.kernel.org, Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: Fedor Pchelkin <pchelkin@ispras.ru>, Jakub Kicinski <kuba@kernel.org>, Alexey Khoroshilov <khoroshilov@ispras.ru>
+Message-ID: <20220715162632.332718-3-pchelkin@ispras.ru>
+
+From: Fedor Pchelkin <pchelkin@ispras.ru>
+
+From: Jakub Kicinski <kuba@kernel.org>
+
+commit c269a24ce057abfc31130960e96ab197ef6ab196 upstream.
+
+There are two flavors of handling netdev registration:
+ - ones called without holding rtnl_lock: register_netdev() and
+   unregister_netdev(); and
+ - those called with rtnl_lock held: register_netdevice() and
+   unregister_netdevice().
+
+While the semantics of the former are pretty clear, the same can't
+be said about the latter. The netdev_todo mechanism is utilized to
+perform some of the device unregistering tasks and it hooks into
+rtnl_unlock() so the locked variants can't actually finish the work.
+In general free_netdev() does not mix well with locked calls. Most
+drivers operating under rtnl_lock set dev->needs_free_netdev to true
+and expect core to make the free_netdev() call some time later.
+
+The part where this becomes most problematic is error paths. There is
+no way to unwind the state cleanly after a call to register_netdevice(),
+since unreg can't be performed fully without dropping locks.
+
+Make free_netdev() more lenient, and defer the freeing if device
+is being unregistered. This allows error paths to simply call
+free_netdev() both after register_netdevice() failed, and after
+a call to unregister_netdevice() but before dropping rtnl_lock.
+
+Simplify the error paths which are currently doing gymnastics
+around free_netdev() handling.
+
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Fedor Pchelkin <pchelkin@ispras.ru>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/8021q/vlan.c     |    4 +---
+ net/core/dev.c       |   11 +++++++++++
+ net/core/rtnetlink.c |   23 ++++++-----------------
+ 3 files changed, 18 insertions(+), 20 deletions(-)
+
+--- a/net/8021q/vlan.c
++++ b/net/8021q/vlan.c
+@@ -278,9 +278,7 @@ static int register_vlan_device(struct n
+ 	return 0;
+ 
+ out_free_newdev:
+-	if (new_dev->reg_state == NETREG_UNINITIALIZED ||
+-	    new_dev->reg_state == NETREG_UNREGISTERED)
+-		free_netdev(new_dev);
++	free_netdev(new_dev);
+ 	return err;
+ }
+ 
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -10683,6 +10683,17 @@ void free_netdev(struct net_device *dev)
+ 	struct napi_struct *p, *n;
+ 
+ 	might_sleep();
++
++	/* When called immediately after register_netdevice() failed the unwind
++	 * handling may still be dismantling the device. Handle that case by
++	 * deferring the free.
++	 */
++	if (dev->reg_state == NETREG_UNREGISTERING) {
++		ASSERT_RTNL();
++		dev->needs_free_netdev = true;
++		return;
++	}
++
+ 	netif_free_tx_queues(dev);
+ 	netif_free_rx_queues(dev);
+ 
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@ -3442,26 +3442,15 @@ replay:
+ 
+ 	dev->ifindex = ifm->ifi_index;
+ 
+-	if (ops->newlink) {
++	if (ops->newlink)
+ 		err = ops->newlink(link_net ? : net, dev, tb, data, extack);
+-		/* Drivers should set dev->needs_free_netdev
+-		 * and unregister it on failure after registration
+-		 * so that device could be finally freed in rtnl_unlock.
+-		 */
+-		if (err < 0) {
+-			/* If device is not registered at all, free it now */
+-			if (dev->reg_state == NETREG_UNINITIALIZED ||
+-			    dev->reg_state == NETREG_UNREGISTERED)
+-				free_netdev(dev);
+-			goto out;
+-		}
+-	} else {
++	else
+ 		err = register_netdevice(dev);
+-		if (err < 0) {
+-			free_netdev(dev);
+-			goto out;
+-		}
++	if (err < 0) {
++		free_netdev(dev);
++		goto out;
+ 	}
++
+ 	err = rtnl_configure_link(dev, ifm);
+ 	if (err < 0)
+ 		goto out_unregister;
