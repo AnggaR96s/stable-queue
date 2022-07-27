@@ -1,0 +1,145 @@
+From 9cdbeec4096804083944d05da96bbaf59a1eb4f9 Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Tue, 11 Jan 2022 12:11:14 +0100
+Subject: x86/entry_32: Fix segment exceptions
+
+From: Peter Zijlstra <peterz@infradead.org>
+
+commit 9cdbeec4096804083944d05da96bbaf59a1eb4f9 upstream.
+
+The LKP robot reported that commit in Fixes: caused a failure. Turns out
+the ldt_gdt_32 selftest turns into an infinite loop trying to clear the
+segment.
+
+As discovered by Sean, what happens is that PARANOID_EXIT_TO_KERNEL_MODE
+in the handle_exception_return path overwrites the entry stack data with
+the task stack data, restoring the "bad" segment value.
+
+Instead of having the exception retry the instruction, have it emulate
+the full instruction. Replace EX_TYPE_POP_ZERO with EX_TYPE_POP_REG
+which will do the equivalent of: POP %reg; MOV $imm, %reg.
+
+In order to encode the segment registers, add them as registers 8-11 for
+32-bit.
+
+By setting regs->[defg]s the (nested) RESTORE_REGS will pop this value
+at the end of the exception handler and by increasing regs->sp, it will
+have skipped the stack slot.
+
+This was debugged by Sean Christopherson <seanjc@google.com>.
+
+ [ bp: Add EX_REG_GS too. ]
+
+Fixes: aa93e2ad7464 ("x86/entry_32: Remove .fixup usage")
+Reported-by: kernel test robot <oliver.sang@intel.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lore.kernel.org/r/Yd1l0gInc4zRcnt/@hirez.programming.kicks-ass.net
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/x86/entry/entry_32.S                  |   13 +++++++++----
+ arch/x86/include/asm/extable_fixup_types.h |   11 ++++++++++-
+ arch/x86/lib/insn-eval.c                   |    5 +++++
+ arch/x86/mm/extable.c                      |   17 +++--------------
+ 4 files changed, 27 insertions(+), 19 deletions(-)
+
+--- a/arch/x86/entry/entry_32.S
++++ b/arch/x86/entry/entry_32.S
+@@ -268,11 +268,16 @@
+ 1:	popl	%ds
+ 2:	popl	%es
+ 3:	popl	%fs
+-	addl	$(4 + \pop), %esp	/* pop the unused "gs" slot */
++4:	addl	$(4 + \pop), %esp	/* pop the unused "gs" slot */
+ 	IRET_FRAME
+-	_ASM_EXTABLE_TYPE(1b, 1b, EX_TYPE_POP_ZERO)
+-	_ASM_EXTABLE_TYPE(2b, 2b, EX_TYPE_POP_ZERO)
+-	_ASM_EXTABLE_TYPE(3b, 3b, EX_TYPE_POP_ZERO)
++
++	/*
++	 * There is no _ASM_EXTABLE_TYPE_REG() for ASM, however since this is
++	 * ASM the registers are known and we can trivially hard-code them.
++	 */
++	_ASM_EXTABLE_TYPE(1b, 2b, EX_TYPE_POP_ZERO|EX_REG_DS)
++	_ASM_EXTABLE_TYPE(2b, 3b, EX_TYPE_POP_ZERO|EX_REG_ES)
++	_ASM_EXTABLE_TYPE(3b, 4b, EX_TYPE_POP_ZERO|EX_REG_FS)
+ .endm
+ 
+ .macro RESTORE_ALL_NMI cr3_reg:req pop=0
+--- a/arch/x86/include/asm/extable_fixup_types.h
++++ b/arch/x86/include/asm/extable_fixup_types.h
+@@ -16,9 +16,16 @@
+ #define EX_DATA_FLAG_SHIFT		12
+ #define EX_DATA_IMM_SHIFT		16
+ 
++#define EX_DATA_REG(reg)		((reg) << EX_DATA_REG_SHIFT)
+ #define EX_DATA_FLAG(flag)		((flag) << EX_DATA_FLAG_SHIFT)
+ #define EX_DATA_IMM(imm)		((imm) << EX_DATA_IMM_SHIFT)
+ 
++/* segment regs */
++#define EX_REG_DS			EX_DATA_REG(8)
++#define EX_REG_ES			EX_DATA_REG(9)
++#define EX_REG_FS			EX_DATA_REG(10)
++#define EX_REG_GS			EX_DATA_REG(11)
++
+ /* flags */
+ #define EX_FLAG_CLEAR_AX		EX_DATA_FLAG(1)
+ #define EX_FLAG_CLEAR_DX		EX_DATA_FLAG(2)
+@@ -41,7 +48,9 @@
+ #define	EX_TYPE_RDMSR_IN_MCE		13
+ #define	EX_TYPE_DEFAULT_MCE_SAFE	14
+ #define	EX_TYPE_FAULT_MCE_SAFE		15
+-#define	EX_TYPE_POP_ZERO		16
++
++#define	EX_TYPE_POP_REG			16 /* sp += sizeof(long) */
++#define EX_TYPE_POP_ZERO		(EX_TYPE_POP_REG | EX_DATA_IMM(0))
+ 
+ #define	EX_TYPE_IMM_REG			17 /* reg := (long)imm */
+ #define	EX_TYPE_EFAULT_REG		(EX_TYPE_IMM_REG | EX_DATA_IMM(-EFAULT))
+--- a/arch/x86/lib/insn-eval.c
++++ b/arch/x86/lib/insn-eval.c
+@@ -430,6 +430,11 @@ static const int pt_regoff[] = {
+ 	offsetof(struct pt_regs, r13),
+ 	offsetof(struct pt_regs, r14),
+ 	offsetof(struct pt_regs, r15),
++#else
++	offsetof(struct pt_regs, ds),
++	offsetof(struct pt_regs, es),
++	offsetof(struct pt_regs, fs),
++	offsetof(struct pt_regs, gs),
+ #endif
+ };
+ 
+--- a/arch/x86/mm/extable.c
++++ b/arch/x86/mm/extable.c
+@@ -118,18 +118,6 @@ static bool ex_handler_clear_fs(const st
+ 	return ex_handler_default(fixup, regs);
+ }
+ 
+-static bool ex_handler_pop_zero(const struct exception_table_entry *fixup,
+-				struct pt_regs *regs)
+-{
+-	/*
+-	 * Typically used for when "pop %seg" traps, in which case we'll clear
+-	 * the stack slot and re-try the instruction, which will then succeed
+-	 * to pop zero.
+-	 */
+-	*((unsigned long *)regs->sp) = 0;
+-	return ex_handler_default(fixup, regs);
+-}
+-
+ static bool ex_handler_imm_reg(const struct exception_table_entry *fixup,
+ 			       struct pt_regs *regs, int reg, int imm)
+ {
+@@ -203,8 +191,9 @@ int fixup_exception(struct pt_regs *regs
+ 	case EX_TYPE_RDMSR_IN_MCE:
+ 		ex_handler_msr_mce(regs, false);
+ 		break;
+-	case EX_TYPE_POP_ZERO:
+-		return ex_handler_pop_zero(e, regs);
++	case EX_TYPE_POP_REG:
++		regs->sp += sizeof(long);
++		fallthrough;
+ 	case EX_TYPE_IMM_REG:
+ 		return ex_handler_imm_reg(e, regs, reg, imm);
+ 	}
