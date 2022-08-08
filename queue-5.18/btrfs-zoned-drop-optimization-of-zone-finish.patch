@@ -1,0 +1,80 @@
+From b3a3b0255797e1d395253366ba24a4cc6c8bdf9c Mon Sep 17 00:00:00 2001
+From: Naohiro Aota <naohiro.aota@wdc.com>
+Date: Wed, 29 Jun 2022 11:00:38 +0900
+Subject: btrfs: zoned: drop optimization of zone finish
+
+From: Naohiro Aota <naohiro.aota@wdc.com>
+
+commit b3a3b0255797e1d395253366ba24a4cc6c8bdf9c upstream.
+
+We have an optimization in do_zone_finish() to send REQ_OP_ZONE_FINISH only
+when necessary, i.e. we don't send REQ_OP_ZONE_FINISH when we assume we
+wrote fully into the zone.
+
+The assumption is determined by "alloc_offset == capacity". This condition
+won't work if the last ordered extent is canceled due to some errors. In
+that case, we consider the zone is deactivated without sending the finish
+command while it's still active.
+
+This inconstancy results in activating another block group while we cannot
+really activate the underlying zone, which causes the active zone exceeds
+errors like below.
+
+    BTRFS error (device nvme3n2): allocation failed flags 1, wanted 520192 tree-log 0, relocation: 0
+    nvme3n2: I/O Cmd(0x7d) @ LBA 160432128, 127 blocks, I/O Error (sct 0x1 / sc 0xbd) MORE DNR
+    active zones exceeded error, dev nvme3n2, sector 0 op 0xd:(ZONE_APPEND) flags 0x4800 phys_seg 1 prio class 0
+    nvme3n2: I/O Cmd(0x7d) @ LBA 160432128, 127 blocks, I/O Error (sct 0x1 / sc 0xbd) MORE DNR
+    active zones exceeded error, dev nvme3n2, sector 0 op 0xd:(ZONE_APPEND) flags 0x4800 phys_seg 1 prio class 0
+
+Fix the issue by removing the optimization for now.
+
+Fixes: 8376d9e1ed8f ("btrfs: zoned: finish superblock zone once no space left for new SB")
+Reviewed-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+Signed-off-by: Naohiro Aota <naohiro.aota@wdc.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/btrfs/zoned.c |   23 ++++++++++++++++++-----
+ 1 file changed, 18 insertions(+), 5 deletions(-)
+
+--- a/fs/btrfs/zoned.c
++++ b/fs/btrfs/zoned.c
+@@ -2005,6 +2005,7 @@ void btrfs_zone_finish_endio(struct btrf
+ 	struct btrfs_device *device;
+ 	u64 min_alloc_bytes;
+ 	u64 physical;
++	int i;
+ 
+ 	if (!btrfs_is_zoned(fs_info))
+ 		return;
+@@ -2039,13 +2040,25 @@ void btrfs_zone_finish_endio(struct btrf
+ 	spin_unlock(&block_group->lock);
+ 
+ 	map = block_group->physical_map;
+-	device = map->stripes[0].dev;
+-	physical = map->stripes[0].physical;
++	for (i = 0; i < map->num_stripes; i++) {
++		int ret;
+ 
+-	if (!device->zone_info->max_active_zones)
+-		goto out;
++		device = map->stripes[i].dev;
++		physical = map->stripes[i].physical;
++
++		if (device->zone_info->max_active_zones == 0)
++			continue;
++
++		ret = blkdev_zone_mgmt(device->bdev, REQ_OP_ZONE_FINISH,
++				       physical >> SECTOR_SHIFT,
++				       device->zone_info->zone_size >> SECTOR_SHIFT,
++				       GFP_NOFS);
+ 
+-	btrfs_dev_clear_active_zone(device, physical);
++		if (ret)
++			return;
++
++		btrfs_dev_clear_active_zone(device, physical);
++	}
+ 
+ 	spin_lock(&fs_info->zone_active_bgs_lock);
+ 	ASSERT(!list_empty(&block_group->active_bg_list));
