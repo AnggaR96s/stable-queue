@@ -1,0 +1,113 @@
+From foo@baz Thu Aug 25 02:12:36 PM CEST 2022
+From: Ankit Jain <ankitja@vmware.com>
+Date: Mon, 22 Aug 2022 13:09:39 +0530
+Subject: sched/deadline: Unthrottle PI boosted threads while enqueuing
+To: juri.lelli@redhat.com, bristot@redhat.com, l.stach@pengutronix.de, suhui_kernel@163.com, msimmons@redhat.com, peterz@infradead.org, glenn@aurora.tech, stable@vger.kernel.org, linux-kernel@vger.kernel.org, gregkh@linuxfoundation.org
+Cc: srivatsab@vmware.com, srivatsa@csail.mit.edu, akaher@vmware.com, amakhalov@vmware.com, vsirnapalli@vmware.com, sturlapati@vmware.com, bordoloih@vmware.com, keerthanak@vmware.com, Ankit Jain <ankitja@vmware.com>
+Message-ID: <20220822073942.218045-2-ankitja@vmware.com>
+
+From: Daniel Bristot de Oliveira <bristot@redhat.com>
+
+commit feff2e65efd8d84cf831668e182b2ce73c604bbb upstream.
+
+stress-ng has a test (stress-ng --cyclic) that creates a set of threads
+under SCHED_DEADLINE with the following parameters:
+
+    dl_runtime   =  10000 (10 us)
+    dl_deadline  = 100000 (100 us)
+    dl_period    = 100000 (100 us)
+
+These parameters are very aggressive. When using a system without HRTICK
+set, these threads can easily execute longer than the dl_runtime because
+the throttling happens with 1/HZ resolution.
+
+During the main part of the test, the system works just fine because
+the workload does not try to run over the 10 us. The problem happens at
+the end of the test, on the exit() path. During exit(), the threads need
+to do some cleanups that require real-time mutex locks, mainly those
+related to memory management, resulting in this scenario:
+
+Note: locks are rt_mutexes...
+ ------------------------------------------------------------------------
+    TASK A:		TASK B:				TASK C:
+    activation
+							activation
+			activation
+
+    lock(a): OK!	lock(b): OK!
+    			<overrun runtime>
+    			lock(a)
+    			-> block (task A owns it)
+			  -> self notice/set throttled
+ +--<			  -> arm replenished timer
+ |    			switch-out
+ |    							lock(b)
+ |    							-> <C prio > B prio>
+ |    							-> boost TASK B
+ |  unlock(a)						switch-out
+ |  -> handle lock a to B
+ |    -> wakeup(B)
+ |      -> B is throttled:
+ |        -> do not enqueue
+ |     switch-out
+ |
+ |
+ +---------------------> replenishment timer
+			-> TASK B is boosted:
+			  -> do not enqueue
+ ------------------------------------------------------------------------
+
+BOOM: TASK B is runnable but !enqueued, holding TASK C: the system
+crashes with hung task C.
+
+This problem is avoided by removing the throttle state from the boosted
+thread while boosting it (by TASK A in the example above), allowing it to
+be queued and run boosted.
+
+The next replenishment will take care of the runtime overrun, pushing
+the deadline further away. See the "while (dl_se->runtime <= 0)" on
+replenish_dl_entity() for more information.
+
+Reported-by: Mark Simmons <msimmons@redhat.com>
+Signed-off-by: Daniel Bristot de Oliveira <bristot@redhat.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Reviewed-by: Juri Lelli <juri.lelli@redhat.com>
+Tested-by: Mark Simmons <msimmons@redhat.com>
+Link: https://lkml.kernel.org/r/5076e003450835ec74e6fa5917d02c4fa41687e6.1600170294.git.bristot@redhat.com
+[Ankit: Regenerated the patch for v5.4.y]
+Signed-off-by: Ankit Jain <ankitja@vmware.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ kernel/sched/deadline.c |   21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+--- a/kernel/sched/deadline.c
++++ b/kernel/sched/deadline.c
+@@ -1484,6 +1484,27 @@ static void enqueue_task_dl(struct rq *r
+ 	 */
+ 	if (pi_task && dl_prio(pi_task->normal_prio) && p->dl.dl_boosted) {
+ 		pi_se = &pi_task->dl;
++		/*
++		 * Because of delays in the detection of the overrun of a
++		 * thread's runtime, it might be the case that a thread
++		 * goes to sleep in a rt mutex with negative runtime. As
++		 * a consequence, the thread will be throttled.
++		 *
++		 * While waiting for the mutex, this thread can also be
++		 * boosted via PI, resulting in a thread that is throttled
++		 * and boosted at the same time.
++		 *
++		 * In this case, the boost overrides the throttle.
++		 */
++		if (p->dl.dl_throttled) {
++			/*
++			 * The replenish timer needs to be canceled. No
++			 * problem if it fires concurrently: boosted threads
++			 * are ignored in dl_task_timer().
++			 */
++			hrtimer_try_to_cancel(&p->dl.dl_timer);
++			p->dl.dl_throttled = 0;
++		}
+ 	} else if (!dl_prio(p->normal_prio)) {
+ 		/*
+ 		 * Special case in which we have a !SCHED_DEADLINE task
