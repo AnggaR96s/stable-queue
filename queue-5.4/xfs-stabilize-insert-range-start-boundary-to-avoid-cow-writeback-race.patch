@@ -1,0 +1,96 @@
+From foo@baz Mon Sep 26 08:48:28 AM CEST 2022
+From: Chandan Babu R <chandan.babu@oracle.com>
+Date: Sat, 24 Sep 2022 18:26:50 +0530
+Subject: xfs: stabilize insert range start boundary to avoid COW writeback race
+To: gregkh@linuxfoundation.org
+Cc: sashal@kernel.org, mcgrof@kernel.org, linux-xfs@vger.kernel.org, stable@vger.kernel.org, djwong@kernel.org, chandan.babu@oracle.com, amir73il@gmail.com, leah.rumancik@gmail.com
+Message-ID: <20220924125656.101069-14-chandan.babu@oracle.com>
+
+From: Brian Foster <bfoster@redhat.com>
+
+commit d0c2204135a0cdbc607c94c481cf1ccb2f659aa7 upstream.
+
+generic/522 (fsx) occasionally fails with a file corruption due to
+an insert range operation. The primary characteristic of the
+corruption is a misplaced insert range operation that differs from
+the requested target offset. The reason for this behavior is a race
+between the extent shift sequence of an insert range and a COW
+writeback completion that causes a front merge with the first extent
+in the shift.
+
+The shift preparation function flushes and unmaps from the target
+offset of the operation to the end of the file to ensure no
+modifications can be made and page cache is invalidated before file
+data is shifted. An insert range operation then splits the extent at
+the target offset, if necessary, and begins to shift the start
+offset of each extent starting from the end of the file to the start
+offset. The shift sequence operates at extent level and so depends
+on the preparation sequence to guarantee no changes can be made to
+the target range during the shift. If the block immediately prior to
+the target offset was dirty and shared, however, it can undergo
+writeback and move from the COW fork to the data fork at any point
+during the shift. If the block is contiguous with the block at the
+start offset of the insert range, it can front merge and alter the
+start offset of the extent. Once the shift sequence reaches the
+target offset, it shifts based on the latest start offset and
+silently changes the target offset of the operation and corrupts the
+file.
+
+To address this problem, update the shift preparation code to
+stabilize the start boundary along with the full range of the
+insert. Also update the existing corruption check to fail if any
+extent is shifted with a start offset behind the target offset of
+the insert range. This prevents insert from racing with COW
+writeback completion and fails loudly in the event of an unexpected
+extent shift.
+
+Signed-off-by: Brian Foster <bfoster@redhat.com>
+Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+Acked-by: Darrick J. Wong <djwong@kernel.org>
+Signed-off-by: Chandan Babu R <chandan.babu@oracle.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/xfs/libxfs/xfs_bmap.c |    2 +-
+ fs/xfs/xfs_bmap_util.c   |   12 ++++++++++++
+ 2 files changed, 13 insertions(+), 1 deletion(-)
+
+--- a/fs/xfs/libxfs/xfs_bmap.c
++++ b/fs/xfs/libxfs/xfs_bmap.c
+@@ -5876,7 +5876,7 @@ xfs_bmap_insert_extents(
+ 	XFS_WANT_CORRUPTED_GOTO(mp, !isnullstartblock(got.br_startblock),
+ 				del_cursor);
+ 
+-	if (stop_fsb >= got.br_startoff + got.br_blockcount) {
++	if (stop_fsb > got.br_startoff) {
+ 		ASSERT(0);
+ 		error = -EFSCORRUPTED;
+ 		goto del_cursor;
+--- a/fs/xfs/xfs_bmap_util.c
++++ b/fs/xfs/xfs_bmap_util.c
+@@ -1167,6 +1167,7 @@ xfs_prepare_shift(
+ 	struct xfs_inode	*ip,
+ 	loff_t			offset)
+ {
++	struct xfs_mount	*mp = ip->i_mount;
+ 	int			error;
+ 
+ 	/*
+@@ -1180,6 +1181,17 @@ xfs_prepare_shift(
+ 	}
+ 
+ 	/*
++	 * Shift operations must stabilize the start block offset boundary along
++	 * with the full range of the operation. If we don't, a COW writeback
++	 * completion could race with an insert, front merge with the start
++	 * extent (after split) during the shift and corrupt the file. Start
++	 * with the block just prior to the start to stabilize the boundary.
++	 */
++	offset = round_down(offset, 1 << mp->m_sb.sb_blocklog);
++	if (offset)
++		offset -= (1 << mp->m_sb.sb_blocklog);
++
++	/*
+ 	 * Writeback and invalidate cache for the remainder of the file as we're
+ 	 * about to shift down every extent from offset to EOF.
+ 	 */
