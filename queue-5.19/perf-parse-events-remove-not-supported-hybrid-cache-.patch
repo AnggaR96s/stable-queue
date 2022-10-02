@@ -1,0 +1,236 @@
+From 068bb60fb09466ffe23a658e3738f3c42cba141c Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 23 Sep 2022 11:00:13 +0800
+Subject: perf parse-events: Remove "not supported" hybrid cache events
+
+From: Zhengjun Xing <zhengjun.xing@linux.intel.com>
+
+[ Upstream commit 71c86cda750b001100e0d6dc04a88449b7381a59 ]
+
+By default, we create two hybrid cache events, one is for cpu_core, and
+another is for cpu_atom. But Some hybrid hardware cache events are only
+available on one CPU PMU. For example, the 'L1-dcache-load-misses' is only
+available on cpu_core, while the 'L1-icache-loads' is only available on
+cpu_atom. We need to remove "not supported" hybrid cache events. By
+extending is_event_supported() to global API and using it to check if the
+hybrid cache events are supported before being created, we can remove the
+"not supported" hybrid cache events.
+
+Before:
+
+ # ./perf stat -e L1-dcache-load-misses,L1-icache-loads -a sleep 1
+
+ Performance counter stats for 'system wide':
+
+            52,570      cpu_core/L1-dcache-load-misses/
+   <not supported>      cpu_atom/L1-dcache-load-misses/
+   <not supported>      cpu_core/L1-icache-loads/
+         1,471,817      cpu_atom/L1-icache-loads/
+
+       1.004915229 seconds time elapsed
+
+After:
+
+ # ./perf stat -e L1-dcache-load-misses,L1-icache-loads -a sleep 1
+
+ Performance counter stats for 'system wide':
+
+            54,510      cpu_core/L1-dcache-load-misses/
+         1,441,286      cpu_atom/L1-icache-loads/
+
+       1.005114281 seconds time elapsed
+
+Fixes: 30def61f64bac5f5 ("perf parse-events: Create two hybrid cache events")
+Reported-by: Yi Ammy <ammy.yi@intel.com>
+Reviewed-by: Kan Liang <kan.liang@linux.intel.com>
+Signed-off-by: Xing Zhengjun <zhengjun.xing@linux.intel.com>
+Acked-by: Ian Rogers <irogers@google.com>
+Cc: Alexander Shishkin <alexander.shishkin@intel.com>
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Jin Yao <yao.jin@linux.intel.com>
+Cc: Jiri Olsa <jolsa@kernel.org>
+Cc: Namhyung Kim <namhyung@kernel.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Link: https://lore.kernel.org/r/20220923030013.3726410-2-zhengjun.xing@linux.intel.com
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ tools/perf/util/parse-events-hybrid.c | 21 ++++++++++++---
+ tools/perf/util/parse-events.c        | 39 +++++++++++++++++++++++++++
+ tools/perf/util/parse-events.h        |  1 +
+ tools/perf/util/print-events.c        | 39 ---------------------------
+ 4 files changed, 57 insertions(+), 43 deletions(-)
+
+diff --git a/tools/perf/util/parse-events-hybrid.c b/tools/perf/util/parse-events-hybrid.c
+index 284f8eabd3b9..7c9f9150bad5 100644
+--- a/tools/perf/util/parse-events-hybrid.c
++++ b/tools/perf/util/parse-events-hybrid.c
+@@ -33,7 +33,8 @@ static void config_hybrid_attr(struct perf_event_attr *attr,
+ 	 * If the PMU type ID is 0, the PERF_TYPE_RAW will be applied.
+ 	 */
+ 	attr->type = type;
+-	attr->config = attr->config | ((__u64)pmu_type << PERF_PMU_TYPE_SHIFT);
++	attr->config = (attr->config & PERF_HW_EVENT_MASK) |
++			((__u64)pmu_type << PERF_PMU_TYPE_SHIFT);
+ }
+ 
+ static int create_event_hybrid(__u32 config_type, int *idx,
+@@ -48,13 +49,25 @@ static int create_event_hybrid(__u32 config_type, int *idx,
+ 	__u64 config = attr->config;
+ 
+ 	config_hybrid_attr(attr, config_type, pmu->type);
++
++	/*
++	 * Some hybrid hardware cache events are only available on one CPU
++	 * PMU. For example, the 'L1-dcache-load-misses' is only available
++	 * on cpu_core, while the 'L1-icache-loads' is only available on
++	 * cpu_atom. We need to remove "not supported" hybrid cache events.
++	 */
++	if (attr->type == PERF_TYPE_HW_CACHE
++	    && !is_event_supported(attr->type, attr->config))
++		return 0;
++
+ 	evsel = parse_events__add_event_hybrid(list, idx, attr, name, metric_id,
+ 					       pmu, config_terms);
+-	if (evsel)
++	if (evsel) {
+ 		evsel->pmu_name = strdup(pmu->name);
+-	else
++		if (!evsel->pmu_name)
++			return -ENOMEM;
++	} else
+ 		return -ENOMEM;
+-
+ 	attr->type = type;
+ 	attr->config = config;
+ 	return 0;
+diff --git a/tools/perf/util/parse-events.c b/tools/perf/util/parse-events.c
+index 3acf7452572c..b51c646c212e 100644
+--- a/tools/perf/util/parse-events.c
++++ b/tools/perf/util/parse-events.c
+@@ -29,6 +29,7 @@
+ #include "util/parse-events-hybrid.h"
+ #include "util/pmu-hybrid.h"
+ #include "tracepoint.h"
++#include "thread_map.h"
+ 
+ #define MAX_NAME_LEN 100
+ 
+@@ -158,6 +159,44 @@ struct event_symbol event_symbols_sw[PERF_COUNT_SW_MAX] = {
+ #define PERF_EVENT_TYPE(config)		__PERF_EVENT_FIELD(config, TYPE)
+ #define PERF_EVENT_ID(config)		__PERF_EVENT_FIELD(config, EVENT)
+ 
++bool is_event_supported(u8 type, u64 config)
++{
++	bool ret = true;
++	int open_return;
++	struct evsel *evsel;
++	struct perf_event_attr attr = {
++		.type = type,
++		.config = config,
++		.disabled = 1,
++	};
++	struct perf_thread_map *tmap = thread_map__new_by_tid(0);
++
++	if (tmap == NULL)
++		return false;
++
++	evsel = evsel__new(&attr);
++	if (evsel) {
++		open_return = evsel__open(evsel, NULL, tmap);
++		ret = open_return >= 0;
++
++		if (open_return == -EACCES) {
++			/*
++			 * This happens if the paranoid value
++			 * /proc/sys/kernel/perf_event_paranoid is set to 2
++			 * Re-run with exclude_kernel set; we don't do that
++			 * by default as some ARM machines do not support it.
++			 *
++			 */
++			evsel->core.attr.exclude_kernel = 1;
++			ret = evsel__open(evsel, NULL, tmap) >= 0;
++		}
++		evsel__delete(evsel);
++	}
++
++	perf_thread_map__put(tmap);
++	return ret;
++}
++
+ const char *event_type(int type)
+ {
+ 	switch (type) {
+diff --git a/tools/perf/util/parse-events.h b/tools/perf/util/parse-events.h
+index ba9fa3ddaf6e..fd97bb74559e 100644
+--- a/tools/perf/util/parse-events.h
++++ b/tools/perf/util/parse-events.h
+@@ -19,6 +19,7 @@ struct option;
+ struct perf_pmu;
+ 
+ bool have_tracepoints(struct list_head *evlist);
++bool is_event_supported(u8 type, u64 config);
+ 
+ const char *event_type(int type);
+ 
+diff --git a/tools/perf/util/print-events.c b/tools/perf/util/print-events.c
+index 04050d4f6db8..c4d5d87fae2f 100644
+--- a/tools/perf/util/print-events.c
++++ b/tools/perf/util/print-events.c
+@@ -22,7 +22,6 @@
+ #include "probe-file.h"
+ #include "string2.h"
+ #include "strlist.h"
+-#include "thread_map.h"
+ #include "tracepoint.h"
+ #include "pfm.h"
+ #include "pmu-hybrid.h"
+@@ -239,44 +238,6 @@ void print_sdt_events(const char *subsys_glob, const char *event_glob,
+ 	strlist__delete(sdtlist);
+ }
+ 
+-static bool is_event_supported(u8 type, u64 config)
+-{
+-	bool ret = true;
+-	int open_return;
+-	struct evsel *evsel;
+-	struct perf_event_attr attr = {
+-		.type = type,
+-		.config = config,
+-		.disabled = 1,
+-	};
+-	struct perf_thread_map *tmap = thread_map__new_by_tid(0);
+-
+-	if (tmap == NULL)
+-		return false;
+-
+-	evsel = evsel__new(&attr);
+-	if (evsel) {
+-		open_return = evsel__open(evsel, NULL, tmap);
+-		ret = open_return >= 0;
+-
+-		if (open_return == -EACCES) {
+-			/*
+-			 * This happens if the paranoid value
+-			 * /proc/sys/kernel/perf_event_paranoid is set to 2
+-			 * Re-run with exclude_kernel set; we don't do that
+-			 * by default as some ARM machines do not support it.
+-			 *
+-			 */
+-			evsel->core.attr.exclude_kernel = 1;
+-			ret = evsel__open(evsel, NULL, tmap) >= 0;
+-		}
+-		evsel__delete(evsel);
+-	}
+-
+-	perf_thread_map__put(tmap);
+-	return ret;
+-}
+-
+ int print_hwcache_events(const char *event_glob, bool name_only)
+ {
+ 	unsigned int type, op, i, evt_i = 0, evt_num = 0, npmus = 0;
+-- 
+2.35.1
+

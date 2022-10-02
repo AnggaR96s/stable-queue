@@ -1,0 +1,83 @@
+From 0ddff6a150f6ade4dcf05ed74ed14056ec9db3dc Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 27 Sep 2022 15:20:42 +0300
+Subject: net: mscc: ocelot: fix tagged VLAN refusal while under a VLAN-unaware
+ bridge
+
+From: Vladimir Oltean <vladimir.oltean@nxp.com>
+
+[ Upstream commit 276d37eb449133bc22872b8f0a6f878e120deeff ]
+
+Currently the following set of commands fails:
+
+$ ip link add br0 type bridge # vlan_filtering 0
+$ ip link set swp0 master br0
+$ bridge vlan
+port              vlan-id
+swp0              1 PVID Egress Untagged
+$ bridge vlan add dev swp0 vid 10
+Error: mscc_ocelot_switch_lib: Port with more than one egress-untagged VLAN cannot have egress-tagged VLANs.
+
+Dumping ocelot->vlans, one can see that the 2 egress-untagged VLANs on swp0 are
+vid 1 (the bridge PVID) and vid 4094, a PVID used privately by the driver for
+VLAN-unaware bridging. So this is why bridge vid 10 is refused, despite
+'bridge vlan' showing a single egress untagged VLAN.
+
+As mentioned in the comment added, having this private VLAN does not impose
+restrictions to the hardware configuration, yet it is a bookkeeping problem.
+
+There are 2 possible solutions.
+
+One is to make the functions that operate on VLAN-unaware pvids:
+- ocelot_add_vlan_unaware_pvid()
+- ocelot_del_vlan_unaware_pvid()
+- ocelot_port_setup_dsa_8021q_cpu()
+- ocelot_port_teardown_dsa_8021q_cpu()
+call something different than ocelot_vlan_member_(add|del)(), the latter being
+the real problem, because it allocates a struct ocelot_bridge_vlan *vlan which
+it adds to ocelot->vlans. We don't really *need* the private VLANs in
+ocelot->vlans, it's just that we have the extra convenience of having the
+vlan->portmask cached in software (whereas without these structures, we'd have
+to create a raw ocelot_vlant_rmw_mask() procedure which reads back the current
+port mask from hardware).
+
+The other solution is to filter out the private VLANs from
+ocelot_port_num_untagged_vlans(), since they aren't what callers care about.
+We only need to do this to the mentioned function and not to
+ocelot_port_num_tagged_vlans(), because private VLANs are never egress-tagged.
+
+Nothing else seems to be broken in either solution, but the first one requires
+more rework which will conflict with the net-next change  36a0bf443585 ("net:
+mscc: ocelot: set up tag_8021q CPU ports independent of user port affinity"),
+and I'd like to avoid that. So go with the other one.
+
+Fixes: 54c319846086 ("net: mscc: ocelot: enforce FDB isolation when VLAN-unaware")
+Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+Link: https://lore.kernel.org/r/20220927122042.1100231-1-vladimir.oltean@nxp.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/net/ethernet/mscc/ocelot.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/drivers/net/ethernet/mscc/ocelot.c b/drivers/net/ethernet/mscc/ocelot.c
+index 68991b021c56..c250ad6dc956 100644
+--- a/drivers/net/ethernet/mscc/ocelot.c
++++ b/drivers/net/ethernet/mscc/ocelot.c
+@@ -290,6 +290,13 @@ static int ocelot_port_num_untagged_vlans(struct ocelot *ocelot, int port)
+ 		if (!(vlan->portmask & BIT(port)))
+ 			continue;
+ 
++		/* Ignore the VLAN added by ocelot_add_vlan_unaware_pvid(),
++		 * because this is never active in hardware at the same time as
++		 * the bridge VLANs, which only matter in VLAN-aware mode.
++		 */
++		if (vlan->vid >= OCELOT_RSV_VLAN_RANGE_START)
++			continue;
++
+ 		if (vlan->untagged & BIT(port))
+ 			num_untagged++;
+ 	}
+-- 
+2.35.1
+
