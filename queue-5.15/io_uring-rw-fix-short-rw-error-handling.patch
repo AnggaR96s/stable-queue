@@ -1,0 +1,102 @@
+From foo@baz Mon Oct 17 11:43:27 AM CEST 2022
+From: Pavel Begunkov <asml.silence@gmail.com>
+Date: Sun, 16 Oct 2022 22:42:56 +0100
+Subject: io_uring/rw: fix short rw error handling
+To: stable@vger.kernel.org
+Cc: Jens Axboe <axboe@kernel.dk>, asml.silence@gmail.com
+Message-ID: <6592121a38f7ee5834ce0691b1f85d54fcea3cfa.1665954636.git.asml.silence@gmail.com>
+
+From: Pavel Begunkov <asml.silence@gmail.com>
+
+[ upstream commit 89473c1a9205760c4fa6d158058da7b594a815f0 ]
+
+We have a couple of problems, first reports of unexpected link breakage
+for reads when cqe->res indicates that the IO was done in full. The
+reason here is partial IO with retries.
+
+TL;DR; we compare the result in __io_complete_rw_common() against
+req->cqe.res, but req->cqe.res doesn't store the full length but rather
+the length left to be done. So, when we pass the full corrected result
+via kiocb_done() -> __io_complete_rw_common(), it fails.
+
+The second problem is that we don't try to correct res in
+io_complete_rw(), which, for instance, might be a problem for O_DIRECT
+but when a prefix of data was cached in the page cache. We also
+definitely don't want to pass a corrected result into io_rw_done().
+
+The fix here is to leave __io_complete_rw_common() alone, always pass
+not corrected result into it and fix it up as the last step just before
+actually finishing the I/O.
+
+Cc: stable@vger.kernel.org
+Signed-off-by: Pavel Begunkov <asml.silence@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/io_uring.c |   28 +++++++++++++++++-----------
+ 1 file changed, 17 insertions(+), 11 deletions(-)
+
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@ -2701,6 +2701,20 @@ static bool __io_complete_rw_common(stru
+ 	return false;
+ }
+ 
++static inline unsigned io_fixup_rw_res(struct io_kiocb *req, unsigned res)
++{
++	struct io_async_rw *io = req->async_data;
++
++	/* add previously done IO, if any */
++	if (io && io->bytes_done > 0) {
++		if (res < 0)
++			res = io->bytes_done;
++		else
++			res += io->bytes_done;
++	}
++	return res;
++}
++
+ static void io_req_task_complete(struct io_kiocb *req, bool *locked)
+ {
+ 	unsigned int cflags = io_put_rw_kbuf(req);
+@@ -2724,7 +2738,7 @@ static void __io_complete_rw(struct io_k
+ {
+ 	if (__io_complete_rw_common(req, res))
+ 		return;
+-	__io_req_complete(req, issue_flags, req->result, io_put_rw_kbuf(req));
++	__io_req_complete(req, issue_flags, io_fixup_rw_res(req, res), io_put_rw_kbuf(req));
+ }
+ 
+ static void io_complete_rw(struct kiocb *kiocb, long res, long res2)
+@@ -2733,7 +2747,7 @@ static void io_complete_rw(struct kiocb
+ 
+ 	if (__io_complete_rw_common(req, res))
+ 		return;
+-	req->result = res;
++	req->result = io_fixup_rw_res(req, res);
+ 	req->io_task_work.func = io_req_task_complete;
+ 	io_req_task_work_add(req);
+ }
+@@ -2979,15 +2993,6 @@ static void kiocb_done(struct kiocb *kio
+ 		       unsigned int issue_flags)
+ {
+ 	struct io_kiocb *req = container_of(kiocb, struct io_kiocb, rw.kiocb);
+-	struct io_async_rw *io = req->async_data;
+-
+-	/* add previously done IO, if any */
+-	if (io && io->bytes_done > 0) {
+-		if (ret < 0)
+-			ret = io->bytes_done;
+-		else
+-			ret += io->bytes_done;
+-	}
+ 
+ 	if (req->flags & REQ_F_CUR_POS)
+ 		req->file->f_pos = kiocb->ki_pos;
+@@ -3004,6 +3009,7 @@ static void kiocb_done(struct kiocb *kio
+ 			unsigned int cflags = io_put_rw_kbuf(req);
+ 			struct io_ring_ctx *ctx = req->ctx;
+ 
++			ret = io_fixup_rw_res(req, ret);
+ 			req_set_fail(req);
+ 			if (!(issue_flags & IO_URING_F_NONBLOCK)) {
+ 				mutex_lock(&ctx->uring_lock);
