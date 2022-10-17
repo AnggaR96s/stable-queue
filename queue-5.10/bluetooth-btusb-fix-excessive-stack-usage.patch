@@ -1,0 +1,115 @@
+From d75da669221fca80dcfb4769b558d8f87e566fd8 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 4 Feb 2021 16:47:07 +0100
+Subject: Bluetooth: btusb: fix excessive stack usage
+
+From: Arnd Bergmann <arnd@arndb.de>
+
+[ Upstream commit 10888140f09c3472146dc206accd0cfa051d0ed4 ]
+
+Enlarging the size of 'struct btmtk_hci_wmt_cmd' makes it no longer
+fit on the kernel stack, as seen from this compiler warning:
+
+drivers/bluetooth/btusb.c:3365:12: error: stack frame size of 1036 bytes in function 'btusb_mtk_hci_wmt_sync' [-Werror,-Wframe-larger-than=]
+
+Change the function to dynamically allocate the buffer instead.
+As there are other sleeping functions called from the same location,
+using GFP_KERNEL should be fine here, and the runtime overhead should
+not matter as this is rarely called.
+
+Unfortunately, I could not figure out why the message size is
+increased in the previous patch. Using dynamic allocation means
+any size is possible now, but there is still a range check that
+limits the total size (including the five-byte header) to 255
+bytes, so whatever was intended there is now undone.
+
+Fixes: 48c13301e6ba ("Bluetooth: btusb: Fine-tune mt7663 mechanism.")
+Signed-off-by: Arnd Bergmann <arnd@arndb.de>
+Signed-off-by: Marcel Holtmann <marcel@holtmann.org>
+Stable-dep-of: fd3f106677ba ("Bluetooth: btusb: mediatek: fix WMT failure during runtime suspend")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/bluetooth/btusb.c | 24 +++++++++++++++---------
+ 1 file changed, 15 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/bluetooth/btusb.c b/drivers/bluetooth/btusb.c
+index eb6e33d168d8..80a3d5019950 100644
+--- a/drivers/bluetooth/btusb.c
++++ b/drivers/bluetooth/btusb.c
+@@ -2832,7 +2832,7 @@ struct btmtk_wmt_hdr {
+ 
+ struct btmtk_hci_wmt_cmd {
+ 	struct btmtk_wmt_hdr hdr;
+-	u8 data[1000];
++	u8 data[];
+ } __packed;
+ 
+ struct btmtk_hci_wmt_evt {
+@@ -3011,7 +3011,7 @@ static int btusb_mtk_hci_wmt_sync(struct hci_dev *hdev,
+ 	struct btmtk_hci_wmt_evt_funcc *wmt_evt_funcc;
+ 	u32 hlen, status = BTMTK_WMT_INVALID;
+ 	struct btmtk_hci_wmt_evt *wmt_evt;
+-	struct btmtk_hci_wmt_cmd wc;
++	struct btmtk_hci_wmt_cmd *wc;
+ 	struct btmtk_wmt_hdr *hdr;
+ 	int err;
+ 
+@@ -3020,20 +3020,24 @@ static int btusb_mtk_hci_wmt_sync(struct hci_dev *hdev,
+ 	if (hlen > 255)
+ 		return -EINVAL;
+ 
+-	hdr = (struct btmtk_wmt_hdr *)&wc;
++	wc = kzalloc(hlen, GFP_KERNEL);
++	if (!wc)
++		return -ENOMEM;
++
++	hdr = &wc->hdr;
+ 	hdr->dir = 1;
+ 	hdr->op = wmt_params->op;
+ 	hdr->dlen = cpu_to_le16(wmt_params->dlen + 1);
+ 	hdr->flag = wmt_params->flag;
+-	memcpy(wc.data, wmt_params->data, wmt_params->dlen);
++	memcpy(wc->data, wmt_params->data, wmt_params->dlen);
+ 
+ 	set_bit(BTUSB_TX_WAIT_VND_EVT, &data->flags);
+ 
+-	err = __hci_cmd_send(hdev, 0xfc6f, hlen, &wc);
++	err = __hci_cmd_send(hdev, 0xfc6f, hlen, wc);
+ 
+ 	if (err < 0) {
+ 		clear_bit(BTUSB_TX_WAIT_VND_EVT, &data->flags);
+-		return err;
++		goto err_free_wc;
+ 	}
+ 
+ 	/* Submit control IN URB on demand to process the WMT event */
+@@ -3055,13 +3059,14 @@ static int btusb_mtk_hci_wmt_sync(struct hci_dev *hdev,
+ 	if (err == -EINTR) {
+ 		bt_dev_err(hdev, "Execution of wmt command interrupted");
+ 		clear_bit(BTUSB_TX_WAIT_VND_EVT, &data->flags);
+-		return err;
++		goto err_free_wc;
+ 	}
+ 
+ 	if (err) {
+ 		bt_dev_err(hdev, "Execution of wmt command timed out");
+ 		clear_bit(BTUSB_TX_WAIT_VND_EVT, &data->flags);
+-		return -ETIMEDOUT;
++		err = -ETIMEDOUT;
++		goto err_free_wc;
+ 	}
+ 
+ 	/* Parse and handle the return WMT event */
+@@ -3097,7 +3102,8 @@ static int btusb_mtk_hci_wmt_sync(struct hci_dev *hdev,
+ err_free_skb:
+ 	kfree_skb(data->evt_skb);
+ 	data->evt_skb = NULL;
+-
++err_free_wc:
++	kfree(wc);
+ 	return err;
+ }
+ 
+-- 
+2.35.1
+
