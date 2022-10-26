@@ -1,0 +1,104 @@
+From foo@baz Wed Oct 26 04:49:40 PM CEST 2022
+From: Chandan Babu R <chandan.babu@oracle.com>
+Date: Wed, 26 Oct 2022 11:58:42 +0530
+Subject: xfs: move inode flush to the sync workqueue
+To: gregkh@linuxfoundation.org
+Cc: sashal@kernel.org, mcgrof@kernel.org, linux-xfs@vger.kernel.org, stable@vger.kernel.org, djwong@kernel.org, chandan.babu@oracle.com, amir73il@gmail.com, leah.rumancik@gmail.com
+Message-ID: <20221026062843.927600-26-chandan.babu@oracle.com>
+
+From: "Darrick J. Wong" <darrick.wong@oracle.com>
+
+commit f0f7a674d4df1510d8ca050a669e1420cf7d7fab upstream.
+
+[ Modify fs/xfs/xfs_super.c to include the changes at locations suitable for
+ 5.4-lts kernel ]
+
+Move the inode dirty data flushing to a workqueue so that multiple
+threads can take advantage of a single thread's flushing work.  The
+ratelimiting technique used in bdd4ee4 was not successful, because
+threads that skipped the inode flush scan due to ratelimiting would
+ENOSPC early, which caused occasional (but noticeable) changes in
+behavior and sporadic fstest regressions.
+
+Therefore, make all the writer threads wait on a single inode flush,
+which eliminates both the stampeding hordes of flushers and the small
+window in which a write could fail with ENOSPC because it lost the
+ratelimit race after even another thread freed space.
+
+Fixes: c6425702f21e ("xfs: ratelimit inode flush on buffered write ENOSPC")
+Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Acked-by: Darrick J. Wong <djwong@kernel.org>
+Signed-off-by: Chandan Babu R <chandan.babu@oracle.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/xfs/xfs_mount.h |    5 +++++
+ fs/xfs/xfs_super.c |   28 +++++++++++++++++++++++-----
+ 2 files changed, 28 insertions(+), 5 deletions(-)
+
+--- a/fs/xfs/xfs_mount.h
++++ b/fs/xfs/xfs_mount.h
+@@ -179,6 +179,11 @@ typedef struct xfs_mount {
+ 	struct xfs_error_cfg	m_error_cfg[XFS_ERR_CLASS_MAX][XFS_ERR_ERRNO_MAX];
+ 	struct xstats		m_stats;	/* per-fs stats */
+ 
++	/*
++	 * Workqueue item so that we can coalesce multiple inode flush attempts
++	 * into a single flush.
++	 */
++	struct work_struct	m_flush_inodes_work;
+ 	struct workqueue_struct *m_buf_workqueue;
+ 	struct workqueue_struct	*m_unwritten_workqueue;
+ 	struct workqueue_struct	*m_cil_workqueue;
+--- a/fs/xfs/xfs_super.c
++++ b/fs/xfs/xfs_super.c
+@@ -840,6 +840,20 @@ xfs_destroy_mount_workqueues(
+ 	destroy_workqueue(mp->m_buf_workqueue);
+ }
+ 
++static void
++xfs_flush_inodes_worker(
++	struct work_struct	*work)
++{
++	struct xfs_mount	*mp = container_of(work, struct xfs_mount,
++						   m_flush_inodes_work);
++	struct super_block	*sb = mp->m_super;
++
++	if (down_read_trylock(&sb->s_umount)) {
++		sync_inodes_sb(sb);
++		up_read(&sb->s_umount);
++	}
++}
++
+ /*
+  * Flush all dirty data to disk. Must not be called while holding an XFS_ILOCK
+  * or a page lock. We use sync_inodes_sb() here to ensure we block while waiting
+@@ -850,12 +864,15 @@ void
+ xfs_flush_inodes(
+ 	struct xfs_mount	*mp)
+ {
+-	struct super_block	*sb = mp->m_super;
++	/*
++	 * If flush_work() returns true then that means we waited for a flush
++	 * which was already in progress.  Don't bother running another scan.
++	 */
++	if (flush_work(&mp->m_flush_inodes_work))
++		return;
+ 
+-	if (down_read_trylock(&sb->s_umount)) {
+-		sync_inodes_sb(sb);
+-		up_read(&sb->s_umount);
+-	}
++	queue_work(mp->m_sync_workqueue, &mp->m_flush_inodes_work);
++	flush_work(&mp->m_flush_inodes_work);
+ }
+ 
+ /* Catch misguided souls that try to use this interface on XFS */
+@@ -1532,6 +1549,7 @@ xfs_mount_alloc(
+ 	spin_lock_init(&mp->m_perag_lock);
+ 	mutex_init(&mp->m_growlock);
+ 	atomic_set(&mp->m_active_trans, 0);
++	INIT_WORK(&mp->m_flush_inodes_work, xfs_flush_inodes_worker);
+ 	INIT_DELAYED_WORK(&mp->m_reclaim_work, xfs_reclaim_worker);
+ 	INIT_DELAYED_WORK(&mp->m_eofblocks_work, xfs_eofblocks_worker);
+ 	INIT_DELAYED_WORK(&mp->m_cowblocks_work, xfs_cowblocks_worker);
