@@ -1,0 +1,101 @@
+From stable-owner@vger.kernel.org Fri Nov 11 05:11:27 2022
+From: Chandan Babu R <chandan.babu@oracle.com>
+Date: Fri, 11 Nov 2022 09:40:25 +0530
+Subject: xfs: drain the buf delwri queue before xfsaild idles
+To: gregkh@linuxfoundation.org
+Cc: sashal@kernel.org, mcgrof@kernel.org, linux-xfs@vger.kernel.org, stable@vger.kernel.org, djwong@kernel.org, chandan.babu@oracle.com, amir73il@gmail.com, leah.rumancik@gmail.com
+Message-ID: <20221111041025.87704-7-chandan.babu@oracle.com>
+
+From: Brian Foster <bfoster@redhat.com>
+
+commit f376b45e861d8b7b34bf0eceeecfdd00dbe65cde upstream.
+
+xfsaild is racy with respect to transaction abort and shutdown in
+that the task can idle or exit with an empty AIL but buffers still
+on the delwri queue. This was partly addressed by cancelling the
+delwri queue before the task exits to prevent memory leaks, but it's
+also possible for xfsaild to empty and idle with buffers on the
+delwri queue. For example, a transaction that pins a buffer that
+also happens to sit on the AIL delwri queue will explicitly remove
+the associated log item from the AIL if the transaction aborts. The
+side effect of this is an unmount hang in xfs_wait_buftarg() as the
+associated buffers remain held by the delwri queue indefinitely.
+This is reproduced on repeated runs of generic/531 with an fs format
+(-mrmapbt=1 -bsize=1k) that happens to also reproduce transaction
+aborts.
+
+Update xfsaild to not idle until both the AIL and associated delwri
+queue are empty and update the push code to continue delwri queue
+submission attempts even when the AIL is empty. This allows the AIL
+to eventually release aborted buffers stranded on the delwri queue
+when they are unlocked by the associated transaction. This should
+have no significant effect on normal runtime behavior because the
+xfsaild currently idles only when the AIL is empty and in practice
+the AIL is rarely empty with a populated delwri queue. The items
+must be AIL resident to land in the queue in the first place and
+generally aren't removed until writeback completes.
+
+Note that the pre-existing delwri queue cancel logic in the exit
+path is retained because task stop is external, could technically
+come at any point, and xfsaild is still responsible to release its
+buffer references before it exits.
+
+Signed-off-by: Brian Foster <bfoster@redhat.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+Acked-by: Darrick J. Wong <djwong@kernel.org>
+Signed-off-by: Chandan Babu R <chandan.babu@oracle.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/xfs/xfs_trans_ail.c |   16 ++++++----------
+ 1 file changed, 6 insertions(+), 10 deletions(-)
+
+--- a/fs/xfs/xfs_trans_ail.c
++++ b/fs/xfs/xfs_trans_ail.c
+@@ -402,16 +402,10 @@ xfsaild_push(
+ 	target = ailp->ail_target;
+ 	ailp->ail_target_prev = target;
+ 
++	/* we're done if the AIL is empty or our push has reached the end */
+ 	lip = xfs_trans_ail_cursor_first(ailp, &cur, ailp->ail_last_pushed_lsn);
+-	if (!lip) {
+-		/*
+-		 * If the AIL is empty or our push has reached the end we are
+-		 * done now.
+-		 */
+-		xfs_trans_ail_cursor_done(&cur);
+-		spin_unlock(&ailp->ail_lock);
++	if (!lip)
+ 		goto out_done;
+-	}
+ 
+ 	XFS_STATS_INC(mp, xs_push_ail);
+ 
+@@ -493,6 +487,8 @@ xfsaild_push(
+ 			break;
+ 		lsn = lip->li_lsn;
+ 	}
++
++out_done:
+ 	xfs_trans_ail_cursor_done(&cur);
+ 	spin_unlock(&ailp->ail_lock);
+ 
+@@ -500,7 +496,6 @@ xfsaild_push(
+ 		ailp->ail_log_flush++;
+ 
+ 	if (!count || XFS_LSN_CMP(lsn, target) >= 0) {
+-out_done:
+ 		/*
+ 		 * We reached the target or the AIL is empty, so wait a bit
+ 		 * longer for I/O to complete and remove pushed items from the
+@@ -592,7 +587,8 @@ xfsaild(
+ 		 */
+ 		smp_rmb();
+ 		if (!xfs_ail_min(ailp) &&
+-		    ailp->ail_target == ailp->ail_target_prev) {
++		    ailp->ail_target == ailp->ail_target_prev &&
++		    list_empty(&ailp->ail_buf_list)) {
+ 			spin_unlock(&ailp->ail_lock);
+ 			freezable_schedule();
+ 			tout = 0;
