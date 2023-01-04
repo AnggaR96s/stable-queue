@@ -1,0 +1,90 @@
+From dfed913e8b55a0c2c4906f1242fd38fd9a116e49 Mon Sep 17 00:00:00 2001
+From: Hangbin Liu <liuhangbin@gmail.com>
+Date: Mon, 25 Apr 2022 09:45:02 +0800
+Subject: net/af_packet: add VLAN support for AF_PACKET SOCK_RAW GSO
+
+From: Hangbin Liu <liuhangbin@gmail.com>
+
+commit dfed913e8b55a0c2c4906f1242fd38fd9a116e49 upstream.
+
+Currently, the kernel drops GSO VLAN tagged packet if it's created with
+socket(AF_PACKET, SOCK_RAW, 0) plus virtio_net_hdr.
+
+The reason is AF_PACKET doesn't adjust the skb network header if there is
+a VLAN tag. Then after virtio_net_hdr_set_proto() called, the skb->protocol
+will be set to ETH_P_IP/IPv6. And in later inet/ipv6_gso_segment() the skb
+is dropped as network header position is invalid.
+
+Let's handle VLAN packets by adjusting network header position in
+packet_parse_headers(). The adjustment is safe and does not affect the
+later xmit as tap device also did that.
+
+In packet_snd(), packet_parse_headers() need to be moved before calling
+virtio_net_hdr_set_proto(), so we can set correct skb->protocol and
+network header first.
+
+There is no need to update tpacket_snd() as it calls packet_parse_headers()
+in tpacket_fill_skb(), which is already before calling virtio_net_hdr_*
+functions.
+
+skb->no_fcs setting is also moved upper to make all skb settings together
+and keep consistency with function packet_sendmsg_spkt().
+
+Signed-off-by: Hangbin Liu <liuhangbin@gmail.com>
+Acked-by: Willem de Bruijn <willemb@google.com>
+Acked-by: Michael S. Tsirkin <mst@redhat.com>
+Link: https://lore.kernel.org/r/20220425014502.985464-1-liuhangbin@gmail.com
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Tudor Ambarus <tudor.ambarus@linaro.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/packet/af_packet.c |   18 +++++++++++++-----
+ 1 file changed, 13 insertions(+), 5 deletions(-)
+
+--- a/net/packet/af_packet.c
++++ b/net/packet/af_packet.c
+@@ -1888,12 +1888,20 @@ oom:
+ 
+ static void packet_parse_headers(struct sk_buff *skb, struct socket *sock)
+ {
++	int depth;
++
+ 	if ((!skb->protocol || skb->protocol == htons(ETH_P_ALL)) &&
+ 	    sock->type == SOCK_RAW) {
+ 		skb_reset_mac_header(skb);
+ 		skb->protocol = dev_parse_header_protocol(skb);
+ 	}
+ 
++	/* Move network header to the right position for VLAN tagged packets */
++	if (likely(skb->dev->type == ARPHRD_ETHER) &&
++	    eth_type_vlan(skb->protocol) &&
++	    __vlan_get_protocol(skb, skb->protocol, &depth) != 0)
++		skb_set_network_header(skb, depth);
++
+ 	skb_probe_transport_header(skb);
+ }
+ 
+@@ -3008,6 +3016,11 @@ static int packet_snd(struct socket *soc
+ 	skb->mark = sockc.mark;
+ 	skb->tstamp = sockc.transmit_time;
+ 
++	if (unlikely(extra_len == 4))
++		skb->no_fcs = 1;
++
++	packet_parse_headers(skb, sock);
++
+ 	if (has_vnet_hdr) {
+ 		err = virtio_net_hdr_to_skb(skb, &vnet_hdr, vio_le());
+ 		if (err)
+@@ -3016,11 +3029,6 @@ static int packet_snd(struct socket *soc
+ 		virtio_net_hdr_set_proto(skb, &vnet_hdr);
+ 	}
+ 
+-	packet_parse_headers(skb, sock);
+-
+-	if (unlikely(extra_len == 4))
+-		skb->no_fcs = 1;
+-
+ 	err = po->xmit(skb);
+ 	if (unlikely(err != 0)) {
+ 		if (err > 0)
