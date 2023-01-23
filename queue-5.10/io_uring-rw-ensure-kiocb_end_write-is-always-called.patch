@@ -1,0 +1,112 @@
+From 847059841bf49921adc58c31b910b52e46568e3e Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Sun, 22 Jan 2023 10:36:37 -0700
+Subject: io_uring/rw: ensure kiocb_end_write() is always called
+
+From: Jens Axboe <axboe@kernel.dk>
+
+commit 2ec33a6c3cca9fe2465e82050c81f5ffdc508b36 upstream.
+
+A previous commit moved the notifications and end-write handling, but
+it is now missing a few spots where we also want to call both of those.
+Without that, we can potentially be missing file notifications, and
+more importantly, have an imbalance in the super_block writers sem
+accounting.
+
+Fixes: b000145e9907 ("io_uring/rw: defer fsnotify calls to task context")
+Reported-by: Dave Chinner <david@fromorbit.com>
+Link: https://lore.kernel.org/all/20221010050319.GC2703033@dread.disaster.area/
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ io_uring/io_uring.c |   57 +++++++++++++++++++++++++++++++++-------------------
+ 1 file changed, 37 insertions(+), 20 deletions(-)
+
+--- a/io_uring/io_uring.c
++++ b/io_uring/io_uring.c
+@@ -2700,11 +2700,34 @@ static bool io_rw_should_reissue(struct
+ }
+ #endif
+ 
++/*
++ * Trigger the notifications after having done some IO, and finish the write
++ * accounting, if any.
++ */
++static void io_req_io_end(struct io_kiocb *req)
++{
++	struct io_rw *rw = &req->rw;
++
++	WARN_ON(!in_task());
++
++	if (rw->kiocb.ki_flags & IOCB_WRITE) {
++		kiocb_end_write(req);
++		fsnotify_modify(req->file);
++	} else {
++		fsnotify_access(req->file);
++	}
++}
++
+ static bool __io_complete_rw_common(struct io_kiocb *req, long res)
+ {
+ 	if (res != req->result) {
+ 		if ((res == -EAGAIN || res == -EOPNOTSUPP) &&
+ 		    io_rw_should_reissue(req)) {
++			/*
++			 * Reissue will start accounting again, finish the
++			 * current cycle.
++			 */
++			io_req_io_end(req);
+ 			req->flags |= REQ_F_REISSUE;
+ 			return true;
+ 		}
+@@ -2746,25 +2769,9 @@ static void io_req_task_complete(struct
+ 	}
+ }
+ 
+-static void __io_complete_rw(struct io_kiocb *req, long res, long res2,
+-			     unsigned int issue_flags)
+-{
+-	if (__io_complete_rw_common(req, res))
+-		return;
+-	__io_req_complete(req, issue_flags, io_fixup_rw_res(req, res), io_put_rw_kbuf(req));
+-}
+-
+ static void io_req_rw_complete(struct io_kiocb *req, bool *locked)
+ {
+-	struct io_rw *rw = &req->rw;
+-
+-	if (rw->kiocb.ki_flags & IOCB_WRITE) {
+-		kiocb_end_write(req);
+-		fsnotify_modify(req->file);
+-	} else {
+-		fsnotify_access(req->file);
+-	}
+-
++	io_req_io_end(req);
+ 	io_req_task_complete(req, locked);
+ }
+ 
+@@ -3032,10 +3039,20 @@ static void kiocb_done(struct kiocb *kio
+ 
+ 	if (req->flags & REQ_F_CUR_POS)
+ 		req->file->f_pos = kiocb->ki_pos;
+-	if (ret >= 0 && (kiocb->ki_complete == io_complete_rw))
+-		__io_complete_rw(req, ret, 0, issue_flags);
+-	else
++	if (ret >= 0 && (kiocb->ki_complete == io_complete_rw)) {
++		if (!__io_complete_rw_common(req, ret)) {
++			/*
++			 * Safe to call io_end from here as we're inline
++			 * from the submission path.
++			 */
++			io_req_io_end(req);
++			__io_req_complete(req, issue_flags,
++					  io_fixup_rw_res(req, ret),
++					  io_put_rw_kbuf(req));
++		}
++	} else {
+ 		io_rw_done(kiocb, ret);
++	}
+ 
+ 	if (req->flags & REQ_F_REISSUE) {
+ 		req->flags &= ~REQ_F_REISSUE;
