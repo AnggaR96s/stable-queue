@@ -1,0 +1,132 @@
+From 08eb83c24e5000516b1922b50ee304a1d13f1e41 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 6 Jun 2022 21:11:49 +0300
+Subject: KVM: SVM: fix tsc scaling cache logic
+
+From: Maxim Levitsky <mlevitsk@redhat.com>
+
+[ Upstream commit 11d39e8cc43e1c6737af19ca9372e590061b5ad2 ]
+
+SVM uses a per-cpu variable to cache the current value of the
+tsc scaling multiplier msr on each cpu.
+
+Commit 1ab9287add5e2
+("KVM: X86: Add vendor callbacks for writing the TSC multiplier")
+broke this caching logic.
+
+Refactor the code so that all TSC scaling multiplier writes go through
+a single function which checks and updates the cache.
+
+This fixes the following scenario:
+
+1. A CPU runs a guest with some tsc scaling ratio.
+
+2. New guest with different tsc scaling ratio starts on this CPU
+   and terminates almost immediately.
+
+   This ensures that the short running guest had set the tsc scaling ratio just
+   once when it was set via KVM_SET_TSC_KHZ. Due to the bug,
+   the per-cpu cache is not updated.
+
+3. The original guest continues to run, it doesn't restore the msr
+   value back to its own value, because the cache matches,
+   and thus continues to run with a wrong tsc scaling ratio.
+
+Fixes: 1ab9287add5e2 ("KVM: X86: Add vendor callbacks for writing the TSC multiplier")
+Signed-off-by: Maxim Levitsky <mlevitsk@redhat.com>
+Message-Id: <20220606181149.103072-1-mlevitsk@redhat.com>
+Cc: stable@vger.kernel.org
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ arch/x86/kvm/svm/svm.c | 34 +++++++++++++++++++++++-----------
+ arch/x86/kvm/svm/svm.h |  1 +
+ 2 files changed, 24 insertions(+), 11 deletions(-)
+
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+index 773420203305..c1a758038892 100644
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -465,11 +465,24 @@ static int has_svm(void)
+ 	return 1;
+ }
+ 
++void __svm_write_tsc_multiplier(u64 multiplier)
++{
++	preempt_disable();
++
++	if (multiplier == __this_cpu_read(current_tsc_ratio))
++		goto out;
++
++	wrmsrl(MSR_AMD64_TSC_RATIO, multiplier);
++	__this_cpu_write(current_tsc_ratio, multiplier);
++out:
++	preempt_enable();
++}
++
+ static void svm_hardware_disable(void)
+ {
+ 	/* Make sure we clean up behind us */
+ 	if (static_cpu_has(X86_FEATURE_TSCRATEMSR))
+-		wrmsrl(MSR_AMD64_TSC_RATIO, TSC_RATIO_DEFAULT);
++		__svm_write_tsc_multiplier(TSC_RATIO_DEFAULT);
+ 
+ 	cpu_svm_disable();
+ 
+@@ -511,8 +524,11 @@ static int svm_hardware_enable(void)
+ 	wrmsrl(MSR_VM_HSAVE_PA, __sme_page_pa(sd->save_area));
+ 
+ 	if (static_cpu_has(X86_FEATURE_TSCRATEMSR)) {
+-		wrmsrl(MSR_AMD64_TSC_RATIO, TSC_RATIO_DEFAULT);
+-		__this_cpu_write(current_tsc_ratio, TSC_RATIO_DEFAULT);
++		/*
++		 * Set the default value, even if we don't use TSC scaling
++		 * to avoid having stale value in the msr
++		 */
++		__svm_write_tsc_multiplier(TSC_RATIO_DEFAULT);
+ 	}
+ 
+ 
+@@ -1125,9 +1141,10 @@ static void svm_write_tsc_offset(struct kvm_vcpu *vcpu, u64 offset)
+ 
+ static void svm_write_tsc_multiplier(struct kvm_vcpu *vcpu, u64 multiplier)
+ {
+-	wrmsrl(MSR_AMD64_TSC_RATIO, multiplier);
++	__svm_write_tsc_multiplier(multiplier);
+ }
+ 
++
+ /* Evaluate instruction intercepts that depend on guest CPUID features. */
+ static void svm_recalc_instruction_intercepts(struct kvm_vcpu *vcpu,
+ 					      struct vcpu_svm *svm)
+@@ -1451,13 +1468,8 @@ static void svm_prepare_guest_switch(struct kvm_vcpu *vcpu)
+ 		vmsave(__sme_page_pa(sd->save_area));
+ 	}
+ 
+-	if (static_cpu_has(X86_FEATURE_TSCRATEMSR)) {
+-		u64 tsc_ratio = vcpu->arch.tsc_scaling_ratio;
+-		if (tsc_ratio != __this_cpu_read(current_tsc_ratio)) {
+-			__this_cpu_write(current_tsc_ratio, tsc_ratio);
+-			wrmsrl(MSR_AMD64_TSC_RATIO, tsc_ratio);
+-		}
+-	}
++	if (static_cpu_has(X86_FEATURE_TSCRATEMSR))
++		__svm_write_tsc_multiplier(vcpu->arch.tsc_scaling_ratio);
+ 
+ 	if (likely(tsc_aux_uret_slot >= 0))
+ 		kvm_set_user_return_msr(tsc_aux_uret_slot, svm->tsc_aux, -1ull);
+diff --git a/arch/x86/kvm/svm/svm.h b/arch/x86/kvm/svm/svm.h
+index 7004f356edf9..1d9b1a9e4398 100644
+--- a/arch/x86/kvm/svm/svm.h
++++ b/arch/x86/kvm/svm/svm.h
+@@ -487,6 +487,7 @@ int nested_svm_check_exception(struct vcpu_svm *svm, unsigned nr,
+ int nested_svm_exit_special(struct vcpu_svm *svm);
+ void nested_load_control_from_vmcb12(struct vcpu_svm *svm,
+ 				     struct vmcb_control_area *control);
++void __svm_write_tsc_multiplier(u64 multiplier);
+ void nested_sync_control_from_vmcb02(struct vcpu_svm *svm);
+ void nested_vmcb02_compute_g_pat(struct vcpu_svm *svm);
+ void svm_switch_vmcb(struct vcpu_svm *svm, struct kvm_vmcb_info *target_vmcb);
+-- 
+2.39.0
+
