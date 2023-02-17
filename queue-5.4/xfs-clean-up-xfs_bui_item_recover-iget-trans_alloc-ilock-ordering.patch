@@ -1,0 +1,108 @@
+From chandan.babu@oracle.com Thu Feb 16 06:22:24 2023
+From: Chandan Babu R <chandan.babu@oracle.com>
+Date: Thu, 16 Feb 2023 10:50:09 +0530
+Subject: xfs: clean up xfs_bui_item_recover iget/trans_alloc/ilock ordering
+To: gregkh@linuxfoundation.org
+Cc: sashal@kernel.org, mcgrof@kernel.org, linux-xfs@vger.kernel.org, stable@vger.kernel.org, djwong@kernel.org, chandan.babu@oracle.com, amir73il@gmail.com, leah.rumancik@gmail.com
+Message-ID: <20230216052019.368896-16-chandan.babu@oracle.com>
+
+From: "Darrick J. Wong" <darrick.wong@oracle.com>
+
+commit 64a3f3315bc60f710a0a25c1798ac0ea58c6fa1f upstream.
+
+In most places in XFS, we have a specific order in which we gather
+resources: grab the inode, allocate a transaction, then lock the inode.
+xfs_bui_item_recover doesn't do it in that order, so fix it to be more
+consistent.  This also makes the error bailout code a bit less weird.
+
+Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+Reviewed-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Signed-off-by: Chandan Babu R <chandan.babu@oracle.com>
+Acked-by: Darrick J. Wong <djwong@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/xfs/xfs_bmap_item.c |   38 ++++++++++++++++++++++++--------------
+ 1 file changed, 24 insertions(+), 14 deletions(-)
+
+--- a/fs/xfs/xfs_bmap_item.c
++++ b/fs/xfs/xfs_bmap_item.c
+@@ -22,6 +22,7 @@
+ #include "xfs_bmap_btree.h"
+ #include "xfs_trans_space.h"
+ #include "xfs_error.h"
++#include "xfs_quota.h"
+ 
+ kmem_zone_t	*xfs_bui_zone;
+ kmem_zone_t	*xfs_bud_zone;
+@@ -488,21 +489,26 @@ xfs_bui_recover(
+ 		return -EFSCORRUPTED;
+ 	}
+ 
+-	error = xfs_trans_alloc(mp, &M_RES(mp)->tr_itruncate,
+-			XFS_EXTENTADD_SPACE_RES(mp, XFS_DATA_FORK), 0, 0, &tp);
++	/* Grab the inode. */
++	error = xfs_iget(mp, NULL, bmap->me_owner, 0, 0, &ip);
+ 	if (error)
+ 		return error;
+ 
+-	budp = xfs_trans_get_bud(tp, buip);
+-
+-	/* Grab the inode. */
+-	error = xfs_iget(mp, tp, bmap->me_owner, 0, XFS_ILOCK_EXCL, &ip);
++	error = xfs_qm_dqattach(ip);
+ 	if (error)
+-		goto err_inode;
++		goto err_rele;
+ 
+ 	if (VFS_I(ip)->i_nlink == 0)
+ 		xfs_iflags_set(ip, XFS_IRECOVERY);
+ 
++	/* Allocate transaction and do the work. */
++	error = xfs_trans_alloc(mp, &M_RES(mp)->tr_itruncate,
++			XFS_EXTENTADD_SPACE_RES(mp, XFS_DATA_FORK), 0, 0, &tp);
++	if (error)
++		goto err_rele;
++
++	budp = xfs_trans_get_bud(tp, buip);
++	xfs_ilock(ip, XFS_ILOCK_EXCL);
+ 	xfs_trans_ijoin(tp, ip, 0);
+ 
+ 	count = bmap->me_len;
+@@ -510,7 +516,7 @@ xfs_bui_recover(
+ 			whichfork, bmap->me_startoff, bmap->me_startblock,
+ 			&count, state);
+ 	if (error)
+-		goto err_inode;
++		goto err_cancel;
+ 
+ 	if (count > 0) {
+ 		ASSERT(bui_type == XFS_BMAP_UNMAP);
+@@ -522,16 +528,20 @@ xfs_bui_recover(
+ 	}
+ 
+ 	set_bit(XFS_BUI_RECOVERED, &buip->bui_flags);
++	/* Commit transaction, which frees the transaction. */
+ 	error = xfs_defer_ops_capture_and_commit(tp, capture_list);
++	if (error)
++		goto err_unlock;
++
+ 	xfs_iunlock(ip, XFS_ILOCK_EXCL);
+ 	xfs_irele(ip);
+-	return error;
++	return 0;
+ 
+-err_inode:
++err_cancel:
+ 	xfs_trans_cancel(tp);
+-	if (ip) {
+-		xfs_iunlock(ip, XFS_ILOCK_EXCL);
+-		xfs_irele(ip);
+-	}
++err_unlock:
++	xfs_iunlock(ip, XFS_ILOCK_EXCL);
++err_rele:
++	xfs_irele(ip);
+ 	return error;
+ }
