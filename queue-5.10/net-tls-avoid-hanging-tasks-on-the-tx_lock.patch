@@ -1,0 +1,78 @@
+From f3221361dc85d4de22586ce8441ec2c67b454f5d Mon Sep 17 00:00:00 2001
+From: Jakub Kicinski <kuba@kernel.org>
+Date: Tue, 28 Feb 2023 16:28:57 -0800
+Subject: net: tls: avoid hanging tasks on the tx_lock
+
+From: Jakub Kicinski <kuba@kernel.org>
+
+commit f3221361dc85d4de22586ce8441ec2c67b454f5d upstream.
+
+syzbot sent a hung task report and Eric explains that adversarial
+receiver may keep RWIN at 0 for a long time, so we are not guaranteed
+to make forward progress. Thread which took tx_lock and went to sleep
+may not release tx_lock for hours. Use interruptible sleep where
+possible and reschedule the work if it can't take the lock.
+
+Testing: existing selftest passes
+
+Reported-by: syzbot+9c0268252b8ef967c62e@syzkaller.appspotmail.com
+Fixes: 79ffe6087e91 ("net/tls: add a TX lock")
+Link: https://lore.kernel.org/all/000000000000e412e905f5b46201@google.com/
+Cc: stable@vger.kernel.org # wait 4 weeks
+Reviewed-by: Eric Dumazet <edumazet@google.com>
+Link: https://lore.kernel.org/r/20230301002857.2101894-1-kuba@kernel.org
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/tls/tls_sw.c |   26 +++++++++++++++++++-------
+ 1 file changed, 19 insertions(+), 7 deletions(-)
+
+--- a/net/tls/tls_sw.c
++++ b/net/tls/tls_sw.c
+@@ -949,7 +949,9 @@ int tls_sw_sendmsg(struct sock *sk, stru
+ 			       MSG_CMSG_COMPAT))
+ 		return -EOPNOTSUPP;
+ 
+-	mutex_lock(&tls_ctx->tx_lock);
++	ret = mutex_lock_interruptible(&tls_ctx->tx_lock);
++	if (ret)
++		return ret;
+ 	lock_sock(sk);
+ 
+ 	if (unlikely(msg->msg_controllen)) {
+@@ -1283,7 +1285,9 @@ int tls_sw_sendpage(struct sock *sk, str
+ 		      MSG_SENDPAGE_NOTLAST | MSG_SENDPAGE_NOPOLICY))
+ 		return -EOPNOTSUPP;
+ 
+-	mutex_lock(&tls_ctx->tx_lock);
++	ret = mutex_lock_interruptible(&tls_ctx->tx_lock);
++	if (ret)
++		return ret;
+ 	lock_sock(sk);
+ 	ret = tls_sw_do_sendpage(sk, page, offset, size, flags);
+ 	release_sock(sk);
+@@ -2266,11 +2270,19 @@ static void tx_work_handler(struct work_
+ 
+ 	if (!test_and_clear_bit(BIT_TX_SCHEDULED, &ctx->tx_bitmask))
+ 		return;
+-	mutex_lock(&tls_ctx->tx_lock);
+-	lock_sock(sk);
+-	tls_tx_records(sk, -1);
+-	release_sock(sk);
+-	mutex_unlock(&tls_ctx->tx_lock);
++
++	if (mutex_trylock(&tls_ctx->tx_lock)) {
++		lock_sock(sk);
++		tls_tx_records(sk, -1);
++		release_sock(sk);
++		mutex_unlock(&tls_ctx->tx_lock);
++	} else if (!test_and_set_bit(BIT_TX_SCHEDULED, &ctx->tx_bitmask)) {
++		/* Someone is holding the tx_lock, they will likely run Tx
++		 * and cancel the work on their way out of the lock section.
++		 * Schedule a long delay just in case.
++		 */
++		schedule_delayed_work(&ctx->tx_work.work, msecs_to_jiffies(10));
++	}
+ }
+ 
+ void tls_sw_write_space(struct sock *sk, struct tls_context *ctx)
