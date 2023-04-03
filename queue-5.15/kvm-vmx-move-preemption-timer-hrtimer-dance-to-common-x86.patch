@@ -1,0 +1,100 @@
+From 98c25ead5eda5e9d41abe57839ad3e8caf19500c Mon Sep 17 00:00:00 2001
+From: Sean Christopherson <seanjc@google.com>
+Date: Wed, 8 Dec 2021 01:52:17 +0000
+Subject: KVM: VMX: Move preemption timer <=> hrtimer dance to common x86
+
+From: Sean Christopherson <seanjc@google.com>
+
+commit 98c25ead5eda5e9d41abe57839ad3e8caf19500c upstream.
+
+Handle the switch to/from the hypervisor/software timer when a vCPU is
+blocking in common x86 instead of in VMX.  Even though VMX is the only
+user of a hypervisor timer, the logic and all functions involved are
+generic x86 (unless future CPUs do something completely different and
+implement a hypervisor timer that runs regardless of mode).
+
+Handling the switch in common x86 will allow for the elimination of the
+pre/post_blocks hooks, and also lets KVM switch back to the hypervisor
+timer if and only if it was in use (without additional params).  Add a
+comment explaining why the switch cannot be deferred to kvm_sched_out()
+or kvm_vcpu_block().
+
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Reviewed-by: Maxim Levitsky <mlevitsk@redhat.com>
+Message-Id: <20211208015236.1616697-8-seanjc@google.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+[ta: Fix conflicts in vmx_pre_block and vmx_post_block as per Paolo's
+suggestion. Add Reported-by and Link tags.]
+Reported-by: syzbot+b6a74be92b5063a0f1ff@syzkaller.appspotmail.com
+Link: https://syzkaller.appspot.com/bug?id=489beb3d76ef14cc6cd18125782dc6f86051a605
+Tested-by: Tudor Ambarus <tudor.ambarus@linaro.org>
+Signed-off-by: Tudor Ambarus <tudor.ambarus@linaro.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/x86/kvm/vmx/vmx.c |    6 ------
+ arch/x86/kvm/x86.c     |   21 +++++++++++++++++++++
+ 2 files changed, 21 insertions(+), 6 deletions(-)
+
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -7597,17 +7597,11 @@ static int vmx_pre_block(struct kvm_vcpu
+ 	if (pi_pre_block(vcpu))
+ 		return 1;
+ 
+-	if (kvm_lapic_hv_timer_in_use(vcpu))
+-		kvm_lapic_switch_to_sw_timer(vcpu);
+-
+ 	return 0;
+ }
+ 
+ static void vmx_post_block(struct kvm_vcpu *vcpu)
+ {
+-	if (kvm_x86_ops.set_hv_timer)
+-		kvm_lapic_switch_to_hv_timer(vcpu);
+-
+ 	pi_post_block(vcpu);
+ }
+ 
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -10043,12 +10043,28 @@ out:
+ 
+ static inline int vcpu_block(struct kvm *kvm, struct kvm_vcpu *vcpu)
+ {
++	bool hv_timer;
++
+ 	if (!kvm_arch_vcpu_runnable(vcpu) &&
+ 	    (!kvm_x86_ops.pre_block || static_call(kvm_x86_pre_block)(vcpu) == 0)) {
++		/*
++		 * Switch to the software timer before halt-polling/blocking as
++		 * the guest's timer may be a break event for the vCPU, and the
++		 * hypervisor timer runs only when the CPU is in guest mode.
++		 * Switch before halt-polling so that KVM recognizes an expired
++		 * timer before blocking.
++		 */
++		hv_timer = kvm_lapic_hv_timer_in_use(vcpu);
++		if (hv_timer)
++			kvm_lapic_switch_to_sw_timer(vcpu);
++
+ 		srcu_read_unlock(&kvm->srcu, vcpu->srcu_idx);
+ 		kvm_vcpu_block(vcpu);
+ 		vcpu->srcu_idx = srcu_read_lock(&kvm->srcu);
+ 
++		if (hv_timer)
++			kvm_lapic_switch_to_hv_timer(vcpu);
++
+ 		if (kvm_x86_ops.post_block)
+ 			static_call(kvm_x86_post_block)(vcpu);
+ 
+@@ -10287,6 +10303,11 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_v
+ 			r = -EINTR;
+ 			goto out;
+ 		}
++		/*
++		 * It should be impossible for the hypervisor timer to be in
++		 * use before KVM has ever run the vCPU.
++		 */
++		WARN_ON_ONCE(kvm_lapic_hv_timer_in_use(vcpu));
+ 		kvm_vcpu_block(vcpu);
+ 		if (kvm_apic_accept_events(vcpu) < 0) {
+ 			r = 0;
