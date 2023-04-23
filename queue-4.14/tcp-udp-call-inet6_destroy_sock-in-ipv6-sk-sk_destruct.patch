@@ -1,0 +1,143 @@
+From d38afeec26ed4739c640bf286c270559aab2ba5f Mon Sep 17 00:00:00 2001
+From: Kuniyuki Iwashima <kuniyu@amazon.com>
+Date: Thu, 6 Oct 2022 11:53:47 -0700
+Subject: tcp/udp: Call inet6_destroy_sock() in IPv6 sk->sk_destruct().
+
+From: Kuniyuki Iwashima <kuniyu@amazon.com>
+
+commit d38afeec26ed4739c640bf286c270559aab2ba5f upstream.
+
+Originally, inet6_sk(sk)->XXX were changed under lock_sock(), so we were
+able to clean them up by calling inet6_destroy_sock() during the IPv6 ->
+IPv4 conversion by IPV6_ADDRFORM.  However, commit 03485f2adcde ("udpv6:
+Add lockless sendmsg() support") added a lockless memory allocation path,
+which could cause a memory leak:
+
+setsockopt(IPV6_ADDRFORM)                 sendmsg()
++-----------------------+                 +-------+
+- do_ipv6_setsockopt(sk, ...)             - udpv6_sendmsg(sk, ...)
+  - sockopt_lock_sock(sk)                   ^._ called via udpv6_prot
+    - lock_sock(sk)                             before WRITE_ONCE()
+  - WRITE_ONCE(sk->sk_prot, &tcp_prot)
+  - inet6_destroy_sock()                    - if (!corkreq)
+  - sockopt_release_sock(sk)                  - ip6_make_skb(sk, ...)
+    - release_sock(sk)                          ^._ lockless fast path for
+                                                    the non-corking case
+
+                                                - __ip6_append_data(sk, ...)
+                                                  - ipv6_local_rxpmtu(sk, ...)
+                                                    - xchg(&np->rxpmtu, skb)
+                                                      ^._ rxpmtu is never freed.
+
+                                                - goto out_no_dst;
+
+                                            - lock_sock(sk)
+
+For now, rxpmtu is only the case, but not to miss the future change
+and a similar bug fixed in commit e27326009a3d ("net: ping6: Fix
+memleak in ipv6_renew_options()."), let's set a new function to IPv6
+sk->sk_destruct() and call inet6_cleanup_sock() there.  Since the
+conversion does not change sk->sk_destruct(), we can guarantee that
+we can clean up IPv6 resources finally.
+
+We can now remove all inet6_destroy_sock() calls from IPv6 protocol
+specific ->destroy() functions, but such changes are invasive to
+backport.  So they can be posted as a follow-up later for net-next.
+
+Fixes: 03485f2adcde ("udpv6: Add lockless sendmsg() support")
+Signed-off-by: Kuniyuki Iwashima <kuniyu@amazon.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Ziyang Xuan <william.xuanziyang@huawei.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/dccp/dccp.h     |    1 +
+ net/dccp/ipv6.c     |   15 ++++++++-------
+ net/dccp/proto.c    |    8 +++++++-
+ net/ipv6/af_inet6.c |    1 +
+ 4 files changed, 17 insertions(+), 8 deletions(-)
+
+--- a/net/dccp/dccp.h
++++ b/net/dccp/dccp.h
+@@ -291,6 +291,7 @@ int dccp_rcv_state_process(struct sock *
+ int dccp_rcv_established(struct sock *sk, struct sk_buff *skb,
+ 			 const struct dccp_hdr *dh, const unsigned int len);
+ 
++void dccp_destruct_common(struct sock *sk);
+ int dccp_init_sock(struct sock *sk, const __u8 ctl_sock_initialized);
+ void dccp_destroy_sock(struct sock *sk);
+ 
+--- a/net/dccp/ipv6.c
++++ b/net/dccp/ipv6.c
+@@ -1000,6 +1000,12 @@ static const struct inet_connection_sock
+ #endif
+ };
+ 
++static void dccp_v6_sk_destruct(struct sock *sk)
++{
++	dccp_destruct_common(sk);
++	inet6_sock_destruct(sk);
++}
++
+ /* NOTE: A lot of things set to zero explicitly by call to
+  *       sk_alloc() so need not be done here.
+  */
+@@ -1012,17 +1018,12 @@ static int dccp_v6_init_sock(struct sock
+ 		if (unlikely(!dccp_v6_ctl_sock_initialized))
+ 			dccp_v6_ctl_sock_initialized = 1;
+ 		inet_csk(sk)->icsk_af_ops = &dccp_ipv6_af_ops;
++		sk->sk_destruct = dccp_v6_sk_destruct;
+ 	}
+ 
+ 	return err;
+ }
+ 
+-static void dccp_v6_destroy_sock(struct sock *sk)
+-{
+-	dccp_destroy_sock(sk);
+-	inet6_destroy_sock(sk);
+-}
+-
+ static struct timewait_sock_ops dccp6_timewait_sock_ops = {
+ 	.twsk_obj_size	= sizeof(struct dccp6_timewait_sock),
+ };
+@@ -1045,7 +1046,7 @@ static struct proto dccp_v6_prot = {
+ 	.accept		   = inet_csk_accept,
+ 	.get_port	   = inet_csk_get_port,
+ 	.shutdown	   = dccp_shutdown,
+-	.destroy	   = dccp_v6_destroy_sock,
++	.destroy	   = dccp_destroy_sock,
+ 	.orphan_count	   = &dccp_orphan_count,
+ 	.max_header	   = MAX_DCCP_HEADER,
+ 	.obj_size	   = sizeof(struct dccp6_sock),
+--- a/net/dccp/proto.c
++++ b/net/dccp/proto.c
+@@ -171,12 +171,18 @@ const char *dccp_packet_name(const int t
+ 
+ EXPORT_SYMBOL_GPL(dccp_packet_name);
+ 
+-static void dccp_sk_destruct(struct sock *sk)
++void dccp_destruct_common(struct sock *sk)
+ {
+ 	struct dccp_sock *dp = dccp_sk(sk);
+ 
+ 	ccid_hc_tx_delete(dp->dccps_hc_tx_ccid, sk);
+ 	dp->dccps_hc_tx_ccid = NULL;
++}
++EXPORT_SYMBOL_GPL(dccp_destruct_common);
++
++static void dccp_sk_destruct(struct sock *sk)
++{
++	dccp_destruct_common(sk);
+ 	inet_sock_destruct(sk);
+ }
+ 
+--- a/net/ipv6/af_inet6.c
++++ b/net/ipv6/af_inet6.c
+@@ -106,6 +106,7 @@ static __inline__ struct ipv6_pinfo *ine
+ 
+ 	return (struct ipv6_pinfo *)(((u8 *)sk) + offset);
+ }
++EXPORT_SYMBOL_GPL(inet6_sock_destruct);
+ 
+ static int inet6_create(struct net *net, struct socket *sock, int protocol,
+ 			int kern)
