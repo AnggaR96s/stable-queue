@@ -1,0 +1,109 @@
+From 978ddaa6977c40c605c6233ae5f8bd293b227d0f Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 27 Jul 2018 21:06:30 +0800
+Subject: drm/amdgpu: Put enable gfx off feature to a delay thread
+
+From: Rex Zhu <Rex.Zhu@amd.com>
+
+[ Upstream commit 1e317b99f0c244bd8830918fdae9715210baf4fe ]
+
+delay to enable gfx off feature to avoid gfx on/off frequently
+suggested by Alex and Evan.
+
+Reviewed-by: Hawking Zhang <Hawking.Zhang@amd.com>
+Reviewed-by: Felix Kuehling <Felix.Kuehling@amd.com>
+Signed-off-by: Rex Zhu <Rex.Zhu@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Stable-dep-of: 2397e3d8d2e1 ("drm/amdgpu: add a missing lock for AMDGPU_SCHED")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h        |  2 ++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_device.c | 15 +++++++++++++++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c    |  8 ++++++--
+ 3 files changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 624864148f1d6..45e6dfa330adc 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -954,6 +954,8 @@ struct amdgpu_gfx {
+ 	bool                            gfx_off_state; /* true: enabled, false: disabled */
+ 	struct mutex                    gfx_off_mutex;
+ 	uint32_t                        gfx_off_req_count; /* default 1, enable gfx off: dec 1, disable gfx off: add 1 */
++	struct delayed_work             gfx_off_delay_work;
++
+ 	/* pipe reservation */
+ 	struct mutex			pipe_reserve_mutex;
+ 	DECLARE_BITMAP			(pipe_reserve_bitmap, AMDGPU_MAX_COMPUTE_QUEUES);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index fed1097c64690..787cbeea8dc55 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -1927,6 +1927,19 @@ static void amdgpu_device_ip_late_init_func_handler(struct work_struct *work)
+ 		DRM_ERROR("ib ring test failed (%d).\n", r);
+ }
+ 
++static void amdgpu_device_delay_enable_gfx_off(struct work_struct *work)
++{
++	struct amdgpu_device *adev =
++		container_of(work, struct amdgpu_device, gfx.gfx_off_delay_work.work);
++
++	mutex_lock(&adev->gfx.gfx_off_mutex);
++	if (!adev->gfx.gfx_off_state && !adev->gfx.gfx_off_req_count) {
++		if (!amdgpu_dpm_set_powergating_by_smu(adev, AMD_IP_BLOCK_TYPE_GFX, true))
++			adev->gfx.gfx_off_state = true;
++	}
++	mutex_unlock(&adev->gfx.gfx_off_mutex);
++}
++
+ /**
+  * amdgpu_device_ip_suspend_phase1 - run suspend for hardware IPs (phase 1)
+  *
+@@ -2396,6 +2409,8 @@ int amdgpu_device_init(struct amdgpu_device *adev,
+ 
+ 	INIT_DELAYED_WORK(&adev->late_init_work,
+ 			  amdgpu_device_ip_late_init_func_handler);
++	INIT_DELAYED_WORK(&adev->gfx.gfx_off_delay_work,
++			  amdgpu_device_delay_enable_gfx_off);
+ 
+ 	adev->gfx.gfx_off_req_count = 1;
+ 	adev->pm.ac_power = power_supply_is_system_supplied() > 0 ? true : false;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
+index 889d1266f3ae7..af42c2464a598 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gfx.c
+@@ -26,6 +26,9 @@
+ #include "amdgpu.h"
+ #include "amdgpu_gfx.h"
+ 
++/* 0.5 second timeout */
++#define GFX_OFF_DELAY_ENABLE         msecs_to_jiffies(500)
++
+ /*
+  * GPU scratch registers helpers function.
+  */
+@@ -360,6 +363,7 @@ void amdgpu_gfx_off_ctrl(struct amdgpu_device *adev, bool enable)
+ 	if (!adev->powerplay.pp_funcs->set_powergating_by_smu)
+ 		return;
+ 
++
+ 	mutex_lock(&adev->gfx.gfx_off_mutex);
+ 
+ 	if (!enable)
+@@ -368,11 +372,11 @@ void amdgpu_gfx_off_ctrl(struct amdgpu_device *adev, bool enable)
+ 		adev->gfx.gfx_off_req_count--;
+ 
+ 	if (enable && !adev->gfx.gfx_off_state && !adev->gfx.gfx_off_req_count) {
+-		if (!amdgpu_dpm_set_powergating_by_smu(adev, AMD_IP_BLOCK_TYPE_GFX, true))
+-			adev->gfx.gfx_off_state = true;
++		schedule_delayed_work(&adev->gfx.gfx_off_delay_work, GFX_OFF_DELAY_ENABLE);
+ 	} else if (!enable && adev->gfx.gfx_off_state) {
+ 		if (!amdgpu_dpm_set_powergating_by_smu(adev, AMD_IP_BLOCK_TYPE_GFX, false))
+ 			adev->gfx.gfx_off_state = false;
+ 	}
++
+ 	mutex_unlock(&adev->gfx.gfx_off_mutex);
+ }
+-- 
+2.39.2
+
