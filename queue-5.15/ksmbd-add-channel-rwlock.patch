@@ -1,0 +1,139 @@
+From 7584fe5f147216d18ccb3b13f90cdeaad6cd6ecd Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 22 Jul 2022 10:15:57 +0900
+Subject: ksmbd: add channel rwlock
+
+From: Namjae Jeon <linkinjeon@kernel.org>
+
+[ Upstream commit 8e06b31e348107c5d78e2c90bb7e69388cb97fb6 ]
+
+Add missing rwlock for channel list in session.
+
+Signed-off-by: Namjae Jeon <linkinjeon@kernel.org>
+Reviewed-by: Hyunchul Lee <hyc.lee@gmail.com>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Stable-dep-of: 7b4323373d84 ("ksmbd: fix deadlock in ksmbd_find_crypto_ctx()")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/ksmbd/mgmt/user_session.c |  3 +++
+ fs/ksmbd/mgmt/user_session.h |  1 +
+ fs/ksmbd/smb2pdu.c           | 20 ++++++++++++++++++--
+ 3 files changed, 22 insertions(+), 2 deletions(-)
+
+diff --git a/fs/ksmbd/mgmt/user_session.c b/fs/ksmbd/mgmt/user_session.c
+index 8fe08df668582..0c7b5335c12af 100644
+--- a/fs/ksmbd/mgmt/user_session.c
++++ b/fs/ksmbd/mgmt/user_session.c
+@@ -32,11 +32,13 @@ static void free_channel_list(struct ksmbd_session *sess)
+ {
+ 	struct channel *chann, *tmp;
+ 
++	write_lock(&sess->chann_lock);
+ 	list_for_each_entry_safe(chann, tmp, &sess->ksmbd_chann_list,
+ 				 chann_list) {
+ 		list_del(&chann->chann_list);
+ 		kfree(chann);
+ 	}
++	write_unlock(&sess->chann_lock);
+ }
+ 
+ static void __session_rpc_close(struct ksmbd_session *sess,
+@@ -305,6 +307,7 @@ static struct ksmbd_session *__session_create(int protocol)
+ 	INIT_LIST_HEAD(&sess->rpc_handle_list);
+ 	sess->sequence_number = 1;
+ 	atomic_set(&sess->refcnt, 1);
++	rwlock_init(&sess->chann_lock);
+ 
+ 	switch (protocol) {
+ 	case CIFDS_SESSION_FLAG_SMB2:
+diff --git a/fs/ksmbd/mgmt/user_session.h b/fs/ksmbd/mgmt/user_session.h
+index 8b08189be3fc2..1ec659f0151bf 100644
+--- a/fs/ksmbd/mgmt/user_session.h
++++ b/fs/ksmbd/mgmt/user_session.h
+@@ -48,6 +48,7 @@ struct ksmbd_session {
+ 	char				sess_key[CIFS_KEY_SIZE];
+ 
+ 	struct hlist_node		hlist;
++	rwlock_t			chann_lock;
+ 	struct list_head		ksmbd_chann_list;
+ 	struct xarray			tree_conns;
+ 	struct ida			tree_conn_ida;
+diff --git a/fs/ksmbd/smb2pdu.c b/fs/ksmbd/smb2pdu.c
+index d41995f89befe..e17f7a5dd9974 100644
+--- a/fs/ksmbd/smb2pdu.c
++++ b/fs/ksmbd/smb2pdu.c
+@@ -1525,7 +1525,9 @@ static int ntlm_authenticate(struct ksmbd_work *work)
+ 
+ binding_session:
+ 	if (conn->dialect >= SMB30_PROT_ID) {
++		read_lock(&sess->chann_lock);
+ 		chann = lookup_chann_list(sess, conn);
++		read_unlock(&sess->chann_lock);
+ 		if (!chann) {
+ 			chann = kmalloc(sizeof(struct channel), GFP_KERNEL);
+ 			if (!chann)
+@@ -1533,7 +1535,9 @@ static int ntlm_authenticate(struct ksmbd_work *work)
+ 
+ 			chann->conn = conn;
+ 			INIT_LIST_HEAD(&chann->chann_list);
++			write_lock(&sess->chann_lock);
+ 			list_add(&chann->chann_list, &sess->ksmbd_chann_list);
++			write_unlock(&sess->chann_lock);
+ 		}
+ 	}
+ 
+@@ -1608,7 +1612,9 @@ static int krb5_authenticate(struct ksmbd_work *work)
+ 	}
+ 
+ 	if (conn->dialect >= SMB30_PROT_ID) {
++		read_lock(&sess->chann_lock);
+ 		chann = lookup_chann_list(sess, conn);
++		read_unlock(&sess->chann_lock);
+ 		if (!chann) {
+ 			chann = kmalloc(sizeof(struct channel), GFP_KERNEL);
+ 			if (!chann)
+@@ -1616,7 +1622,9 @@ static int krb5_authenticate(struct ksmbd_work *work)
+ 
+ 			chann->conn = conn;
+ 			INIT_LIST_HEAD(&chann->chann_list);
++			write_lock(&sess->chann_lock);
+ 			list_add(&chann->chann_list, &sess->ksmbd_chann_list);
++			write_unlock(&sess->chann_lock);
+ 		}
+ 	}
+ 
+@@ -8388,10 +8396,14 @@ int smb3_check_sign_req(struct ksmbd_work *work)
+ 	if (le16_to_cpu(hdr->Command) == SMB2_SESSION_SETUP_HE) {
+ 		signing_key = work->sess->smb3signingkey;
+ 	} else {
++		read_lock(&work->sess->chann_lock);
+ 		chann = lookup_chann_list(work->sess, conn);
+-		if (!chann)
++		if (!chann) {
++			read_unlock(&work->sess->chann_lock);
+ 			return 0;
++		}
+ 		signing_key = chann->smb3signingkey;
++		read_unlock(&work->sess->chann_lock);
+ 	}
+ 
+ 	if (!signing_key) {
+@@ -8451,10 +8463,14 @@ void smb3_set_sign_rsp(struct ksmbd_work *work)
+ 	    le16_to_cpu(hdr->Command) == SMB2_SESSION_SETUP_HE) {
+ 		signing_key = work->sess->smb3signingkey;
+ 	} else {
++		read_lock(&work->sess->chann_lock);
+ 		chann = lookup_chann_list(work->sess, work->conn);
+-		if (!chann)
++		if (!chann) {
++			read_unlock(&work->sess->chann_lock);
+ 			return;
++		}
+ 		signing_key = chann->smb3signingkey;
++		read_unlock(&work->sess->chann_lock);
+ 	}
+ 
+ 	if (!signing_key)
+-- 
+2.39.2
+
