@@ -1,0 +1,159 @@
+From 9ff97f283be3a9c4d707f8291396dfa81c9d4813 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 4 Dec 2018 07:58:17 -0800
+Subject: tcp: reduce POLLOUT events caused by TCP_NOTSENT_LOWAT
+
+From: Eric Dumazet <edumazet@google.com>
+
+[ Upstream commit a74f0fa082b76c6a76cba5672f36218518bfdc09 ]
+
+TCP_NOTSENT_LOWAT socket option or sysctl was added in linux-3.12
+as a step to enable bigger tcp sndbuf limits.
+
+It works reasonably well, but the following happens :
+
+Once the limit is reached, TCP stack generates
+an [E]POLLOUT event for every incoming ACK packet.
+
+This causes a high number of context switches.
+
+This patch implements the strategy David Miller added
+in sock_def_write_space() :
+
+ - If TCP socket has a notsent_lowat constraint of X bytes,
+   allow sendmsg() to fill up to X bytes, but send [E]POLLOUT
+   only if number of notsent bytes is below X/2
+
+This considerably reduces TCP_NOTSENT_LOWAT overhead,
+while allowing to keep the pipe full.
+
+Tested:
+ 100 ms RTT netem testbed between A and B, 100 concurrent TCP_STREAM
+
+A:/# cat /proc/sys/net/ipv4/tcp_wmem
+4096	262144	64000000
+A:/# super_netperf 100 -H B -l 1000 -- -K bbr &
+
+A:/# grep TCP /proc/net/sockstat
+TCP: inuse 203 orphan 0 tw 19 alloc 414 mem 1364904 # This is about 54 MB of memory per flow :/
+
+A:/# vmstat 5 5
+procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+ 0  0      0 256220672  13532 694976    0    0    10     0   28   14  0  1 99  0  0
+ 2  0      0 256320016  13532 698480    0    0   512     0 715901 5927  0 10 90  0  0
+ 0  0      0 256197232  13532 700992    0    0   735    13 771161 5849  0 11 89  0  0
+ 1  0      0 256233824  13532 703320    0    0   512    23 719650 6635  0 11 89  0  0
+ 2  0      0 256226880  13532 705780    0    0   642     4 775650 6009  0 12 88  0  0
+
+A:/# echo 2097152 >/proc/sys/net/ipv4/tcp_notsent_lowat
+
+A:/# grep TCP /proc/net/sockstat
+TCP: inuse 203 orphan 0 tw 19 alloc 414 mem 86411 # 3.5 MB per flow
+
+A:/# vmstat 5 5  # check that context switches have not inflated too much.
+procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+ 2  0      0 260386512  13592 662148    0    0    10     0   17   14  0  1 99  0  0
+ 0  0      0 260519680  13592 604184    0    0   512    13 726843 12424  0 10 90  0  0
+ 1  1      0 260435424  13592 598360    0    0   512    25 764645 12925  0 10 90  0  0
+ 1  0      0 260855392  13592 578380    0    0   512     7 722943 13624  0 11 88  0  0
+ 1  0      0 260445008  13592 601176    0    0   614    34 772288 14317  0 10 90  0  0
+
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Acked-by: Soheil Hassas Yeganeh <soheil@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Stable-dep-of: e14cadfd80d7 ("tcp: add annotations around sk->sk_shutdown accesses")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/net/sock.h | 20 +++++++++++++++-----
+ include/net/tcp.h  |  8 ++++++--
+ net/core/stream.c  |  2 +-
+ 3 files changed, 22 insertions(+), 8 deletions(-)
+
+diff --git a/include/net/sock.h b/include/net/sock.h
+index 629cc89b7f0e4..cfbd241935a30 100644
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@ -1130,7 +1130,7 @@ struct proto {
+ 	unsigned int		inuse_idx;
+ #endif
+ 
+-	bool			(*stream_memory_free)(const struct sock *sk);
++	bool			(*stream_memory_free)(const struct sock *sk, int wake);
+ 	bool			(*stream_memory_read)(const struct sock *sk);
+ 	/* Memory pressure */
+ 	void			(*enter_memory_pressure)(struct sock *sk);
+@@ -1212,19 +1212,29 @@ static inline void sk_refcnt_debug_release(const struct sock *sk)
+ #define sk_refcnt_debug_release(sk) do { } while (0)
+ #endif /* SOCK_REFCNT_DEBUG */
+ 
+-static inline bool sk_stream_memory_free(const struct sock *sk)
++static inline bool __sk_stream_memory_free(const struct sock *sk, int wake)
+ {
+ 	if (sk->sk_wmem_queued >= sk->sk_sndbuf)
+ 		return false;
+ 
+ 	return sk->sk_prot->stream_memory_free ?
+-		sk->sk_prot->stream_memory_free(sk) : true;
++		sk->sk_prot->stream_memory_free(sk, wake) : true;
+ }
+ 
+-static inline bool sk_stream_is_writeable(const struct sock *sk)
++static inline bool sk_stream_memory_free(const struct sock *sk)
++{
++	return __sk_stream_memory_free(sk, 0);
++}
++
++static inline bool __sk_stream_is_writeable(const struct sock *sk, int wake)
+ {
+ 	return sk_stream_wspace(sk) >= sk_stream_min_wspace(sk) &&
+-	       sk_stream_memory_free(sk);
++	       __sk_stream_memory_free(sk, wake);
++}
++
++static inline bool sk_stream_is_writeable(const struct sock *sk)
++{
++	return __sk_stream_is_writeable(sk, 0);
+ }
+ 
+ static inline int sk_under_cgroup_hierarchy(struct sock *sk,
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index 9a154fe06c60d..9e37f3912ff19 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -1884,12 +1884,16 @@ static inline u32 tcp_notsent_lowat(const struct tcp_sock *tp)
+ 	return tp->notsent_lowat ?: READ_ONCE(net->ipv4.sysctl_tcp_notsent_lowat);
+ }
+ 
+-static inline bool tcp_stream_memory_free(const struct sock *sk)
++/* @wake is one when sk_stream_write_space() calls us.
++ * This sends EPOLLOUT only if notsent_bytes is half the limit.
++ * This mimics the strategy used in sock_def_write_space().
++ */
++static inline bool tcp_stream_memory_free(const struct sock *sk, int wake)
+ {
+ 	const struct tcp_sock *tp = tcp_sk(sk);
+ 	u32 notsent_bytes = READ_ONCE(tp->write_seq) - tp->snd_nxt;
+ 
+-	return notsent_bytes < tcp_notsent_lowat(tp);
++	return (notsent_bytes << wake) < tcp_notsent_lowat(tp);
+ }
+ 
+ #ifdef CONFIG_PROC_FS
+diff --git a/net/core/stream.c b/net/core/stream.c
+index 23e6669d3f8d2..cd60746877b1e 100644
+--- a/net/core/stream.c
++++ b/net/core/stream.c
+@@ -32,7 +32,7 @@ void sk_stream_write_space(struct sock *sk)
+ 	struct socket *sock = sk->sk_socket;
+ 	struct socket_wq *wq;
+ 
+-	if (sk_stream_is_writeable(sk) && sock) {
++	if (__sk_stream_is_writeable(sk, 1) && sock) {
+ 		clear_bit(SOCK_NOSPACE, &sock->flags);
+ 
+ 		rcu_read_lock();
+-- 
+2.39.2
+
