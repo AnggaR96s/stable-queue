@@ -1,0 +1,134 @@
+From d532a33206f0551e79db35b0dcc35bca9dcb4beb Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 14 Feb 2023 17:18:23 +0200
+Subject: dmaengine: at_xdmac: do not resume channels paused by consumers
+
+From: Claudiu Beznea <claudiu.beznea@microchip.com>
+
+[ Upstream commit 44fe8440bda545b5d167329df88c47609a645168 ]
+
+In case there are DMA channels not paused by consumers in suspend
+process (valid on AT91 SoCs for serial driver when no_console_suspend) the
+driver pauses them (using at_xdmac_device_pause() which is also the same
+function called by dmaengine_pause()) and then in the resume process the
+driver resumes them calling at_xdmac_device_resume() which is the same
+function called by dmaengine_resume()). This is good for DMA channels
+not paused by consumers but for drivers that calls
+dmaengine_pause()/dmaegine_resume() on suspend/resume path this may lead to
+DMA channel being enabled before the IP is enabled. For IPs that needs
+strict ordering with regards to DMA channel enablement this will lead to
+wrong behavior. To fix this add a new set of functions
+at_xdmac_device_pause_internal()/at_xdmac_device_resume_internal() to be
+called only on suspend/resume.
+
+Fixes: e1f7c9eee707 ("dmaengine: at_xdmac: creation of the atmel eXtended DMA Controller driver")
+Signed-off-by: Claudiu Beznea <claudiu.beznea@microchip.com>
+Link: https://lore.kernel.org/r/20230214151827.1050280-4-claudiu.beznea@microchip.com
+Signed-off-by: Vinod Koul <vkoul@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/dma/at_xdmac.c | 48 ++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 42 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/dma/at_xdmac.c b/drivers/dma/at_xdmac.c
+index 7f7557e4c31d7..cb1374b161291 100644
+--- a/drivers/dma/at_xdmac.c
++++ b/drivers/dma/at_xdmac.c
+@@ -186,6 +186,7 @@
+ enum atc_status {
+ 	AT_XDMAC_CHAN_IS_CYCLIC = 0,
+ 	AT_XDMAC_CHAN_IS_PAUSED,
++	AT_XDMAC_CHAN_IS_PAUSED_INTERNAL,
+ };
+ 
+ struct at_xdmac_layout {
+@@ -346,6 +347,11 @@ static inline int at_xdmac_chan_is_paused(struct at_xdmac_chan *atchan)
+ 	return test_bit(AT_XDMAC_CHAN_IS_PAUSED, &atchan->status);
+ }
+ 
++static inline int at_xdmac_chan_is_paused_internal(struct at_xdmac_chan *atchan)
++{
++	return test_bit(AT_XDMAC_CHAN_IS_PAUSED_INTERNAL, &atchan->status);
++}
++
+ static inline bool at_xdmac_chan_is_peripheral_xfer(u32 cfg)
+ {
+ 	return cfg & AT_XDMAC_CC_TYPE_PER_TRAN;
+@@ -1807,6 +1813,26 @@ static int at_xdmac_device_config(struct dma_chan *chan,
+ 	return ret;
+ }
+ 
++static void at_xdmac_device_pause_set(struct at_xdmac *atxdmac,
++				      struct at_xdmac_chan *atchan)
++{
++	at_xdmac_write(atxdmac, atxdmac->layout->grws, atchan->mask);
++	while (at_xdmac_chan_read(atchan, AT_XDMAC_CC) &
++	       (AT_XDMAC_CC_WRIP | AT_XDMAC_CC_RDIP))
++		cpu_relax();
++}
++
++static void at_xdmac_device_pause_internal(struct at_xdmac_chan *atchan)
++{
++	struct at_xdmac		*atxdmac = to_at_xdmac(atchan->chan.device);
++	unsigned long		flags;
++
++	spin_lock_irqsave(&atchan->lock, flags);
++	set_bit(AT_XDMAC_CHAN_IS_PAUSED_INTERNAL, &atchan->status);
++	at_xdmac_device_pause_set(atxdmac, atchan);
++	spin_unlock_irqrestore(&atchan->lock, flags);
++}
++
+ static int at_xdmac_device_pause(struct dma_chan *chan)
+ {
+ 	struct at_xdmac_chan	*atchan = to_at_xdmac_chan(chan);
+@@ -1819,15 +1845,25 @@ static int at_xdmac_device_pause(struct dma_chan *chan)
+ 		return 0;
+ 
+ 	spin_lock_irqsave(&atchan->lock, flags);
+-	at_xdmac_write(atxdmac, atxdmac->layout->grws, atchan->mask);
+-	while (at_xdmac_chan_read(atchan, AT_XDMAC_CC)
+-	       & (AT_XDMAC_CC_WRIP | AT_XDMAC_CC_RDIP))
+-		cpu_relax();
++
++	at_xdmac_device_pause_set(atxdmac, atchan);
++	/* Decrement runtime PM ref counter for each active descriptor. */
+ 	spin_unlock_irqrestore(&atchan->lock, flags);
+ 
+ 	return 0;
+ }
+ 
++static void at_xdmac_device_resume_internal(struct at_xdmac_chan *atchan)
++{
++	struct at_xdmac		*atxdmac = to_at_xdmac(atchan->chan.device);
++	unsigned long		flags;
++
++	spin_lock_irqsave(&atchan->lock, flags);
++	at_xdmac_write(atxdmac, atxdmac->layout->grwr, atchan->mask);
++	clear_bit(AT_XDMAC_CHAN_IS_PAUSED_INTERNAL, &atchan->status);
++	spin_unlock_irqrestore(&atchan->lock, flags);
++}
++
+ static int at_xdmac_device_resume(struct dma_chan *chan)
+ {
+ 	struct at_xdmac_chan	*atchan = to_at_xdmac_chan(chan);
+@@ -1982,7 +2018,7 @@ static int __maybe_unused atmel_xdmac_suspend(struct device *dev)
+ 		atchan->save_cc = at_xdmac_chan_read(atchan, AT_XDMAC_CC);
+ 		if (at_xdmac_chan_is_cyclic(atchan)) {
+ 			if (!at_xdmac_chan_is_paused(atchan))
+-				at_xdmac_device_pause(chan);
++				at_xdmac_device_pause_internal(atchan);
+ 			atchan->save_cim = at_xdmac_chan_read(atchan, AT_XDMAC_CIM);
+ 			atchan->save_cnda = at_xdmac_chan_read(atchan, AT_XDMAC_CNDA);
+ 			atchan->save_cndc = at_xdmac_chan_read(atchan, AT_XDMAC_CNDC);
+@@ -2027,7 +2063,7 @@ static int __maybe_unused atmel_xdmac_resume(struct device *dev)
+ 		at_xdmac_chan_write(atchan, AT_XDMAC_CC, atchan->save_cc);
+ 		if (at_xdmac_chan_is_cyclic(atchan)) {
+ 			if (at_xdmac_chan_is_paused(atchan))
+-				at_xdmac_device_resume(chan);
++				at_xdmac_device_resume_internal(atchan);
+ 			at_xdmac_chan_write(atchan, AT_XDMAC_CNDA, atchan->save_cnda);
+ 			at_xdmac_chan_write(atchan, AT_XDMAC_CNDC, atchan->save_cndc);
+ 			at_xdmac_chan_write(atchan, AT_XDMAC_CIE, atchan->save_cim);
+-- 
+2.39.2
+
