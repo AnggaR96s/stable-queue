@@ -1,0 +1,78 @@
+From c8c88d523c89e0ac8affbf2fd57def82e0d5d4bf Mon Sep 17 00:00:00 2001
+From: Andres Freund <andres@anarazel.de>
+Date: Sun, 16 Jul 2023 12:07:03 -0600
+Subject: io_uring: Use io_schedule* in cqring wait
+
+From: Andres Freund <andres@anarazel.de>
+
+Commit 8a796565cec3601071cbbd27d6304e202019d014 upstream.
+
+I observed poor performance of io_uring compared to synchronous IO. That
+turns out to be caused by deeper CPU idle states entered with io_uring,
+due to io_uring using plain schedule(), whereas synchronous IO uses
+io_schedule().
+
+The losses due to this are substantial. On my cascade lake workstation,
+t/io_uring from the fio repository e.g. yields regressions between 20%
+and 40% with the following command:
+./t/io_uring -r 5 -X0 -d 1 -s 1 -c 1 -p 0 -S$use_sync -R 0 /mnt/t2/fio/write.0.0
+
+This is repeatable with different filesystems, using raw block devices
+and using different block devices.
+
+Use io_schedule_prepare() / io_schedule_finish() in
+io_cqring_wait_schedule() to address the difference.
+
+After that using io_uring is on par or surpassing synchronous IO (using
+registered files etc makes it reliably win, but arguably is a less fair
+comparison).
+
+There are other calls to schedule() in io_uring/, but none immediately
+jump out to be similarly situated, so I did not touch them. Similarly,
+it's possible that mutex_lock_io() should be used, but it's not clear if
+there are cases where that matters.
+
+Cc: stable@vger.kernel.org # 5.10+
+Cc: Pavel Begunkov <asml.silence@gmail.com>
+Cc: io-uring@vger.kernel.org
+Cc: linux-kernel@vger.kernel.org
+Signed-off-by: Andres Freund <andres@anarazel.de>
+Link: https://lore.kernel.org/r/20230707162007.194068-1-andres@anarazel.de
+[axboe: minor style fixup]
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ io_uring/io_uring.c |   14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+--- a/io_uring/io_uring.c
++++ b/io_uring/io_uring.c
+@@ -7796,7 +7796,7 @@ static inline int io_cqring_wait_schedul
+ 					  struct io_wait_queue *iowq,
+ 					  ktime_t *timeout)
+ {
+-	int ret;
++	int token, ret;
+ 
+ 	/* make sure we run task_work before checking for signals */
+ 	ret = io_run_task_work_sig();
+@@ -7806,9 +7806,17 @@ static inline int io_cqring_wait_schedul
+ 	if (test_bit(0, &ctx->check_cq_overflow))
+ 		return 1;
+ 
++	/*
++	 * Use io_schedule_prepare/finish, so cpufreq can take into account
++	 * that the task is waiting for IO - turns out to be important for low
++	 * QD IO.
++	 */
++	token = io_schedule_prepare();
++	ret = 1;
+ 	if (!schedule_hrtimeout(timeout, HRTIMER_MODE_ABS))
+-		return -ETIME;
+-	return 1;
++		ret = -ETIME;
++	io_schedule_finish(token);
++	return ret;
+ }
+ 
+ /*
