@@ -1,0 +1,147 @@
+From 841a52c56c2617f57497f05868863901179c458d Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 14 Jun 2023 12:25:59 +0000
+Subject: KVM: arm64: Use different pointer authentication keys for pKVM
+
+From: Mostafa Saleh <smostafa@google.com>
+
+[ Upstream commit 8c15c2a0281087d19f62d7c2b5ab1f9e961b8d97 ]
+
+When the use of pointer authentication is enabled in the kernel it
+applies to both the kernel itself as well as KVM's nVHE hypervisor. The
+same keys are used for both the kernel and the nVHE hypervisor, which is
+less than desirable for pKVM as the host is not trusted at runtime.
+
+Naturally, the fix is to use a different set of keys for the hypervisor
+when running in protected mode. Have the host generate a new set of keys
+for the hypervisor before deprivileging the kernel. While there might be
+other sources of random directly available at EL2, this keeps the
+implementation simple, and the host is trusted anyways until it is
+deprivileged.
+
+Since the host and hypervisor no longer share a set of pointer
+authentication keys, start context switching them on the host entry/exit
+path exactly as we do for guest entry/exit. There is no need to handle
+CPU migration as the nVHE code is not migratable in the first place.
+
+Signed-off-by: Mostafa Saleh <smostafa@google.com>
+Link: https://lore.kernel.org/r/20230614122600.2098901-1-smostafa@google.com
+Signed-off-by: Oliver Upton <oliver.upton@linux.dev>
+Stable-dep-of: fa729bc7c9c8 ("KVM: arm64: Handle kvm_arm_init failure correctly in finalize_pkvm")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ arch/arm64/kvm/arm.c           | 26 ++++++++++++++++++++++++
+ arch/arm64/kvm/hyp/nvhe/host.S | 36 +++++++++++++++++++++++++++++++++-
+ 2 files changed, 61 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm64/kvm/arm.c b/arch/arm64/kvm/arm.c
+index 7d8c3dd8b7ca9..91bec8454d573 100644
+--- a/arch/arm64/kvm/arm.c
++++ b/arch/arm64/kvm/arm.c
+@@ -51,6 +51,8 @@ DECLARE_KVM_HYP_PER_CPU(unsigned long, kvm_hyp_vector);
+ DEFINE_PER_CPU(unsigned long, kvm_arm_hyp_stack_page);
+ DECLARE_KVM_NVHE_PER_CPU(struct kvm_nvhe_init_params, kvm_init_params);
+ 
++DECLARE_KVM_NVHE_PER_CPU(struct kvm_cpu_context, kvm_hyp_ctxt);
++
+ static bool vgic_present;
+ 
+ static DEFINE_PER_CPU(unsigned char, kvm_arm_hardware_enabled);
+@@ -2080,6 +2082,26 @@ static int __init kvm_hyp_init_protection(u32 hyp_va_bits)
+ 	return 0;
+ }
+ 
++static void pkvm_hyp_init_ptrauth(void)
++{
++	struct kvm_cpu_context *hyp_ctxt;
++	int cpu;
++
++	for_each_possible_cpu(cpu) {
++		hyp_ctxt = per_cpu_ptr_nvhe_sym(kvm_hyp_ctxt, cpu);
++		hyp_ctxt->sys_regs[APIAKEYLO_EL1] = get_random_long();
++		hyp_ctxt->sys_regs[APIAKEYHI_EL1] = get_random_long();
++		hyp_ctxt->sys_regs[APIBKEYLO_EL1] = get_random_long();
++		hyp_ctxt->sys_regs[APIBKEYHI_EL1] = get_random_long();
++		hyp_ctxt->sys_regs[APDAKEYLO_EL1] = get_random_long();
++		hyp_ctxt->sys_regs[APDAKEYHI_EL1] = get_random_long();
++		hyp_ctxt->sys_regs[APDBKEYLO_EL1] = get_random_long();
++		hyp_ctxt->sys_regs[APDBKEYHI_EL1] = get_random_long();
++		hyp_ctxt->sys_regs[APGAKEYLO_EL1] = get_random_long();
++		hyp_ctxt->sys_regs[APGAKEYHI_EL1] = get_random_long();
++	}
++}
++
+ /* Inits Hyp-mode on all online CPUs */
+ static int __init init_hyp_mode(void)
+ {
+@@ -2241,6 +2263,10 @@ static int __init init_hyp_mode(void)
+ 	kvm_hyp_init_symbols();
+ 
+ 	if (is_protected_kvm_enabled()) {
++		if (IS_ENABLED(CONFIG_ARM64_PTR_AUTH_KERNEL) &&
++		    cpus_have_const_cap(ARM64_HAS_ADDRESS_AUTH))
++			pkvm_hyp_init_ptrauth();
++
+ 		init_cpu_logical_map();
+ 
+ 		if (!init_psci_relay()) {
+diff --git a/arch/arm64/kvm/hyp/nvhe/host.S b/arch/arm64/kvm/hyp/nvhe/host.S
+index b6c0188c4b35a..c87c63133e10c 100644
+--- a/arch/arm64/kvm/hyp/nvhe/host.S
++++ b/arch/arm64/kvm/hyp/nvhe/host.S
+@@ -10,6 +10,7 @@
+ #include <asm/kvm_arm.h>
+ #include <asm/kvm_asm.h>
+ #include <asm/kvm_mmu.h>
++#include <asm/kvm_ptrauth.h>
+ 
+ 	.text
+ 
+@@ -37,10 +38,43 @@ SYM_FUNC_START(__host_exit)
+ 
+ 	/* Save the host context pointer in x29 across the function call */
+ 	mov	x29, x0
++
++#ifdef CONFIG_ARM64_PTR_AUTH_KERNEL
++alternative_if_not ARM64_HAS_ADDRESS_AUTH
++b __skip_pauth_save
++alternative_else_nop_endif
++
++alternative_if ARM64_KVM_PROTECTED_MODE
++	/* Save kernel ptrauth keys. */
++	add x18, x29, #CPU_APIAKEYLO_EL1
++	ptrauth_save_state x18, x19, x20
++
++	/* Use hyp keys. */
++	adr_this_cpu x18, kvm_hyp_ctxt, x19
++	add x18, x18, #CPU_APIAKEYLO_EL1
++	ptrauth_restore_state x18, x19, x20
++	isb
++alternative_else_nop_endif
++__skip_pauth_save:
++#endif /* CONFIG_ARM64_PTR_AUTH_KERNEL */
++
+ 	bl	handle_trap
+ 
+-	/* Restore host regs x0-x17 */
+ __host_enter_restore_full:
++	/* Restore kernel keys. */
++#ifdef CONFIG_ARM64_PTR_AUTH_KERNEL
++alternative_if_not ARM64_HAS_ADDRESS_AUTH
++b __skip_pauth_restore
++alternative_else_nop_endif
++
++alternative_if ARM64_KVM_PROTECTED_MODE
++	add x18, x29, #CPU_APIAKEYLO_EL1
++	ptrauth_restore_state x18, x19, x20
++alternative_else_nop_endif
++__skip_pauth_restore:
++#endif /* CONFIG_ARM64_PTR_AUTH_KERNEL */
++
++	/* Restore host regs x0-x17 */
+ 	ldp	x0, x1,   [x29, #CPU_XREG_OFFSET(0)]
+ 	ldp	x2, x3,   [x29, #CPU_XREG_OFFSET(2)]
+ 	ldp	x4, x5,   [x29, #CPU_XREG_OFFSET(4)]
+-- 
+2.39.2
+
