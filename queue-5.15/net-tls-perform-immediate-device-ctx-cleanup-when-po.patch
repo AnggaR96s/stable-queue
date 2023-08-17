@@ -1,0 +1,72 @@
+From ad9b0cff3eb47ef9cb9b956de7aa6fdc0a686eb3 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 27 Jul 2022 12:43:41 +0300
+Subject: net/tls: Perform immediate device ctx cleanup when possible
+
+From: Tariq Toukan <tariqt@nvidia.com>
+
+[ Upstream commit 113671b255ee3b9f5585a6d496ef0e675e698698 ]
+
+TLS context destructor can be run in atomic context. Cleanup operations
+for device-offloaded contexts could require access and interaction with
+the device callbacks, which might sleep. Hence, the cleanup of such
+contexts must be deferred and completed inside an async work.
+
+For all others, this is not necessary, as cleanup is atomic. Invoke
+cleanup immediately for them, avoiding queueing redundant gc work.
+
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Reviewed-by: Maxim Mikityanskiy <maximmi@nvidia.com>
+Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Stable-dep-of: 6b47808f223c ("net: tls: avoid discarding data on record close")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ net/tls/tls_device.c | 26 ++++++++++++++++++--------
+ 1 file changed, 18 insertions(+), 8 deletions(-)
+
+diff --git a/net/tls/tls_device.c b/net/tls/tls_device.c
+index cf75969375cfa..19ba57245777b 100644
+--- a/net/tls/tls_device.c
++++ b/net/tls/tls_device.c
+@@ -95,19 +95,29 @@ static void tls_device_gc_task(struct work_struct *work)
+ static void tls_device_queue_ctx_destruction(struct tls_context *ctx)
+ {
+ 	unsigned long flags;
++	bool async_cleanup;
+ 
+ 	spin_lock_irqsave(&tls_device_lock, flags);
+-	if (unlikely(!refcount_dec_and_test(&ctx->refcount)))
+-		goto unlock;
++	if (unlikely(!refcount_dec_and_test(&ctx->refcount))) {
++		spin_unlock_irqrestore(&tls_device_lock, flags);
++		return;
++	}
+ 
+-	list_move_tail(&ctx->list, &tls_device_gc_list);
++	async_cleanup = ctx->netdev && ctx->tx_conf == TLS_HW;
++	if (async_cleanup) {
++		list_move_tail(&ctx->list, &tls_device_gc_list);
+ 
+-	/* schedule_work inside the spinlock
+-	 * to make sure tls_device_down waits for that work.
+-	 */
+-	schedule_work(&tls_device_gc_work);
+-unlock:
++		/* schedule_work inside the spinlock
++		 * to make sure tls_device_down waits for that work.
++		 */
++		schedule_work(&tls_device_gc_work);
++	} else {
++		list_del(&ctx->list);
++	}
+ 	spin_unlock_irqrestore(&tls_device_lock, flags);
++
++	if (!async_cleanup)
++		tls_device_free_ctx(ctx);
+ }
+ 
+ /* We assume that the socket is already connected */
+-- 
+2.40.1
+
