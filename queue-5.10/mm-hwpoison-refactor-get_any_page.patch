@@ -1,0 +1,189 @@
+From 87ba88fa0fd07fcc978c8afab4099f16d9dd71e5 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 14 Dec 2020 19:11:38 -0800
+Subject: mm,hwpoison: refactor get_any_page
+
+From: Oscar Salvador <osalvador@suse.de>
+
+[ Upstream commit 8295d535e2aa198bdf65a4045d622df38955ffe2 ]
+
+Patch series "HWPoison: Refactor get page interface", v2.
+
+This patch (of 3):
+
+When we want to grab a refcount via get_any_page, we call __get_any_page
+that calls get_hwpoison_page to get the actual refcount.
+
+get_any_page() is only there because we have a sort of retry mechanism in
+case the page we met is unknown to us or if we raced with an allocation.
+
+Also __get_any_page() prints some messages about the page type in case the
+page was a free page or the page type was unknown, but if anything, we
+only need to print a message in case the pagetype was unknown, as that is
+reporting an error down the chain.
+
+Let us merge get_any_page() and __get_any_page(), and let the message be
+printed in soft_offline_page.  While we are it, we can also remove the
+'pfn' parameter as it is no longer used.
+
+Link: https://lkml.kernel.org/r/20201204102558.31607-1-osalvador@suse.de
+Link: https://lkml.kernel.org/r/20201204102558.31607-2-osalvador@suse.de
+Signed-off-by: Oscar Salvador <osalvador@suse.de>
+Acked-by: Naoya Horiguchi <naoya.horiguchi@nec.com>
+Acked-by: Vlastimil Babka <Vbabka@suse.cz>
+Cc: Qian Cai <qcai@redhat.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Stable-dep-of: e2c1ab070fdc ("mm: memory-failure: fix unexpected return value in soft_offline_page()")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ mm/memory-failure.c | 101 +++++++++++++++++++-------------------------
+ 1 file changed, 43 insertions(+), 58 deletions(-)
+
+diff --git a/mm/memory-failure.c b/mm/memory-failure.c
+index b21dd4a793926..71fd546dbdc37 100644
+--- a/mm/memory-failure.c
++++ b/mm/memory-failure.c
+@@ -1690,70 +1690,51 @@ EXPORT_SYMBOL(unpoison_memory);
+ 
+ /*
+  * Safely get reference count of an arbitrary page.
+- * Returns 0 for a free page, -EIO for a zero refcount page
+- * that is not free, and 1 for any other page type.
+- * For 1 the page is returned with increased page count, otherwise not.
++ * Returns 0 for a free page, 1 for an in-use page, -EIO for a page-type we
++ * cannot handle and -EBUSY if we raced with an allocation.
++ * We only incremented refcount in case the page was already in-use and it is
++ * a known type we can handle.
+  */
+-static int __get_any_page(struct page *p, unsigned long pfn, int flags)
++static int get_any_page(struct page *p, int flags)
+ {
+-	int ret;
++	int ret = 0, pass = 0;
++	bool count_increased = false;
+ 
+ 	if (flags & MF_COUNT_INCREASED)
+-		return 1;
+-
+-	/*
+-	 * When the target page is a free hugepage, just remove it
+-	 * from free hugepage list.
+-	 */
+-	if (!get_hwpoison_page(p)) {
+-		if (PageHuge(p)) {
+-			pr_info("%s: %#lx free huge page\n", __func__, pfn);
+-			ret = 0;
+-		} else if (is_free_buddy_page(p)) {
+-			pr_info("%s: %#lx free buddy page\n", __func__, pfn);
+-			ret = 0;
+-		} else if (page_count(p)) {
+-			/* raced with allocation */
++		count_increased = true;
++
++try_again:
++	if (!count_increased && !get_hwpoison_page(p)) {
++		if (page_count(p)) {
++			/* We raced with an allocation, retry. */
++			if (pass++ < 3)
++				goto try_again;
+ 			ret = -EBUSY;
+-		} else {
+-			pr_info("%s: %#lx: unknown zero refcount page type %lx\n",
+-				__func__, pfn, p->flags);
++		} else if (!PageHuge(p) && !is_free_buddy_page(p)) {
++			/* We raced with put_page, retry. */
++			if (pass++ < 3)
++				goto try_again;
+ 			ret = -EIO;
+ 		}
+ 	} else {
+-		/* Not a free page */
+-		ret = 1;
+-	}
+-	return ret;
+-}
+-
+-static int get_any_page(struct page *page, unsigned long pfn, int flags)
+-{
+-	int ret = __get_any_page(page, pfn, flags);
+-
+-	if (ret == -EBUSY)
+-		ret = __get_any_page(page, pfn, flags);
+-
+-	if (ret == 1 && !PageHuge(page) &&
+-	    !PageLRU(page) && !__PageMovable(page)) {
+-		/*
+-		 * Try to free it.
+-		 */
+-		put_page(page);
+-		shake_page(page, 1);
+-
+-		/*
+-		 * Did it turn free?
+-		 */
+-		ret = __get_any_page(page, pfn, 0);
+-		if (ret == 1 && !PageLRU(page)) {
+-			/* Drop page reference which is from __get_any_page() */
+-			put_page(page);
+-			pr_info("soft_offline: %#lx: unknown non LRU page type %lx (%pGp)\n",
+-				pfn, page->flags, &page->flags);
+-			return -EIO;
++		if (PageHuge(p) || PageLRU(p) || __PageMovable(p)) {
++			ret = 1;
++		} else {
++			/*
++			 * A page we cannot handle. Check whether we can turn
++			 * it into something we can handle.
++			 */
++			if (pass++ < 3) {
++				put_page(p);
++				shake_page(p, 1);
++				count_increased = false;
++				goto try_again;
++			}
++			put_page(p);
++			ret = -EIO;
+ 		}
+ 	}
++
+ 	return ret;
+ }
+ 
+@@ -1922,7 +1903,7 @@ int soft_offline_page(unsigned long pfn, int flags)
+ 		return -EIO;
+ 
+ 	if (PageHWPoison(page)) {
+-		pr_info("soft offline: %#lx page already poisoned\n", pfn);
++		pr_info("%s: %#lx page already poisoned\n", __func__, pfn);
+ 		if (flags & MF_COUNT_INCREASED)
+ 			put_page(page);
+ 		return 0;
+@@ -1930,17 +1911,21 @@ int soft_offline_page(unsigned long pfn, int flags)
+ 
+ retry:
+ 	get_online_mems();
+-	ret = get_any_page(page, pfn, flags);
++	ret = get_any_page(page, flags);
+ 	put_online_mems();
+ 
+-	if (ret > 0)
++	if (ret > 0) {
+ 		ret = soft_offline_in_use_page(page);
+-	else if (ret == 0)
++	} else if (ret == 0) {
+ 		if (soft_offline_free_page(page) && try_again) {
+ 			try_again = false;
+ 			flags &= ~MF_COUNT_INCREASED;
+ 			goto retry;
+ 		}
++	} else if (ret == -EIO) {
++		pr_info("%s: %#lx: unknown page type: %lx (%pGP)\n",
++			 __func__, pfn, page->flags, &page->flags);
++	}
+ 
+ 	return ret;
+ }
+-- 
+2.40.1
+
