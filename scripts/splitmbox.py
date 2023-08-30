@@ -1,4 +1,4 @@
-#! /usr/bin/env python2
+#! /usr/bin/env python3
 """ Split a Unix-style mailbox into individual files
 
 Written by Aquarius <aquarius@kryogenix.org>
@@ -75,8 +75,8 @@ mbox_file.close()
 mbox_file = open(mbox_fname)
 mbox = mailbox.UnixMailbox(mbox_file)
 
-#digits = len(str(count))
-digits = 3
+digits = len(str(count))
+#digits = 3
 count = 0
 while 1:
 	msg = mbox.next()
