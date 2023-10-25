@@ -1,0 +1,159 @@
+From 0e1b1c8d696d3b57537a87da07190aa723dbff6d Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 4 Nov 2021 15:32:31 +0900
+Subject: mmc: core: adjust polling interval for CMD1
+
+From: Huijin Park <huijin.park@samsung.com>
+
+[ Upstream commit 76bfc7ccc2fa9d382576f6013b57a0ef93d5a722 ]
+
+In mmc_send_op_cond(), loops are continuously performed at the same
+interval of 10 ms.  However the behaviour is not good for some eMMC
+which can be out from a busy state earlier than 10 ms if normal.
+
+Rather than fixing about the interval time in mmc_send_op_cond(),
+let's instead convert into using the common __mmc_poll_for_busy().
+
+The reason for adjusting the interval time is that it is important
+to reduce the eMMC initialization time, especially in devices that
+use eMMC as rootfs.
+
+Test log(eMMC:KLM8G1GETF-B041):
+
+before: 12 ms (0.311016 - 0.298729)
+[    0.295823] mmc0: starting CMD0 arg 00000000 flags 000000c0
+[    0.298729] mmc0: starting CMD1 arg 40000080 flags 000000e1<-start
+[    0.311016] mmc0: starting CMD1 arg 40000080 flags 000000e1<-finish
+[    0.311336] mmc0: starting CMD2 arg 00000000 flags 00000007
+
+after: 2 ms (0.301270 - 0.298762)
+[    0.295862] mmc0: starting CMD0 arg 00000000 flags 000000c0
+[    0.298762] mmc0: starting CMD1 arg 40000080 flags 000000e1<-start
+[    0.299067] mmc0: starting CMD1 arg 40000080 flags 000000e1
+[    0.299441] mmc0: starting CMD1 arg 40000080 flags 000000e1
+[    0.299879] mmc0: starting CMD1 arg 40000080 flags 000000e1
+[    0.300446] mmc0: starting CMD1 arg 40000080 flags 000000e1
+[    0.301270] mmc0: starting CMD1 arg 40000080 flags 000000e1<-finish
+[    0.301572] mmc0: starting CMD2 arg 00000000 flags 00000007
+
+Signed-off-by: Huijin Park <huijin.park@samsung.com>
+Link: https://lore.kernel.org/r/20211104063231.2115-3-huijin.park@samsung.com
+Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+Stable-dep-of: f19c5a73e6f7 ("mmc: core: Fix error propagation for some ioctl commands")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/mmc/core/mmc_ops.c | 83 +++++++++++++++++++++++++-------------
+ 1 file changed, 54 insertions(+), 29 deletions(-)
+
+diff --git a/drivers/mmc/core/mmc_ops.c b/drivers/mmc/core/mmc_ops.c
+index 9946733a34c6d..d63d1c735335c 100644
+--- a/drivers/mmc/core/mmc_ops.c
++++ b/drivers/mmc/core/mmc_ops.c
+@@ -58,6 +58,12 @@ struct mmc_busy_data {
+ 	enum mmc_busy_cmd busy_cmd;
+ };
+ 
++struct mmc_op_cond_busy_data {
++	struct mmc_host *host;
++	u32 ocr;
++	struct mmc_command *cmd;
++};
++
+ int __mmc_send_status(struct mmc_card *card, u32 *status, unsigned int retries)
+ {
+ 	int err;
+@@ -173,43 +179,62 @@ int mmc_go_idle(struct mmc_host *host)
+ 	return err;
+ }
+ 
++static int __mmc_send_op_cond_cb(void *cb_data, bool *busy)
++{
++	struct mmc_op_cond_busy_data *data = cb_data;
++	struct mmc_host *host = data->host;
++	struct mmc_command *cmd = data->cmd;
++	u32 ocr = data->ocr;
++	int err = 0;
++
++	err = mmc_wait_for_cmd(host, cmd, 0);
++	if (err)
++		return err;
++
++	if (mmc_host_is_spi(host)) {
++		if (!(cmd->resp[0] & R1_SPI_IDLE)) {
++			*busy = false;
++			return 0;
++		}
++	} else {
++		if (cmd->resp[0] & MMC_CARD_BUSY) {
++			*busy = false;
++			return 0;
++		}
++	}
++
++	*busy = true;
++
++	/*
++	 * According to eMMC specification v5.1 section 6.4.3, we
++	 * should issue CMD1 repeatedly in the idle state until
++	 * the eMMC is ready. Otherwise some eMMC devices seem to enter
++	 * the inactive mode after mmc_init_card() issued CMD0 when
++	 * the eMMC device is busy.
++	 */
++	if (!ocr && !mmc_host_is_spi(host))
++		cmd->arg = cmd->resp[0] | BIT(30);
++
++	return 0;
++}
++
+ int mmc_send_op_cond(struct mmc_host *host, u32 ocr, u32 *rocr)
+ {
+ 	struct mmc_command cmd = {};
+-	int i, err = 0;
++	int err = 0;
++	struct mmc_op_cond_busy_data cb_data = {
++		.host = host,
++		.ocr = ocr,
++		.cmd = &cmd
++	};
+ 
+ 	cmd.opcode = MMC_SEND_OP_COND;
+ 	cmd.arg = mmc_host_is_spi(host) ? 0 : ocr;
+ 	cmd.flags = MMC_RSP_SPI_R1 | MMC_RSP_R3 | MMC_CMD_BCR;
+ 
+-	for (i = 100; i; i--) {
+-		err = mmc_wait_for_cmd(host, &cmd, 0);
+-		if (err)
+-			break;
+-
+-		/* wait until reset completes */
+-		if (mmc_host_is_spi(host)) {
+-			if (!(cmd.resp[0] & R1_SPI_IDLE))
+-				break;
+-		} else {
+-			if (cmd.resp[0] & MMC_CARD_BUSY)
+-				break;
+-		}
+-
+-		err = -ETIMEDOUT;
+-
+-		mmc_delay(10);
+-
+-		/*
+-		 * According to eMMC specification v5.1 section 6.4.3, we
+-		 * should issue CMD1 repeatedly in the idle state until
+-		 * the eMMC is ready. Otherwise some eMMC devices seem to enter
+-		 * the inactive mode after mmc_init_card() issued CMD0 when
+-		 * the eMMC device is busy.
+-		 */
+-		if (!ocr && !mmc_host_is_spi(host))
+-			cmd.arg = cmd.resp[0] | BIT(30);
+-	}
++	err = __mmc_poll_for_busy(host, 1000, &__mmc_send_op_cond_cb, &cb_data);
++	if (err)
++		return err;
+ 
+ 	if (rocr && !mmc_host_is_spi(host))
+ 		*rocr = cmd.resp[0];
+-- 
+2.42.0
+
