@@ -1,0 +1,100 @@
+From bd94d86f490b70c58b3fc5739328a53ad4b18d86 Mon Sep 17 00:00:00 2001
+From: Thomas Gleixner <tglx@linutronix.de>
+Date: Wed, 25 Oct 2023 23:31:35 +0200
+Subject: x86/tsc: Defer marking TSC unstable to a worker
+
+From: Thomas Gleixner <tglx@linutronix.de>
+
+commit bd94d86f490b70c58b3fc5739328a53ad4b18d86 upstream.
+
+Tetsuo reported the following lockdep splat when the TSC synchronization
+fails during CPU hotplug:
+
+   tsc: Marking TSC unstable due to check_tsc_sync_source failed
+
+   WARNING: inconsistent lock state
+   inconsistent {IN-HARDIRQ-W} -> {HARDIRQ-ON-W} usage.
+   ffffffff8cfa1c78 (watchdog_lock){?.-.}-{2:2}, at: clocksource_watchdog+0x23/0x5a0
+   {IN-HARDIRQ-W} state was registered at:
+     _raw_spin_lock_irqsave+0x3f/0x60
+     clocksource_mark_unstable+0x1b/0x90
+     mark_tsc_unstable+0x41/0x50
+     check_tsc_sync_source+0x14f/0x180
+     sysvec_call_function_single+0x69/0x90
+
+   Possible unsafe locking scenario:
+     lock(watchdog_lock);
+     <Interrupt>
+       lock(watchdog_lock);
+
+   stack backtrace:
+    _raw_spin_lock+0x30/0x40
+    clocksource_watchdog+0x23/0x5a0
+    run_timer_softirq+0x2a/0x50
+    sysvec_apic_timer_interrupt+0x6e/0x90
+
+The reason is the recent conversion of the TSC synchronization function
+during CPU hotplug on the control CPU to a SMP function call. In case
+that the synchronization with the upcoming CPU fails, the TSC has to be
+marked unstable via clocksource_mark_unstable().
+
+clocksource_mark_unstable() acquires 'watchdog_lock', but that lock is
+taken with interrupts enabled in the watchdog timer callback to minimize
+interrupt disabled time. That's obviously a possible deadlock scenario,
+
+Before that change the synchronization function was invoked in thread
+context so this could not happen.
+
+As it is not crucical whether the unstable marking happens slightly
+delayed, defer the call to a worker thread which avoids the lock context
+problem.
+
+Fixes: 9d349d47f0e3 ("x86/smpboot: Make TSC synchronization function call based")
+Reported-by: Tetsuo Handa <penguin-kernel@i-love.sakura.ne.jp>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Tested-by: Tetsuo Handa <penguin-kernel@i-love.sakura.ne.jp>
+Cc: stable@vger.kernel.org
+Link: https://lore.kernel.org/r/87zg064ceg.ffs@tglx
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/x86/kernel/tsc_sync.c | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/arch/x86/kernel/tsc_sync.c b/arch/x86/kernel/tsc_sync.c
+index bbc440c93e08..1123ef3ccf90 100644
+--- a/arch/x86/kernel/tsc_sync.c
++++ b/arch/x86/kernel/tsc_sync.c
+@@ -15,6 +15,7 @@
+  * ( The serial nature of the boot logic and the CPU hotplug lock
+  *   protects against more than 2 CPUs entering this code. )
+  */
++#include <linux/workqueue.h>
+ #include <linux/topology.h>
+ #include <linux/spinlock.h>
+ #include <linux/kernel.h>
+@@ -342,6 +343,13 @@ static inline unsigned int loop_timeout(int cpu)
+ 	return (cpumask_weight(topology_core_cpumask(cpu)) > 1) ? 2 : 20;
+ }
+ 
++static void tsc_sync_mark_tsc_unstable(struct work_struct *work)
++{
++	mark_tsc_unstable("check_tsc_sync_source failed");
++}
++
++static DECLARE_WORK(tsc_sync_work, tsc_sync_mark_tsc_unstable);
++
+ /*
+  * The freshly booted CPU initiates this via an async SMP function call.
+  */
+@@ -395,7 +403,7 @@ retry:
+ 			"turning off TSC clock.\n", max_warp);
+ 		if (random_warps)
+ 			pr_warn("TSC warped randomly between CPUs\n");
+-		mark_tsc_unstable("check_tsc_sync_source failed");
++		schedule_work(&tsc_sync_work);
+ 	}
+ 
+ 	/*
+-- 
+2.42.0
+
