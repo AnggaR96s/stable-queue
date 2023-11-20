@@ -1,0 +1,97 @@
+From 0f1496d838c87ffb947b6935392a4ccc2b11429b Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 15 Nov 2023 18:28:24 -0800
+Subject: xfs: don't leak memory when attr fork loading fails
+
+From: Darrick J. Wong <djwong@kernel.org>
+
+[ Upstream commit c78c2d0903183a41beb90c56a923e30f90fa91b9 ]
+
+I observed the following evidence of a memory leak while running xfs/399
+from the xfs fsck test suite (edited for brevity):
+
+XFS (sde): Metadata corruption detected at xfs_attr_shortform_verify_struct.part.0+0x7b/0xb0 [xfs], inode 0x1172 attr fork
+XFS: Assertion failed: ip->i_af.if_u1.if_data == NULL, file: fs/xfs/libxfs/xfs_inode_fork.c, line: 315
+------------[ cut here ]------------
+WARNING: CPU: 2 PID: 91635 at fs/xfs/xfs_message.c:104 assfail+0x46/0x4a [xfs]
+CPU: 2 PID: 91635 Comm: xfs_scrub Tainted: G        W         5.19.0-rc7-xfsx #rc7 6e6475eb29fd9dda3181f81b7ca7ff961d277a40
+Hardware name: QEMU Standard PC (Q35 + ICH9, 2009), BIOS 1.15.0-1 04/01/2014
+RIP: 0010:assfail+0x46/0x4a [xfs]
+Call Trace:
+ <TASK>
+ xfs_ifork_zap_attr+0x7c/0xb0
+ xfs_iformat_attr_fork+0x86/0x110
+ xfs_inode_from_disk+0x41d/0x480
+ xfs_iget+0x389/0xd70
+ xfs_bulkstat_one_int+0x5b/0x540
+ xfs_bulkstat_iwalk+0x1e/0x30
+ xfs_iwalk_ag_recs+0xd1/0x160
+ xfs_iwalk_run_callbacks+0xb9/0x180
+ xfs_iwalk_ag+0x1d8/0x2e0
+ xfs_iwalk+0x141/0x220
+ xfs_bulkstat+0x105/0x180
+ xfs_ioc_bulkstat.constprop.0.isra.0+0xc5/0x130
+ xfs_file_ioctl+0xa5f/0xef0
+ __x64_sys_ioctl+0x82/0xa0
+ do_syscall_64+0x2b/0x80
+ entry_SYSCALL_64_after_hwframe+0x46/0xb0
+
+This newly-added assertion checks that there aren't any incore data
+structures hanging off the incore fork when we're trying to reset its
+contents.  From the call trace, it is evident that iget was trying to
+construct an incore inode from the ondisk inode, but the attr fork
+verifier failed and we were trying to undo all the memory allocations
+that we had done earlier.
+
+The three assertions in xfs_ifork_zap_attr check that the caller has
+already called xfs_idestroy_fork, which clearly has not been done here.
+As the zap function then zeroes the pointers, we've effectively leaked
+the memory.
+
+The shortest change would have been to insert an extra call to
+xfs_idestroy_fork, but it makes more sense to bundle the _idestroy_fork
+call into _zap_attr, since all other callsites call _idestroy_fork
+immediately prior to calling _zap_attr.  IOWs, it eliminates one way to
+fail.
+
+Note: This change only applies cleanly to 2ed5b09b3e8f, since we just
+reworked the attr fork lifetime.  However, I think this memory leak has
+existed since 0f45a1b20cd8, since the chain xfs_iformat_attr_fork ->
+xfs_iformat_local -> xfs_init_local_fork will allocate
+ifp->if_u1.if_data, but if xfs_ifork_verify_local_attr fails,
+xfs_iformat_attr_fork will free i_afp without freeing any of the stuff
+hanging off i_afp.  The solution for older kernels I think is to add the
+missing call to xfs_idestroy_fork just prior to calling kmem_cache_free.
+
+Found by fuzzing a.sfattr.hdr.totsize = lastbit in xfs/399.
+
+[ backport note: did not include refactoring of xfs_idestroy_fork into
+xfs_ifork_zap_attr, simply added the missing call as suggested in the
+commit for backports ]
+
+Fixes: 2ed5b09b3e8f ("xfs: make inode attribute forks a permanent part of struct xfs_inode")
+Probably-Fixes: 0f45a1b20cd8 ("xfs: improve local fork verification")
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Dave Chinner <dchinner@redhat.com>
+Signed-off-by: Leah Rumancik <leah.rumancik@gmail.com>
+Acked-by: Chandan Babu R <chandanbabu@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/xfs/libxfs/xfs_inode_fork.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/fs/xfs/libxfs/xfs_inode_fork.c b/fs/xfs/libxfs/xfs_inode_fork.c
+index 20095233d7bc0..c1f965af8432d 100644
+--- a/fs/xfs/libxfs/xfs_inode_fork.c
++++ b/fs/xfs/libxfs/xfs_inode_fork.c
+@@ -330,6 +330,7 @@ xfs_iformat_attr_fork(
+ 	}
+ 
+ 	if (error) {
++		xfs_idestroy_fork(ip->i_afp);
+ 		kmem_cache_free(xfs_ifork_zone, ip->i_afp);
+ 		ip->i_afp = NULL;
+ 	}
+-- 
+2.42.0
+
