@@ -1,0 +1,148 @@
+From b9082ca9d25d2ef2cb12cd011dbb577ef1d7da4e Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 19 Feb 2020 20:34:37 -0800
+Subject: scsi: qla2xxx: Simplify the code for aborting SCSI commands
+
+From: Bart Van Assche <bvanassche@acm.org>
+
+[ Upstream commit c81ef0ed4477c637d1f1dd96ecd8e8fbe18b7283 ]
+
+Since the SCSI core does not reuse the tag of the SCSI command that is
+being aborted by .eh_abort() before .eh_abort() has finished it is not
+necessary to check from inside that callback whether or not the SCSI
+command has already completed. Instead, rely on the firmware to return an
+error code when attempting to abort a command that has already
+completed. Additionally, rely on the firmware to return an error code when
+attempting to abort an already aborted command.
+
+In qla2x00_abort_srb(), use blk_mq_request_started() instead of
+sp->completed and sp->aborted.
+
+Link: https://lore.kernel.org/r/20200220043441.20504-2-bvanassche@acm.org
+Cc: Martin Wilck <mwilck@suse.com>
+Cc: Quinn Tran <qutran@marvell.com>
+Reviewed-by: Daniel Wagner <dwagner@suse.de>
+Reviewed-by: Roman Bolshakov <r.bolshakov@yadro.com>
+Acked-by: Himanshu Madhani <hmadhani@marvell.com>
+Signed-off-by: Bart Van Assche <bvanassche@acm.org>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Stable-dep-of: 19597cad64d6 ("scsi: qla2xxx: Fix system crash due to bad pointer access")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/scsi/qla2xxx/qla_def.h |  3 ---
+ drivers/scsi/qla2xxx/qla_isr.c |  5 -----
+ drivers/scsi/qla2xxx/qla_os.c  | 27 ++++++++++++++-------------
+ 3 files changed, 14 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/scsi/qla2xxx/qla_def.h b/drivers/scsi/qla2xxx/qla_def.h
+index 2ef6277244f57..bfddae586995a 100644
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@ -596,9 +596,6 @@ typedef struct srb {
+ 	struct fc_port *fcport;
+ 	struct scsi_qla_host *vha;
+ 	unsigned int start_timer:1;
+-	unsigned int abort:1;
+-	unsigned int aborted:1;
+-	unsigned int completed:1;
+ 
+ 	uint32_t handle;
+ 	uint16_t flags;
+diff --git a/drivers/scsi/qla2xxx/qla_isr.c b/drivers/scsi/qla2xxx/qla_isr.c
+index aca8ec3ff9391..c5021bd1ad5e5 100644
+--- a/drivers/scsi/qla2xxx/qla_isr.c
++++ b/drivers/scsi/qla2xxx/qla_isr.c
+@@ -2479,11 +2479,6 @@ qla2x00_status_entry(scsi_qla_host_t *vha, struct rsp_que *rsp, void *pkt)
+ 		return;
+ 	}
+ 
+-	if (sp->abort)
+-		sp->aborted = 1;
+-	else
+-		sp->completed = 1;
+-
+ 	if (sp->cmd_type != TYPE_SRB) {
+ 		req->outstanding_cmds[handle] = NULL;
+ 		ql_dbg(ql_dbg_io, vha, 0x3015,
+diff --git a/drivers/scsi/qla2xxx/qla_os.c b/drivers/scsi/qla2xxx/qla_os.c
+index 57f8d2378f778..8329b80c41eb7 100644
+--- a/drivers/scsi/qla2xxx/qla_os.c
++++ b/drivers/scsi/qla2xxx/qla_os.c
+@@ -1243,17 +1243,6 @@ qla2xxx_eh_abort(struct scsi_cmnd *cmd)
+ 		return fast_fail_status != SUCCESS ? fast_fail_status : FAILED;
+ 
+ 	spin_lock_irqsave(qpair->qp_lock_ptr, flags);
+-	if (sp->completed) {
+-		spin_unlock_irqrestore(qpair->qp_lock_ptr, flags);
+-		return SUCCESS;
+-	}
+-
+-	if (sp->abort || sp->aborted) {
+-		spin_unlock_irqrestore(qpair->qp_lock_ptr, flags);
+-		return FAILED;
+-	}
+-
+-	sp->abort = 1;
+ 	sp->comp = &comp;
+ 	spin_unlock_irqrestore(qpair->qp_lock_ptr, flags);
+ 
+@@ -1661,6 +1650,10 @@ qla2x00_loop_reset(scsi_qla_host_t *vha)
+ 	return QLA_SUCCESS;
+ }
+ 
++/*
++ * The caller must ensure that no completion interrupts will happen
++ * while this function is in progress.
++ */
+ static void qla2x00_abort_srb(struct qla_qpair *qp, srb_t *sp, const int res,
+ 			      unsigned long *flags)
+ 	__releases(qp->qp_lock_ptr)
+@@ -1669,6 +1662,7 @@ static void qla2x00_abort_srb(struct qla_qpair *qp, srb_t *sp, const int res,
+ 	DECLARE_COMPLETION_ONSTACK(comp);
+ 	scsi_qla_host_t *vha = qp->vha;
+ 	struct qla_hw_data *ha = vha->hw;
++	struct scsi_cmnd *cmd = GET_CMD_SP(sp);
+ 	int rval;
+ 	bool ret_cmd;
+ 	uint32_t ratov_j;
+@@ -1688,7 +1682,6 @@ static void qla2x00_abort_srb(struct qla_qpair *qp, srb_t *sp, const int res,
+ 		}
+ 
+ 		sp->comp = &comp;
+-		sp->abort =  1;
+ 		spin_unlock_irqrestore(qp->qp_lock_ptr, *flags);
+ 
+ 		rval = ha->isp_ops->abort_command(sp);
+@@ -1712,13 +1705,17 @@ static void qla2x00_abort_srb(struct qla_qpair *qp, srb_t *sp, const int res,
+ 		}
+ 
+ 		spin_lock_irqsave(qp->qp_lock_ptr, *flags);
+-		if (ret_cmd && (!sp->completed || !sp->aborted))
++		if (ret_cmd && blk_mq_request_started(cmd->request))
+ 			sp->done(sp, res);
+ 	} else {
+ 		sp->done(sp, res);
+ 	}
+ }
+ 
++/*
++ * The caller must ensure that no completion interrupts will happen
++ * while this function is in progress.
++ */
+ static void
+ __qla2x00_abort_all_cmds(struct qla_qpair *qp, int res)
+ {
+@@ -1776,6 +1773,10 @@ __qla2x00_abort_all_cmds(struct qla_qpair *qp, int res)
+ 	spin_unlock_irqrestore(qp->qp_lock_ptr, flags);
+ }
+ 
++/*
++ * The caller must ensure that no completion interrupts will happen
++ * while this function is in progress.
++ */
+ void
+ qla2x00_abort_all_cmds(scsi_qla_host_t *vha, int res)
+ {
+-- 
+2.42.0
+
