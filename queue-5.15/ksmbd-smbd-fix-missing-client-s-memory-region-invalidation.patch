@@ -1,0 +1,140 @@
+From stable+bounces-7651-greg=kroah.com@vger.kernel.org Mon Dec 18 16:40:20 2023
+From: Namjae Jeon <linkinjeon@kernel.org>
+Date: Tue, 19 Dec 2023 00:32:42 +0900
+Subject: ksmbd: smbd: fix missing client's memory region invalidation
+To: gregkh@linuxfoundation.org, stable@vger.kernel.org
+Cc: smfrench@gmail.com, Hyunchul Lee <hyc.lee@gmail.com>, Namjae Jeon <linkinjeon@kernel.org>, Steve French <stfrench@microsoft.com>
+Message-ID: <20231218153454.8090-23-linkinjeon@kernel.org>
+
+From: Hyunchul Lee <hyc.lee@gmail.com>
+
+[ Upstream commit 2fd5dcb1c8ef96c9f0fa8bda53ca480524b80ae7 ]
+
+if the Channel of a SMB2 WRITE request is
+SMB2_CHANNEL_RDMA_V1_INVALIDTE, a client
+does not invalidate its memory regions but
+ksmbd must do it by sending a SMB2 WRITE response
+with IB_WR_SEND_WITH_INV.
+
+But if errors occur while processing a SMB2
+READ/WRITE request, ksmbd sends a response
+with IB_WR_SEND. So a client could use memory
+regions already in use.
+
+Acked-by: Namjae Jeon <linkinjeon@kernel.org>
+Signed-off-by: Hyunchul Lee <hyc.lee@gmail.com>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/ksmbd/smb2pdu.c |   71 +++++++++++++++++++++++++++++++++--------------------
+ 1 file changed, 45 insertions(+), 26 deletions(-)
+
+--- a/fs/ksmbd/smb2pdu.c
++++ b/fs/ksmbd/smb2pdu.c
+@@ -6203,25 +6203,33 @@ out:
+ 	return err;
+ }
+ 
+-static ssize_t smb2_read_rdma_channel(struct ksmbd_work *work,
+-				      struct smb2_read_req *req, void *data_buf,
+-				      size_t length)
++static int smb2_set_remote_key_for_rdma(struct ksmbd_work *work,
++					struct smb2_buffer_desc_v1 *desc,
++					__le32 Channel,
++					__le16 ChannelInfoOffset,
++					__le16 ChannelInfoLength)
+ {
+-	struct smb2_buffer_desc_v1 *desc =
+-		(struct smb2_buffer_desc_v1 *)&req->Buffer[0];
+-	int err;
+-
+ 	if (work->conn->dialect == SMB30_PROT_ID &&
+-	    req->Channel != SMB2_CHANNEL_RDMA_V1)
++	    Channel != SMB2_CHANNEL_RDMA_V1)
+ 		return -EINVAL;
+ 
+-	if (req->ReadChannelInfoOffset == 0 ||
+-	    le16_to_cpu(req->ReadChannelInfoLength) < sizeof(*desc))
++	if (ChannelInfoOffset == 0 ||
++	    le16_to_cpu(ChannelInfoLength) < sizeof(*desc))
+ 		return -EINVAL;
+ 
+ 	work->need_invalidate_rkey =
+-		(req->Channel == SMB2_CHANNEL_RDMA_V1_INVALIDATE);
++		(Channel == SMB2_CHANNEL_RDMA_V1_INVALIDATE);
+ 	work->remote_key = le32_to_cpu(desc->token);
++	return 0;
++}
++
++static ssize_t smb2_read_rdma_channel(struct ksmbd_work *work,
++				      struct smb2_read_req *req, void *data_buf,
++				      size_t length)
++{
++	struct smb2_buffer_desc_v1 *desc =
++		(struct smb2_buffer_desc_v1 *)&req->Buffer[0];
++	int err;
+ 
+ 	err = ksmbd_conn_rdma_write(work->conn, data_buf, length,
+ 				    le32_to_cpu(desc->token),
+@@ -6263,6 +6271,18 @@ int smb2_read(struct ksmbd_work *work)
+ 		return smb2_read_pipe(work);
+ 	}
+ 
++	if (req->Channel == SMB2_CHANNEL_RDMA_V1_INVALIDATE ||
++	    req->Channel == SMB2_CHANNEL_RDMA_V1) {
++		err = smb2_set_remote_key_for_rdma(work,
++						   (struct smb2_buffer_desc_v1 *)
++						   &req->Buffer[0],
++						   req->Channel,
++						   req->ReadChannelInfoOffset,
++						   req->ReadChannelInfoLength);
++		if (err)
++			goto out;
++	}
++
+ 	fp = ksmbd_lookup_fd_slow(work, le64_to_cpu(req->VolatileFileId),
+ 				  le64_to_cpu(req->PersistentFileId));
+ 	if (!fp) {
+@@ -6448,21 +6468,6 @@ static ssize_t smb2_write_rdma_channel(s
+ 
+ 	desc = (struct smb2_buffer_desc_v1 *)&req->Buffer[0];
+ 
+-	if (work->conn->dialect == SMB30_PROT_ID &&
+-	    req->Channel != SMB2_CHANNEL_RDMA_V1)
+-		return -EINVAL;
+-
+-	if (req->Length != 0 || req->DataOffset != 0)
+-		return -EINVAL;
+-
+-	if (req->WriteChannelInfoOffset == 0 ||
+-	    le16_to_cpu(req->WriteChannelInfoLength) < sizeof(*desc))
+-		return -EINVAL;
+-
+-	work->need_invalidate_rkey =
+-		(req->Channel == SMB2_CHANNEL_RDMA_V1_INVALIDATE);
+-	work->remote_key = le32_to_cpu(desc->token);
+-
+ 	data_buf = kvmalloc(length, GFP_KERNEL | __GFP_ZERO);
+ 	if (!data_buf)
+ 		return -ENOMEM;
+@@ -6509,6 +6514,20 @@ int smb2_write(struct ksmbd_work *work)
+ 		return smb2_write_pipe(work);
+ 	}
+ 
++	if (req->Channel == SMB2_CHANNEL_RDMA_V1 ||
++	    req->Channel == SMB2_CHANNEL_RDMA_V1_INVALIDATE) {
++		if (req->Length != 0 || req->DataOffset != 0)
++			return -EINVAL;
++		err = smb2_set_remote_key_for_rdma(work,
++						   (struct smb2_buffer_desc_v1 *)
++						   &req->Buffer[0],
++						   req->Channel,
++						   req->WriteChannelInfoOffset,
++						   req->WriteChannelInfoLength);
++		if (err)
++			goto out;
++	}
++
+ 	if (!test_tree_conn_flag(work->tcon, KSMBD_TREE_CONN_FLAG_WRITABLE)) {
+ 		ksmbd_debug(SMB, "User does not have write permission\n");
+ 		err = -EACCES;
