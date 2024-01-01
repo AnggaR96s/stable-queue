@@ -1,0 +1,124 @@
+From 1f1e9b56184791336c39332a28d67dc5148660d3 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 27 Dec 2023 19:26:03 +0900
+Subject: ksmbd: lazy v2 lease break on smb2_write()
+
+From: Namjae Jeon <linkinjeon@kernel.org>
+
+[ Upstream commit c2a721eead71202a0d8ddd9b56ec8dce652c71d1 ]
+
+Don't immediately send directory lease break notification on smb2_write().
+Instead, It postpones it until smb2_close().
+
+Signed-off-by: Namjae Jeon <linkinjeon@kernel.org>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/ksmbd/oplock.c    | 45 ++++++++++++++++++++++++++++++++++++++++++--
+ fs/ksmbd/oplock.h    |  1 +
+ fs/ksmbd/vfs.c       |  3 +++
+ fs/ksmbd/vfs_cache.h |  1 +
+ 4 files changed, 48 insertions(+), 2 deletions(-)
+
+diff --git a/fs/ksmbd/oplock.c b/fs/ksmbd/oplock.c
+index df6f00f58f19d..2da256259722d 100644
+--- a/fs/ksmbd/oplock.c
++++ b/fs/ksmbd/oplock.c
+@@ -396,8 +396,8 @@ void close_id_del_oplock(struct ksmbd_file *fp)
+ {
+ 	struct oplock_info *opinfo;
+ 
+-	if (S_ISDIR(file_inode(fp->filp)->i_mode))
+-		return;
++	if (fp->reserve_lease_break)
++		smb_lazy_parent_lease_break_close(fp);
+ 
+ 	opinfo = opinfo_get(fp);
+ 	if (!opinfo)
+@@ -1127,6 +1127,47 @@ void smb_send_parent_lease_break_noti(struct ksmbd_file *fp,
+ 	ksmbd_inode_put(p_ci);
+ }
+ 
++void smb_lazy_parent_lease_break_close(struct ksmbd_file *fp)
++{
++	struct oplock_info *opinfo;
++	struct ksmbd_inode *p_ci = NULL;
++
++	rcu_read_lock();
++	opinfo = rcu_dereference(fp->f_opinfo);
++	rcu_read_unlock();
++
++	if (!opinfo->is_lease || opinfo->o_lease->version != 2)
++		return;
++
++	p_ci = ksmbd_inode_lookup_lock(fp->filp->f_path.dentry->d_parent);
++	if (!p_ci)
++		return;
++
++	read_lock(&p_ci->m_lock);
++	list_for_each_entry(opinfo, &p_ci->m_op_list, op_entry) {
++		if (!opinfo->is_lease)
++			continue;
++
++		if (opinfo->o_lease->state != SMB2_OPLOCK_LEVEL_NONE) {
++			if (!atomic_inc_not_zero(&opinfo->refcount))
++				continue;
++
++			atomic_inc(&opinfo->conn->r_count);
++			if (ksmbd_conn_releasing(opinfo->conn)) {
++				atomic_dec(&opinfo->conn->r_count);
++				continue;
++			}
++			read_unlock(&p_ci->m_lock);
++			oplock_break(opinfo, SMB2_OPLOCK_LEVEL_NONE);
++			opinfo_conn_put(opinfo);
++			read_lock(&p_ci->m_lock);
++		}
++	}
++	read_unlock(&p_ci->m_lock);
++
++	ksmbd_inode_put(p_ci);
++}
++
+ /**
+  * smb_grant_oplock() - handle oplock/lease request on file open
+  * @work:		smb work
+diff --git a/fs/ksmbd/oplock.h b/fs/ksmbd/oplock.h
+index b64d1536882a1..5b93ea9196c01 100644
+--- a/fs/ksmbd/oplock.h
++++ b/fs/ksmbd/oplock.h
+@@ -129,4 +129,5 @@ int find_same_lease_key(struct ksmbd_session *sess, struct ksmbd_inode *ci,
+ void destroy_lease_table(struct ksmbd_conn *conn);
+ void smb_send_parent_lease_break_noti(struct ksmbd_file *fp,
+ 				      struct lease_ctx_info *lctx);
++void smb_lazy_parent_lease_break_close(struct ksmbd_file *fp);
+ #endif /* __KSMBD_OPLOCK_H */
+diff --git a/fs/ksmbd/vfs.c b/fs/ksmbd/vfs.c
+index a89529b21c866..173a488bfeee4 100644
+--- a/fs/ksmbd/vfs.c
++++ b/fs/ksmbd/vfs.c
+@@ -517,6 +517,9 @@ int ksmbd_vfs_write(struct ksmbd_work *work, struct ksmbd_file *fp,
+ 		}
+ 	}
+ 
++	/* Reserve lease break for parent dir at closing time */
++	fp->reserve_lease_break = true;
++
+ 	/* Do we need to break any of a levelII oplock? */
+ 	smb_break_all_levII_oplock(work, fp, 1);
+ 
+diff --git a/fs/ksmbd/vfs_cache.h b/fs/ksmbd/vfs_cache.h
+index 4d4938d6029b6..a528f0cc775ae 100644
+--- a/fs/ksmbd/vfs_cache.h
++++ b/fs/ksmbd/vfs_cache.h
+@@ -105,6 +105,7 @@ struct ksmbd_file {
+ 	struct ksmbd_readdir_data	readdir_data;
+ 	int				dot_dotdot[2];
+ 	unsigned int			f_state;
++	bool				reserve_lease_break;
+ };
+ 
+ static inline void set_ctx_actor(struct dir_context *ctx,
+-- 
+2.43.0
+
