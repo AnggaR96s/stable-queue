@@ -1,0 +1,239 @@
+From af67175aec67b7af42238066c2738e7e52340603 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 29 Mar 2019 14:09:56 +0100
+Subject: crypto: scompress - Use per-CPU struct instead multiple variables
+
+From: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+
+[ Upstream commit 71052dcf4be70be4077817297dcde7b155e745f2 ]
+
+Two per-CPU variables are allocated as pointer to per-CPU memory which
+then are used as scratch buffers.
+We could be smart about this and use instead a per-CPU struct which
+contains the pointers already and then we need to allocate just the
+scratch buffers.
+Add a lock to the struct. By doing so we can avoid the get_cpu()
+statement and gain lockdep coverage (if enabled) to ensure that the lock
+is always acquired in the right context. On non-preemptible kernels the
+lock vanishes.
+It is okay to use raw_cpu_ptr() in order to get a pointer to the struct
+since it is protected by the spinlock.
+
+The diffstat of this is negative and according to size scompress.o:
+   text    data     bss     dec     hex filename
+   1847     160      24    2031     7ef dbg_before.o
+   1754     232       4    1990     7c6 dbg_after.o
+   1799      64      24    1887     75f no_dbg-before.o
+   1703      88       4    1795     703 no_dbg-after.o
+
+The overall size increase difference is also negative. The increase in
+the data section is only four bytes without lockdep.
+
+Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+Stable-dep-of: 744e1885922a ("crypto: scomp - fix req->dst buffer overflow")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ crypto/scompress.c | 125 ++++++++++++++++++++-------------------------
+ 1 file changed, 54 insertions(+), 71 deletions(-)
+
+diff --git a/crypto/scompress.c b/crypto/scompress.c
+index 15641c96ff99..3702f1648ea8 100644
+--- a/crypto/scompress.c
++++ b/crypto/scompress.c
+@@ -29,9 +29,17 @@
+ #include <crypto/internal/scompress.h>
+ #include "internal.h"
+ 
++struct scomp_scratch {
++	spinlock_t	lock;
++	void		*src;
++	void		*dst;
++};
++
++static DEFINE_PER_CPU(struct scomp_scratch, scomp_scratch) = {
++	.lock = __SPIN_LOCK_UNLOCKED(scomp_scratch.lock),
++};
++
+ static const struct crypto_type crypto_scomp_type;
+-static void * __percpu *scomp_src_scratches;
+-static void * __percpu *scomp_dst_scratches;
+ static int scomp_scratch_users;
+ static DEFINE_MUTEX(scomp_lock);
+ 
+@@ -65,76 +73,53 @@ static void crypto_scomp_show(struct seq_file *m, struct crypto_alg *alg)
+ 	seq_puts(m, "type         : scomp\n");
+ }
+ 
+-static void crypto_scomp_free_scratches(void * __percpu *scratches)
++static void crypto_scomp_free_scratches(void)
+ {
++	struct scomp_scratch *scratch;
+ 	int i;
+ 
+-	if (!scratches)
+-		return;
+-
+-	for_each_possible_cpu(i)
+-		vfree(*per_cpu_ptr(scratches, i));
++	for_each_possible_cpu(i) {
++		scratch = raw_cpu_ptr(&scomp_scratch);
+ 
+-	free_percpu(scratches);
++		vfree(scratch->src);
++		vfree(scratch->dst);
++		scratch->src = NULL;
++		scratch->dst = NULL;
++	}
+ }
+ 
+-static void * __percpu *crypto_scomp_alloc_scratches(void)
++static int crypto_scomp_alloc_scratches(void)
+ {
+-	void * __percpu *scratches;
++	struct scomp_scratch *scratch;
+ 	int i;
+ 
+-	scratches = alloc_percpu(void *);
+-	if (!scratches)
+-		return NULL;
+-
+ 	for_each_possible_cpu(i) {
+-		void *scratch;
+-
+-		scratch = vmalloc_node(SCOMP_SCRATCH_SIZE, cpu_to_node(i));
+-		if (!scratch)
+-			goto error;
+-		*per_cpu_ptr(scratches, i) = scratch;
+-	}
+-
+-	return scratches;
+-
+-error:
+-	crypto_scomp_free_scratches(scratches);
+-	return NULL;
+-}
++		void *mem;
+ 
+-static void crypto_scomp_free_all_scratches(void)
+-{
+-	if (!--scomp_scratch_users) {
+-		crypto_scomp_free_scratches(scomp_src_scratches);
+-		crypto_scomp_free_scratches(scomp_dst_scratches);
+-		scomp_src_scratches = NULL;
+-		scomp_dst_scratches = NULL;
+-	}
+-}
++		scratch = raw_cpu_ptr(&scomp_scratch);
+ 
+-static int crypto_scomp_alloc_all_scratches(void)
+-{
+-	if (!scomp_scratch_users++) {
+-		scomp_src_scratches = crypto_scomp_alloc_scratches();
+-		if (!scomp_src_scratches)
+-			return -ENOMEM;
+-		scomp_dst_scratches = crypto_scomp_alloc_scratches();
+-		if (!scomp_dst_scratches) {
+-			crypto_scomp_free_scratches(scomp_src_scratches);
+-			scomp_src_scratches = NULL;
+-			return -ENOMEM;
+-		}
++		mem = vmalloc_node(SCOMP_SCRATCH_SIZE, cpu_to_node(i));
++		if (!mem)
++			goto error;
++		scratch->src = mem;
++		mem = vmalloc_node(SCOMP_SCRATCH_SIZE, cpu_to_node(i));
++		if (!mem)
++			goto error;
++		scratch->dst = mem;
+ 	}
+ 	return 0;
++error:
++	crypto_scomp_free_scratches();
++	return -ENOMEM;
+ }
+ 
+ static int crypto_scomp_init_tfm(struct crypto_tfm *tfm)
+ {
+-	int ret;
++	int ret = 0;
+ 
+ 	mutex_lock(&scomp_lock);
+-	ret = crypto_scomp_alloc_all_scratches();
++	if (!scomp_scratch_users++)
++		ret = crypto_scomp_alloc_scratches();
+ 	mutex_unlock(&scomp_lock);
+ 
+ 	return ret;
+@@ -146,31 +131,28 @@ static int scomp_acomp_comp_decomp(struct acomp_req *req, int dir)
+ 	void **tfm_ctx = acomp_tfm_ctx(tfm);
+ 	struct crypto_scomp *scomp = *tfm_ctx;
+ 	void **ctx = acomp_request_ctx(req);
+-	const int cpu = get_cpu();
+-	u8 *scratch_src = *per_cpu_ptr(scomp_src_scratches, cpu);
+-	u8 *scratch_dst = *per_cpu_ptr(scomp_dst_scratches, cpu);
++	struct scomp_scratch *scratch;
+ 	int ret;
+ 
+-	if (!req->src || !req->slen || req->slen > SCOMP_SCRATCH_SIZE) {
+-		ret = -EINVAL;
+-		goto out;
+-	}
++	if (!req->src || !req->slen || req->slen > SCOMP_SCRATCH_SIZE)
++		return -EINVAL;
+ 
+-	if (req->dst && !req->dlen) {
+-		ret = -EINVAL;
+-		goto out;
+-	}
++	if (req->dst && !req->dlen)
++		return -EINVAL;
+ 
+ 	if (!req->dlen || req->dlen > SCOMP_SCRATCH_SIZE)
+ 		req->dlen = SCOMP_SCRATCH_SIZE;
+ 
+-	scatterwalk_map_and_copy(scratch_src, req->src, 0, req->slen, 0);
++	scratch = raw_cpu_ptr(&scomp_scratch);
++	spin_lock(&scratch->lock);
++
++	scatterwalk_map_and_copy(scratch->src, req->src, 0, req->slen, 0);
+ 	if (dir)
+-		ret = crypto_scomp_compress(scomp, scratch_src, req->slen,
+-					    scratch_dst, &req->dlen, *ctx);
++		ret = crypto_scomp_compress(scomp, scratch->src, req->slen,
++					    scratch->dst, &req->dlen, *ctx);
+ 	else
+-		ret = crypto_scomp_decompress(scomp, scratch_src, req->slen,
+-					      scratch_dst, &req->dlen, *ctx);
++		ret = crypto_scomp_decompress(scomp, scratch->src, req->slen,
++					      scratch->dst, &req->dlen, *ctx);
+ 	if (!ret) {
+ 		if (!req->dst) {
+ 			req->dst = sgl_alloc(req->dlen, GFP_ATOMIC, NULL);
+@@ -179,11 +161,11 @@ static int scomp_acomp_comp_decomp(struct acomp_req *req, int dir)
+ 				goto out;
+ 			}
+ 		}
+-		scatterwalk_map_and_copy(scratch_dst, req->dst, 0, req->dlen,
++		scatterwalk_map_and_copy(scratch->dst, req->dst, 0, req->dlen,
+ 					 1);
+ 	}
+ out:
+-	put_cpu();
++	spin_unlock(&scratch->lock);
+ 	return ret;
+ }
+ 
+@@ -204,7 +186,8 @@ static void crypto_exit_scomp_ops_async(struct crypto_tfm *tfm)
+ 	crypto_free_scomp(*ctx);
+ 
+ 	mutex_lock(&scomp_lock);
+-	crypto_scomp_free_all_scratches();
++	if (!--scomp_scratch_users)
++		crypto_scomp_free_scratches();
+ 	mutex_unlock(&scomp_lock);
+ }
+ 
+-- 
+2.43.0
+
