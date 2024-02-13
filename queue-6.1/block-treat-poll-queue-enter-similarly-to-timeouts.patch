@@ -1,0 +1,70 @@
+From 33391eecd63158536fb5257fee5be3a3bdc30e3c Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Fri, 20 Jan 2023 07:51:07 -0700
+Subject: block: treat poll queue enter similarly to timeouts
+
+From: Jens Axboe <axboe@kernel.dk>
+
+commit 33391eecd63158536fb5257fee5be3a3bdc30e3c upstream.
+
+We ran into an issue where a production workload would randomly grind to
+a halt and not continue until the pending IO had timed out. This turned
+out to be a complicated interaction between queue freezing and polled
+IO:
+
+1) You have an application that does polled IO. At any point in time,
+   there may be polled IO pending.
+
+2) You have a monitoring application that issues a passthrough command,
+   which is marked with side effects such that it needs to freeze the
+   queue.
+
+3) Passthrough command is started, which calls blk_freeze_queue_start()
+   on the device. At this point the queue is marked frozen, and any
+   attempt to enter the queue will fail (for non-blocking) or block.
+
+4) Now the driver calls blk_mq_freeze_queue_wait(), which will return
+   when the queue is quiesced and pending IO has completed.
+
+5) The pending IO is polled IO, but any attempt to poll IO through the
+   normal iocb_bio_iopoll() -> bio_poll() will fail when it gets to
+   bio_queue_enter() as the queue is frozen. Rather than poll and
+   complete IO, the polling threads will sit in a tight loop attempting
+   to poll, but failing to enter the queue to do so.
+
+The end result is that progress for either application will be stalled
+until all pending polled IO has timed out. This causes obvious huge
+latency issues for the application doing polled IO, but also long delays
+for passthrough command.
+
+Fix this by treating queue enter for polled IO just like we do for
+timeouts. This allows quick quiesce of the queue as we still poll and
+complete this IO, while still disallowing queueing up new IO.
+
+Reviewed-by: Keith Busch <kbusch@kernel.org>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ block/blk-core.c |   11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -864,7 +864,16 @@ int bio_poll(struct bio *bio, struct io_
+ 	 */
+ 	blk_flush_plug(current->plug, false);
+ 
+-	if (bio_queue_enter(bio))
++	/*
++	 * We need to be able to enter a frozen queue, similar to how
++	 * timeouts also need to do that. If that is blocked, then we can
++	 * have pending IO when a queue freeze is started, and then the
++	 * wait for the freeze to finish will wait for polled requests to
++	 * timeout as the poller is preventer from entering the queue and
++	 * completing them. As long as we prevent new IO from being queued,
++	 * that should be all that matters.
++	 */
++	if (!percpu_ref_tryget(&q->q_usage_counter))
+ 		return 0;
+ 	if (queue_is_mq(q)) {
+ 		ret = blk_mq_poll(q, cookie, iob, flags);
