@@ -1,0 +1,135 @@
+From gongruiqi1@huawei.com  Fri Feb 23 16:36:49 2024
+From: "GONG, Ruiqi" <gongruiqi1@huawei.com>
+Date: Thu, 22 Feb 2024 11:02:37 +0800
+Subject: memcg: add refcnt for pcpu stock to avoid UAF problem in drain_all_stock()
+To: <linux-kernel@vger.kernel.org>, <stable@vger.kernel.org>, Johannes Weiner <hannes@cmpxchg.org>, Michal Hocko <mhocko@kernel.org>, Roman Gushchin <roman.gushchin@linux.dev>, Shakeel Butt <shakeelb@google.com>, Muchun Song <muchun.song@linux.dev>
+Cc: <cgroups@vger.kernel.org>, <linux-mm@kvack.org>, Wang Weiyang <wangweiyang2@huawei.com>, Xiu Jianfeng <xiujianfeng@huawei.com>
+Message-ID: <20240222030237.82486-1-gongruiqi1@huawei.com>
+
+From: "GONG, Ruiqi" <gongruiqi1@huawei.com>
+
+commit 1a3e1f40962c445b997151a542314f3c6097f8c3 upstream.
+
+NOTE: This is a partial backport since we only need the refcnt between
+memcg and stock to fix the problem stated below, and in this way
+multiple versions use the same code and align with each other.
+
+There was a kernel panic happened on an in-house environment running
+3.10, and the same problem was reproduced on 4.19:
+
+general protection fault: 0000 [#1] SMP PTI
+CPU: 1 PID: 2085 Comm: bash Kdump: loaded Tainted: G             L    4.19.90+ #7
+Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS rel-1.15.0-0-g2dd4b9b3f840-prebuilt.qemu.org 04/01/2014
+RIP: 0010 drain_all_stock+0xad/0x140
+Code: 00 00 4d 85 ff 74 2c 45 85 c9 74 27 4d 39 fc 74 42 41 80 bc 24 28 04 00 00 00 74 17 49 8b 04 24 49 8b 17 48 8b 88 90 02 00 00 <48> 39 8a 90 02 00 00 74 02 eb 86 48 63 88 3c 01 00 00 39 8a 3c 01
+RSP: 0018:ffffa7efc5813d70 EFLAGS: 00010202
+RAX: ffff8cb185548800 RBX: ffff8cb89f420160 RCX: ffff8cb1867b6000
+RDX: babababababababa RSI: 0000000000000001 RDI: 0000000000231876
+RBP: 0000000000000000 R08: 0000000000000415 R09: 0000000000000002
+R10: 0000000000000000 R11: 0000000000000001 R12: ffff8cb186f89040
+R13: 0000000000020160 R14: 0000000000000001 R15: ffff8cb186b27040
+FS:  00007f4a308d3740(0000) GS:ffff8cb89f440000(0000) knlGS:0000000000000000
+CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+CR2: 00007ffe4d634a68 CR3: 000000010b022000 CR4: 00000000000006e0
+DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7: 0000000000000400
+Call Trace:
+ mem_cgroup_force_empty_write+0x31/0xb0
+ cgroup_file_write+0x60/0x140
+ ? __check_object_size+0x136/0x147
+ kernfs_fop_write+0x10e/0x190
+ __vfs_write+0x37/0x1b0
+ ? selinux_file_permission+0xe8/0x130
+ ? security_file_permission+0x2e/0xb0
+ vfs_write+0xb6/0x1a0
+ ksys_write+0x57/0xd0
+ do_syscall_64+0x63/0x250
+ ? async_page_fault+0x8/0x30
+ entry_SYSCALL_64_after_hwframe+0x5c/0xc1
+Modules linked in: ...
+
+It is found that in case of stock->nr_pages == 0, the memcg on
+stock->cached could be freed due to its refcnt decreased to 0, which
+made stock->cached become a dangling pointer. It could cause a UAF
+problem in drain_all_stock() in the following concurrent scenario. Note
+that drain_all_stock() doesn't disable irq but only preemption.
+
+CPU1                             CPU2
+==============================================================================
+stock->cached = memcgA (freed)
+                                 drain_all_stock(memcgB)
+                                  rcu_read_lock()
+                                  memcg = CPU1's stock->cached (memcgA)
+                                  (interrupted)
+refill_stock(memcgC)
+ drain_stock(memcgA)
+ stock->cached = memcgC
+ stock->nr_pages += xxx (> 0)
+                                  stock->nr_pages > 0
+                                  mem_cgroup_is_descendant(memcgA, memcgB) [UAF]
+                                  rcu_read_unlock()
+
+This problem is, unintentionally, fixed at 5.9, where commit
+1a3e1f40962c ("mm: memcontrol: decouple reference counting from page
+accounting") adds memcg refcnt for stock. Therefore affected LTS
+versions include 4.19 and 5.4.
+
+For 4.19, memcg's css offline process doesn't call drain_all_stock(). so
+it's easier for the released memcg to be left on the stock. For 5.4,
+although mem_cgroup_css_offline() does call drain_all_stock(), but the
+flushing could be skipped when stock->nr_pages happens to be 0, and
+besides the async draining could be delayed and take place after the UAF
+problem has happened.
+
+Fix this problem by adding (and decreasing) memcg's refcnt when memcg is
+put onto (and removed from) stock, just like how commit 1a3e1f40962c
+("mm: memcontrol: decouple reference counting from page accounting")
+does. After all, "being on the stock" is a kind of reference with
+regards to memcg. As such, it's guaranteed that a css on stock would not
+be freed.
+
+It's good to mention that refill_stock() is executed in an irq-disabled
+context, so the drain_stock() patched with css_put() would not actually
+free memcgA until the end of refill_stock(), since css_put() is an RCU
+free and it's still in grace period. For CPU2, the access to CPU1's
+stock->cached is protected by rcu_read_lock(), so in this case it gets
+either NULL from stock->cached or a memcgA that is still good.
+
+Cc: stable@vger.kernel.org      # 4.19 5.4
+Fixes: cdec2e4265df ("memcg: coalesce charging via percpu storage")
+Signed-off-by: GONG, Ruiqi <gongruiqi1@huawei.com>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ mm/memcontrol.c |    6 ++++++
+ 1 file changed, 6 insertions(+)
+
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -2214,6 +2214,9 @@ static void drain_stock(struct memcg_sto
+ {
+ 	struct mem_cgroup *old = stock->cached;
+ 
++	if (!old)
++		return;
++
+ 	if (stock->nr_pages) {
+ 		page_counter_uncharge(&old->memory, stock->nr_pages);
+ 		if (do_memsw_account())
+@@ -2221,6 +2224,8 @@ static void drain_stock(struct memcg_sto
+ 		css_put_many(&old->css, stock->nr_pages);
+ 		stock->nr_pages = 0;
+ 	}
++
++	css_put(&old->css);
+ 	stock->cached = NULL;
+ }
+ 
+@@ -2256,6 +2261,7 @@ static void refill_stock(struct mem_cgro
+ 	stock = this_cpu_ptr(&memcg_stock);
+ 	if (stock->cached != memcg) { /* reset if necessary */
+ 		drain_stock(stock);
++		css_get(&memcg->css);
+ 		stock->cached = memcg;
+ 	}
+ 	stock->nr_pages += nr_pages;
