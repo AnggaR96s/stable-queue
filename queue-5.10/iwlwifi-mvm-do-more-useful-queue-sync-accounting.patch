@@ -1,0 +1,114 @@
+From 097431a2b270f8ecce1b799de76e1050293283e4 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 9 Dec 2020 23:16:31 +0200
+Subject: iwlwifi: mvm: do more useful queue sync accounting
+
+From: Johannes Berg <johannes.berg@intel.com>
+
+[ Upstream commit 2f7a04c7b03b7fd63b7618e29295fc25732faac1 ]
+
+We're currently doing accounting on the queue sync with an
+atomic variable that counts down the number of remaining
+notifications that we still need.
+
+As we've been hitting issues in this area, modify this to
+track a bitmap of queues, not just the number of queues,
+and print out the remaining bitmap in the warning.
+
+Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+Signed-off-by: Luca Coelho <luciano.coelho@intel.com>
+Link: https://lore.kernel.org/r/iwlwifi.20201209231352.0a3fa177cd6b.I7c69ff999419368266279ec27dd618eb450908b3@changeid
+Signed-off-by: Luca Coelho <luciano.coelho@intel.com>
+Stable-dep-of: 5f8a3561ea8b ("iwlwifi: mvm: write queue_sync_state only for sync")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/net/wireless/intel/iwlwifi/mvm/mac80211.c | 11 ++++++-----
+ drivers/net/wireless/intel/iwlwifi/mvm/mvm.h      |  2 +-
+ drivers/net/wireless/intel/iwlwifi/mvm/ops.c      |  2 +-
+ drivers/net/wireless/intel/iwlwifi/mvm/rxmq.c     | 10 +++++++---
+ 4 files changed, 15 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/mac80211.c b/drivers/net/wireless/intel/iwlwifi/mvm/mac80211.c
+index d2c6fdb702732..f2096729ac5ac 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/mac80211.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/mac80211.c
+@@ -5155,8 +5155,7 @@ void iwl_mvm_sync_rx_queues_internal(struct iwl_mvm *mvm,
+ 
+ 	if (notif->sync) {
+ 		notif->cookie = mvm->queue_sync_cookie;
+-		atomic_set(&mvm->queue_sync_counter,
+-			   mvm->trans->num_rx_queues);
++		mvm->queue_sync_state = (1 << mvm->trans->num_rx_queues) - 1;
+ 	}
+ 
+ 	ret = iwl_mvm_notify_rx_queue(mvm, qmask, (u8 *)notif,
+@@ -5169,14 +5168,16 @@ void iwl_mvm_sync_rx_queues_internal(struct iwl_mvm *mvm,
+ 	if (notif->sync) {
+ 		lockdep_assert_held(&mvm->mutex);
+ 		ret = wait_event_timeout(mvm->rx_sync_waitq,
+-					 atomic_read(&mvm->queue_sync_counter) == 0 ||
++					 READ_ONCE(mvm->queue_sync_state) == 0 ||
+ 					 iwl_mvm_is_radio_killed(mvm),
+ 					 HZ);
+-		WARN_ON_ONCE(!ret && !iwl_mvm_is_radio_killed(mvm));
++		WARN_ONCE(!ret && !iwl_mvm_is_radio_killed(mvm),
++			  "queue sync: failed to sync, state is 0x%lx\n",
++			  mvm->queue_sync_state);
+ 	}
+ 
+ out:
+-	atomic_set(&mvm->queue_sync_counter, 0);
++	mvm->queue_sync_state = 0;
+ 	if (notif->sync)
+ 		mvm->queue_sync_cookie++;
+ }
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/mvm.h b/drivers/net/wireless/intel/iwlwifi/mvm/mvm.h
+index 64f5a4cb3d3ac..8b779c3a92d43 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/mvm.h
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/mvm.h
+@@ -842,7 +842,7 @@ struct iwl_mvm {
+ 	unsigned long status;
+ 
+ 	u32 queue_sync_cookie;
+-	atomic_t queue_sync_counter;
++	unsigned long queue_sync_state;
+ 	/*
+ 	 * for beacon filtering -
+ 	 * currently only one interface can be supported
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/ops.c b/drivers/net/wireless/intel/iwlwifi/mvm/ops.c
+index 5b173f21e87bf..3548eb57f1f30 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/ops.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/ops.c
+@@ -725,7 +725,7 @@ iwl_op_mode_mvm_start(struct iwl_trans *trans, const struct iwl_cfg *cfg,
+ 
+ 	init_waitqueue_head(&mvm->rx_sync_waitq);
+ 
+-	atomic_set(&mvm->queue_sync_counter, 0);
++	mvm->queue_sync_state = 0;
+ 
+ 	SET_IEEE80211_DEV(mvm->hw, mvm->trans->dev);
+ 
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/rxmq.c b/drivers/net/wireless/intel/iwlwifi/mvm/rxmq.c
+index 86b3fb321dfdd..e2a39e8b98d07 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/rxmq.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/rxmq.c
+@@ -853,9 +853,13 @@ void iwl_mvm_rx_queue_notif(struct iwl_mvm *mvm, struct napi_struct *napi,
+ 		WARN_ONCE(1, "Invalid identifier %d", internal_notif->type);
+ 	}
+ 
+-	if (internal_notif->sync &&
+-	    !atomic_dec_return(&mvm->queue_sync_counter))
+-		wake_up(&mvm->rx_sync_waitq);
++	if (internal_notif->sync) {
++		WARN_ONCE(!test_and_clear_bit(queue, &mvm->queue_sync_state),
++			  "queue sync: queue %d responded a second time!\n",
++			  queue);
++		if (READ_ONCE(mvm->queue_sync_state) == 0)
++			wake_up(&mvm->rx_sync_waitq);
++	}
+ }
+ 
+ static void iwl_mvm_oldsn_workaround(struct iwl_mvm *mvm,
+-- 
+2.43.0
+
