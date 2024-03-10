@@ -1,0 +1,85 @@
+From 356935a2011365d59bbfc6728029166f964d39c3 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 19 Oct 2023 12:21:35 +0100
+Subject: ARM: 9328/1: mm: try VMA lock-based page fault handling first
+
+From: Wang Kefeng <wangkefeng.wang@huawei.com>
+
+[ Upstream commit c16af1212479570454752671a170a1756e11fdfb ]
+
+Attempt VMA lock-based page fault handling first, and fall back to the
+existing mmap_lock-based handling if that fails, the ebizzy benchmark
+shows 25% improvement on qemu with 2 cpus.
+
+Signed-off-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Russell King (Oracle) <rmk+kernel@armlinux.org.uk>
+Stable-dep-of: e870920bbe68 ("arch/arm/mm: fix major fault accounting when retrying under per-VMA lock")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ arch/arm/Kconfig    |  1 +
+ arch/arm/mm/fault.c | 30 ++++++++++++++++++++++++++++++
+ 2 files changed, 31 insertions(+)
+
+diff --git a/arch/arm/Kconfig b/arch/arm/Kconfig
+index f8567e95f98be..8f47d6762ea4b 100644
+--- a/arch/arm/Kconfig
++++ b/arch/arm/Kconfig
+@@ -35,6 +35,7 @@ config ARM
+ 	select ARCH_OPTIONAL_KERNEL_RWX_DEFAULT if CPU_V7
+ 	select ARCH_SUPPORTS_ATOMIC_RMW
+ 	select ARCH_SUPPORTS_HUGETLBFS if ARM_LPAE
++	select ARCH_SUPPORTS_PER_VMA_LOCK
+ 	select ARCH_USE_BUILTIN_BSWAP
+ 	select ARCH_USE_CMPXCHG_LOCKREF
+ 	select ARCH_USE_MEMTEST
+diff --git a/arch/arm/mm/fault.c b/arch/arm/mm/fault.c
+index fef62e4a9edde..e96fb40b9cc32 100644
+--- a/arch/arm/mm/fault.c
++++ b/arch/arm/mm/fault.c
+@@ -278,6 +278,35 @@ do_page_fault(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
+ 
+ 	perf_sw_event(PERF_COUNT_SW_PAGE_FAULTS, 1, regs, addr);
+ 
++	if (!(flags & FAULT_FLAG_USER))
++		goto lock_mmap;
++
++	vma = lock_vma_under_rcu(mm, addr);
++	if (!vma)
++		goto lock_mmap;
++
++	if (!(vma->vm_flags & vm_flags)) {
++		vma_end_read(vma);
++		goto lock_mmap;
++	}
++	fault = handle_mm_fault(vma, addr, flags | FAULT_FLAG_VMA_LOCK, regs);
++	if (!(fault & (VM_FAULT_RETRY | VM_FAULT_COMPLETED)))
++		vma_end_read(vma);
++
++	if (!(fault & VM_FAULT_RETRY)) {
++		count_vm_vma_lock_event(VMA_LOCK_SUCCESS);
++		goto done;
++	}
++	count_vm_vma_lock_event(VMA_LOCK_RETRY);
++
++	/* Quick path to respond to signals */
++	if (fault_signal_pending(fault, regs)) {
++		if (!user_mode(regs))
++			goto no_context;
++		return 0;
++	}
++lock_mmap:
++
+ retry:
+ 	vma = lock_mm_and_find_vma(mm, addr, regs);
+ 	if (unlikely(!vma)) {
+@@ -316,6 +345,7 @@ do_page_fault(unsigned long addr, unsigned int fsr, struct pt_regs *regs)
+ 	}
+ 
+ 	mmap_read_unlock(mm);
++done:
+ 
+ 	/*
+ 	 * Handle the "normal" case first - VM_FAULT_MAJOR
+-- 
+2.43.0
+
