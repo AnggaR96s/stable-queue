@@ -1,0 +1,108 @@
+From d069a005c45770eced39a4cc7f4048713e0ec0dc Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 8 Jan 2021 16:53:42 -0800
+Subject: hv_netvsc: Wait for completion on request SWITCH_DATA_PATH
+
+From: Long Li <longli@microsoft.com>
+
+[ Upstream commit 8b31f8c982b738e4130539e47f03967c599d8e22 ]
+
+The completion indicates if NVSP_MSG4_TYPE_SWITCH_DATA_PATH has been
+processed by the VSP. The traffic is steered to VF or synthetic after we
+receive this completion.
+
+Signed-off-by: Long Li <longli@microsoft.com>
+Reported-by: kernel test robot <lkp@intel.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Stable-dep-of: 9cae43da9867 ("hv_netvsc: Register VF in netvsc_probe if NET_DEVICE_REGISTER missed")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/net/hyperv/netvsc.c     | 37 ++++++++++++++++++++++++++++++---
+ drivers/net/hyperv/netvsc_drv.c |  1 -
+ 2 files changed, 34 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/hyperv/netvsc.c b/drivers/net/hyperv/netvsc.c
+index c9b73a0448813..03333a4136bf4 100644
+--- a/drivers/net/hyperv/netvsc.c
++++ b/drivers/net/hyperv/netvsc.c
+@@ -37,6 +37,10 @@ void netvsc_switch_datapath(struct net_device *ndev, bool vf)
+ 	struct netvsc_device *nv_dev = rtnl_dereference(net_device_ctx->nvdev);
+ 	struct nvsp_message *init_pkt = &nv_dev->channel_init_pkt;
+ 
++	/* Block sending traffic to VF if it's about to be gone */
++	if (!vf)
++		net_device_ctx->data_path_is_vf = vf;
++
+ 	memset(init_pkt, 0, sizeof(struct nvsp_message));
+ 	init_pkt->hdr.msg_type = NVSP_MSG4_TYPE_SWITCH_DATA_PATH;
+ 	if (vf)
+@@ -50,8 +54,11 @@ void netvsc_switch_datapath(struct net_device *ndev, bool vf)
+ 
+ 	vmbus_sendpacket(dev->channel, init_pkt,
+ 			       sizeof(struct nvsp_message),
+-			       VMBUS_RQST_ID_NO_RESPONSE,
+-			       VM_PKT_DATA_INBAND, 0);
++			       (unsigned long)init_pkt,
++			       VM_PKT_DATA_INBAND,
++			       VMBUS_DATA_PACKET_FLAG_COMPLETION_REQUESTED);
++	wait_for_completion(&nv_dev->channel_init_wait);
++	net_device_ctx->data_path_is_vf = vf;
+ }
+ 
+ /* Worker to setup sub channels on initial setup
+@@ -757,8 +764,31 @@ static void netvsc_send_completion(struct net_device *ndev,
+ 				   const struct vmpacket_descriptor *desc,
+ 				   int budget)
+ {
+-	const struct nvsp_message *nvsp_packet = hv_pkt_data(desc);
++	const struct nvsp_message *nvsp_packet;
+ 	u32 msglen = hv_pkt_datalen(desc);
++	struct nvsp_message *pkt_rqst;
++	u64 cmd_rqst;
++
++	/* First check if this is a VMBUS completion without data payload */
++	if (!msglen) {
++		cmd_rqst = vmbus_request_addr(&incoming_channel->requestor,
++					      (u64)desc->trans_id);
++		if (cmd_rqst == VMBUS_RQST_ERROR) {
++			netdev_err(ndev, "Invalid transaction id\n");
++			return;
++		}
++
++		pkt_rqst = (struct nvsp_message *)(uintptr_t)cmd_rqst;
++		switch (pkt_rqst->hdr.msg_type) {
++		case NVSP_MSG4_TYPE_SWITCH_DATA_PATH:
++			complete(&net_device->channel_init_wait);
++			break;
++
++		default:
++			netdev_err(ndev, "Unexpected VMBUS completion!!\n");
++		}
++		return;
++	}
+ 
+ 	/* Ensure packet is big enough to read header fields */
+ 	if (msglen < sizeof(struct nvsp_message_header)) {
+@@ -766,6 +796,7 @@ static void netvsc_send_completion(struct net_device *ndev,
+ 		return;
+ 	}
+ 
++	nvsp_packet = hv_pkt_data(desc);
+ 	switch (nvsp_packet->hdr.msg_type) {
+ 	case NVSP_MSG_TYPE_INIT_COMPLETE:
+ 		if (msglen < sizeof(struct nvsp_message_header) +
+diff --git a/drivers/net/hyperv/netvsc_drv.c b/drivers/net/hyperv/netvsc_drv.c
+index 790bf750281ad..57a5ec098e7e0 100644
+--- a/drivers/net/hyperv/netvsc_drv.c
++++ b/drivers/net/hyperv/netvsc_drv.c
+@@ -2429,7 +2429,6 @@ static int netvsc_vf_changed(struct net_device *vf_netdev)
+ 
+ 	if (net_device_ctx->data_path_is_vf == vf_is_up)
+ 		return NOTIFY_OK;
+-	net_device_ctx->data_path_is_vf = vf_is_up;
+ 
+ 	if (vf_is_up && !net_device_ctx->vf_alloc) {
+ 		netdev_info(ndev, "Waiting for the VF association from host\n");
+-- 
+2.43.0
+
