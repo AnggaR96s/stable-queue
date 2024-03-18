@@ -1,0 +1,115 @@
+From 0344daa1912d57154c182395e390902770c2b923 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 20 Sep 2021 15:25:21 -0400
+Subject: NFSD: Optimize DRC bucket pruning
+
+From: Chuck Lever <chuck.lever@oracle.com>
+
+[ Upstream commit 8847ecc9274a14114385d1cb4030326baa0766eb ]
+
+DRC bucket pruning is done by nfsd_cache_lookup(), which is part of
+every NFSv2 and NFSv3 dispatch (ie, it's done while the client is
+waiting).
+
+I added a trace_printk() in prune_bucket() to see just how long
+it takes to prune. Here are two ends of the spectrum:
+
+ prune_bucket: Scanned 1 and freed 0 in 90 ns, 62 entries remaining
+ prune_bucket: Scanned 2 and freed 1 in 716 ns, 63 entries remaining
+...
+ prune_bucket: Scanned 75 and freed 74 in 34149 ns, 1 entries remaining
+
+Pruning latency is noticeable on fast transports with fast storage.
+By noticeable, I mean that the latency measured here in the worst
+case is the same order of magnitude as the round trip time for
+cached server operations.
+
+We could do something like moving expired entries to an expired list
+and then free them later instead of freeing them right in
+prune_bucket(). But simply limiting the number of entries that can
+be pruned by a lookup is simple and retains more entries in the
+cache, making the DRC somewhat more effective.
+
+Comparison with a 70/30 fio 8KB 12 thread direct I/O test:
+
+Before:
+
+  write: IOPS=61.6k, BW=481MiB/s (505MB/s)(14.1GiB/30001msec); 0 zone resets
+
+WRITE:
+        1848726 ops (30%)
+        avg bytes sent per op: 8340 avg bytes received per op: 136
+        backlog wait: 0.635158  RTT: 0.128525   total execute time: 0.827242 (milliseconds)
+
+After:
+
+  write: IOPS=63.0k, BW=492MiB/s (516MB/s)(14.4GiB/30001msec); 0 zone resets
+
+WRITE:
+        1891144 ops (30%)
+        avg bytes sent per op: 8340 avg bytes received per op: 136
+        backlog wait: 0.616114  RTT: 0.126842   total execute time: 0.805348 (milliseconds)
+
+Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+---
+ fs/nfsd/nfscache.c | 17 +++++++++++------
+ 1 file changed, 11 insertions(+), 6 deletions(-)
+
+diff --git a/fs/nfsd/nfscache.c b/fs/nfsd/nfscache.c
+index 830bb8493c7fd..6b9ef15c9c03b 100644
+--- a/fs/nfsd/nfscache.c
++++ b/fs/nfsd/nfscache.c
+@@ -241,8 +241,8 @@ lru_put_end(struct nfsd_drc_bucket *b, struct svc_cacherep *rp)
+ 	list_move_tail(&rp->c_lru, &b->lru_head);
+ }
+ 
+-static long
+-prune_bucket(struct nfsd_drc_bucket *b, struct nfsd_net *nn)
++static long prune_bucket(struct nfsd_drc_bucket *b, struct nfsd_net *nn,
++			 unsigned int max)
+ {
+ 	struct svc_cacherep *rp, *tmp;
+ 	long freed = 0;
+@@ -258,11 +258,17 @@ prune_bucket(struct nfsd_drc_bucket *b, struct nfsd_net *nn)
+ 		    time_before(jiffies, rp->c_timestamp + RC_EXPIRE))
+ 			break;
+ 		nfsd_reply_cache_free_locked(b, rp, nn);
+-		freed++;
++		if (max && freed++ > max)
++			break;
+ 	}
+ 	return freed;
+ }
+ 
++static long nfsd_prune_bucket(struct nfsd_drc_bucket *b, struct nfsd_net *nn)
++{
++	return prune_bucket(b, nn, 3);
++}
++
+ /*
+  * Walk the LRU list and prune off entries that are older than RC_EXPIRE.
+  * Also prune the oldest ones when the total exceeds the max number of entries.
+@@ -279,7 +285,7 @@ prune_cache_entries(struct nfsd_net *nn)
+ 		if (list_empty(&b->lru_head))
+ 			continue;
+ 		spin_lock(&b->cache_lock);
+-		freed += prune_bucket(b, nn);
++		freed += prune_bucket(b, nn, 0);
+ 		spin_unlock(&b->cache_lock);
+ 	}
+ 	return freed;
+@@ -453,8 +459,7 @@ int nfsd_cache_lookup(struct svc_rqst *rqstp)
+ 	atomic_inc(&nn->num_drc_entries);
+ 	nfsd_stats_drc_mem_usage_add(nn, sizeof(*rp));
+ 
+-	/* go ahead and prune the cache */
+-	prune_bucket(b, nn);
++	nfsd_prune_bucket(b, nn);
+ 
+ out_unlock:
+ 	spin_unlock(&b->cache_lock);
+-- 
+2.43.0
+
