@@ -1,0 +1,236 @@
+From cecfb59ff7a95c98b8355c7049ed5c270480496c Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 1 Sep 2022 17:28:02 -0700
+Subject: bpf: net: Change sk_getsockopt() to take the sockptr_t argument
+
+From: Martin KaFai Lau <martin.lau@kernel.org>
+
+[ Upstream commit 4ff09db1b79b98b4a2a7511571c640b76cab3beb ]
+
+This patch changes sk_getsockopt() to take the sockptr_t argument
+such that it can be used by bpf_getsockopt(SOL_SOCKET) in a
+latter patch.
+
+security_socket_getpeersec_stream() is not changed.  It stays
+with the __user ptr (optval.user and optlen.user) to avoid changes
+to other security hooks.  bpf_getsockopt(SOL_SOCKET) also does not
+support SO_PEERSEC.
+
+Signed-off-by: Martin KaFai Lau <martin.lau@kernel.org>
+Link: https://lore.kernel.org/r/20220902002802.2888419-1-kafai@fb.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Stable-dep-of: 5c3be3e0eb44 ("ipmr: fix incorrect parameter validation in the ip_mroute_getsockopt() function")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/linux/filter.h  |  3 +--
+ include/linux/sockptr.h |  5 +++++
+ net/core/filter.c       |  5 ++---
+ net/core/sock.c         | 43 +++++++++++++++++++++++------------------
+ 4 files changed, 32 insertions(+), 24 deletions(-)
+
+diff --git a/include/linux/filter.h b/include/linux/filter.h
+index 2b6da8e356aab..ddaeb2afc022f 100644
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@ -943,8 +943,7 @@ int sk_reuseport_attach_filter(struct sock_fprog *fprog, struct sock *sk);
+ int sk_reuseport_attach_bpf(u32 ufd, struct sock *sk);
+ void sk_reuseport_prog_free(struct bpf_prog *prog);
+ int sk_detach_filter(struct sock *sk);
+-int sk_get_filter(struct sock *sk, struct sock_filter __user *filter,
+-		  unsigned int len);
++int sk_get_filter(struct sock *sk, sockptr_t optval, unsigned int len);
+ 
+ bool sk_filter_charge(struct sock *sk, struct sk_filter *fp);
+ void sk_filter_uncharge(struct sock *sk, struct sk_filter *fp);
+diff --git a/include/linux/sockptr.h b/include/linux/sockptr.h
+index ea193414298b7..38862819e77a1 100644
+--- a/include/linux/sockptr.h
++++ b/include/linux/sockptr.h
+@@ -64,6 +64,11 @@ static inline int copy_to_sockptr_offset(sockptr_t dst, size_t offset,
+ 	return 0;
+ }
+ 
++static inline int copy_to_sockptr(sockptr_t dst, const void *src, size_t size)
++{
++	return copy_to_sockptr_offset(dst, 0, src, size);
++}
++
+ static inline void *memdup_sockptr(sockptr_t src, size_t len)
+ {
+ 	void *p = kmalloc_track_caller(len, GFP_USER | __GFP_NOWARN);
+diff --git a/net/core/filter.c b/net/core/filter.c
+index f0a3cdc4d4961..457d1a164ad5d 100644
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -10316,8 +10316,7 @@ int sk_detach_filter(struct sock *sk)
+ }
+ EXPORT_SYMBOL_GPL(sk_detach_filter);
+ 
+-int sk_get_filter(struct sock *sk, struct sock_filter __user *ubuf,
+-		  unsigned int len)
++int sk_get_filter(struct sock *sk, sockptr_t optval, unsigned int len)
+ {
+ 	struct sock_fprog_kern *fprog;
+ 	struct sk_filter *filter;
+@@ -10348,7 +10347,7 @@ int sk_get_filter(struct sock *sk, struct sock_filter __user *ubuf,
+ 		goto out;
+ 
+ 	ret = -EFAULT;
+-	if (copy_to_user(ubuf, fprog->filter, bpf_classic_proglen(fprog)))
++	if (copy_to_sockptr(optval, fprog->filter, bpf_classic_proglen(fprog)))
+ 		goto out;
+ 
+ 	/* Instead of bytes, the API requests to return the number
+diff --git a/net/core/sock.c b/net/core/sock.c
+index f8e3ba34e0a34..6f761f3c272aa 100644
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@ -671,8 +671,8 @@ static int sock_setbindtodevice(struct sock *sk, sockptr_t optval, int optlen)
+ 	return ret;
+ }
+ 
+-static int sock_getbindtodevice(struct sock *sk, char __user *optval,
+-				int __user *optlen, int len)
++static int sock_getbindtodevice(struct sock *sk, sockptr_t optval,
++				sockptr_t optlen, int len)
+ {
+ 	int ret = -ENOPROTOOPT;
+ #ifdef CONFIG_NETDEVICES
+@@ -695,12 +695,12 @@ static int sock_getbindtodevice(struct sock *sk, char __user *optval,
+ 	len = strlen(devname) + 1;
+ 
+ 	ret = -EFAULT;
+-	if (copy_to_user(optval, devname, len))
++	if (copy_to_sockptr(optval, devname, len))
+ 		goto out;
+ 
+ zero:
+ 	ret = -EFAULT;
+-	if (put_user(len, optlen))
++	if (copy_to_sockptr(optlen, &len, sizeof(int)))
+ 		goto out;
+ 
+ 	ret = 0;
+@@ -1404,20 +1404,23 @@ static void cred_to_ucred(struct pid *pid, const struct cred *cred,
+ 	}
+ }
+ 
+-static int groups_to_user(gid_t __user *dst, const struct group_info *src)
++static int groups_to_user(sockptr_t dst, const struct group_info *src)
+ {
+ 	struct user_namespace *user_ns = current_user_ns();
+ 	int i;
+ 
+-	for (i = 0; i < src->ngroups; i++)
+-		if (put_user(from_kgid_munged(user_ns, src->gid[i]), dst + i))
++	for (i = 0; i < src->ngroups; i++) {
++		gid_t gid = from_kgid_munged(user_ns, src->gid[i]);
++
++		if (copy_to_sockptr_offset(dst, i * sizeof(gid), &gid, sizeof(gid)))
+ 			return -EFAULT;
++	}
+ 
+ 	return 0;
+ }
+ 
+ static int sk_getsockopt(struct sock *sk, int level, int optname,
+-			 char __user *optval, int __user *optlen)
++			 sockptr_t optval, sockptr_t optlen)
+ {
+ 	struct socket *sock = sk->sk_socket;
+ 
+@@ -1436,7 +1439,7 @@ static int sk_getsockopt(struct sock *sk, int level, int optname,
+ 	int lv = sizeof(int);
+ 	int len;
+ 
+-	if (get_user(len, optlen))
++	if (copy_from_sockptr(&len, optlen, sizeof(int)))
+ 		return -EFAULT;
+ 	if (len < 0)
+ 		return -EINVAL;
+@@ -1578,7 +1581,7 @@ static int sk_getsockopt(struct sock *sk, int level, int optname,
+ 		cred_to_ucred(sk->sk_peer_pid, sk->sk_peer_cred, &peercred);
+ 		spin_unlock(&sk->sk_peer_lock);
+ 
+-		if (copy_to_user(optval, &peercred, len))
++		if (copy_to_sockptr(optval, &peercred, len))
+ 			return -EFAULT;
+ 		goto lenout;
+ 	}
+@@ -1596,11 +1599,11 @@ static int sk_getsockopt(struct sock *sk, int level, int optname,
+ 		if (len < n * sizeof(gid_t)) {
+ 			len = n * sizeof(gid_t);
+ 			put_cred(cred);
+-			return put_user(len, optlen) ? -EFAULT : -ERANGE;
++			return copy_to_sockptr(optlen, &len, sizeof(int)) ? -EFAULT : -ERANGE;
+ 		}
+ 		len = n * sizeof(gid_t);
+ 
+-		ret = groups_to_user((gid_t __user *)optval, cred->group_info);
++		ret = groups_to_user(optval, cred->group_info);
+ 		put_cred(cred);
+ 		if (ret)
+ 			return ret;
+@@ -1616,7 +1619,7 @@ static int sk_getsockopt(struct sock *sk, int level, int optname,
+ 			return -ENOTCONN;
+ 		if (lv < len)
+ 			return -EINVAL;
+-		if (copy_to_user(optval, address, len))
++		if (copy_to_sockptr(optval, address, len))
+ 			return -EFAULT;
+ 		goto lenout;
+ 	}
+@@ -1633,7 +1636,7 @@ static int sk_getsockopt(struct sock *sk, int level, int optname,
+ 		break;
+ 
+ 	case SO_PEERSEC:
+-		return security_socket_getpeersec_stream(sock, optval, optlen, len);
++		return security_socket_getpeersec_stream(sock, optval.user, optlen.user, len);
+ 
+ 	case SO_MARK:
+ 		v.val = sk->sk_mark;
+@@ -1661,7 +1664,7 @@ static int sk_getsockopt(struct sock *sk, int level, int optname,
+ 		return sock_getbindtodevice(sk, optval, optlen, len);
+ 
+ 	case SO_GET_FILTER:
+-		len = sk_get_filter(sk, (struct sock_filter __user *)optval, len);
++		len = sk_get_filter(sk, optval, len);
+ 		if (len < 0)
+ 			return len;
+ 
+@@ -1711,7 +1714,7 @@ static int sk_getsockopt(struct sock *sk, int level, int optname,
+ 		sk_get_meminfo(sk, meminfo);
+ 
+ 		len = min_t(unsigned int, len, sizeof(meminfo));
+-		if (copy_to_user(optval, &meminfo, len))
++		if (copy_to_sockptr(optval, &meminfo, len))
+ 			return -EFAULT;
+ 
+ 		goto lenout;
+@@ -1772,10 +1775,10 @@ static int sk_getsockopt(struct sock *sk, int level, int optname,
+ 
+ 	if (len > lv)
+ 		len = lv;
+-	if (copy_to_user(optval, &v, len))
++	if (copy_to_sockptr(optval, &v, len))
+ 		return -EFAULT;
+ lenout:
+-	if (put_user(len, optlen))
++	if (copy_to_sockptr(optlen, &len, sizeof(int)))
+ 		return -EFAULT;
+ 	return 0;
+ }
+@@ -1783,7 +1786,9 @@ static int sk_getsockopt(struct sock *sk, int level, int optname,
+ int sock_getsockopt(struct socket *sock, int level, int optname,
+ 		    char __user *optval, int __user *optlen)
+ {
+-	return sk_getsockopt(sock->sk, level, optname, optval, optlen);
++	return sk_getsockopt(sock->sk, level, optname,
++			     USER_SOCKPTR(optval),
++			     USER_SOCKPTR(optlen));
+ }
+ 
+ /*
+-- 
+2.43.0
+
