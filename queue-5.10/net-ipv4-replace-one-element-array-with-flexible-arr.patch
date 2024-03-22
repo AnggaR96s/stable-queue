@@ -1,0 +1,195 @@
+From e4b1b58d8759210a2dedfa5817b2ba7088c6dc39 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Sat, 31 Jul 2021 12:08:30 -0500
+Subject: net/ipv4: Replace one-element array with flexible-array member
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+From: Gustavo A. R. Silva <gustavoars@kernel.org>
+
+[ Upstream commit 2d3e5caf96b9449af951e63476657acd759c1a30 ]
+
+There is a regular need in the kernel to provide a way to declare having
+a dynamically sized set of trailing elements in a structure. Kernel code
+should always use “flexible array members”[1] for these cases. The older
+style of one-element or zero-length arrays should no longer be used[2].
+
+Use an anonymous union with a couple of anonymous structs in order to
+keep userspace unchanged:
+
+$ pahole -C ip_msfilter net/ipv4/ip_sockglue.o
+struct ip_msfilter {
+	union {
+		struct {
+			__be32     imsf_multiaddr_aux;   /*     0     4 */
+			__be32     imsf_interface_aux;   /*     4     4 */
+			__u32      imsf_fmode_aux;       /*     8     4 */
+			__u32      imsf_numsrc_aux;      /*    12     4 */
+			__be32     imsf_slist[1];        /*    16     4 */
+		};                                       /*     0    20 */
+		struct {
+			__be32     imsf_multiaddr;       /*     0     4 */
+			__be32     imsf_interface;       /*     4     4 */
+			__u32      imsf_fmode;           /*     8     4 */
+			__u32      imsf_numsrc;          /*    12     4 */
+			__be32     imsf_slist_flex[0];   /*    16     0 */
+		};                                       /*     0    16 */
+	};                                               /*     0    20 */
+
+	/* size: 20, cachelines: 1, members: 1 */
+	/* last cacheline: 20 bytes */
+};
+
+Also, refactor the code accordingly and make use of the struct_size()
+and flex_array_size() helpers.
+
+This helps with the ongoing efforts to globally enable -Warray-bounds
+and get us closer to being able to tighten the FORTIFY_SOURCE routines
+on memcpy().
+
+[1] https://en.wikipedia.org/wiki/Flexible_array_member
+[2] https://www.kernel.org/doc/html/v5.10/process/deprecated.html#zero-length-and-one-element-arrays
+
+Link: https://github.com/KSPP/linux/issues/79
+Link: https://github.com/KSPP/linux/issues/109
+Signed-off-by: Gustavo A. R. Silva <gustavoars@kernel.org>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Stable-dep-of: 5c3be3e0eb44 ("ipmr: fix incorrect parameter validation in the ip_mroute_getsockopt() function")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/uapi/linux/in.h | 21 ++++++++++++++++-----
+ net/ipv4/igmp.c         | 12 ++++++------
+ net/ipv4/ip_sockglue.c  | 15 ++++++++-------
+ 3 files changed, 30 insertions(+), 18 deletions(-)
+
+diff --git a/include/uapi/linux/in.h b/include/uapi/linux/in.h
+index 3960bc3da6b30..066098a5b9360 100644
+--- a/include/uapi/linux/in.h
++++ b/include/uapi/linux/in.h
+@@ -190,11 +190,22 @@ struct ip_mreq_source {
+ };
+ 
+ struct ip_msfilter {
+-	__be32		imsf_multiaddr;
+-	__be32		imsf_interface;
+-	__u32		imsf_fmode;
+-	__u32		imsf_numsrc;
+-	__be32		imsf_slist[1];
++	union {
++		struct {
++			__be32		imsf_multiaddr_aux;
++			__be32		imsf_interface_aux;
++			__u32		imsf_fmode_aux;
++			__u32		imsf_numsrc_aux;
++			__be32		imsf_slist[1];
++		};
++		struct {
++			__be32		imsf_multiaddr;
++			__be32		imsf_interface;
++			__u32		imsf_fmode;
++			__u32		imsf_numsrc;
++			__be32		imsf_slist_flex[];
++		};
++	};
+ };
+ 
+ #define IP_MSFILTER_SIZE(numsrc) \
+diff --git a/net/ipv4/igmp.c b/net/ipv4/igmp.c
+index cb55fede03c04..134f1682a7e9b 100644
+--- a/net/ipv4/igmp.c
++++ b/net/ipv4/igmp.c
+@@ -2493,8 +2493,8 @@ int ip_mc_msfilter(struct sock *sk, struct ip_msfilter *msf, int ifindex)
+ 			goto done;
+ 		}
+ 		newpsl->sl_max = newpsl->sl_count = msf->imsf_numsrc;
+-		memcpy(newpsl->sl_addr, msf->imsf_slist,
+-			msf->imsf_numsrc * sizeof(msf->imsf_slist[0]));
++		memcpy(newpsl->sl_addr, msf->imsf_slist_flex,
++		       flex_array_size(msf, imsf_slist_flex, msf->imsf_numsrc));
+ 		err = ip_mc_add_src(in_dev, &msf->imsf_multiaddr,
+ 			msf->imsf_fmode, newpsl->sl_count, newpsl->sl_addr, 0);
+ 		if (err) {
+@@ -2571,14 +2571,14 @@ int ip_mc_msfget(struct sock *sk, struct ip_msfilter *msf,
+ 		count = psl->sl_count;
+ 	}
+ 	copycount = count < msf->imsf_numsrc ? count : msf->imsf_numsrc;
+-	len = copycount * sizeof(psl->sl_addr[0]);
++	len = flex_array_size(psl, sl_addr, copycount);
+ 	msf->imsf_numsrc = count;
+-	if (put_user(IP_MSFILTER_SIZE(copycount), optlen) ||
+-	    copy_to_user(optval, msf, IP_MSFILTER_SIZE(0))) {
++	if (put_user(struct_size(optval, imsf_slist_flex, copycount), optlen) ||
++	    copy_to_user(optval, msf, struct_size(optval, imsf_slist_flex, 0))) {
+ 		return -EFAULT;
+ 	}
+ 	if (len &&
+-	    copy_to_user(&optval->imsf_slist[0], psl->sl_addr, len))
++	    copy_to_user(&optval->imsf_slist_flex[0], psl->sl_addr, len))
+ 		return -EFAULT;
+ 	return 0;
+ done:
+diff --git a/net/ipv4/ip_sockglue.c b/net/ipv4/ip_sockglue.c
+index 1b35afd326b8d..2cfc507712300 100644
+--- a/net/ipv4/ip_sockglue.c
++++ b/net/ipv4/ip_sockglue.c
+@@ -670,12 +670,11 @@ static int set_mcast_msfilter(struct sock *sk, int ifindex,
+ 			      struct sockaddr_storage *group,
+ 			      struct sockaddr_storage *list)
+ {
+-	int msize = IP_MSFILTER_SIZE(numsrc);
+ 	struct ip_msfilter *msf;
+ 	struct sockaddr_in *psin;
+ 	int err, i;
+ 
+-	msf = kmalloc(msize, GFP_KERNEL);
++	msf = kmalloc(struct_size(msf, imsf_slist_flex, numsrc), GFP_KERNEL);
+ 	if (!msf)
+ 		return -ENOBUFS;
+ 
+@@ -691,7 +690,7 @@ static int set_mcast_msfilter(struct sock *sk, int ifindex,
+ 
+ 		if (psin->sin_family != AF_INET)
+ 			goto Eaddrnotavail;
+-		msf->imsf_slist[i] = psin->sin_addr.s_addr;
++		msf->imsf_slist_flex[i] = psin->sin_addr.s_addr;
+ 	}
+ 	err = ip_mc_msfilter(sk, msf, ifindex);
+ 	kfree(msf);
+@@ -1236,7 +1235,7 @@ static int do_ip_setsockopt(struct sock *sk, int level, int optname,
+ 	{
+ 		struct ip_msfilter *msf;
+ 
+-		if (optlen < IP_MSFILTER_SIZE(0))
++		if (optlen < struct_size(msf, imsf_slist_flex, 0))
+ 			goto e_inval;
+ 		if (optlen > READ_ONCE(sysctl_optmem_max)) {
+ 			err = -ENOBUFS;
+@@ -1254,7 +1253,8 @@ static int do_ip_setsockopt(struct sock *sk, int level, int optname,
+ 			err = -ENOBUFS;
+ 			break;
+ 		}
+-		if (IP_MSFILTER_SIZE(msf->imsf_numsrc) > optlen) {
++		if (struct_size(msf, imsf_slist_flex, msf->imsf_numsrc) >
++		    optlen) {
+ 			kfree(msf);
+ 			err = -EINVAL;
+ 			break;
+@@ -1667,11 +1667,12 @@ static int do_ip_getsockopt(struct sock *sk, int level, int optname,
+ 	{
+ 		struct ip_msfilter msf;
+ 
+-		if (len < IP_MSFILTER_SIZE(0)) {
++		if (len < struct_size(&msf, imsf_slist_flex, 0)) {
+ 			err = -EINVAL;
+ 			goto out;
+ 		}
+-		if (copy_from_user(&msf, optval, IP_MSFILTER_SIZE(0))) {
++		if (copy_from_user(&msf, optval,
++				   struct_size(&msf, imsf_slist_flex, 0))) {
+ 			err = -EFAULT;
+ 			goto out;
+ 		}
+-- 
+2.43.0
+
