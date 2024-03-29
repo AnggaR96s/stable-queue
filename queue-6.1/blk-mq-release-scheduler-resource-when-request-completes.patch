@@ -1,0 +1,111 @@
+From e5c0ca13659e9d18f53368d651ed7e6e433ec1cf Mon Sep 17 00:00:00 2001
+From: Chengming Zhou <zhouchengming@bytedance.com>
+Date: Sun, 13 Aug 2023 23:23:25 +0800
+Subject: blk-mq: release scheduler resource when request completes
+
+From: Chengming Zhou <zhouchengming@bytedance.com>
+
+commit e5c0ca13659e9d18f53368d651ed7e6e433ec1cf upstream.
+
+Chuck reported [1] an IO hang problem on NFS exports that reside on SATA
+devices and bisected to commit 615939a2ae73 ("blk-mq: defer to the normal
+submission path for post-flush requests").
+
+We analysed the IO hang problem, found there are two postflush requests
+waiting for each other.
+
+The first postflush request completed the REQ_FSEQ_DATA sequence, so go to
+the REQ_FSEQ_POSTFLUSH sequence and added in the flush pending list, but
+failed to blk_kick_flush() because of the second postflush request which
+is inflight waiting in scheduler queue.
+
+The second postflush waiting in scheduler queue can't be dispatched because
+the first postflush hasn't released scheduler resource even though it has
+completed by itself.
+
+Fix it by releasing scheduler resource when the first postflush request
+completed, so the second postflush can be dispatched and completed, then
+make blk_kick_flush() succeed.
+
+While at it, remove the check for e->ops.finish_request, as all
+schedulers set that. Reaffirm this requirement by adding a WARN_ON_ONCE()
+at scheduler registration time, just like we do for insert_requests and
+dispatch_request.
+
+[1] https://lore.kernel.org/all/7A57C7AE-A51A-4254-888B-FE15CA21F9E9@oracle.com/
+
+Link: https://lore.kernel.org/linux-block/20230819031206.2744005-1-chengming.zhou@linux.dev/
+Reported-by: kernel test robot <oliver.sang@intel.com>
+Closes: https://lore.kernel.org/oe-lkp/202308172100.8ce4b853-oliver.sang@intel.com
+Fixes: 615939a2ae73 ("blk-mq: defer to the normal submission path for post-flush requests")
+Reported-by: Chuck Lever <chuck.lever@oracle.com>
+Signed-off-by: Chengming Zhou <zhouchengming@bytedance.com>
+Tested-by: Chuck Lever <chuck.lever@oracle.com>
+Link: https://lore.kernel.org/r/20230813152325.3017343-1-chengming.zhou@linux.dev
+[axboe: folded in incremental fix and added tags]
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+[bvanassche: changed RQF_USE_SCHED into RQF_ELVPRIV; restored the
+finish_request pointer check before calling finish_request and removed
+the new warning from the elevator code. This patch fixes an I/O hang
+when submitting a REQ_FUA request to a request queue for a zoned block
+device for which FUA has been disabled (QUEUE_FLAG_FUA is not set).]
+Signed-off-by: Bart Van Assche <bvanassche@acm.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ block/blk-mq.c |   24 +++++++++++++++++++++---
+ 1 file changed, 21 insertions(+), 3 deletions(-)
+
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -675,6 +675,22 @@ out_queue_exit:
+ }
+ EXPORT_SYMBOL_GPL(blk_mq_alloc_request_hctx);
+ 
++static void blk_mq_finish_request(struct request *rq)
++{
++	struct request_queue *q = rq->q;
++
++	if ((rq->rq_flags & RQF_ELVPRIV) &&
++	    q->elevator->type->ops.finish_request) {
++		q->elevator->type->ops.finish_request(rq);
++		/*
++		 * For postflush request that may need to be
++		 * completed twice, we should clear this flag
++		 * to avoid double finish_request() on the rq.
++		 */
++		rq->rq_flags &= ~RQF_ELVPRIV;
++	}
++}
++
+ static void __blk_mq_free_request(struct request *rq)
+ {
+ 	struct request_queue *q = rq->q;
+@@ -701,9 +717,7 @@ void blk_mq_free_request(struct request
+ {
+ 	struct request_queue *q = rq->q;
+ 
+-	if ((rq->rq_flags & RQF_ELVPRIV) &&
+-	    q->elevator->type->ops.finish_request)
+-		q->elevator->type->ops.finish_request(rq);
++	blk_mq_finish_request(rq);
+ 
+ 	if (unlikely(laptop_mode && !blk_rq_is_passthrough(rq)))
+ 		laptop_io_completion(q->disk->bdi);
+@@ -1025,6 +1039,8 @@ inline void __blk_mq_end_request(struct
+ 	if (blk_mq_need_time_stamp(rq))
+ 		__blk_mq_end_request_acct(rq, ktime_get_ns());
+ 
++	blk_mq_finish_request(rq);
++
+ 	if (rq->end_io) {
+ 		rq_qos_done(rq->q, rq);
+ 		if (rq->end_io(rq, error) == RQ_END_IO_FREE)
+@@ -1079,6 +1095,8 @@ void blk_mq_end_request_batch(struct io_
+ 		if (iob->need_ts)
+ 			__blk_mq_end_request_acct(rq, now);
+ 
++		blk_mq_finish_request(rq);
++
+ 		rq_qos_done(rq->q, rq);
+ 
+ 		/*
