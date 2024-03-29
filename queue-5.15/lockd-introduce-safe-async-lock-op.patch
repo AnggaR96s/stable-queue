@@ -1,0 +1,148 @@
+From 23069375a9d6af6db887f087de022c57f6ef36c8 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 12 Sep 2023 17:53:18 -0400
+Subject: lockd: introduce safe async lock op
+
+From: Alexander Aring <aahringo@redhat.com>
+
+[ Upstream commit 2dd10de8e6bcbacf85ad758b904543c294820c63 ]
+
+This patch reverts mostly commit 40595cdc93ed ("nfs: block notification
+on fs with its own ->lock") and introduces an EXPORT_OP_ASYNC_LOCK
+export flag to signal that the "own ->lock" implementation supports
+async lock requests. The only main user is DLM that is used by GFS2 and
+OCFS2 filesystem. Those implement their own lock() implementation and
+return FILE_LOCK_DEFERRED as return value. Since commit 40595cdc93ed
+("nfs: block notification on fs with its own ->lock") the DLM
+implementation were never updated. This patch should prepare for DLM
+to set the EXPORT_OP_ASYNC_LOCK export flag and update the DLM
+plock implementation regarding to it.
+
+Acked-by: Jeff Layton <jlayton@kernel.org>
+Signed-off-by: Alexander Aring <aahringo@redhat.com>
+Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+---
+ Documentation/filesystems/nfs/exporting.rst |  7 +++++++
+ fs/lockd/svclock.c                          |  4 +---
+ fs/nfsd/nfs4state.c                         | 10 +++++++---
+ include/linux/exportfs.h                    | 14 ++++++++++++++
+ 4 files changed, 29 insertions(+), 6 deletions(-)
+
+diff --git a/Documentation/filesystems/nfs/exporting.rst b/Documentation/filesystems/nfs/exporting.rst
+index 6f59a364f84cd..6a1cbd7de38df 100644
+--- a/Documentation/filesystems/nfs/exporting.rst
++++ b/Documentation/filesystems/nfs/exporting.rst
+@@ -241,3 +241,10 @@ following flags are defined:
+     all of an inode's dirty data on last close. Exports that behave this
+     way should set EXPORT_OP_FLUSH_ON_CLOSE so that NFSD knows to skip
+     waiting for writeback when closing such files.
++
++  EXPORT_OP_ASYNC_LOCK - Indicates a capable filesystem to do async lock
++    requests from lockd. Only set EXPORT_OP_ASYNC_LOCK if the filesystem has
++    it's own ->lock() functionality as core posix_lock_file() implementation
++    has no async lock request handling yet. For more information about how to
++    indicate an async lock request from a ->lock() file_operations struct, see
++    fs/locks.c and comment for the function vfs_lock_file().
+diff --git a/fs/lockd/svclock.c b/fs/lockd/svclock.c
+index 4e30f3c509701..55c0a03311884 100644
+--- a/fs/lockd/svclock.c
++++ b/fs/lockd/svclock.c
+@@ -470,9 +470,7 @@ nlmsvc_lock(struct svc_rqst *rqstp, struct nlm_file *file,
+ 	    struct nlm_host *host, struct nlm_lock *lock, int wait,
+ 	    struct nlm_cookie *cookie, int reclaim)
+ {
+-#if IS_ENABLED(CONFIG_SUNRPC_DEBUG)
+ 	struct inode		*inode = nlmsvc_file_inode(file);
+-#endif
+ 	struct nlm_block	*block = NULL;
+ 	int			error;
+ 	int			mode;
+@@ -486,7 +484,7 @@ nlmsvc_lock(struct svc_rqst *rqstp, struct nlm_file *file,
+ 				(long long)lock->fl.fl_end,
+ 				wait);
+ 
+-	if (nlmsvc_file_file(file)->f_op->lock) {
++	if (!exportfs_lock_op_is_async(inode->i_sb->s_export_op)) {
+ 		async_block = wait;
+ 		wait = 0;
+ 	}
+diff --git a/fs/nfsd/nfs4state.c b/fs/nfsd/nfs4state.c
+index 69bc4622a95a4..4d95b2052c31a 100644
+--- a/fs/nfsd/nfs4state.c
++++ b/fs/nfsd/nfs4state.c
+@@ -7424,6 +7424,7 @@ nfsd4_lock(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
+ 	struct nfsd4_blocked_lock *nbl = NULL;
+ 	struct file_lock *file_lock = NULL;
+ 	struct file_lock *conflock = NULL;
++	struct super_block *sb;
+ 	__be32 status = 0;
+ 	int lkflg;
+ 	int err;
+@@ -7445,6 +7446,7 @@ nfsd4_lock(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
+ 		dprintk("NFSD: nfsd4_lock: permission denied!\n");
+ 		return status;
+ 	}
++	sb = cstate->current_fh.fh_dentry->d_sb;
+ 
+ 	if (lock->lk_is_new) {
+ 		if (nfsd4_has_session(cstate))
+@@ -7496,7 +7498,8 @@ nfsd4_lock(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
+ 	fp = lock_stp->st_stid.sc_file;
+ 	switch (lock->lk_type) {
+ 		case NFS4_READW_LT:
+-			if (nfsd4_has_session(cstate))
++			if (nfsd4_has_session(cstate) ||
++			    exportfs_lock_op_is_async(sb->s_export_op))
+ 				fl_flags |= FL_SLEEP;
+ 			fallthrough;
+ 		case NFS4_READ_LT:
+@@ -7508,7 +7511,8 @@ nfsd4_lock(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
+ 			fl_type = F_RDLCK;
+ 			break;
+ 		case NFS4_WRITEW_LT:
+-			if (nfsd4_has_session(cstate))
++			if (nfsd4_has_session(cstate) ||
++			    exportfs_lock_op_is_async(sb->s_export_op))
+ 				fl_flags |= FL_SLEEP;
+ 			fallthrough;
+ 		case NFS4_WRITE_LT:
+@@ -7536,7 +7540,7 @@ nfsd4_lock(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
+ 	 * for file locks), so don't attempt blocking lock notifications
+ 	 * on those filesystems:
+ 	 */
+-	if (nf->nf_file->f_op->lock)
++	if (!exportfs_lock_op_is_async(sb->s_export_op))
+ 		fl_flags &= ~FL_SLEEP;
+ 
+ 	nbl = find_or_allocate_block(lock_sop, &fp->fi_fhandle, nn);
+diff --git a/include/linux/exportfs.h b/include/linux/exportfs.h
+index 218fc5c54e901..6525f4b7eb97f 100644
+--- a/include/linux/exportfs.h
++++ b/include/linux/exportfs.h
+@@ -222,9 +222,23 @@ struct export_operations {
+ 						  atomic attribute updates
+ 						*/
+ #define EXPORT_OP_FLUSH_ON_CLOSE	(0x20) /* fs flushes file data on close */
++#define EXPORT_OP_ASYNC_LOCK		(0x40) /* fs can do async lock request */
+ 	unsigned long	flags;
+ };
+ 
++/**
++ * exportfs_lock_op_is_async() - export op supports async lock operation
++ * @export_ops:	the nfs export operations to check
++ *
++ * Returns true if the nfs export_operations structure has
++ * EXPORT_OP_ASYNC_LOCK in their flags set
++ */
++static inline bool
++exportfs_lock_op_is_async(const struct export_operations *export_ops)
++{
++	return export_ops->flags & EXPORT_OP_ASYNC_LOCK;
++}
++
+ extern int exportfs_encode_inode_fh(struct inode *inode, struct fid *fid,
+ 				    int *max_len, struct inode *parent);
+ extern int exportfs_encode_fh(struct dentry *dentry, struct fid *fid,
+-- 
+2.43.0
+

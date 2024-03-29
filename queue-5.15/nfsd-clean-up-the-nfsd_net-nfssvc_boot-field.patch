@@ -1,0 +1,172 @@
+From 2490ca224f9232bc7cf1292affe006e2dc1aec9c Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 29 Dec 2021 14:43:16 -0500
+Subject: NFSD: Clean up the nfsd_net::nfssvc_boot field
+
+From: Chuck Lever <chuck.lever@oracle.com>
+
+[ Upstream commit 91d2e9b56cf5c80f9efc530d494968369a8a0e0d ]
+
+There are two boot-time fields in struct nfsd_net: one called
+boot_time and one called nfssvc_boot. The latter is used only to
+form write verifiers, but its documenting comment declares:
+
+        /* Time of server startup */
+
+Since commit 27c438f53e79 ("nfsd: Support the server resetting the
+boot verifier"), this field can be reset at any time; it's no
+longer tied to server restart. So that comment is stale.
+
+Also, according to pahole, struct timespec64 is 16 bytes long on
+x86_64. The nfssvc_boot field is used only to form a write verifier,
+which is 8 bytes long.
+
+Let's clarify this situation by manufacturing an 8-byte verifier
+in nfs_reset_boot_verifier() and storing only that in struct
+nfsd_net.
+
+We're grabbing 128 bits of time, so compress all of those into a
+64-bit verifier instead of throwing out the high-order bits.
+In the future, the siphash_key can be re-used for other hashed
+objects per-nfsd_net.
+
+Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+---
+ fs/nfsd/netns.h  |  8 +++++---
+ fs/nfsd/nfsctl.c |  3 ++-
+ fs/nfsd/nfssvc.c | 51 ++++++++++++++++++++++++++++++++++++------------
+ 3 files changed, 45 insertions(+), 17 deletions(-)
+
+diff --git a/fs/nfsd/netns.h b/fs/nfsd/netns.h
+index 9e8b77d2a3a47..a6ed300259849 100644
+--- a/fs/nfsd/netns.h
++++ b/fs/nfsd/netns.h
+@@ -11,6 +11,7 @@
+ #include <net/net_namespace.h>
+ #include <net/netns/generic.h>
+ #include <linux/percpu_counter.h>
++#include <linux/siphash.h>
+ 
+ /* Hash tables for nfs4_clientid state */
+ #define CLIENT_HASH_BITS                 4
+@@ -108,9 +109,8 @@ struct nfsd_net {
+ 	bool nfsd_net_up;
+ 	bool lockd_up;
+ 
+-	/* Time of server startup */
+-	struct timespec64 nfssvc_boot;
+-	seqlock_t boot_lock;
++	seqlock_t writeverf_lock;
++	unsigned char writeverf[8];
+ 
+ 	/*
+ 	 * Max number of connections this nfsd container will allow. Defaults
+@@ -187,6 +187,8 @@ struct nfsd_net {
+ 	char			nfsd_name[UNX_MAXNODENAME+1];
+ 
+ 	struct nfsd_fcache_disposal *fcache_disposal;
++
++	siphash_key_t		siphash_key;
+ };
+ 
+ /* Simple check to find out if a given net was properly initialized */
+diff --git a/fs/nfsd/nfsctl.c b/fs/nfsd/nfsctl.c
+index 504b169d27881..68b020f2002b7 100644
+--- a/fs/nfsd/nfsctl.c
++++ b/fs/nfsd/nfsctl.c
+@@ -1484,7 +1484,8 @@ static __net_init int nfsd_init_net(struct net *net)
+ 	nn->clientid_counter = nn->clientid_base + 1;
+ 	nn->s2s_cp_cl_id = nn->clientid_counter++;
+ 
+-	seqlock_init(&nn->boot_lock);
++	get_random_bytes(&nn->siphash_key, sizeof(nn->siphash_key));
++	seqlock_init(&nn->writeverf_lock);
+ 
+ 	return 0;
+ 
+diff --git a/fs/nfsd/nfssvc.c b/fs/nfsd/nfssvc.c
+index 4d1d8aa6d7f9d..5a60664695352 100644
+--- a/fs/nfsd/nfssvc.c
++++ b/fs/nfsd/nfssvc.c
+@@ -12,6 +12,7 @@
+ #include <linux/module.h>
+ #include <linux/fs_struct.h>
+ #include <linux/swap.h>
++#include <linux/siphash.h>
+ 
+ #include <linux/sunrpc/stats.h>
+ #include <linux/sunrpc/svcsock.h>
+@@ -344,33 +345,57 @@ static bool nfsd_needs_lockd(struct nfsd_net *nn)
+ 	return nfsd_vers(nn, 2, NFSD_TEST) || nfsd_vers(nn, 3, NFSD_TEST);
+ }
+ 
++/**
++ * nfsd_copy_boot_verifier - Atomically copy a write verifier
++ * @verf: buffer in which to receive the verifier cookie
++ * @nn: NFS net namespace
++ *
++ * This function provides a wait-free mechanism for copying the
++ * namespace's boot verifier without tearing it.
++ */
+ void nfsd_copy_boot_verifier(__be32 verf[2], struct nfsd_net *nn)
+ {
+ 	int seq = 0;
+ 
+ 	do {
+-		read_seqbegin_or_lock(&nn->boot_lock, &seq);
+-		/*
+-		 * This is opaque to client, so no need to byte-swap. Use
+-		 * __force to keep sparse happy. y2038 time_t overflow is
+-		 * irrelevant in this usage
+-		 */
+-		verf[0] = (__force __be32)nn->nfssvc_boot.tv_sec;
+-		verf[1] = (__force __be32)nn->nfssvc_boot.tv_nsec;
+-	} while (need_seqretry(&nn->boot_lock, seq));
+-	done_seqretry(&nn->boot_lock, seq);
++		read_seqbegin_or_lock(&nn->writeverf_lock, &seq);
++		memcpy(verf, nn->writeverf, sizeof(*verf));
++	} while (need_seqretry(&nn->writeverf_lock, seq));
++	done_seqretry(&nn->writeverf_lock, seq);
+ }
+ 
+ static void nfsd_reset_boot_verifier_locked(struct nfsd_net *nn)
+ {
+-	ktime_get_raw_ts64(&nn->nfssvc_boot);
++	struct timespec64 now;
++	u64 verf;
++
++	/*
++	 * Because the time value is hashed, y2038 time_t overflow
++	 * is irrelevant in this usage.
++	 */
++	ktime_get_raw_ts64(&now);
++	verf = siphash_2u64(now.tv_sec, now.tv_nsec, &nn->siphash_key);
++	memcpy(nn->writeverf, &verf, sizeof(nn->writeverf));
+ }
+ 
++/**
++ * nfsd_reset_boot_verifier - Generate a new boot verifier
++ * @nn: NFS net namespace
++ *
++ * This function updates the ->writeverf field of @nn. This field
++ * contains an opaque cookie that, according to Section 18.32.3 of
++ * RFC 8881, "the client can use to determine whether a server has
++ * changed instance state (e.g., server restart) between a call to
++ * WRITE and a subsequent call to either WRITE or COMMIT.  This
++ * cookie MUST be unchanged during a single instance of the NFSv4.1
++ * server and MUST be unique between instances of the NFSv4.1
++ * server."
++ */
+ void nfsd_reset_boot_verifier(struct nfsd_net *nn)
+ {
+-	write_seqlock(&nn->boot_lock);
++	write_seqlock(&nn->writeverf_lock);
+ 	nfsd_reset_boot_verifier_locked(nn);
+-	write_sequnlock(&nn->boot_lock);
++	write_sequnlock(&nn->writeverf_lock);
+ }
+ 
+ static int nfsd_startup_net(struct net *net, const struct cred *cred)
+-- 
+2.43.0
+
