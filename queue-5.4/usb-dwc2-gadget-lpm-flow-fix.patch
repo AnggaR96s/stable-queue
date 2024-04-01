@@ -1,0 +1,150 @@
+From 5d69a3b54e5a630c90d82a4c2bdce3d53dc78710 Mon Sep 17 00:00:00 2001
+From: Minas Harutyunyan <Minas.Harutyunyan@synopsys.com>
+Date: Wed, 13 Mar 2024 09:22:13 +0000
+Subject: usb: dwc2: gadget: LPM flow fix
+
+From: Minas Harutyunyan <Minas.Harutyunyan@synopsys.com>
+
+commit 5d69a3b54e5a630c90d82a4c2bdce3d53dc78710 upstream.
+
+Added functionality to exit from L1 state by device initiation
+using remote wakeup signaling, in case when function driver queuing
+request while core in L1 state.
+
+Fixes: 273d576c4d41 ("usb: dwc2: gadget: Add functionality to exit from LPM L1 state")
+Fixes: 88b02f2cb1e1 ("usb: dwc2: Add core state checking")
+CC: stable@vger.kernel.org
+Signed-off-by: Minas Harutyunyan <Minas.Harutyunyan@synopsys.com>
+Link: https://lore.kernel.org/r/b4d9de5382375dddbf7ef6049d9a82066ad87d5d.1710166393.git.Minas.Harutyunyan@synopsys.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/dwc2/core.h      |    1 
+ drivers/usb/dwc2/core_intr.c |   65 ++++++++++++++++++++++++++++---------------
+ drivers/usb/dwc2/gadget.c    |    4 ++
+ 3 files changed, 48 insertions(+), 22 deletions(-)
+
+--- a/drivers/usb/dwc2/core.h
++++ b/drivers/usb/dwc2/core.h
+@@ -1334,6 +1334,7 @@ int dwc2_backup_global_registers(struct
+ int dwc2_restore_global_registers(struct dwc2_hsotg *hsotg);
+ 
+ void dwc2_enable_acg(struct dwc2_hsotg *hsotg);
++void dwc2_wakeup_from_lpm_l1(struct dwc2_hsotg *hsotg, bool remotewakeup);
+ 
+ /* This function should be called on every hardware interrupt. */
+ irqreturn_t dwc2_handle_common_intr(int irq, void *dev);
+--- a/drivers/usb/dwc2/core_intr.c
++++ b/drivers/usb/dwc2/core_intr.c
+@@ -349,10 +349,11 @@ static void dwc2_handle_session_req_intr
+  * @hsotg: Programming view of DWC_otg controller
+  *
+  */
+-static void dwc2_wakeup_from_lpm_l1(struct dwc2_hsotg *hsotg)
++void dwc2_wakeup_from_lpm_l1(struct dwc2_hsotg *hsotg, bool remotewakeup)
+ {
+ 	u32 glpmcfg;
+-	u32 i = 0;
++	u32 pcgctl;
++	u32 dctl;
+ 
+ 	if (hsotg->lx_state != DWC2_L1) {
+ 		dev_err(hsotg->dev, "Core isn't in DWC2_L1 state\n");
+@@ -361,37 +362,57 @@ static void dwc2_wakeup_from_lpm_l1(stru
+ 
+ 	glpmcfg = dwc2_readl(hsotg, GLPMCFG);
+ 	if (dwc2_is_device_mode(hsotg)) {
+-		dev_dbg(hsotg->dev, "Exit from L1 state\n");
++		dev_dbg(hsotg->dev, "Exit from L1 state, remotewakeup=%d\n", remotewakeup);
+ 		glpmcfg &= ~GLPMCFG_ENBLSLPM;
+-		glpmcfg &= ~GLPMCFG_HIRD_THRES_EN;
++		glpmcfg &= ~GLPMCFG_HIRD_THRES_MASK;
+ 		dwc2_writel(hsotg, glpmcfg, GLPMCFG);
+ 
+-		do {
+-			glpmcfg = dwc2_readl(hsotg, GLPMCFG);
+-
+-			if (!(glpmcfg & (GLPMCFG_COREL1RES_MASK |
+-					 GLPMCFG_L1RESUMEOK | GLPMCFG_SLPSTS)))
+-				break;
++		pcgctl = dwc2_readl(hsotg, PCGCTL);
++		pcgctl &= ~PCGCTL_ENBL_SLEEP_GATING;
++		dwc2_writel(hsotg, pcgctl, PCGCTL);
++
++		glpmcfg = dwc2_readl(hsotg, GLPMCFG);
++		if (glpmcfg & GLPMCFG_ENBESL) {
++			glpmcfg |= GLPMCFG_RSTRSLPSTS;
++			dwc2_writel(hsotg, glpmcfg, GLPMCFG);
++		}
+ 
+-			udelay(1);
+-		} while (++i < 200);
++		if (remotewakeup) {
++			if (dwc2_hsotg_wait_bit_set(hsotg, GLPMCFG, GLPMCFG_L1RESUMEOK, 1000)) {
++				dev_warn(hsotg->dev, "%s: timeout GLPMCFG_L1RESUMEOK\n", __func__);
++				goto fail;
++				return;
++			}
++
++			dctl = dwc2_readl(hsotg, DCTL);
++			dctl |= DCTL_RMTWKUPSIG;
++			dwc2_writel(hsotg, dctl, DCTL);
++
++			if (dwc2_hsotg_wait_bit_set(hsotg, GINTSTS, GINTSTS_WKUPINT, 1000)) {
++				dev_warn(hsotg->dev, "%s: timeout GINTSTS_WKUPINT\n", __func__);
++				goto fail;
++				return;
++			}
++		}
+ 
+-		if (i == 200) {
+-			dev_err(hsotg->dev, "Failed to exit L1 sleep state in 200us.\n");
++		glpmcfg = dwc2_readl(hsotg, GLPMCFG);
++		if (glpmcfg & GLPMCFG_COREL1RES_MASK || glpmcfg & GLPMCFG_SLPSTS ||
++		    glpmcfg & GLPMCFG_L1RESUMEOK) {
++			goto fail;
+ 			return;
+ 		}
+-		dwc2_gadget_init_lpm(hsotg);
++
++		/* Inform gadget to exit from L1 */
++		call_gadget(hsotg, resume);
++		/* Change to L0 state */
++		hsotg->lx_state = DWC2_L0;
++		hsotg->bus_suspended = false;
++fail:		dwc2_gadget_init_lpm(hsotg);
+ 	} else {
+ 		/* TODO */
+ 		dev_err(hsotg->dev, "Host side LPM is not supported.\n");
+ 		return;
+ 	}
+-
+-	/* Change to L0 state */
+-	hsotg->lx_state = DWC2_L0;
+-
+-	/* Inform gadget to exit from L1 */
+-	call_gadget(hsotg, resume);
+ }
+ 
+ /*
+@@ -412,7 +433,7 @@ static void dwc2_handle_wakeup_detected_
+ 	dev_dbg(hsotg->dev, "%s lxstate = %d\n", __func__, hsotg->lx_state);
+ 
+ 	if (hsotg->lx_state == DWC2_L1) {
+-		dwc2_wakeup_from_lpm_l1(hsotg);
++		dwc2_wakeup_from_lpm_l1(hsotg, false);
+ 		return;
+ 	}
+ 
+--- a/drivers/usb/dwc2/gadget.c
++++ b/drivers/usb/dwc2/gadget.c
+@@ -1416,6 +1416,10 @@ static int dwc2_hsotg_ep_queue(struct us
+ 		ep->name, req, req->length, req->buf, req->no_interrupt,
+ 		req->zero, req->short_not_ok);
+ 
++	if (hs->lx_state == DWC2_L1) {
++		dwc2_wakeup_from_lpm_l1(hs, true);
++	}
++
+ 	/* Prevent new request submission when controller is suspended */
+ 	if (hs->lx_state != DWC2_L0) {
+ 		dev_dbg(hs->dev, "%s: submit request only in active state\n",
