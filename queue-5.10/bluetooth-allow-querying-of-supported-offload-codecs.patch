@@ -1,0 +1,212 @@
+From 8bf980068612e7431ce14077b115729a05ebd523 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 7 Sep 2021 15:42:40 +0530
+Subject: Bluetooth: Allow querying of supported offload codecs over SCO socket
+
+From: Kiran K <kiran.k@intel.com>
+
+[ Upstream commit 248733e87d503e75624a2e95e241f51334fdd320 ]
+
+Add BT_CODEC option for getsockopt systemcall to get the details
+of offload codecs supported over SCO socket
+
+Signed-off-by: Kiran K <kiran.k@intel.com>
+Reviewed-by: Chethan T N <chethan.tumkur.narayan@intel.com>
+Reviewed-by: Srivatsa Ravishankar <ravishankar.srivatsa@intel.com>
+Signed-off-by: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+Stable-dep-of: 51eda36d33e4 ("Bluetooth: SCO: Fix not validating setsockopt user input")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/net/bluetooth/bluetooth.h |  20 ++++++
+ include/net/bluetooth/hci.h       |   4 ++
+ include/net/bluetooth/hci_core.h  |   1 +
+ net/bluetooth/sco.c               | 101 ++++++++++++++++++++++++++++++
+ 4 files changed, 126 insertions(+)
+
+diff --git a/include/net/bluetooth/bluetooth.h b/include/net/bluetooth/bluetooth.h
+index 355835639ae58..8700635f08a69 100644
+--- a/include/net/bluetooth/bluetooth.h
++++ b/include/net/bluetooth/bluetooth.h
+@@ -153,6 +153,26 @@ struct bt_voice {
+ 
+ #define BT_SCM_PKT_STATUS	0x03
+ 
++#define BT_CODEC	19
++
++struct	bt_codec_caps {
++	__u8	len;
++	__u8	data[];
++} __packed;
++
++struct bt_codec {
++	__u8	id;
++	__u16	cid;
++	__u16	vid;
++	__u8	data_path;
++	__u8	num_caps;
++} __packed;
++
++struct bt_codecs {
++	__u8		num_codecs;
++	struct bt_codec	codecs[];
++} __packed;
++
+ __printf(1, 2)
+ void bt_info(const char *fmt, ...);
+ __printf(1, 2)
+diff --git a/include/net/bluetooth/hci.h b/include/net/bluetooth/hci.h
+index 17ed339b54c73..fcb2852df3268 100644
+--- a/include/net/bluetooth/hci.h
++++ b/include/net/bluetooth/hci.h
+@@ -330,6 +330,7 @@ enum {
+ 	HCI_CMD_PENDING,
+ 	HCI_FORCE_NO_MITM,
+ 	HCI_QUALITY_REPORT,
++	HCI_OFFLOAD_CODECS_ENABLED,
+ 
+ 	__HCI_NUM_FLAGS,
+ };
+@@ -2584,6 +2585,9 @@ static inline struct hci_sco_hdr *hci_sco_hdr(const struct sk_buff *skb)
+ #define hci_iso_data_len(h)		((h) & 0x3fff)
+ #define hci_iso_data_flags(h)		((h) >> 14)
+ 
++/* codec transport types */
++#define HCI_TRANSPORT_SCO_ESCO	0x01
++
+ /* le24 support */
+ static inline void hci_cpu_to_le24(__u32 val, __u8 dst[3])
+ {
+diff --git a/include/net/bluetooth/hci_core.h b/include/net/bluetooth/hci_core.h
+index 12d78527b0935..cb4d42a7a9f1f 100644
+--- a/include/net/bluetooth/hci_core.h
++++ b/include/net/bluetooth/hci_core.h
+@@ -599,6 +599,7 @@ struct hci_dev {
+ 	void (*cmd_timeout)(struct hci_dev *hdev);
+ 	bool (*prevent_wake)(struct hci_dev *hdev);
+ 	int (*set_quality_report)(struct hci_dev *hdev, bool enable);
++	int (*get_data_path_id)(struct hci_dev *hdev, __u8 *data_path);
+ };
+ 
+ #define HCI_PHY_HANDLE(handle)	(handle & 0xff)
+diff --git a/net/bluetooth/sco.c b/net/bluetooth/sco.c
+index 8244d3ae185bf..5e518a6d5e13d 100644
+--- a/net/bluetooth/sco.c
++++ b/net/bluetooth/sco.c
+@@ -967,6 +967,12 @@ static int sco_sock_getsockopt(struct socket *sock, int level, int optname,
+ 	struct bt_voice voice;
+ 	u32 phys;
+ 	int pkt_status;
++	int buf_len;
++	struct codec_list *c;
++	u8 num_codecs, i, __user *ptr;
++	struct hci_dev *hdev;
++	struct hci_codec_caps *caps;
++	struct bt_codec codec;
+ 
+ 	BT_DBG("sk %p", sk);
+ 
+@@ -1031,6 +1037,101 @@ static int sco_sock_getsockopt(struct socket *sock, int level, int optname,
+ 			err = -EFAULT;
+ 		break;
+ 
++	case BT_CODEC:
++		num_codecs = 0;
++		buf_len = 0;
++
++		hdev = hci_get_route(&sco_pi(sk)->dst, &sco_pi(sk)->src, BDADDR_BREDR);
++		if (!hdev) {
++			err = -EBADFD;
++			break;
++		}
++
++		if (!hci_dev_test_flag(hdev, HCI_OFFLOAD_CODECS_ENABLED)) {
++			hci_dev_put(hdev);
++			err = -EOPNOTSUPP;
++			break;
++		}
++
++		if (!hdev->get_data_path_id) {
++			hci_dev_put(hdev);
++			err = -EOPNOTSUPP;
++			break;
++		}
++
++		/* find total buffer size required to copy codec + caps */
++		hci_dev_lock(hdev);
++		list_for_each_entry(c, &hdev->local_codecs, list) {
++			if (c->transport != HCI_TRANSPORT_SCO_ESCO)
++				continue;
++			num_codecs++;
++			for (i = 0, caps = c->caps; i < c->num_caps; i++) {
++				buf_len += 1 + caps->len;
++				caps = (void *)&caps->data[caps->len];
++			}
++			buf_len += sizeof(struct bt_codec);
++		}
++		hci_dev_unlock(hdev);
++
++		buf_len += sizeof(struct bt_codecs);
++		if (buf_len > len) {
++			hci_dev_put(hdev);
++			err = -ENOBUFS;
++			break;
++		}
++		ptr = optval;
++
++		if (put_user(num_codecs, ptr)) {
++			hci_dev_put(hdev);
++			err = -EFAULT;
++			break;
++		}
++		ptr += sizeof(num_codecs);
++
++		/* Iterate all the codecs supported over SCO and populate
++		 * codec data
++		 */
++		hci_dev_lock(hdev);
++		list_for_each_entry(c, &hdev->local_codecs, list) {
++			if (c->transport != HCI_TRANSPORT_SCO_ESCO)
++				continue;
++
++			codec.id = c->id;
++			codec.cid = c->cid;
++			codec.vid = c->vid;
++			err = hdev->get_data_path_id(hdev, &codec.data_path);
++			if (err < 0)
++				break;
++			codec.num_caps = c->num_caps;
++			if (copy_to_user(ptr, &codec, sizeof(codec))) {
++				err = -EFAULT;
++				break;
++			}
++			ptr += sizeof(codec);
++
++			/* find codec capabilities data length */
++			len = 0;
++			for (i = 0, caps = c->caps; i < c->num_caps; i++) {
++				len += 1 + caps->len;
++				caps = (void *)&caps->data[caps->len];
++			}
++
++			/* copy codec capabilities data */
++			if (len && copy_to_user(ptr, c->caps, len)) {
++				err = -EFAULT;
++				break;
++			}
++			ptr += len;
++		}
++
++		if (!err && put_user(buf_len, optlen))
++			err = -EFAULT;
++
++		hci_dev_unlock(hdev);
++		hci_dev_put(hdev);
++
++		break;
++
+ 	default:
+ 		err = -ENOPROTOOPT;
+ 		break;
+-- 
+2.43.0
+
