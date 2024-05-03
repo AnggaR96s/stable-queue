@@ -1,0 +1,230 @@
+From 27fea31c3205b3bc115a72aa40646c6866296d50 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 15 Feb 2024 14:05:21 -0800
+Subject: NFSD: add support for CB_GETATTR callback
+
+From: Dai Ngo <dai.ngo@oracle.com>
+
+[ Upstream commit 6487a13b5c6bee2ca3fc931f8ad28c8ae887a41f ]
+
+Includes:
+   . CB_GETATTR proc for nfs4_cb_procedures[]
+   . XDR encoding and decoding function for CB_GETATTR request/reply
+   . add nfs4_cb_fattr to nfs4_delegation for sending CB_GETATTR
+     and store file attributes from client's reply.
+
+Signed-off-by: Dai Ngo <dai.ngo@oracle.com>
+Reviewed-by: Jeff Layton <jlayton@kernel.org>
+Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+Stable-dep-of: 18180a4550d0 ("NFSD: Fix nfsd4_encode_fattr4() crasher")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/nfsd/nfs4callback.c | 97 +++++++++++++++++++++++++++++++++++++++++-
+ fs/nfsd/state.h        | 14 ++++++
+ fs/nfsd/xdr4cb.h       | 18 ++++++++
+ 3 files changed, 128 insertions(+), 1 deletion(-)
+
+diff --git a/fs/nfsd/nfs4callback.c b/fs/nfsd/nfs4callback.c
+index 926c29879c6ab..30aa241038eb4 100644
+--- a/fs/nfsd/nfs4callback.c
++++ b/fs/nfsd/nfs4callback.c
+@@ -85,7 +85,21 @@ static void encode_uint32(struct xdr_stream *xdr, u32 n)
+ static void encode_bitmap4(struct xdr_stream *xdr, const __u32 *bitmap,
+ 			   size_t len)
+ {
+-	WARN_ON_ONCE(xdr_stream_encode_uint32_array(xdr, bitmap, len) < 0);
++	xdr_stream_encode_uint32_array(xdr, bitmap, len);
++}
++
++static int decode_cb_fattr4(struct xdr_stream *xdr, uint32_t *bitmap,
++				struct nfs4_cb_fattr *fattr)
++{
++	fattr->ncf_cb_change = 0;
++	fattr->ncf_cb_fsize = 0;
++	if (bitmap[0] & FATTR4_WORD0_CHANGE)
++		if (xdr_stream_decode_u64(xdr, &fattr->ncf_cb_change) < 0)
++			return -NFSERR_BAD_XDR;
++	if (bitmap[0] & FATTR4_WORD0_SIZE)
++		if (xdr_stream_decode_u64(xdr, &fattr->ncf_cb_fsize) < 0)
++			return -NFSERR_BAD_XDR;
++	return 0;
+ }
+ 
+ static void encode_nfs_cb_opnum4(struct xdr_stream *xdr, enum nfs_cb_opnum4 op)
+@@ -333,6 +347,30 @@ encode_cb_recallany4args(struct xdr_stream *xdr,
+ 	hdr->nops++;
+ }
+ 
++/*
++ * CB_GETATTR4args
++ *	struct CB_GETATTR4args {
++ *	   nfs_fh4 fh;
++ *	   bitmap4 attr_request;
++ *	};
++ *
++ * The size and change attributes are the only one
++ * guaranteed to be serviced by the client.
++ */
++static void
++encode_cb_getattr4args(struct xdr_stream *xdr, struct nfs4_cb_compound_hdr *hdr,
++			struct nfs4_cb_fattr *fattr)
++{
++	struct nfs4_delegation *dp =
++		container_of(fattr, struct nfs4_delegation, dl_cb_fattr);
++	struct knfsd_fh *fh = &dp->dl_stid.sc_file->fi_fhandle;
++
++	encode_nfs_cb_opnum4(xdr, OP_CB_GETATTR);
++	encode_nfs_fh4(xdr, fh);
++	encode_bitmap4(xdr, fattr->ncf_cb_bmap, ARRAY_SIZE(fattr->ncf_cb_bmap));
++	hdr->nops++;
++}
++
+ /*
+  * CB_SEQUENCE4args
+  *
+@@ -468,6 +506,26 @@ static void nfs4_xdr_enc_cb_null(struct rpc_rqst *req, struct xdr_stream *xdr,
+ 	xdr_reserve_space(xdr, 0);
+ }
+ 
++/*
++ * 20.1.  Operation 3: CB_GETATTR - Get Attributes
++ */
++static void nfs4_xdr_enc_cb_getattr(struct rpc_rqst *req,
++		struct xdr_stream *xdr, const void *data)
++{
++	const struct nfsd4_callback *cb = data;
++	struct nfs4_cb_fattr *ncf =
++		container_of(cb, struct nfs4_cb_fattr, ncf_getattr);
++	struct nfs4_cb_compound_hdr hdr = {
++		.ident = cb->cb_clp->cl_cb_ident,
++		.minorversion = cb->cb_clp->cl_minorversion,
++	};
++
++	encode_cb_compound4args(xdr, &hdr);
++	encode_cb_sequence4args(xdr, cb, &hdr);
++	encode_cb_getattr4args(xdr, &hdr, ncf);
++	encode_cb_nops(&hdr);
++}
++
+ /*
+  * 20.2. Operation 4: CB_RECALL - Recall a Delegation
+  */
+@@ -523,6 +581,42 @@ static int nfs4_xdr_dec_cb_null(struct rpc_rqst *req, struct xdr_stream *xdr,
+ 	return 0;
+ }
+ 
++/*
++ * 20.1.  Operation 3: CB_GETATTR - Get Attributes
++ */
++static int nfs4_xdr_dec_cb_getattr(struct rpc_rqst *rqstp,
++				  struct xdr_stream *xdr,
++				  void *data)
++{
++	struct nfsd4_callback *cb = data;
++	struct nfs4_cb_compound_hdr hdr;
++	int status;
++	u32 bitmap[3] = {0};
++	u32 attrlen;
++	struct nfs4_cb_fattr *ncf =
++		container_of(cb, struct nfs4_cb_fattr, ncf_getattr);
++
++	status = decode_cb_compound4res(xdr, &hdr);
++	if (unlikely(status))
++		return status;
++
++	status = decode_cb_sequence4res(xdr, cb);
++	if (unlikely(status || cb->cb_seq_status))
++		return status;
++
++	status = decode_cb_op_status(xdr, OP_CB_GETATTR, &cb->cb_status);
++	if (status)
++		return status;
++	if (xdr_stream_decode_uint32_array(xdr, bitmap, 3) < 0)
++		return -NFSERR_BAD_XDR;
++	if (xdr_stream_decode_u32(xdr, &attrlen) < 0)
++		return -NFSERR_BAD_XDR;
++	if (attrlen > (sizeof(ncf->ncf_cb_change) + sizeof(ncf->ncf_cb_fsize)))
++		return -NFSERR_BAD_XDR;
++	status = decode_cb_fattr4(xdr, bitmap, ncf);
++	return status;
++}
++
+ /*
+  * 20.2. Operation 4: CB_RECALL - Recall a Delegation
+  */
+@@ -831,6 +925,7 @@ static const struct rpc_procinfo nfs4_cb_procedures[] = {
+ 	PROC(CB_NOTIFY_LOCK,	COMPOUND,	cb_notify_lock,	cb_notify_lock),
+ 	PROC(CB_OFFLOAD,	COMPOUND,	cb_offload,	cb_offload),
+ 	PROC(CB_RECALL_ANY,	COMPOUND,	cb_recall_any,	cb_recall_any),
++	PROC(CB_GETATTR,	COMPOUND,	cb_getattr,	cb_getattr),
+ };
+ 
+ static unsigned int nfs4_cb_counts[ARRAY_SIZE(nfs4_cb_procedures)];
+diff --git a/fs/nfsd/state.h b/fs/nfsd/state.h
+index 41bdc913fa715..0bbbe57e027d3 100644
+--- a/fs/nfsd/state.h
++++ b/fs/nfsd/state.h
+@@ -117,6 +117,16 @@ struct nfs4_cpntf_state {
+ 	time64_t		cpntf_time;	/* last time stateid used */
+ };
+ 
++struct nfs4_cb_fattr {
++	struct nfsd4_callback ncf_getattr;
++	u32 ncf_cb_status;
++	u32 ncf_cb_bmap[1];
++
++	/* from CB_GETATTR reply */
++	u64 ncf_cb_change;
++	u64 ncf_cb_fsize;
++};
++
+ /*
+  * Represents a delegation stateid. The nfs4_client holds references to these
+  * and they are put when it is being destroyed or when the delegation is
+@@ -150,6 +160,9 @@ struct nfs4_delegation {
+ 	int			dl_retries;
+ 	struct nfsd4_callback	dl_recall;
+ 	bool			dl_recalled;
++
++	/* for CB_GETATTR */
++	struct nfs4_cb_fattr    dl_cb_fattr;
+ };
+ 
+ #define cb_to_delegation(cb) \
+@@ -640,6 +653,7 @@ enum nfsd4_cb_op {
+ 	NFSPROC4_CLNT_CB_SEQUENCE,
+ 	NFSPROC4_CLNT_CB_NOTIFY_LOCK,
+ 	NFSPROC4_CLNT_CB_RECALL_ANY,
++	NFSPROC4_CLNT_CB_GETATTR,
+ };
+ 
+ /* Returns true iff a is later than b: */
+diff --git a/fs/nfsd/xdr4cb.h b/fs/nfsd/xdr4cb.h
+index 0d39af1b00a0f..e8b00309c449f 100644
+--- a/fs/nfsd/xdr4cb.h
++++ b/fs/nfsd/xdr4cb.h
+@@ -54,3 +54,21 @@
+ #define NFS4_dec_cb_recall_any_sz	(cb_compound_dec_hdr_sz  +      \
+ 					cb_sequence_dec_sz +            \
+ 					op_dec_sz)
++
++/*
++ * 1: CB_GETATTR opcode (32-bit)
++ * N: file_handle
++ * 1: number of entry in attribute array (32-bit)
++ * 1: entry 0 in attribute array (32-bit)
++ */
++#define NFS4_enc_cb_getattr_sz		(cb_compound_enc_hdr_sz +       \
++					cb_sequence_enc_sz +            \
++					1 + enc_nfs4_fh_sz + 1 + 1)
++/*
++ * 4: fattr_bitmap_maxsz
++ * 1: attribute array len
++ * 2: change attr (64-bit)
++ * 2: size (64-bit)
++ */
++#define NFS4_dec_cb_getattr_sz		(cb_compound_dec_hdr_sz  +      \
++			cb_sequence_dec_sz + 4 + 1 + 2 + 2 + op_dec_sz)
+-- 
+2.43.0
+
