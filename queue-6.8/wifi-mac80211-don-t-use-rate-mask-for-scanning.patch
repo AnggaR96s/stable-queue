@@ -1,0 +1,119 @@
+From c23785873ec1e01e03bb8b8e45ea8c7babd01dd8 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 26 Mar 2024 22:08:54 +0100
+Subject: wifi: mac80211: don't use rate mask for scanning
+
+From: Johannes Berg <johannes.berg@intel.com>
+
+[ Upstream commit ab9177d83c040eba58387914077ebca56f14fae6 ]
+
+The rate mask is intended for use during operation, and
+can be set to only have masks for the currently active
+band. As such, it cannot be used for scanning which can
+be on other bands as well.
+
+Simply ignore the rate masks during scanning to avoid
+warnings from incorrect settings.
+
+Reported-by: syzbot+fdc5123366fb9c3fdc6d@syzkaller.appspotmail.com
+Closes: https://syzkaller.appspot.com/bug?extid=fdc5123366fb9c3fdc6d
+Co-developed-by: Dmitry Antipov <dmantipov@yandex.ru>
+Signed-off-by: Dmitry Antipov <dmantipov@yandex.ru>
+Tested-by: Dmitry Antipov <dmantipov@yandex.ru>
+Link: https://msgid.link/20240326220854.9594cbb418ca.I7f86c0ba1f98cf7e27c2bacf6c2d417200ecea5c@changeid
+Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/net/mac80211.h |  3 +++
+ net/mac80211/rate.c    |  6 +++++-
+ net/mac80211/scan.c    |  1 +
+ net/mac80211/tx.c      | 13 +++++++++----
+ 4 files changed, 18 insertions(+), 5 deletions(-)
+
+diff --git a/include/net/mac80211.h b/include/net/mac80211.h
+index d400fe2e8668d..df9b578e58bb2 100644
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -932,6 +932,8 @@ enum mac80211_tx_info_flags {
+  *	of their QoS TID or other priority field values.
+  * @IEEE80211_TX_CTRL_MCAST_MLO_FIRST_TX: first MLO TX, used mostly internally
+  *	for sequence number assignment
++ * @IEEE80211_TX_CTRL_SCAN_TX: Indicates that this frame is transmitted
++ *	due to scanning, not in normal operation on the interface.
+  * @IEEE80211_TX_CTRL_MLO_LINK: If not @IEEE80211_LINK_UNSPECIFIED, this
+  *	frame should be transmitted on the specific link. This really is
+  *	only relevant for frames that do not have data present, and is
+@@ -952,6 +954,7 @@ enum mac80211_tx_control_flags {
+ 	IEEE80211_TX_CTRL_NO_SEQNO		= BIT(7),
+ 	IEEE80211_TX_CTRL_DONT_REORDER		= BIT(8),
+ 	IEEE80211_TX_CTRL_MCAST_MLO_FIRST_TX	= BIT(9),
++	IEEE80211_TX_CTRL_SCAN_TX		= BIT(10),
+ 	IEEE80211_TX_CTRL_MLO_LINK		= 0xf0000000,
+ };
+ 
+diff --git a/net/mac80211/rate.c b/net/mac80211/rate.c
+index 0efdaa8f2a92e..3cf252418bd38 100644
+--- a/net/mac80211/rate.c
++++ b/net/mac80211/rate.c
+@@ -877,6 +877,7 @@ void ieee80211_get_tx_rates(struct ieee80211_vif *vif,
+ 	struct ieee80211_sub_if_data *sdata;
+ 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+ 	struct ieee80211_supported_band *sband;
++	u32 mask = ~0;
+ 
+ 	rate_control_fill_sta_table(sta, info, dest, max_rates);
+ 
+@@ -889,9 +890,12 @@ void ieee80211_get_tx_rates(struct ieee80211_vif *vif,
+ 	if (ieee80211_is_tx_data(skb))
+ 		rate_control_apply_mask(sdata, sta, sband, dest, max_rates);
+ 
++	if (!(info->control.flags & IEEE80211_TX_CTRL_SCAN_TX))
++		mask = sdata->rc_rateidx_mask[info->band];
++
+ 	if (dest[0].idx < 0)
+ 		__rate_control_send_low(&sdata->local->hw, sband, sta, info,
+-					sdata->rc_rateidx_mask[info->band]);
++					mask);
+ 
+ 	if (sta)
+ 		rate_fixup_ratelist(vif, sband, info, dest, max_rates);
+diff --git a/net/mac80211/scan.c b/net/mac80211/scan.c
+index f9d5842601fa9..dd0ec34a3f8a8 100644
+--- a/net/mac80211/scan.c
++++ b/net/mac80211/scan.c
+@@ -638,6 +638,7 @@ static void ieee80211_send_scan_probe_req(struct ieee80211_sub_if_data *sdata,
+ 				cpu_to_le16(IEEE80211_SN_TO_SEQ(sn));
+ 		}
+ 		IEEE80211_SKB_CB(skb)->flags |= tx_flags;
++		IEEE80211_SKB_CB(skb)->control.flags |= IEEE80211_TX_CTRL_SCAN_TX;
+ 		ieee80211_tx_skb_tid_band(sdata, skb, 7, channel->band);
+ 	}
+ }
+diff --git a/net/mac80211/tx.c b/net/mac80211/tx.c
+index 6fbb15b65902c..a8a4912bf2cb4 100644
+--- a/net/mac80211/tx.c
++++ b/net/mac80211/tx.c
+@@ -701,11 +701,16 @@ ieee80211_tx_h_rate_ctrl(struct ieee80211_tx_data *tx)
+ 	txrc.bss_conf = &tx->sdata->vif.bss_conf;
+ 	txrc.skb = tx->skb;
+ 	txrc.reported_rate.idx = -1;
+-	txrc.rate_idx_mask = tx->sdata->rc_rateidx_mask[info->band];
+ 
+-	if (tx->sdata->rc_has_mcs_mask[info->band])
+-		txrc.rate_idx_mcs_mask =
+-			tx->sdata->rc_rateidx_mcs_mask[info->band];
++	if (unlikely(info->control.flags & IEEE80211_TX_CTRL_SCAN_TX)) {
++		txrc.rate_idx_mask = ~0;
++	} else {
++		txrc.rate_idx_mask = tx->sdata->rc_rateidx_mask[info->band];
++
++		if (tx->sdata->rc_has_mcs_mask[info->band])
++			txrc.rate_idx_mcs_mask =
++				tx->sdata->rc_rateidx_mcs_mask[info->band];
++	}
+ 
+ 	txrc.bss = (tx->sdata->vif.type == NL80211_IFTYPE_AP ||
+ 		    tx->sdata->vif.type == NL80211_IFTYPE_MESH_POINT ||
+-- 
+2.43.0
+

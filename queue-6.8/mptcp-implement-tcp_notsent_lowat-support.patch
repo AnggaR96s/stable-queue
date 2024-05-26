@@ -1,0 +1,202 @@
+From 2a46eda8186692bbbf798c05afd9481c5d708887 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 1 Mar 2024 18:43:46 +0100
+Subject: mptcp: implement TCP_NOTSENT_LOWAT support
+
+From: Paolo Abeni <pabeni@redhat.com>
+
+[ Upstream commit 29b5e5ef87397963ca38d3eec0d296ad1c979bbc ]
+
+Add support for such socket option storing the user-space provided
+value in a new msk field, and using such data to implement the
+_mptcp_stream_memory_free() helper, similar to the TCP one.
+
+To avoid adding more indirect calls in the fast path, open-code
+a variant of sk_stream_memory_free() in mptcp_sendmsg() and add
+direct calls to the mptcp stream memory free helper where possible.
+
+Closes: https://github.com/multipath-tcp/mptcp_net-next/issues/464
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Reviewed-by: Mat Martineau <martineau@kernel.org>
+Signed-off-by: Matthieu Baerts (NGI0) <matttbe@kernel.org>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Stable-dep-of: bd11dc4fb969 ("mptcp: fix full TCP keep-alive support")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ net/mptcp/protocol.c | 39 ++++++++++++++++++++++++++++++++++-----
+ net/mptcp/protocol.h | 28 +++++++++++++++++++++++++++-
+ net/mptcp/sockopt.c  | 12 ++++++++++++
+ 3 files changed, 73 insertions(+), 6 deletions(-)
+
+diff --git a/net/mptcp/protocol.c b/net/mptcp/protocol.c
+index fcd85adc621c1..54e29ab911f0d 100644
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -1757,6 +1757,30 @@ static int do_copy_data_nocache(struct sock *sk, int copy,
+ 	return 0;
+ }
+ 
++/* open-code sk_stream_memory_free() plus sent limit computation to
++ * avoid indirect calls in fast-path.
++ * Called under the msk socket lock, so we can avoid a bunch of ONCE
++ * annotations.
++ */
++static u32 mptcp_send_limit(const struct sock *sk)
++{
++	const struct mptcp_sock *msk = mptcp_sk(sk);
++	u32 limit, not_sent;
++
++	if (sk->sk_wmem_queued >= READ_ONCE(sk->sk_sndbuf))
++		return 0;
++
++	limit = mptcp_notsent_lowat(sk);
++	if (limit == UINT_MAX)
++		return UINT_MAX;
++
++	not_sent = msk->write_seq - msk->snd_nxt;
++	if (not_sent >= limit)
++		return 0;
++
++	return limit - not_sent;
++}
++
+ static int mptcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
+ {
+ 	struct mptcp_sock *msk = mptcp_sk(sk);
+@@ -1801,6 +1825,12 @@ static int mptcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
+ 		struct mptcp_data_frag *dfrag;
+ 		bool dfrag_collapsed;
+ 		size_t psize, offset;
++		u32 copy_limit;
++
++		/* ensure fitting the notsent_lowat() constraint */
++		copy_limit = mptcp_send_limit(sk);
++		if (!copy_limit)
++			goto wait_for_memory;
+ 
+ 		/* reuse tail pfrag, if possible, or carve a new one from the
+ 		 * page allocator
+@@ -1808,9 +1838,6 @@ static int mptcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
+ 		dfrag = mptcp_pending_tail(sk);
+ 		dfrag_collapsed = mptcp_frag_can_collapse_to(msk, pfrag, dfrag);
+ 		if (!dfrag_collapsed) {
+-			if (!sk_stream_memory_free(sk))
+-				goto wait_for_memory;
+-
+ 			if (!mptcp_page_frag_refill(sk, pfrag))
+ 				goto wait_for_memory;
+ 
+@@ -1825,6 +1852,7 @@ static int mptcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
+ 		offset = dfrag->offset + dfrag->data_len;
+ 		psize = pfrag->size - offset;
+ 		psize = min_t(size_t, psize, msg_data_left(msg));
++		psize = min_t(size_t, psize, copy_limit);
+ 		total_ts = psize + frag_truesize;
+ 
+ 		if (!sk_wmem_schedule(sk, total_ts))
+@@ -3761,6 +3789,7 @@ static struct proto mptcp_prot = {
+ 	.unhash		= mptcp_unhash,
+ 	.get_port	= mptcp_get_port,
+ 	.forward_alloc_get	= mptcp_forward_alloc_get,
++	.stream_memory_free	= mptcp_stream_memory_free,
+ 	.sockets_allocated	= &mptcp_sockets_allocated,
+ 
+ 	.memory_allocated	= &tcp_memory_allocated,
+@@ -3932,12 +3961,12 @@ static __poll_t mptcp_check_writeable(struct mptcp_sock *msk)
+ {
+ 	struct sock *sk = (struct sock *)msk;
+ 
+-	if (sk_stream_is_writeable(sk))
++	if (__mptcp_stream_is_writeable(sk, 1))
+ 		return EPOLLOUT | EPOLLWRNORM;
+ 
+ 	set_bit(SOCK_NOSPACE, &sk->sk_socket->flags);
+ 	smp_mb__after_atomic(); /* NOSPACE is changed by mptcp_write_space() */
+-	if (sk_stream_is_writeable(sk))
++	if (__mptcp_stream_is_writeable(sk, 1))
+ 		return EPOLLOUT | EPOLLWRNORM;
+ 
+ 	return 0;
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+index 6b83869ef7938..2f17f295d7c8b 100644
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -305,6 +305,7 @@ struct mptcp_sock {
+ 			in_accept_queue:1,
+ 			free_first:1,
+ 			rcvspace_init:1;
++	u32		notsent_lowat;
+ 	struct work_struct work;
+ 	struct sk_buff  *ooo_last_skb;
+ 	struct rb_root  out_of_order_queue;
+@@ -789,11 +790,36 @@ static inline bool mptcp_data_fin_enabled(const struct mptcp_sock *msk)
+ 	       READ_ONCE(msk->write_seq) == READ_ONCE(msk->snd_nxt);
+ }
+ 
++static inline u32 mptcp_notsent_lowat(const struct sock *sk)
++{
++	struct net *net = sock_net(sk);
++	u32 val;
++
++	val = READ_ONCE(mptcp_sk(sk)->notsent_lowat);
++	return val ?: READ_ONCE(net->ipv4.sysctl_tcp_notsent_lowat);
++}
++
++static inline bool mptcp_stream_memory_free(const struct sock *sk, int wake)
++{
++	const struct mptcp_sock *msk = mptcp_sk(sk);
++	u32 notsent_bytes;
++
++	notsent_bytes = READ_ONCE(msk->write_seq) - READ_ONCE(msk->snd_nxt);
++	return (notsent_bytes << wake) < mptcp_notsent_lowat(sk);
++}
++
++static inline bool __mptcp_stream_is_writeable(const struct sock *sk, int wake)
++{
++	return mptcp_stream_memory_free(sk, wake) &&
++	       __sk_stream_is_writeable(sk, wake);
++}
++
+ static inline void mptcp_write_space(struct sock *sk)
+ {
+ 	/* pairs with memory barrier in mptcp_poll */
+ 	smp_mb();
+-	sk_stream_write_space(sk);
++	if (mptcp_stream_memory_free(sk, 1))
++		sk_stream_write_space(sk);
+ }
+ 
+ static inline void __mptcp_sync_sndbuf(struct sock *sk)
+diff --git a/net/mptcp/sockopt.c b/net/mptcp/sockopt.c
+index 82d0cd0819f09..f2fe28a3912a9 100644
+--- a/net/mptcp/sockopt.c
++++ b/net/mptcp/sockopt.c
+@@ -810,6 +810,16 @@ static int mptcp_setsockopt_sol_tcp(struct mptcp_sock *msk, int optname,
+ 		return 0;
+ 	case TCP_ULP:
+ 		return -EOPNOTSUPP;
++	case TCP_NOTSENT_LOWAT:
++		ret = mptcp_get_int_option(msk, optval, optlen, &val);
++		if (ret)
++			return ret;
++
++		lock_sock(sk);
++		WRITE_ONCE(msk->notsent_lowat, val);
++		mptcp_write_space(sk);
++		release_sock(sk);
++		return 0;
+ 	case TCP_CONGESTION:
+ 		return mptcp_setsockopt_sol_tcp_congestion(msk, optval, optlen);
+ 	case TCP_CORK:
+@@ -1343,6 +1353,8 @@ static int mptcp_getsockopt_sol_tcp(struct mptcp_sock *msk, int optname,
+ 		return mptcp_put_int_option(msk, optval, optlen, msk->cork);
+ 	case TCP_NODELAY:
+ 		return mptcp_put_int_option(msk, optval, optlen, msk->nodelay);
++	case TCP_NOTSENT_LOWAT:
++		return mptcp_put_int_option(msk, optval, optlen, msk->notsent_lowat);
+ 	}
+ 	return -EOPNOTSUPP;
+ }
+-- 
+2.43.0
+
