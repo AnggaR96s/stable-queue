@@ -1,0 +1,114 @@
+From b5075f5154a6f790c7e1cb4cce4ba430e88def0d Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 6 Mar 2023 09:15:17 +0100
+Subject: mm, vmalloc: fix high order __GFP_NOFAIL allocations
+
+From: Michal Hocko <mhocko@suse.com>
+
+[ Upstream commit e9c3cda4d86e56bf7fe403729f38c4f0f65d3860 ]
+
+Gao Xiang has reported that the page allocator complains about high order
+__GFP_NOFAIL request coming from the vmalloc core:
+
+ __alloc_pages+0x1cb/0x5b0 mm/page_alloc.c:5549
+ alloc_pages+0x1aa/0x270 mm/mempolicy.c:2286
+ vm_area_alloc_pages mm/vmalloc.c:2989 [inline]
+ __vmalloc_area_node mm/vmalloc.c:3057 [inline]
+ __vmalloc_node_range+0x978/0x13c0 mm/vmalloc.c:3227
+ kvmalloc_node+0x156/0x1a0 mm/util.c:606
+ kvmalloc include/linux/slab.h:737 [inline]
+ kvmalloc_array include/linux/slab.h:755 [inline]
+ kvcalloc include/linux/slab.h:760 [inline]
+
+it seems that I have completely missed high order allocation backing
+vmalloc areas case when implementing __GFP_NOFAIL support.  This means
+that [k]vmalloc at al.  can allocate higher order allocations with
+__GFP_NOFAIL which can trigger OOM killer for non-costly orders easily or
+cause a lot of reclaim/compaction activity if those requests cannot be
+satisfied.
+
+Fix the issue by falling back to zero order allocations for __GFP_NOFAIL
+requests if the high order request fails.
+
+Link: https://lkml.kernel.org/r/ZAXynvdNqcI0f6Us@dhcp22.suse.cz
+Fixes: 9376130c390a ("mm/vmalloc: add support for __GFP_NOFAIL")
+Reported-by: Gao Xiang <hsiangkao@linux.alibaba.com>
+  Link: https://lkml.kernel.org/r/20230305053035.1911-1-hsiangkao@linux.alibaba.com
+Signed-off-by: Michal Hocko <mhocko@suse.com>
+Reviewed-by: Uladzislau Rezki (Sony) <urezki@gmail.com>
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
+Cc: Baoquan He <bhe@redhat.com>
+Cc: Christoph Hellwig <hch@lst.de>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Stable-dep-of: 8e0545c83d67 ("mm/vmalloc: fix vmalloc which may return null if called with __GFP_NOFAIL")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ mm/vmalloc.c | 28 +++++++++++++++++++++++-----
+ 1 file changed, 23 insertions(+), 5 deletions(-)
+
+diff --git a/mm/vmalloc.c b/mm/vmalloc.c
+index 67a10a04df041..cab30d9497e6b 100644
+--- a/mm/vmalloc.c
++++ b/mm/vmalloc.c
+@@ -2923,6 +2923,8 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
+ 		unsigned int order, unsigned int nr_pages, struct page **pages)
+ {
+ 	unsigned int nr_allocated = 0;
++	gfp_t alloc_gfp = gfp;
++	bool nofail = false;
+ 	struct page *page;
+ 	int i;
+ 
+@@ -2933,6 +2935,7 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
+ 	 * more permissive.
+ 	 */
+ 	if (!order) {
++		/* bulk allocator doesn't support nofail req. officially */
+ 		gfp_t bulk_gfp = gfp & ~__GFP_NOFAIL;
+ 
+ 		while (nr_allocated < nr_pages) {
+@@ -2971,20 +2974,35 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
+ 			if (nr != nr_pages_request)
+ 				break;
+ 		}
++	} else if (gfp & __GFP_NOFAIL) {
++		/*
++		 * Higher order nofail allocations are really expensive and
++		 * potentially dangerous (pre-mature OOM, disruptive reclaim
++		 * and compaction etc.
++		 */
++		alloc_gfp &= ~__GFP_NOFAIL;
++		nofail = true;
+ 	}
+ 
+ 	/* High-order pages or fallback path if "bulk" fails. */
+-
+ 	while (nr_allocated < nr_pages) {
+ 		if (fatal_signal_pending(current))
+ 			break;
+ 
+ 		if (nid == NUMA_NO_NODE)
+-			page = alloc_pages(gfp, order);
++			page = alloc_pages(alloc_gfp, order);
+ 		else
+-			page = alloc_pages_node(nid, gfp, order);
+-		if (unlikely(!page))
+-			break;
++			page = alloc_pages_node(nid, alloc_gfp, order);
++		if (unlikely(!page)) {
++			if (!nofail)
++				break;
++
++			/* fall back to the zero order allocations */
++			alloc_gfp |= __GFP_NOFAIL;
++			order = 0;
++			continue;
++		}
++
+ 		/*
+ 		 * Higher order allocations must be able to be treated as
+ 		 * indepdenent small pages by callers (as they can with
+-- 
+2.43.0
+
