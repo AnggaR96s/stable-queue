@@ -1,0 +1,144 @@
+From 877d7800645a18f7ee72a0a202cf5d940af224b7 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 13 Jun 2022 09:40:06 -0400
+Subject: NLM: Defend against file_lock changes after vfs_test_lock()
+
+From: Benjamin Coddington <bcodding@redhat.com>
+
+[ Upstream commit 184cefbe62627730c30282df12bcff9aae4816ea ]
+
+Instead of trusting that struct file_lock returns completely unchanged
+after vfs_test_lock() when there's no conflicting lock, stash away our
+nlm_lockowner reference so we can properly release it for all cases.
+
+This defends against another file_lock implementation overwriting fl_owner
+when the return type is F_UNLCK.
+
+Reported-by: Roberto Bergantinos Corpas <rbergant@redhat.com>
+Tested-by: Roberto Bergantinos Corpas <rbergant@redhat.com>
+Signed-off-by: Benjamin Coddington <bcodding@redhat.com>
+Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/lockd/svc4proc.c         |  4 +++-
+ fs/lockd/svclock.c          | 10 +---------
+ fs/lockd/svcproc.c          |  5 ++++-
+ include/linux/lockd/lockd.h |  1 +
+ 4 files changed, 9 insertions(+), 11 deletions(-)
+
+diff --git a/fs/lockd/svc4proc.c b/fs/lockd/svc4proc.c
+index 176b468a61c75..4f247ab8be611 100644
+--- a/fs/lockd/svc4proc.c
++++ b/fs/lockd/svc4proc.c
+@@ -87,6 +87,7 @@ __nlm4svc_proc_test(struct svc_rqst *rqstp, struct nlm_res *resp)
+ 	struct nlm_args *argp = rqstp->rq_argp;
+ 	struct nlm_host	*host;
+ 	struct nlm_file	*file;
++	struct nlm_lockowner *test_owner;
+ 	__be32 rc = rpc_success;
+ 
+ 	dprintk("lockd: TEST4        called\n");
+@@ -96,6 +97,7 @@ __nlm4svc_proc_test(struct svc_rqst *rqstp, struct nlm_res *resp)
+ 	if ((resp->status = nlm4svc_retrieve_args(rqstp, argp, &host, &file)))
+ 		return resp->status == nlm_drop_reply ? rpc_drop_reply :rpc_success;
+ 
++	test_owner = argp->lock.fl.fl_owner;
+ 	/* Now check for conflicting locks */
+ 	resp->status = nlmsvc_testlock(rqstp, file, host, &argp->lock, &resp->lock, &resp->cookie);
+ 	if (resp->status == nlm_drop_reply)
+@@ -103,7 +105,7 @@ __nlm4svc_proc_test(struct svc_rqst *rqstp, struct nlm_res *resp)
+ 	else
+ 		dprintk("lockd: TEST4        status %d\n", ntohl(resp->status));
+ 
+-	nlmsvc_release_lockowner(&argp->lock);
++	nlmsvc_put_lockowner(test_owner);
+ 	nlmsvc_release_host(host);
+ 	nlm_release_file(file);
+ 	return rc;
+diff --git a/fs/lockd/svclock.c b/fs/lockd/svclock.c
+index cb3658ab9b7ae..9c1aa75441e1c 100644
+--- a/fs/lockd/svclock.c
++++ b/fs/lockd/svclock.c
+@@ -340,7 +340,7 @@ nlmsvc_get_lockowner(struct nlm_lockowner *lockowner)
+ 	return lockowner;
+ }
+ 
+-static void nlmsvc_put_lockowner(struct nlm_lockowner *lockowner)
++void nlmsvc_put_lockowner(struct nlm_lockowner *lockowner)
+ {
+ 	if (!refcount_dec_and_lock(&lockowner->count, &lockowner->host->h_lock))
+ 		return;
+@@ -590,7 +590,6 @@ nlmsvc_testlock(struct svc_rqst *rqstp, struct nlm_file *file,
+ 	int			error;
+ 	int			mode;
+ 	__be32			ret;
+-	struct nlm_lockowner	*test_owner;
+ 
+ 	dprintk("lockd: nlmsvc_testlock(%s/%ld, ty=%d, %Ld-%Ld)\n",
+ 				nlmsvc_file_inode(file)->i_sb->s_id,
+@@ -604,9 +603,6 @@ nlmsvc_testlock(struct svc_rqst *rqstp, struct nlm_file *file,
+ 		goto out;
+ 	}
+ 
+-	/* If there's a conflicting lock, remember to clean up the test lock */
+-	test_owner = (struct nlm_lockowner *)lock->fl.fl_owner;
+-
+ 	mode = lock_to_openmode(&lock->fl);
+ 	error = vfs_test_lock(file->f_file[mode], &lock->fl);
+ 	if (error) {
+@@ -635,10 +631,6 @@ nlmsvc_testlock(struct svc_rqst *rqstp, struct nlm_file *file,
+ 	conflock->fl.fl_end = lock->fl.fl_end;
+ 	locks_release_private(&lock->fl);
+ 
+-	/* Clean up the test lock */
+-	lock->fl.fl_owner = NULL;
+-	nlmsvc_put_lockowner(test_owner);
+-
+ 	ret = nlm_lck_denied;
+ out:
+ 	return ret;
+diff --git a/fs/lockd/svcproc.c b/fs/lockd/svcproc.c
+index 4dc1b40a489a2..b09ca35b527cc 100644
+--- a/fs/lockd/svcproc.c
++++ b/fs/lockd/svcproc.c
+@@ -116,6 +116,7 @@ __nlmsvc_proc_test(struct svc_rqst *rqstp, struct nlm_res *resp)
+ 	struct nlm_args *argp = rqstp->rq_argp;
+ 	struct nlm_host	*host;
+ 	struct nlm_file	*file;
++	struct nlm_lockowner *test_owner;
+ 	__be32 rc = rpc_success;
+ 
+ 	dprintk("lockd: TEST          called\n");
+@@ -125,6 +126,8 @@ __nlmsvc_proc_test(struct svc_rqst *rqstp, struct nlm_res *resp)
+ 	if ((resp->status = nlmsvc_retrieve_args(rqstp, argp, &host, &file)))
+ 		return resp->status == nlm_drop_reply ? rpc_drop_reply :rpc_success;
+ 
++	test_owner = argp->lock.fl.fl_owner;
++
+ 	/* Now check for conflicting locks */
+ 	resp->status = cast_status(nlmsvc_testlock(rqstp, file, host, &argp->lock, &resp->lock, &resp->cookie));
+ 	if (resp->status == nlm_drop_reply)
+@@ -133,7 +136,7 @@ __nlmsvc_proc_test(struct svc_rqst *rqstp, struct nlm_res *resp)
+ 		dprintk("lockd: TEST          status %d vers %d\n",
+ 			ntohl(resp->status), rqstp->rq_vers);
+ 
+-	nlmsvc_release_lockowner(&argp->lock);
++	nlmsvc_put_lockowner(test_owner);
+ 	nlmsvc_release_host(host);
+ 	nlm_release_file(file);
+ 	return rc;
+diff --git a/include/linux/lockd/lockd.h b/include/linux/lockd/lockd.h
+index fcef192e5e45e..70ce419e27093 100644
+--- a/include/linux/lockd/lockd.h
++++ b/include/linux/lockd/lockd.h
+@@ -292,6 +292,7 @@ void		  nlmsvc_locks_init_private(struct file_lock *, struct nlm_host *, pid_t);
+ __be32		  nlm_lookup_file(struct svc_rqst *, struct nlm_file **,
+ 					struct nlm_lock *);
+ void		  nlm_release_file(struct nlm_file *);
++void		  nlmsvc_put_lockowner(struct nlm_lockowner *);
+ void		  nlmsvc_release_lockowner(struct nlm_lock *);
+ void		  nlmsvc_mark_resources(struct net *);
+ void		  nlmsvc_free_host_resources(struct nlm_host *);
+-- 
+2.43.0
+

@@ -1,0 +1,155 @@
+From ac4a334158da9104b77f1c2c25520e9a638f9031 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 30 Nov 2020 17:03:16 -0500
+Subject: nfsd: close cached files prior to a REMOVE or RENAME that would
+ replace target
+
+From: Jeff Layton <jeff.layton@primarydata.com>
+
+[ Upstream commit 7f84b488f9add1d5cca3e6197c95914c7bd3c1cf ]
+
+It's not uncommon for some workloads to do a bunch of I/O to a file and
+delete it just afterward. If knfsd has a cached open file however, then
+the file may still be open when the dentry is unlinked. If the
+underlying filesystem is nfs, then that could trigger it to do a
+sillyrename.
+
+On a REMOVE or RENAME scan the nfsd_file cache for open files that
+correspond to the inode, and proactively unhash and put their
+references. This should prevent any delete-on-last-close activity from
+occurring, solely due to knfsd's open file cache.
+
+This must be done synchronously though so we use the variants that call
+flush_delayed_fput. There are deadlock possibilities if you call
+flush_delayed_fput while holding locks, however. In the case of
+nfsd_rename, we don't even do the lookups of the dentries to be renamed
+until we've locked for rename.
+
+Once we've figured out what the target dentry is for a rename, check to
+see whether there are cached open files associated with it. If there
+are, then unwind all of the locking, close them all, and then reattempt
+the rename.
+
+None of this is really necessary for "typical" filesystems though. It's
+mostly of use for NFS, so declare a new export op flag and use that to
+determine whether to close the files beforehand.
+
+Signed-off-by: Jeff Layton <jeff.layton@primarydata.com>
+Signed-off-by: Lance Shelton <lance.shelton@hammerspace.com>
+Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+[ cel: adjusted to apply to 5.10.y ]
+Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ Documentation/filesystems/nfs/exporting.rst | 13 +++++++++++++
+ fs/nfs/export.c                             |  2 +-
+ fs/nfsd/vfs.c                               | 16 +++++++++-------
+ include/linux/exportfs.h                    |  5 +++--
+ 4 files changed, 26 insertions(+), 10 deletions(-)
+
+diff --git a/Documentation/filesystems/nfs/exporting.rst b/Documentation/filesystems/nfs/exporting.rst
+index 960be64446cb9..0e98edd353b5f 100644
+--- a/Documentation/filesystems/nfs/exporting.rst
++++ b/Documentation/filesystems/nfs/exporting.rst
+@@ -202,3 +202,16 @@ following flags are defined:
+     This flag exempts the filesystem from subtree checking and causes
+     exportfs to get back an error if it tries to enable subtree checking
+     on it.
++
++  EXPORT_OP_CLOSE_BEFORE_UNLINK - always close cached files before unlinking
++    On some exportable filesystems (such as NFS) unlinking a file that
++    is still open can cause a fair bit of extra work. For instance,
++    the NFS client will do a "sillyrename" to ensure that the file
++    sticks around while it's still open. When reexporting, that open
++    file is held by nfsd so we usually end up doing a sillyrename, and
++    then immediately deleting the sillyrenamed file just afterward when
++    the link count actually goes to zero. Sometimes this delete can race
++    with other operations (for instance an rmdir of the parent directory).
++    This flag causes nfsd to close any open files for this inode _before_
++    calling into the vfs to do an unlink or a rename that would replace
++    an existing file.
+diff --git a/fs/nfs/export.c b/fs/nfs/export.c
+index b9ba306bf9120..5428713af5fee 100644
+--- a/fs/nfs/export.c
++++ b/fs/nfs/export.c
+@@ -171,5 +171,5 @@ const struct export_operations nfs_export_ops = {
+ 	.encode_fh = nfs_encode_fh,
+ 	.fh_to_dentry = nfs_fh_to_dentry,
+ 	.get_parent = nfs_get_parent,
+-	.flags = EXPORT_OP_NOWCC|EXPORT_OP_NOSUBTREECHK,
++	.flags = EXPORT_OP_NOWCC|EXPORT_OP_NOSUBTREECHK|EXPORT_OP_CLOSE_BEFORE_UNLINK,
+ };
+diff --git a/fs/nfsd/vfs.c b/fs/nfsd/vfs.c
+index 31edb883afd0d..fb4e6c57ce0bb 100644
+--- a/fs/nfsd/vfs.c
++++ b/fs/nfsd/vfs.c
+@@ -1739,7 +1739,7 @@ nfsd_rename(struct svc_rqst *rqstp, struct svc_fh *ffhp, char *fname, int flen,
+ 	struct inode	*fdir, *tdir;
+ 	__be32		err;
+ 	int		host_err;
+-	bool		has_cached = false;
++	bool		close_cached = false;
+ 
+ 	err = fh_verify(rqstp, ffhp, S_IFDIR, NFSD_MAY_REMOVE);
+ 	if (err)
+@@ -1798,8 +1798,9 @@ nfsd_rename(struct svc_rqst *rqstp, struct svc_fh *ffhp, char *fname, int flen,
+ 	if (ndentry == trap)
+ 		goto out_dput_new;
+ 
+-	if (nfsd_has_cached_files(ndentry)) {
+-		has_cached = true;
++	if ((ndentry->d_sb->s_export_op->flags & EXPORT_OP_CLOSE_BEFORE_UNLINK) &&
++	    nfsd_has_cached_files(ndentry)) {
++		close_cached = true;
+ 		goto out_dput_old;
+ 	} else {
+ 		host_err = vfs_rename(fdir, odentry, tdir, ndentry, NULL, 0);
+@@ -1820,7 +1821,7 @@ nfsd_rename(struct svc_rqst *rqstp, struct svc_fh *ffhp, char *fname, int flen,
+ 	 * as that would do the wrong thing if the two directories
+ 	 * were the same, so again we do it by hand.
+ 	 */
+-	if (!has_cached) {
++	if (!close_cached) {
+ 		fill_post_wcc(ffhp);
+ 		fill_post_wcc(tfhp);
+ 	}
+@@ -1834,8 +1835,8 @@ nfsd_rename(struct svc_rqst *rqstp, struct svc_fh *ffhp, char *fname, int flen,
+ 	 * shouldn't be done with locks held however, so we delay it until this
+ 	 * point and then reattempt the whole shebang.
+ 	 */
+-	if (has_cached) {
+-		has_cached = false;
++	if (close_cached) {
++		close_cached = false;
+ 		nfsd_close_cached_files(ndentry);
+ 		dput(ndentry);
+ 		goto retry;
+@@ -1887,7 +1888,8 @@ nfsd_unlink(struct svc_rqst *rqstp, struct svc_fh *fhp, int type,
+ 		type = d_inode(rdentry)->i_mode & S_IFMT;
+ 
+ 	if (type != S_IFDIR) {
+-		nfsd_close_cached_files(rdentry);
++		if (rdentry->d_sb->s_export_op->flags & EXPORT_OP_CLOSE_BEFORE_UNLINK)
++			nfsd_close_cached_files(rdentry);
+ 		host_err = vfs_unlink(dirp, rdentry, NULL);
+ 	} else {
+ 		host_err = vfs_rmdir(dirp, rdentry);
+diff --git a/include/linux/exportfs.h b/include/linux/exportfs.h
+index 2fcbab0f6b612..d829403ffd3bb 100644
+--- a/include/linux/exportfs.h
++++ b/include/linux/exportfs.h
+@@ -213,8 +213,9 @@ struct export_operations {
+ 			  bool write, u32 *device_generation);
+ 	int (*commit_blocks)(struct inode *inode, struct iomap *iomaps,
+ 			     int nr_iomaps, struct iattr *iattr);
+-#define	EXPORT_OP_NOWCC		(0x1)	/* Don't collect wcc data for NFSv3 replies */
+-#define	EXPORT_OP_NOSUBTREECHK	(0x2)	/* Subtree checking is not supported! */
++#define	EXPORT_OP_NOWCC			(0x1) /* don't collect v3 wcc data */
++#define	EXPORT_OP_NOSUBTREECHK		(0x2) /* no subtree checking */
++#define	EXPORT_OP_CLOSE_BEFORE_UNLINK	(0x4) /* close files before unlink */
+ 	unsigned long	flags;
+ };
+ 
+-- 
+2.43.0
+

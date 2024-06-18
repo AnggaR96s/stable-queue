@@ -1,0 +1,130 @@
+From ff827c1eae83681438649ed2dc137a3f7f7a16d5 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Sat, 19 Dec 2020 20:46:08 -0800
+Subject: inotify, memcg: account inotify instances to kmemcg
+
+From: Shakeel Butt <shakeelb@google.com>
+
+[ Upstream commit ac7b79fd190b02e7151bc7d2b9da692f537657f3 ]
+
+Currently the fs sysctl inotify/max_user_instances is used to limit the
+number of inotify instances on the system. For systems running multiple
+workloads, the per-user namespace sysctl max_inotify_instances can be
+used to further partition inotify instances. However there is no easy
+way to set a sensible system level max limit on inotify instances and
+further partition it between the workloads. It is much easier to charge
+the underlying resource (i.e. memory) behind the inotify instances to
+the memcg of the workload and let their memory limits limit the number
+of inotify instances they can create.
+
+With inotify instances charged to memcg, the admin can simply set
+max_user_instances to INT_MAX and let the memcg limits of the jobs limit
+their inotify instances.
+
+Link: https://lore.kernel.org/r/20201220044608.1258123-1-shakeelb@google.com
+Reviewed-by: Amir Goldstein <amir73il@gmail.com>
+Signed-off-by: Shakeel Butt <shakeelb@google.com>
+Signed-off-by: Jan Kara <jack@suse.cz>
+Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/notify/fanotify/fanotify_user.c |  2 +-
+ fs/notify/group.c                  | 25 ++++++++++++++++++++-----
+ fs/notify/inotify/inotify_user.c   |  4 ++--
+ include/linux/fsnotify_backend.h   |  1 +
+ 4 files changed, 24 insertions(+), 8 deletions(-)
+
+diff --git a/fs/notify/fanotify/fanotify_user.c b/fs/notify/fanotify/fanotify_user.c
+index 84de9f97bbc09..3e905b2e1b9c3 100644
+--- a/fs/notify/fanotify/fanotify_user.c
++++ b/fs/notify/fanotify/fanotify_user.c
+@@ -976,7 +976,7 @@ SYSCALL_DEFINE2(fanotify_init, unsigned int, flags, unsigned int, event_f_flags)
+ 		f_flags |= O_NONBLOCK;
+ 
+ 	/* fsnotify_alloc_group takes a ref.  Dropped in fanotify_release */
+-	group = fsnotify_alloc_group(&fanotify_fsnotify_ops);
++	group = fsnotify_alloc_user_group(&fanotify_fsnotify_ops);
+ 	if (IS_ERR(group)) {
+ 		free_uid(user);
+ 		return PTR_ERR(group);
+diff --git a/fs/notify/group.c b/fs/notify/group.c
+index a4a4b1c64d32a..ffd723ffe46de 100644
+--- a/fs/notify/group.c
++++ b/fs/notify/group.c
+@@ -111,14 +111,12 @@ void fsnotify_put_group(struct fsnotify_group *group)
+ }
+ EXPORT_SYMBOL_GPL(fsnotify_put_group);
+ 
+-/*
+- * Create a new fsnotify_group and hold a reference for the group returned.
+- */
+-struct fsnotify_group *fsnotify_alloc_group(const struct fsnotify_ops *ops)
++static struct fsnotify_group *__fsnotify_alloc_group(
++				const struct fsnotify_ops *ops, gfp_t gfp)
+ {
+ 	struct fsnotify_group *group;
+ 
+-	group = kzalloc(sizeof(struct fsnotify_group), GFP_KERNEL);
++	group = kzalloc(sizeof(struct fsnotify_group), gfp);
+ 	if (!group)
+ 		return ERR_PTR(-ENOMEM);
+ 
+@@ -139,8 +137,25 @@ struct fsnotify_group *fsnotify_alloc_group(const struct fsnotify_ops *ops)
+ 
+ 	return group;
+ }
++
++/*
++ * Create a new fsnotify_group and hold a reference for the group returned.
++ */
++struct fsnotify_group *fsnotify_alloc_group(const struct fsnotify_ops *ops)
++{
++	return __fsnotify_alloc_group(ops, GFP_KERNEL);
++}
+ EXPORT_SYMBOL_GPL(fsnotify_alloc_group);
+ 
++/*
++ * Create a new fsnotify_group and hold a reference for the group returned.
++ */
++struct fsnotify_group *fsnotify_alloc_user_group(const struct fsnotify_ops *ops)
++{
++	return __fsnotify_alloc_group(ops, GFP_KERNEL_ACCOUNT);
++}
++EXPORT_SYMBOL_GPL(fsnotify_alloc_user_group);
++
+ int fsnotify_fasync(int fd, struct file *file, int on)
+ {
+ 	struct fsnotify_group *group = file->private_data;
+diff --git a/fs/notify/inotify/inotify_user.c b/fs/notify/inotify/inotify_user.c
+index b564a32403aa5..ad8fb4bca6dc1 100644
+--- a/fs/notify/inotify/inotify_user.c
++++ b/fs/notify/inotify/inotify_user.c
+@@ -632,11 +632,11 @@ static struct fsnotify_group *inotify_new_group(unsigned int max_events)
+ 	struct fsnotify_group *group;
+ 	struct inotify_event_info *oevent;
+ 
+-	group = fsnotify_alloc_group(&inotify_fsnotify_ops);
++	group = fsnotify_alloc_user_group(&inotify_fsnotify_ops);
+ 	if (IS_ERR(group))
+ 		return group;
+ 
+-	oevent = kmalloc(sizeof(struct inotify_event_info), GFP_KERNEL);
++	oevent = kmalloc(sizeof(struct inotify_event_info), GFP_KERNEL_ACCOUNT);
+ 	if (unlikely(!oevent)) {
+ 		fsnotify_destroy_group(group);
+ 		return ERR_PTR(-ENOMEM);
+diff --git a/include/linux/fsnotify_backend.h b/include/linux/fsnotify_backend.h
+index a2e42d3cd87cf..e5409b83e7313 100644
+--- a/include/linux/fsnotify_backend.h
++++ b/include/linux/fsnotify_backend.h
+@@ -470,6 +470,7 @@ static inline void fsnotify_update_flags(struct dentry *dentry)
+ 
+ /* create a new group */
+ extern struct fsnotify_group *fsnotify_alloc_group(const struct fsnotify_ops *ops);
++extern struct fsnotify_group *fsnotify_alloc_user_group(const struct fsnotify_ops *ops);
+ /* get reference to a group */
+ extern void fsnotify_get_group(struct fsnotify_group *group);
+ /* drop reference on a group from fsnotify_alloc_group */
+-- 
+2.43.0
+
