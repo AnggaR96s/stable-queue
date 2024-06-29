@@ -1,0 +1,160 @@
+From 51aa83486c6ba6445c1fd90207ab09714f7e1b99 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 28 Jan 2022 22:26:21 +0300
+Subject: tcp: Use BPF timeout setting for SYN ACK RTO
+
+From: Akhmat Karakotov <hmukos@yandex-team.ru>
+
+[ Upstream commit 5903123f662ed18483f05cac3f9e800a074c29ff ]
+
+When setting RTO through BPF program, some SYN ACK packets were unaffected
+and continued to use TCP_TIMEOUT_INIT constant. This patch adds timeout
+option to struct request_sock. Option is initialized with TCP_TIMEOUT_INIT
+and is reassigned through BPF using tcp_timeout_init call. SYN ACK
+retransmits now use newly added timeout option.
+
+Signed-off-by: Akhmat Karakotov <hmukos@yandex-team.ru>
+Acked-by: Martin KaFai Lau <kafai@fb.com>
+
+v2:
+	- Add timeout option to struct request_sock. Do not call
+	  tcp_timeout_init on every syn ack retransmit.
+
+v3:
+	- Use unsigned long for min. Bound tcp_timeout_init to TCP_RTO_MAX.
+
+v4: - Refactor duplicate code by adding reqsk_timeout function.
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Stable-dep-of: ff46e3b44219 ("Fix race for duplicate reqsk on identical SYN")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/net/inet_connection_sock.h | 8 ++++++++
+ include/net/request_sock.h         | 2 ++
+ include/net/tcp.h                  | 2 +-
+ net/ipv4/inet_connection_sock.c    | 5 +----
+ net/ipv4/tcp_input.c               | 8 +++++---
+ net/ipv4/tcp_minisocks.c           | 5 ++---
+ 6 files changed, 19 insertions(+), 11 deletions(-)
+
+diff --git a/include/net/inet_connection_sock.h b/include/net/inet_connection_sock.h
+index b6b7e210f9d7a..7794cf2b5ef50 100644
+--- a/include/net/inet_connection_sock.h
++++ b/include/net/inet_connection_sock.h
+@@ -284,6 +284,14 @@ static inline int inet_csk_reqsk_queue_is_full(const struct sock *sk)
+ bool inet_csk_reqsk_queue_drop(struct sock *sk, struct request_sock *req);
+ void inet_csk_reqsk_queue_drop_and_put(struct sock *sk, struct request_sock *req);
+ 
++static inline unsigned long
++reqsk_timeout(struct request_sock *req, unsigned long max_timeout)
++{
++	u64 timeout = (u64)req->timeout << req->num_timeout;
++
++	return (unsigned long)min_t(u64, timeout, max_timeout);
++}
++
+ static inline void inet_csk_prepare_for_destroy_sock(struct sock *sk)
+ {
+ 	/* The below has to be done to allow calling inet_csk_destroy_sock */
+diff --git a/include/net/request_sock.h b/include/net/request_sock.h
+index 29e41ff3ec933..144c39db9898a 100644
+--- a/include/net/request_sock.h
++++ b/include/net/request_sock.h
+@@ -70,6 +70,7 @@ struct request_sock {
+ 	struct saved_syn		*saved_syn;
+ 	u32				secid;
+ 	u32				peer_secid;
++	u32				timeout;
+ };
+ 
+ static inline struct request_sock *inet_reqsk(const struct sock *sk)
+@@ -104,6 +105,7 @@ reqsk_alloc(const struct request_sock_ops *ops, struct sock *sk_listener,
+ 	sk_node_init(&req_to_sk(req)->sk_node);
+ 	sk_tx_queue_clear(req_to_sk(req));
+ 	req->saved_syn = NULL;
++	req->timeout = 0;
+ 	req->num_timeout = 0;
+ 	req->num_retrans = 0;
+ 	req->sk = NULL;
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index 08923ed4278f0..30f8111f750b5 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -2362,7 +2362,7 @@ static inline u32 tcp_timeout_init(struct sock *sk)
+ 
+ 	if (timeout <= 0)
+ 		timeout = TCP_TIMEOUT_INIT;
+-	return timeout;
++	return min_t(int, timeout, TCP_RTO_MAX);
+ }
+ 
+ static inline u32 tcp_rwnd_init_bpf(struct sock *sk)
+diff --git a/net/ipv4/inet_connection_sock.c b/net/ipv4/inet_connection_sock.c
+index 27975a44d1f9d..43e370f45b81d 100644
+--- a/net/ipv4/inet_connection_sock.c
++++ b/net/ipv4/inet_connection_sock.c
+@@ -889,12 +889,9 @@ static void reqsk_timer_handler(struct timer_list *t)
+ 	    (!resend ||
+ 	     !inet_rtx_syn_ack(sk_listener, req) ||
+ 	     inet_rsk(req)->acked)) {
+-		unsigned long timeo;
+-
+ 		if (req->num_timeout++ == 0)
+ 			atomic_dec(&queue->young);
+-		timeo = min(TCP_TIMEOUT_INIT << req->num_timeout, TCP_RTO_MAX);
+-		mod_timer(&req->rsk_timer, jiffies + timeo);
++		mod_timer(&req->rsk_timer, jiffies + reqsk_timeout(req, TCP_RTO_MAX));
+ 
+ 		if (!nreq)
+ 			return;
+diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
+index 5ad7e6965a645..ca72dbaa27b46 100644
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -6769,6 +6769,7 @@ struct request_sock *inet_reqsk_alloc(const struct request_sock_ops *ops,
+ 		ireq->ireq_state = TCP_NEW_SYN_RECV;
+ 		write_pnet(&ireq->ireq_net, sock_net(sk_listener));
+ 		ireq->ireq_family = sk_listener->sk_family;
++		req->timeout = TCP_TIMEOUT_INIT;
+ 	}
+ 
+ 	return req;
+@@ -6991,9 +6992,10 @@ int tcp_conn_request(struct request_sock_ops *rsk_ops,
+ 		sock_put(fastopen_sk);
+ 	} else {
+ 		tcp_rsk(req)->tfo_listener = false;
+-		if (!want_cookie)
+-			inet_csk_reqsk_queue_hash_add(sk, req,
+-				tcp_timeout_init((struct sock *)req));
++		if (!want_cookie) {
++			req->timeout = tcp_timeout_init((struct sock *)req);
++			inet_csk_reqsk_queue_hash_add(sk, req, req->timeout);
++		}
+ 		af_ops->send_synack(sk, dst, &fl, req, &foc,
+ 				    !want_cookie ? TCP_SYNACK_NORMAL :
+ 						   TCP_SYNACK_COOKIE,
+diff --git a/net/ipv4/tcp_minisocks.c b/net/ipv4/tcp_minisocks.c
+index 2606a5571116a..d84b71f70766b 100644
+--- a/net/ipv4/tcp_minisocks.c
++++ b/net/ipv4/tcp_minisocks.c
+@@ -593,7 +593,7 @@ struct sock *tcp_check_req(struct sock *sk, struct sk_buff *skb,
+ 			 * it can be estimated (approximately)
+ 			 * from another data.
+ 			 */
+-			tmp_opt.ts_recent_stamp = ktime_get_seconds() - ((TCP_TIMEOUT_INIT/HZ)<<req->num_timeout);
++			tmp_opt.ts_recent_stamp = ktime_get_seconds() - reqsk_timeout(req, TCP_RTO_MAX) / HZ;
+ 			paws_reject = tcp_paws_reject(&tmp_opt, th->rst);
+ 		}
+ 	}
+@@ -632,8 +632,7 @@ struct sock *tcp_check_req(struct sock *sk, struct sk_buff *skb,
+ 		    !inet_rtx_syn_ack(sk, req)) {
+ 			unsigned long expires = jiffies;
+ 
+-			expires += min(TCP_TIMEOUT_INIT << req->num_timeout,
+-				       TCP_RTO_MAX);
++			expires += reqsk_timeout(req, TCP_RTO_MAX);
+ 			if (!fastopen)
+ 				mod_timer_pending(&req->rsk_timer, expires);
+ 			else
+-- 
+2.43.0
+
