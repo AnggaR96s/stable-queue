@@ -1,0 +1,96 @@
+From 6718aa792b7d297ece53024a138ea679e8153ea6 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 13 Jun 2024 18:38:17 +0200
+Subject: loop: Disable fallocate() zero and discard if not supported
+
+From: Cyril Hrubis <chrubis@suse.cz>
+
+[ Upstream commit 5f75e081ab5cbfbe7aca2112a802e69576ee9778 ]
+
+If fallcate is implemented but zero and discard operations are not
+supported by the filesystem the backing file is on we continue to fill
+dmesg with errors from the blk_mq_end_request() since each time we call
+fallocate() on the loop device the EOPNOTSUPP error from lo_fallocate()
+ends up propagated into the block layer. In the end syscall succeeds
+since the blkdev_issue_zeroout() falls back to writing zeroes which
+makes the errors even more misleading and confusing.
+
+How to reproduce:
+
+1. make sure /tmp is mounted as tmpfs
+2. dd if=/dev/zero of=/tmp/disk.img bs=1M count=100
+3. losetup /dev/loop0 /tmp/disk.img
+4. mkfs.ext2 /dev/loop0
+5. dmesg |tail
+
+[710690.898214] operation not supported error, dev loop0, sector 204672 op 0x9:(WRITE_ZEROES) flags 0x8000800 phys_seg 0 prio class 0
+[710690.898279] operation not supported error, dev loop0, sector 522 op 0x9:(WRITE_ZEROES) flags 0x8000800 phys_seg 0 prio class 0
+[710690.898603] operation not supported error, dev loop0, sector 16906 op 0x9:(WRITE_ZEROES) flags 0x8000800 phys_seg 0 prio class 0
+[710690.898917] operation not supported error, dev loop0, sector 32774 op 0x9:(WRITE_ZEROES) flags 0x8000800 phys_seg 0 prio class 0
+[710690.899218] operation not supported error, dev loop0, sector 49674 op 0x9:(WRITE_ZEROES) flags 0x8000800 phys_seg 0 prio class 0
+[710690.899484] operation not supported error, dev loop0, sector 65542 op 0x9:(WRITE_ZEROES) flags 0x8000800 phys_seg 0 prio class 0
+[710690.899743] operation not supported error, dev loop0, sector 82442 op 0x9:(WRITE_ZEROES) flags 0x8000800 phys_seg 0 prio class 0
+[710690.900015] operation not supported error, dev loop0, sector 98310 op 0x9:(WRITE_ZEROES) flags 0x8000800 phys_seg 0 prio class 0
+[710690.900276] operation not supported error, dev loop0, sector 115210 op 0x9:(WRITE_ZEROES) flags 0x8000800 phys_seg 0 prio class 0
+[710690.900546] operation not supported error, dev loop0, sector 131078 op 0x9:(WRITE_ZEROES) flags 0x8000800 phys_seg 0 prio class 0
+
+This patch changes the lo_fallocate() to clear the flags for zero and
+discard operations if we get EOPNOTSUPP from the backing file fallocate
+callback, that way we at least stop spewing errors after the first
+unsuccessful try.
+
+CC: Jan Kara <jack@suse.cz>
+Signed-off-by: Cyril Hrubis <chrubis@suse.cz>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20240613163817.22640-1-chrubis@suse.cz
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/block/loop.c | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/drivers/block/loop.c b/drivers/block/loop.c
+index 28a95fd366fea..95a468eaa7013 100644
+--- a/drivers/block/loop.c
++++ b/drivers/block/loop.c
+@@ -302,6 +302,21 @@ static int lo_read_simple(struct loop_device *lo, struct request *rq,
+ 	return 0;
+ }
+ 
++static void loop_clear_limits(struct loop_device *lo, int mode)
++{
++	struct queue_limits lim = queue_limits_start_update(lo->lo_queue);
++
++	if (mode & FALLOC_FL_ZERO_RANGE)
++		lim.max_write_zeroes_sectors = 0;
++
++	if (mode & FALLOC_FL_PUNCH_HOLE) {
++		lim.max_hw_discard_sectors = 0;
++		lim.discard_granularity = 0;
++	}
++
++	queue_limits_commit_update(lo->lo_queue, &lim);
++}
++
+ static int lo_fallocate(struct loop_device *lo, struct request *rq, loff_t pos,
+ 			int mode)
+ {
+@@ -320,6 +335,14 @@ static int lo_fallocate(struct loop_device *lo, struct request *rq, loff_t pos,
+ 	ret = file->f_op->fallocate(file, mode, pos, blk_rq_bytes(rq));
+ 	if (unlikely(ret && ret != -EINVAL && ret != -EOPNOTSUPP))
+ 		return -EIO;
++
++	/*
++	 * We initially configure the limits in a hope that fallocate is
++	 * supported and clear them here if that turns out not to be true.
++	 */
++	if (unlikely(ret == -EOPNOTSUPP))
++		loop_clear_limits(lo, mode);
++
+ 	return ret;
+ }
+ 
+-- 
+2.43.0
+
