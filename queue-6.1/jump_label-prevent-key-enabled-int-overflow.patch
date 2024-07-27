@@ -1,0 +1,180 @@
+From 2a27114a104b1c93d69fbc0a72f309581c4ed418 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 23 Nov 2022 17:38:55 +0000
+Subject: jump_label: Prevent key->enabled int overflow
+
+From: Dmitry Safonov <dima@arista.com>
+
+[ Upstream commit eb8c507296f6038d46010396d91b42a05c3b64d9 ]
+
+1. With CONFIG_JUMP_LABEL=n static_key_slow_inc() doesn't have any
+   protection against key->enabled refcounter overflow.
+2. With CONFIG_JUMP_LABEL=y static_key_slow_inc_cpuslocked()
+   still may turn the refcounter negative as (v + 1) may overflow.
+
+key->enabled is indeed a ref-counter as it's documented in multiple
+places: top comment in jump_label.h, Documentation/staging/static-keys.rst,
+etc.
+
+As -1 is reserved for static key that's in process of being enabled,
+functions would break with negative key->enabled refcount:
+- for CONFIG_JUMP_LABEL=n negative return of static_key_count()
+  breaks static_key_false(), static_key_true()
+- the ref counter may become 0 from negative side by too many
+  static_key_slow_inc() calls and lead to use-after-free issues.
+
+These flaws result in that some users have to introduce an additional
+mutex and prevent the reference counter from overflowing themselves,
+see bpf_enable_runtime_stats() checking the counter against INT_MAX / 2.
+
+Prevent the reference counter overflow by checking if (v + 1) > 0.
+Change functions API to return whether the increment was successful.
+
+Signed-off-by: Dmitry Safonov <dima@arista.com>
+Acked-by: Jakub Kicinski <kuba@kernel.org>
+Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Stable-dep-of: 83ab38ef0a0b ("jump_label: Fix concurrency issues in static_key_slow_dec()")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/linux/jump_label.h | 21 +++++++++++---
+ kernel/jump_label.c        | 56 ++++++++++++++++++++++++++++++--------
+ 2 files changed, 61 insertions(+), 16 deletions(-)
+
+diff --git a/include/linux/jump_label.h b/include/linux/jump_label.h
+index 570831ca99518..4e968ebadce60 100644
+--- a/include/linux/jump_label.h
++++ b/include/linux/jump_label.h
+@@ -224,9 +224,10 @@ extern bool arch_jump_label_transform_queue(struct jump_entry *entry,
+ 					    enum jump_label_type type);
+ extern void arch_jump_label_transform_apply(void);
+ extern int jump_label_text_reserved(void *start, void *end);
+-extern void static_key_slow_inc(struct static_key *key);
++extern bool static_key_slow_inc(struct static_key *key);
++extern bool static_key_fast_inc_not_disabled(struct static_key *key);
+ extern void static_key_slow_dec(struct static_key *key);
+-extern void static_key_slow_inc_cpuslocked(struct static_key *key);
++extern bool static_key_slow_inc_cpuslocked(struct static_key *key);
+ extern void static_key_slow_dec_cpuslocked(struct static_key *key);
+ extern int static_key_count(struct static_key *key);
+ extern void static_key_enable(struct static_key *key);
+@@ -278,11 +279,23 @@ static __always_inline bool static_key_true(struct static_key *key)
+ 	return false;
+ }
+ 
+-static inline void static_key_slow_inc(struct static_key *key)
++static inline bool static_key_fast_inc_not_disabled(struct static_key *key)
+ {
++	int v;
++
+ 	STATIC_KEY_CHECK_USE(key);
+-	atomic_inc(&key->enabled);
++	/*
++	 * Prevent key->enabled getting negative to follow the same semantics
++	 * as for CONFIG_JUMP_LABEL=y, see kernel/jump_label.c comment.
++	 */
++	v = atomic_read(&key->enabled);
++	do {
++		if (v < 0 || (v + 1) < 0)
++			return false;
++	} while (!likely(atomic_try_cmpxchg(&key->enabled, &v, v + 1)));
++	return true;
+ }
++#define static_key_slow_inc(key)	static_key_fast_inc_not_disabled(key)
+ 
+ static inline void static_key_slow_dec(struct static_key *key)
+ {
+diff --git a/kernel/jump_label.c b/kernel/jump_label.c
+index 4d6c6f5f60db8..d9c822bbffb8d 100644
+--- a/kernel/jump_label.c
++++ b/kernel/jump_label.c
+@@ -113,9 +113,40 @@ int static_key_count(struct static_key *key)
+ }
+ EXPORT_SYMBOL_GPL(static_key_count);
+ 
+-void static_key_slow_inc_cpuslocked(struct static_key *key)
++/*
++ * static_key_fast_inc_not_disabled - adds a user for a static key
++ * @key: static key that must be already enabled
++ *
++ * The caller must make sure that the static key can't get disabled while
++ * in this function. It doesn't patch jump labels, only adds a user to
++ * an already enabled static key.
++ *
++ * Returns true if the increment was done. Unlike refcount_t the ref counter
++ * is not saturated, but will fail to increment on overflow.
++ */
++bool static_key_fast_inc_not_disabled(struct static_key *key)
+ {
++	int v;
++
+ 	STATIC_KEY_CHECK_USE(key);
++	/*
++	 * Negative key->enabled has a special meaning: it sends
++	 * static_key_slow_inc() down the slow path, and it is non-zero
++	 * so it counts as "enabled" in jump_label_update().  Note that
++	 * atomic_inc_unless_negative() checks >= 0, so roll our own.
++	 */
++	v = atomic_read(&key->enabled);
++	do {
++		if (v <= 0 || (v + 1) < 0)
++			return false;
++	} while (!likely(atomic_try_cmpxchg(&key->enabled, &v, v + 1)));
++
++	return true;
++}
++EXPORT_SYMBOL_GPL(static_key_fast_inc_not_disabled);
++
++bool static_key_slow_inc_cpuslocked(struct static_key *key)
++{
+ 	lockdep_assert_cpus_held();
+ 
+ 	/*
+@@ -124,15 +155,9 @@ void static_key_slow_inc_cpuslocked(struct static_key *key)
+ 	 * jump_label_update() process.  At the same time, however,
+ 	 * the jump_label_update() call below wants to see
+ 	 * static_key_enabled(&key) for jumps to be updated properly.
+-	 *
+-	 * So give a special meaning to negative key->enabled: it sends
+-	 * static_key_slow_inc() down the slow path, and it is non-zero
+-	 * so it counts as "enabled" in jump_label_update().  Note that
+-	 * atomic_inc_unless_negative() checks >= 0, so roll our own.
+ 	 */
+-	for (int v = atomic_read(&key->enabled); v > 0; )
+-		if (likely(atomic_try_cmpxchg(&key->enabled, &v, v + 1)))
+-			return;
++	if (static_key_fast_inc_not_disabled(key))
++		return true;
+ 
+ 	jump_label_lock();
+ 	if (atomic_read(&key->enabled) == 0) {
+@@ -144,16 +169,23 @@ void static_key_slow_inc_cpuslocked(struct static_key *key)
+ 		 */
+ 		atomic_set_release(&key->enabled, 1);
+ 	} else {
+-		atomic_inc(&key->enabled);
++		if (WARN_ON_ONCE(!static_key_fast_inc_not_disabled(key))) {
++			jump_label_unlock();
++			return false;
++		}
+ 	}
+ 	jump_label_unlock();
++	return true;
+ }
+ 
+-void static_key_slow_inc(struct static_key *key)
++bool static_key_slow_inc(struct static_key *key)
+ {
++	bool ret;
++
+ 	cpus_read_lock();
+-	static_key_slow_inc_cpuslocked(key);
++	ret = static_key_slow_inc_cpuslocked(key);
+ 	cpus_read_unlock();
++	return ret;
+ }
+ EXPORT_SYMBOL_GPL(static_key_slow_inc);
+ 
+-- 
+2.43.0
+
