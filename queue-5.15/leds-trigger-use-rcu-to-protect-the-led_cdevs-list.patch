@@ -1,0 +1,166 @@
+From 602b8fda838413ddea84a78759164be8c1f344a8 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 15 Sep 2021 18:16:01 +0200
+Subject: leds: trigger: use RCU to protect the led_cdevs list
+
+From: Johannes Berg <johannes.berg@intel.com>
+
+[ Upstream commit 2a5a8fa8b23144d14567d6f8293dd6fbeecee393 ]
+
+Even with the previous commit 27af8e2c90fb
+("leds: trigger: fix potential deadlock with libata")
+to this file, we still get lockdep unhappy, and Boqun
+explained the report here:
+https://lore.kernel.org/r/YNA+d1X4UkoQ7g8a@boqun-archlinux
+
+Effectively, this means that the read_lock_irqsave() isn't
+enough here because another CPU might be trying to do a
+write lock, and thus block the readers.
+
+This is all pretty messy, but it doesn't seem right that
+the LEDs framework imposes some locking requirements on
+users, in particular we'd have to make the spinlock in the
+iwlwifi driver always disable IRQs, even if we don't need
+that for any other reason, just to avoid this deadlock.
+
+Since writes to the led_cdevs list are rare (and are done
+by userspace), just switch the list to RCU. This costs a
+synchronize_rcu() at removal time so we can ensure things
+are correct, but that seems like a small price to pay for
+getting lock-free iterations and no deadlocks (nor any
+locking requirements imposed on users.)
+
+Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+Signed-off-by: Pavel Machek <pavel@ucw.cz>
+Stable-dep-of: ab477b766edd ("leds: triggers: Flush pending brightness before activating trigger")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/leds/led-triggers.c | 41 +++++++++++++++++++------------------
+ include/linux/leds.h        |  2 +-
+ 2 files changed, 22 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/leds/led-triggers.c b/drivers/leds/led-triggers.c
+index cbe70f38cb572..024b73f84ce0c 100644
+--- a/drivers/leds/led-triggers.c
++++ b/drivers/leds/led-triggers.c
+@@ -157,7 +157,6 @@ EXPORT_SYMBOL_GPL(led_trigger_read);
+ /* Caller must ensure led_cdev->trigger_lock held */
+ int led_trigger_set(struct led_classdev *led_cdev, struct led_trigger *trig)
+ {
+-	unsigned long flags;
+ 	char *event = NULL;
+ 	char *envp[2];
+ 	const char *name;
+@@ -171,10 +170,13 @@ int led_trigger_set(struct led_classdev *led_cdev, struct led_trigger *trig)
+ 
+ 	/* Remove any existing trigger */
+ 	if (led_cdev->trigger) {
+-		write_lock_irqsave(&led_cdev->trigger->leddev_list_lock, flags);
+-		list_del(&led_cdev->trig_list);
+-		write_unlock_irqrestore(&led_cdev->trigger->leddev_list_lock,
+-			flags);
++		spin_lock(&led_cdev->trigger->leddev_list_lock);
++		list_del_rcu(&led_cdev->trig_list);
++		spin_unlock(&led_cdev->trigger->leddev_list_lock);
++
++		/* ensure it's no longer visible on the led_cdevs list */
++		synchronize_rcu();
++
+ 		cancel_work_sync(&led_cdev->set_brightness_work);
+ 		led_stop_software_blink(led_cdev);
+ 		device_remove_groups(led_cdev->dev, led_cdev->trigger->groups);
+@@ -186,9 +188,9 @@ int led_trigger_set(struct led_classdev *led_cdev, struct led_trigger *trig)
+ 		led_set_brightness(led_cdev, LED_OFF);
+ 	}
+ 	if (trig) {
+-		write_lock_irqsave(&trig->leddev_list_lock, flags);
+-		list_add_tail(&led_cdev->trig_list, &trig->led_cdevs);
+-		write_unlock_irqrestore(&trig->leddev_list_lock, flags);
++		spin_lock(&trig->leddev_list_lock);
++		list_add_tail_rcu(&led_cdev->trig_list, &trig->led_cdevs);
++		spin_unlock(&trig->leddev_list_lock);
+ 		led_cdev->trigger = trig;
+ 
+ 		if (trig->activate)
+@@ -223,9 +225,10 @@ int led_trigger_set(struct led_classdev *led_cdev, struct led_trigger *trig)
+ 		trig->deactivate(led_cdev);
+ err_activate:
+ 
+-	write_lock_irqsave(&led_cdev->trigger->leddev_list_lock, flags);
+-	list_del(&led_cdev->trig_list);
+-	write_unlock_irqrestore(&led_cdev->trigger->leddev_list_lock, flags);
++	spin_lock(&led_cdev->trigger->leddev_list_lock);
++	list_del_rcu(&led_cdev->trig_list);
++	spin_unlock(&led_cdev->trigger->leddev_list_lock);
++	synchronize_rcu();
+ 	led_cdev->trigger = NULL;
+ 	led_cdev->trigger_data = NULL;
+ 	led_set_brightness(led_cdev, LED_OFF);
+@@ -285,7 +288,7 @@ int led_trigger_register(struct led_trigger *trig)
+ 	struct led_classdev *led_cdev;
+ 	struct led_trigger *_trig;
+ 
+-	rwlock_init(&trig->leddev_list_lock);
++	spin_lock_init(&trig->leddev_list_lock);
+ 	INIT_LIST_HEAD(&trig->led_cdevs);
+ 
+ 	down_write(&triggers_list_lock);
+@@ -378,15 +381,14 @@ void led_trigger_event(struct led_trigger *trig,
+ 			enum led_brightness brightness)
+ {
+ 	struct led_classdev *led_cdev;
+-	unsigned long flags;
+ 
+ 	if (!trig)
+ 		return;
+ 
+-	read_lock_irqsave(&trig->leddev_list_lock, flags);
+-	list_for_each_entry(led_cdev, &trig->led_cdevs, trig_list)
++	rcu_read_lock();
++	list_for_each_entry_rcu(led_cdev, &trig->led_cdevs, trig_list)
+ 		led_set_brightness(led_cdev, brightness);
+-	read_unlock_irqrestore(&trig->leddev_list_lock, flags);
++	rcu_read_unlock();
+ }
+ EXPORT_SYMBOL_GPL(led_trigger_event);
+ 
+@@ -397,20 +399,19 @@ static void led_trigger_blink_setup(struct led_trigger *trig,
+ 			     int invert)
+ {
+ 	struct led_classdev *led_cdev;
+-	unsigned long flags;
+ 
+ 	if (!trig)
+ 		return;
+ 
+-	read_lock_irqsave(&trig->leddev_list_lock, flags);
+-	list_for_each_entry(led_cdev, &trig->led_cdevs, trig_list) {
++	rcu_read_lock();
++	list_for_each_entry_rcu(led_cdev, &trig->led_cdevs, trig_list) {
+ 		if (oneshot)
+ 			led_blink_set_oneshot(led_cdev, delay_on, delay_off,
+ 					      invert);
+ 		else
+ 			led_blink_set(led_cdev, delay_on, delay_off);
+ 	}
+-	read_unlock_irqrestore(&trig->leddev_list_lock, flags);
++	rcu_read_unlock();
+ }
+ 
+ void led_trigger_blink(struct led_trigger *trig,
+diff --git a/include/linux/leds.h b/include/linux/leds.h
+index a0b730be40ad2..ba4861ec73d30 100644
+--- a/include/linux/leds.h
++++ b/include/linux/leds.h
+@@ -360,7 +360,7 @@ struct led_trigger {
+ 	struct led_hw_trigger_type *trigger_type;
+ 
+ 	/* LEDs under control by this trigger (for simple triggers) */
+-	rwlock_t	  leddev_list_lock;
++	spinlock_t	  leddev_list_lock;
+ 	struct list_head  led_cdevs;
+ 
+ 	/* Link to next registered trigger */
+-- 
+2.43.0
+
