@@ -1,0 +1,134 @@
+From stable+bounces-66327-greg=kroah.com@vger.kernel.org Sat Aug 10 22:00:59 2024
+From: cel@kernel.org
+Date: Sat, 10 Aug 2024 15:59:57 -0400
+Subject: NFSD: Refactor the duplicate reply cache shrinker
+To: <stable@vger.kernel.org>
+Cc: <linux-nfs@vger.kernel.org>, pvorel@suse.cz, sherry.yang@oracle.com, calum.mackay@oracle.com, kernel-team@fb.com, ltp@lists.linux.it, Chuck Lever <chuck.lever@oracle.com>, Jeff Layton <jlayton@kernel.org>
+Message-ID: <20240810200009.9882-7-cel@kernel.org>
+
+From: Chuck Lever <chuck.lever@oracle.com>
+
+[ Upstream commit c135e1269f34dfdea4bd94c11060c83a3c0b3c12 ]
+
+Avoid holding the bucket lock while freeing cache entries. This
+change also caps the number of entries that are freed when the
+shrinker calls to reduce the shrinker's impact on the cache's
+effectiveness.
+
+Reviewed-by: Jeff Layton <jlayton@kernel.org>
+[ cel: adjusted to apply to v6.1.y -- this one might not be necessary ]
+Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/nfsd/nfscache.c |   83 ++++++++++++++++++++++++-----------------------------
+ 1 file changed, 39 insertions(+), 44 deletions(-)
+
+--- a/fs/nfsd/nfscache.c
++++ b/fs/nfsd/nfscache.c
+@@ -310,67 +310,62 @@ nfsd_prune_bucket_locked(struct nfsd_net
+ 	}
+ }
+ 
+-static long prune_bucket(struct nfsd_drc_bucket *b, struct nfsd_net *nn,
+-			 unsigned int max)
++/**
++ * nfsd_reply_cache_count - count_objects method for the DRC shrinker
++ * @shrink: our registered shrinker context
++ * @sc: garbage collection parameters
++ *
++ * Returns the total number of entries in the duplicate reply cache. To
++ * keep things simple and quick, this is not the number of expired entries
++ * in the cache (ie, the number that would be removed by a call to
++ * nfsd_reply_cache_scan).
++ */
++static unsigned long
++nfsd_reply_cache_count(struct shrinker *shrink, struct shrink_control *sc)
+ {
+-	struct svc_cacherep *rp, *tmp;
+-	long freed = 0;
++	struct nfsd_net *nn = container_of(shrink,
++				struct nfsd_net, nfsd_reply_cache_shrinker);
+ 
+-	list_for_each_entry_safe(rp, tmp, &b->lru_head, c_lru) {
+-		/*
+-		 * Don't free entries attached to calls that are still
+-		 * in-progress, but do keep scanning the list.
+-		 */
+-		if (rp->c_state == RC_INPROG)
+-			continue;
+-		if (atomic_read(&nn->num_drc_entries) <= nn->max_drc_entries &&
+-		    time_before(jiffies, rp->c_timestamp + RC_EXPIRE))
+-			break;
+-		nfsd_reply_cache_free_locked(b, rp, nn);
+-		if (max && freed++ > max)
+-			break;
+-	}
+-	return freed;
++	return atomic_read(&nn->num_drc_entries);
+ }
+ 
+-/*
+- * Walk the LRU list and prune off entries that are older than RC_EXPIRE.
+- * Also prune the oldest ones when the total exceeds the max number of entries.
++/**
++ * nfsd_reply_cache_scan - scan_objects method for the DRC shrinker
++ * @shrink: our registered shrinker context
++ * @sc: garbage collection parameters
++ *
++ * Free expired entries on each bucket's LRU list until we've released
++ * nr_to_scan freed objects. Nothing will be released if the cache
++ * has not exceeded it's max_drc_entries limit.
++ *
++ * Returns the number of entries released by this call.
+  */
+-static long
+-prune_cache_entries(struct nfsd_net *nn)
++static unsigned long
++nfsd_reply_cache_scan(struct shrinker *shrink, struct shrink_control *sc)
+ {
++	struct nfsd_net *nn = container_of(shrink,
++				struct nfsd_net, nfsd_reply_cache_shrinker);
++	unsigned long freed = 0;
++	LIST_HEAD(dispose);
+ 	unsigned int i;
+-	long freed = 0;
+ 
+ 	for (i = 0; i < nn->drc_hashsize; i++) {
+ 		struct nfsd_drc_bucket *b = &nn->drc_hashtbl[i];
+ 
+ 		if (list_empty(&b->lru_head))
+ 			continue;
++
+ 		spin_lock(&b->cache_lock);
+-		freed += prune_bucket(b, nn, 0);
++		nfsd_prune_bucket_locked(nn, b, 0, &dispose);
+ 		spin_unlock(&b->cache_lock);
+-	}
+-	return freed;
+-}
+-
+-static unsigned long
+-nfsd_reply_cache_count(struct shrinker *shrink, struct shrink_control *sc)
+-{
+-	struct nfsd_net *nn = container_of(shrink,
+-				struct nfsd_net, nfsd_reply_cache_shrinker);
+ 
+-	return atomic_read(&nn->num_drc_entries);
+-}
+-
+-static unsigned long
+-nfsd_reply_cache_scan(struct shrinker *shrink, struct shrink_control *sc)
+-{
+-	struct nfsd_net *nn = container_of(shrink,
+-				struct nfsd_net, nfsd_reply_cache_shrinker);
++		freed += nfsd_cacherep_dispose(&dispose);
++		if (freed > sc->nr_to_scan)
++			break;
++	}
+ 
+-	return prune_cache_entries(nn);
++	trace_nfsd_drc_gc(nn, freed);
++	return freed;
+ }
+ 
+ /**
