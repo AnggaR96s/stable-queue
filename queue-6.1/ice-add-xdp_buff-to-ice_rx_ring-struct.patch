@@ -1,0 +1,157 @@
+From f7b90d53f5a829f4e859a3ec164b81c6716805d6 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 31 Jan 2023 21:44:55 +0100
+Subject: ice: Add xdp_buff to ice_rx_ring struct
+
+From: Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+
+[ Upstream commit cb0473e0e9dccaa0ddafb252f2c3ef943b86bb56 ]
+
+In preparation for XDP multi-buffer support, let's store xdp_buff on
+Rx ring struct. This will allow us to combine fragmented frames across
+separate NAPI cycles in the same way as currently skb fragments are
+handled. This means that skb pointer on Rx ring will become redundant
+and will be removed. For now it is kept and layout of Rx ring struct was
+not inspected, some member movement will be needed later on so that will
+be the time to take care of it.
+
+Signed-off-by: Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Reviewed-by: Alexander Lobakin <alexandr.lobakin@intel.com>
+Link: https://lore.kernel.org/bpf/20230131204506.219292-3-maciej.fijalkowski@intel.com
+Stable-dep-of: 50b2143356e8 ("ice: fix page reuse when PAGE_SIZE is over 8k")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/net/ethernet/intel/ice/ice_base.c |  1 +
+ drivers/net/ethernet/intel/ice/ice_txrx.c | 39 +++++++++++++----------
+ drivers/net/ethernet/intel/ice/ice_txrx.h |  1 +
+ 3 files changed, 25 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/net/ethernet/intel/ice/ice_base.c b/drivers/net/ethernet/intel/ice/ice_base.c
+index c7c6f01538e0d..4db4ec4b8857a 100644
+--- a/drivers/net/ethernet/intel/ice/ice_base.c
++++ b/drivers/net/ethernet/intel/ice/ice_base.c
+@@ -534,6 +534,7 @@ int ice_vsi_cfg_rxq(struct ice_rx_ring *ring)
+ 		}
+ 	}
+ 
++	xdp_init_buff(&ring->xdp, ice_rx_pg_size(ring) / 2, &ring->xdp_rxq);
+ 	err = ice_setup_rx_ctx(ring);
+ 	if (err) {
+ 		dev_err(dev, "ice_setup_rx_ctx failed for RxQ %d, err %d\n",
+diff --git a/drivers/net/ethernet/intel/ice/ice_txrx.c b/drivers/net/ethernet/intel/ice/ice_txrx.c
+index 2db20263420d8..d3411170f3eaf 100644
+--- a/drivers/net/ethernet/intel/ice/ice_txrx.c
++++ b/drivers/net/ethernet/intel/ice/ice_txrx.c
+@@ -523,8 +523,16 @@ int ice_setup_rx_ring(struct ice_rx_ring *rx_ring)
+ 	return -ENOMEM;
+ }
+ 
++/**
++ * ice_rx_frame_truesize
++ * @rx_ring: ptr to Rx ring
++ * @size: size
++ *
++ * calculate the truesize with taking into the account PAGE_SIZE of
++ * underlying arch
++ */
+ static unsigned int
+-ice_rx_frame_truesize(struct ice_rx_ring *rx_ring, unsigned int __maybe_unused size)
++ice_rx_frame_truesize(struct ice_rx_ring *rx_ring, const unsigned int size)
+ {
+ 	unsigned int truesize;
+ 
+@@ -1103,21 +1111,20 @@ ice_is_non_eop(struct ice_rx_ring *rx_ring, union ice_32b_rx_flex_desc *rx_desc)
+  */
+ int ice_clean_rx_irq(struct ice_rx_ring *rx_ring, int budget)
+ {
+-	unsigned int total_rx_bytes = 0, total_rx_pkts = 0, frame_sz = 0;
++	unsigned int total_rx_bytes = 0, total_rx_pkts = 0;
+ 	u16 cleaned_count = ICE_DESC_UNUSED(rx_ring);
+ 	unsigned int offset = rx_ring->rx_offset;
++	struct xdp_buff *xdp = &rx_ring->xdp;
+ 	struct ice_tx_ring *xdp_ring = NULL;
+ 	unsigned int xdp_res, xdp_xmit = 0;
+ 	struct sk_buff *skb = rx_ring->skb;
+ 	struct bpf_prog *xdp_prog = NULL;
+-	struct xdp_buff xdp;
+ 	bool failure;
+ 
+ 	/* Frame size depend on rx_ring setup when PAGE_SIZE=4K */
+ #if (PAGE_SIZE < 8192)
+-	frame_sz = ice_rx_frame_truesize(rx_ring, 0);
++	xdp->frame_sz = ice_rx_frame_truesize(rx_ring, 0);
+ #endif
+-	xdp_init_buff(&xdp, frame_sz, &rx_ring->xdp_rxq);
+ 
+ 	xdp_prog = READ_ONCE(rx_ring->xdp_prog);
+ 	if (xdp_prog)
+@@ -1171,30 +1178,30 @@ int ice_clean_rx_irq(struct ice_rx_ring *rx_ring, int budget)
+ 		rx_buf = ice_get_rx_buf(rx_ring, size, &rx_buf_pgcnt);
+ 
+ 		if (!size) {
+-			xdp.data = NULL;
+-			xdp.data_end = NULL;
+-			xdp.data_hard_start = NULL;
+-			xdp.data_meta = NULL;
++			xdp->data = NULL;
++			xdp->data_end = NULL;
++			xdp->data_hard_start = NULL;
++			xdp->data_meta = NULL;
+ 			goto construct_skb;
+ 		}
+ 
+ 		hard_start = page_address(rx_buf->page) + rx_buf->page_offset -
+ 			     offset;
+-		xdp_prepare_buff(&xdp, hard_start, offset, size, !!offset);
++		xdp_prepare_buff(xdp, hard_start, offset, size, !!offset);
+ #if (PAGE_SIZE > 4096)
+ 		/* At larger PAGE_SIZE, frame_sz depend on len size */
+-		xdp.frame_sz = ice_rx_frame_truesize(rx_ring, size);
++		xdp->frame_sz = ice_rx_frame_truesize(rx_ring, size);
+ #endif
+ 
+ 		if (!xdp_prog)
+ 			goto construct_skb;
+ 
+-		xdp_res = ice_run_xdp(rx_ring, &xdp, xdp_prog, xdp_ring);
++		xdp_res = ice_run_xdp(rx_ring, xdp, xdp_prog, xdp_ring);
+ 		if (!xdp_res)
+ 			goto construct_skb;
+ 		if (xdp_res & (ICE_XDP_TX | ICE_XDP_REDIR)) {
+ 			xdp_xmit |= xdp_res;
+-			ice_rx_buf_adjust_pg_offset(rx_buf, xdp.frame_sz);
++			ice_rx_buf_adjust_pg_offset(rx_buf, xdp->frame_sz);
+ 		} else {
+ 			rx_buf->pagecnt_bias++;
+ 		}
+@@ -1207,11 +1214,11 @@ int ice_clean_rx_irq(struct ice_rx_ring *rx_ring, int budget)
+ construct_skb:
+ 		if (skb) {
+ 			ice_add_rx_frag(rx_ring, rx_buf, skb, size);
+-		} else if (likely(xdp.data)) {
++		} else if (likely(xdp->data)) {
+ 			if (ice_ring_uses_build_skb(rx_ring))
+-				skb = ice_build_skb(rx_ring, rx_buf, &xdp);
++				skb = ice_build_skb(rx_ring, rx_buf, xdp);
+ 			else
+-				skb = ice_construct_skb(rx_ring, rx_buf, &xdp);
++				skb = ice_construct_skb(rx_ring, rx_buf, xdp);
+ 		}
+ 		/* exit if we failed to retrieve a buffer */
+ 		if (!skb) {
+diff --git a/drivers/net/ethernet/intel/ice/ice_txrx.h b/drivers/net/ethernet/intel/ice/ice_txrx.h
+index bfbe4b16df96a..ef8245f795c5b 100644
+--- a/drivers/net/ethernet/intel/ice/ice_txrx.h
++++ b/drivers/net/ethernet/intel/ice/ice_txrx.h
+@@ -295,6 +295,7 @@ struct ice_rx_ring {
+ 	struct bpf_prog *xdp_prog;
+ 	struct ice_tx_ring *xdp_ring;
+ 	struct xsk_buff_pool *xsk_pool;
++	struct xdp_buff xdp;
+ 	struct sk_buff *skb;
+ 	dma_addr_t dma;			/* physical address of ring */
+ 	u64 cached_phctime;
+-- 
+2.43.0
+
