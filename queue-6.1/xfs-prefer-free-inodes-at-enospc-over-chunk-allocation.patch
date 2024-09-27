@@ -1,0 +1,95 @@
+From stable+bounces-77021-greg=kroah.com@vger.kernel.org Tue Sep 24 20:39:37 2024
+From: Leah Rumancik <leah.rumancik@gmail.com>
+Date: Tue, 24 Sep 2024 11:38:31 -0700
+Subject: xfs: prefer free inodes at ENOSPC over chunk allocation
+To: stable@vger.kernel.org
+Cc: linux-xfs@vger.kernel.org, amir73il@gmail.com, chandan.babu@oracle.com, cem@kernel.org, catherine.hoang@oracle.com, Dave Chinner <dchinner@redhat.com>, Allison Henderson <allison.henderson@oracle.com>, "Darrick J. Wong" <djwong@kernel.org>, Leah Rumancik <leah.rumancik@gmail.com>, Chandan Babu R <chandanbabu@kernel.org>
+Message-ID: <20240924183851.1901667-7-leah.rumancik@gmail.com>
+
+From: Dave Chinner <dchinner@redhat.com>
+
+[ Upstream commit f08f984c63e9980614ae3a0a574b31eaaef284b2 ]
+
+When an XFS filesystem has free inodes in chunks already allocated
+on disk, it will still allocate new inode chunks if the target AG
+has no free inodes in it. Normally, this is a good idea as it
+preserves locality of all the inodes in a given directory.
+
+However, at ENOSPC this can lead to using the last few remaining
+free filesystem blocks to allocate a new chunk when there are many,
+many free inodes that could be allocated without consuming free
+space. This results in speeding up the consumption of the last few
+blocks and inode create operations then returning ENOSPC when there
+free inodes available because we don't have enough block left in the
+filesystem for directory creation reservations to proceed.
+
+Hence when we are near ENOSPC, we should be attempting to preserve
+the remaining blocks for directory block allocation rather than
+using them for unnecessary inode chunk creation.
+
+This particular behaviour is exposed by xfs/294, when it drives to
+ENOSPC on empty file creation whilst there are still thousands of
+free inodes available for allocation in other AGs in the filesystem.
+
+Hence, when we are within 1% of ENOSPC, change the inode allocation
+behaviour to prefer to use existing free inodes over allocating new
+inode chunks, even though it results is poorer locality of the data
+set. It is more important for the allocations to be space efficient
+near ENOSPC than to have optimal locality for performance, so lets
+modify the inode AG selection code to reflect that fact.
+
+This allows generic/294 to not only pass with this allocator rework
+patchset, but to increase the number of post-ENOSPC empty inode
+allocations to from ~600 to ~9080 before we hit ENOSPC on the
+directory create transaction reservation.
+
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Allison Henderson <allison.henderson@oracle.com>
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Signed-off-by: Leah Rumancik <leah.rumancik@gmail.com>
+Acked-by: Chandan Babu R <chandanbabu@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/xfs/libxfs/xfs_ialloc.c |   17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+--- a/fs/xfs/libxfs/xfs_ialloc.c
++++ b/fs/xfs/libxfs/xfs_ialloc.c
+@@ -1737,6 +1737,7 @@ xfs_dialloc(
+ 	struct xfs_perag	*pag;
+ 	struct xfs_ino_geometry	*igeo = M_IGEO(mp);
+ 	bool			ok_alloc = true;
++	bool			low_space = false;
+ 	int			flags;
+ 	xfs_ino_t		ino;
+ 
+@@ -1768,6 +1769,20 @@ xfs_dialloc(
+ 	}
+ 
+ 	/*
++	 * If we are near to ENOSPC, we want to prefer allocation from AGs that
++	 * have free inodes in them rather than use up free space allocating new
++	 * inode chunks. Hence we turn off allocation for the first non-blocking
++	 * pass through the AGs if we are near ENOSPC to consume free inodes
++	 * that we can immediately allocate, but then we allow allocation on the
++	 * second pass if we fail to find an AG with free inodes in it.
++	 */
++	if (percpu_counter_read_positive(&mp->m_fdblocks) <
++			mp->m_low_space[XFS_LOWSP_1_PCNT]) {
++		ok_alloc = false;
++		low_space = true;
++	}
++
++	/*
+ 	 * Loop until we find an allocation group that either has free inodes
+ 	 * or in which we can allocate some inodes.  Iterate through the
+ 	 * allocation groups upward, wrapping at the end.
+@@ -1795,6 +1810,8 @@ xfs_dialloc(
+ 				break;
+ 			}
+ 			flags = 0;
++			if (low_space)
++				ok_alloc = true;
+ 		}
+ 		xfs_perag_put(pag);
+ 	}
