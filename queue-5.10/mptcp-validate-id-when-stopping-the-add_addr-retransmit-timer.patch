@@ -1,0 +1,110 @@
+From stable+bounces-76549-greg=kroah.com@vger.kernel.org Tue Sep 17 09:26:36 2024
+From: "Matthieu Baerts (NGI0)" <matttbe@kernel.org>
+Date: Tue, 17 Sep 2024 09:26:10 +0200
+Subject: mptcp: validate 'id' when stopping the ADD_ADDR retransmit timer
+To: mptcp@lists.linux.dev, stable@vger.kernel.org, gregkh@linuxfoundation.org
+Cc: Davide Caratti <dcaratti@redhat.com>, Mat Martineau <mathew.j.martineau@linux.intel.com>, "David S . Miller" <davem@davemloft.net>, Matthieu Baerts <matttbe@kernel.org>
+Message-ID: <20240917072607.799536-7-matttbe@kernel.org>
+
+From: Davide Caratti <dcaratti@redhat.com>
+
+commit d58300c3185b78ab910092488126b97f0abe3ae2 upstream.
+
+when Linux receives an echo-ed ADD_ADDR, it checks the IP address against
+the list of "announced" addresses. In case of a positive match, the timer
+that handles retransmissions is stopped regardless of the 'Address Id' in
+the received packet: this behaviour does not comply with RFC8684 3.4.1.
+
+Fix it by validating the 'Address Id' in received echo-ed ADD_ADDRs.
+Tested using packetdrill, with the following captured output:
+
+ unpatched kernel:
+
+ Out <...> Flags [.], ack 1, win 256, options [mptcp add-addr v1 id 1 198.51.100.2 hmac 0xfd2e62517888fe29,mptcp dss ack 3007449509], length 0
+ In  <...> Flags [.], ack 1, win 257, options [mptcp add-addr v1-echo id 1 1.2.3.4,mptcp dss ack 3013740213], length 0
+ Out <...> Flags [.], ack 1, win 256, options [mptcp add-addr v1 id 1 198.51.100.2 hmac 0xfd2e62517888fe29,mptcp dss ack 3007449509], length 0
+ In  <...> Flags [.], ack 1, win 257, options [mptcp add-addr v1-echo id 90 198.51.100.2,mptcp dss ack 3013740213], length 0
+        ^^^ retransmission is stopped here, but 'Address Id' is 90
+
+ patched kernel:
+
+ Out <...> Flags [.], ack 1, win 256, options [mptcp add-addr v1 id 1 198.51.100.2 hmac 0x1cf372d59e05f4b8,mptcp dss ack 3007449509], length 0
+ In  <...> Flags [.], ack 1, win 257, options [mptcp add-addr v1-echo id 1 1.2.3.4,mptcp dss ack 1672384568], length 0
+ Out <...> Flags [.], ack 1, win 256, options [mptcp add-addr v1 id 1 198.51.100.2 hmac 0x1cf372d59e05f4b8,mptcp dss ack 3007449509], length 0
+ In  <...> Flags [.], ack 1, win 257, options [mptcp add-addr v1-echo id 90 198.51.100.2,mptcp dss ack 1672384568], length 0
+ Out <...> Flags [.], ack 1, win 256, options [mptcp add-addr v1 id 1 198.51.100.2 hmac 0x1cf372d59e05f4b8,mptcp dss ack 3007449509], length 0
+ In  <...> Flags [.], ack 1, win 257, options [mptcp add-addr v1-echo id 1 198.51.100.2,mptcp dss ack 1672384568], length 0
+        ^^^ retransmission is stopped here, only when both 'Address Id' and 'IP Address' match
+
+Fixes: 00cfd77b9063 ("mptcp: retransmit ADD_ADDR when timeout")
+Signed-off-by: Davide Caratti <dcaratti@redhat.com>
+Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Stable-dep-of: b4cd80b03389 ("mptcp: pm: Fix uaf in __timer_delete_sync")
+[ Conflicts in options.c, because some features are missing in this
+  version, e.g. commit 557963c383e8 ("mptcp: move to next addr when
+  subflow creation fail") and commit f7dafee18538 ("mptcp: use
+  mptcp_addr_info in mptcp_options_received"). ]
+Signed-off-by: Matthieu Baerts (NGI0) <matttbe@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/mptcp/options.c    |    2 +-
+ net/mptcp/pm_netlink.c |    8 ++++----
+ net/mptcp/protocol.h   |    2 +-
+ 3 files changed, 6 insertions(+), 6 deletions(-)
+
+--- a/net/mptcp/options.c
++++ b/net/mptcp/options.c
+@@ -915,7 +915,7 @@ void mptcp_incoming_options(struct sock
+ 			mptcp_pm_add_addr_received(msk, &addr);
+ 			MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_ADDADDR);
+ 		} else {
+-			mptcp_pm_del_add_timer(msk, &addr);
++			mptcp_pm_del_add_timer(msk, &addr, true);
+ 			MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_ECHOADD);
+ 		}
+ 		mp_opt.add_addr = 0;
+--- a/net/mptcp/pm_netlink.c
++++ b/net/mptcp/pm_netlink.c
+@@ -249,18 +249,18 @@ out:
+ 
+ struct mptcp_pm_add_entry *
+ mptcp_pm_del_add_timer(struct mptcp_sock *msk,
+-		       struct mptcp_addr_info *addr)
++		       struct mptcp_addr_info *addr, bool check_id)
+ {
+ 	struct mptcp_pm_add_entry *entry;
+ 	struct sock *sk = (struct sock *)msk;
+ 
+ 	spin_lock_bh(&msk->pm.lock);
+ 	entry = mptcp_lookup_anno_list_by_saddr(msk, addr);
+-	if (entry)
++	if (entry && (!check_id || entry->addr.id == addr->id))
+ 		entry->retrans_times = ADD_ADDR_RETRANS_MAX;
+ 	spin_unlock_bh(&msk->pm.lock);
+ 
+-	if (entry)
++	if (entry && (!check_id || entry->addr.id == addr->id))
+ 		sk_stop_timer_sync(sk, &entry->add_timer);
+ 
+ 	return entry;
+@@ -764,7 +764,7 @@ static bool remove_anno_list_by_saddr(st
+ {
+ 	struct mptcp_pm_add_entry *entry;
+ 
+-	entry = mptcp_pm_del_add_timer(msk, addr);
++	entry = mptcp_pm_del_add_timer(msk, addr, false);
+ 	if (entry) {
+ 		list_del(&entry->list);
+ 		kfree(entry);
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -450,7 +450,7 @@ void mptcp_pm_rm_addr_received(struct mp
+ void mptcp_pm_free_anno_list(struct mptcp_sock *msk);
+ struct mptcp_pm_add_entry *
+ mptcp_pm_del_add_timer(struct mptcp_sock *msk,
+-		       struct mptcp_addr_info *addr);
++		       struct mptcp_addr_info *addr, bool check_id);
+ struct mptcp_pm_add_entry *
+ mptcp_lookup_anno_list_by_saddr(struct mptcp_sock *msk,
+ 				struct mptcp_addr_info *addr);
