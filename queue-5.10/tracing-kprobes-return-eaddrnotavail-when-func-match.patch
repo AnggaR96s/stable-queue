@@ -1,0 +1,164 @@
+From 225b8fa07ad0b6a981d8d9bcf3742be0125e8f96 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 8 Oct 2024 15:29:47 -0700
+Subject: tracing/kprobes: Return EADDRNOTAVAIL when func matches several
+ symbols
+
+From: Francis Laniel <flaniel@linux.microsoft.com>
+
+commit b022f0c7e404887a7c5229788fc99eff9f9a80d5 upstream.
+
+When a kprobe is attached to a function that's name is not unique (is
+static and shares the name with other functions in the kernel), the
+kprobe is attached to the first function it finds. This is a bug as the
+function that it is attaching to is not necessarily the one that the
+user wants to attach to.
+
+Instead of blindly picking a function to attach to what is ambiguous,
+error with EADDRNOTAVAIL to let the user know that this function is not
+unique, and that the user must use another unique function with an
+address offset to get to the function they want to attach to.
+
+Link: https://lore.kernel.org/all/20231020104250.9537-2-flaniel@linux.microsoft.com/
+
+Cc: stable@vger.kernel.org
+Fixes: 413d37d1eb69 ("tracing: Add kprobe-based event tracer")
+Suggested-by: Masami Hiramatsu <mhiramat@kernel.org>
+Signed-off-by: Francis Laniel <flaniel@linux.microsoft.com>
+Link: https://lore.kernel.org/lkml/20230819101105.b0c104ae4494a7d1f2eea742@kernel.org/
+Acked-by: Masami Hiramatsu (Google) <mhiramat@kernel.org>
+Signed-off-by: Masami Hiramatsu (Google) <mhiramat@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+[Sherry: 5.10.y added a new kselftest kprobe_non_uniq_symbol.tc by
+backporting commit 09bcf9254838 ("selftests/ftrace: Add new test case which
+checks non unique symbol"). However, 5.10.y didn't backport this commit which
+provides unique symbol check suppport from kernel side. Minor conflicts due to
+context change, ignore context change]
+Signed-off-by: Sherry Yang <sherry.yang@oracle.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ kernel/trace/trace_kprobe.c | 74 +++++++++++++++++++++++++++++++++++++
+ kernel/trace/trace_probe.h  |  1 +
+ 2 files changed, 75 insertions(+)
+
+diff --git a/kernel/trace/trace_kprobe.c b/kernel/trace/trace_kprobe.c
+index 5453af26ff764..91dfe8cf1ce8b 100644
+--- a/kernel/trace/trace_kprobe.c
++++ b/kernel/trace/trace_kprobe.c
+@@ -715,6 +715,36 @@ static inline void sanitize_event_name(char *name)
+ 			*name = '_';
+ }
+ 
++struct count_symbols_struct {
++	const char *func_name;
++	unsigned int count;
++};
++
++static int count_symbols(void *data, const char *name, struct module *unused0,
++			 unsigned long unused1)
++{
++	struct count_symbols_struct *args = data;
++
++	if (strcmp(args->func_name, name))
++		return 0;
++
++	args->count++;
++
++	return 0;
++}
++
++static unsigned int number_of_same_symbols(char *func_name)
++{
++	struct count_symbols_struct args = {
++		.func_name = func_name,
++		.count = 0,
++	};
++
++	kallsyms_on_each_symbol(count_symbols, &args);
++
++	return args.count;
++}
++
+ static int trace_kprobe_create(int argc, const char *argv[])
+ {
+ 	/*
+@@ -842,6 +872,31 @@ static int trace_kprobe_create(int argc, const char *argv[])
+ 		}
+ 	}
+ 
++	if (symbol && !strchr(symbol, ':')) {
++		unsigned int count;
++
++		count = number_of_same_symbols(symbol);
++		if (count > 1) {
++			/*
++			 * Users should use ADDR to remove the ambiguity of
++			 * using KSYM only.
++			 */
++			trace_probe_log_err(0, NON_UNIQ_SYMBOL);
++			ret = -EADDRNOTAVAIL;
++
++			goto error;
++		} else if (count == 0) {
++			/*
++			 * We can return ENOENT earlier than when register the
++			 * kprobe.
++			 */
++			trace_probe_log_err(0, BAD_PROBE_ADDR);
++			ret = -ENOENT;
++
++			goto error;
++		}
++	}
++
+ 	trace_probe_log_set_index(0);
+ 	if (event) {
+ 		ret = traceprobe_parse_event_name(&event, &group, buf,
+@@ -1805,6 +1860,7 @@ static int unregister_kprobe_event(struct trace_kprobe *tk)
+ }
+ 
+ #ifdef CONFIG_PERF_EVENTS
++
+ /* create a trace_kprobe, but don't add it to global lists */
+ struct trace_event_call *
+ create_local_trace_kprobe(char *func, void *addr, unsigned long offs,
+@@ -1814,6 +1870,24 @@ create_local_trace_kprobe(char *func, void *addr, unsigned long offs,
+ 	int ret;
+ 	char *event;
+ 
++	if (func) {
++		unsigned int count;
++
++		count = number_of_same_symbols(func);
++		if (count > 1)
++			/*
++			 * Users should use addr to remove the ambiguity of
++			 * using func only.
++			 */
++			return ERR_PTR(-EADDRNOTAVAIL);
++		else if (count == 0)
++			/*
++			 * We can return ENOENT earlier than when register the
++			 * kprobe.
++			 */
++			return ERR_PTR(-ENOENT);
++	}
++
+ 	/*
+ 	 * local trace_kprobes are not added to dyn_event, so they are never
+ 	 * searched in find_trace_kprobe(). Therefore, there is no concern of
+diff --git a/kernel/trace/trace_probe.h b/kernel/trace/trace_probe.h
+index d4a69b83902e1..22c05ca977587 100644
+--- a/kernel/trace/trace_probe.h
++++ b/kernel/trace/trace_probe.h
+@@ -390,6 +390,7 @@ extern int traceprobe_define_arg_fields(struct trace_event_call *event_call,
+ 	C(BAD_MAXACT,		"Invalid maxactive number"),		\
+ 	C(MAXACT_TOO_BIG,	"Maxactive is too big"),		\
+ 	C(BAD_PROBE_ADDR,	"Invalid probed address or symbol"),	\
++	C(NON_UNIQ_SYMBOL,	"The symbol is not unique"),		\
+ 	C(BAD_RETPROBE,		"Retprobe address must be an function entry"), \
+ 	C(BAD_ADDR_SUFFIX,	"Invalid probed address suffix"), \
+ 	C(NO_GROUP_NAME,	"Group name is not specified"),		\
+-- 
+2.43.0
+
