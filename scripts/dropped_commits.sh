@@ -24,13 +24,9 @@ is_readded() {
     local ver="$1"
     local upstream_id="$2"
     
-    # Look for any file in releases/{ver}.* that contains the upstream id
-    while read -r file; do
-        if grep -q "$upstream_id" "$file" 2>/dev/null; then
-            return 0  # Found a match
-        fi
-    done < <(find "releases" -type f -path "releases/${ver}.*" 2>/dev/null)
-    return 1  # No match found
+    # Direct grep on releases/${ver}.* pattern
+    grep -q "$upstream_id" releases/${ver}.* 2>/dev/null
+    return $?
 }
 
 # Function to check if entry already exists in dropped_commits
@@ -43,12 +39,46 @@ is_known_drop() {
     return $?
 }
 
+# Function to get the commit range to process
+get_commit_range() {
+    local dropped_commits="$1"
+    
+    if [ ! -f "$dropped_commits" ] || [ ! -s "$dropped_commits" ]; then
+        echo "Processing full history" >&2
+        echo ""  # Return empty string to indicate full history
+        return 0
+    fi
+    
+    # Get the last line and trim whitespace
+    last_line=$(tail -n 1 "$dropped_commits" | tr -d '[:space:]')
+    
+    # Check if last_line is empty
+    if [ -z "$last_line" ]; then
+        echo "Last line is empty, processing full history" >&2
+        echo ""
+        return 0
+    fi
+    
+    # Check if the last line is a valid commit
+    if echo "$last_line" | grep -qE '^[0-9a-f]{40}$' && git rev-parse --verify "$last_line^{commit}" >/dev/null 2>&1; then
+        echo "Processing commits from $last_line..HEAD" >&2
+        echo "$last_line..HEAD"
+        return 0
+    fi
+    
+    echo "Last line is not a valid commit, processing full history" >&2
+    echo ""
+}
+
 # Function to process a single commit
 process_commit() {
     local ver="$1"
     local commit="$2"
     local tmpfile="$3"
     local dropped_commits="$4"
+    
+    # Skip empty commits
+    [ -z "$commit" ] && return
     
     # Get the files deleted in this commit
     git show --diff-filter=D --name-only --pretty="" "$commit" -- "queue-${ver}" | \
@@ -93,6 +123,9 @@ process_repo() {
     mkdir -p scripts
     touch "$dropped_commits"
     
+    # Get commit range to process
+    local commit_range=$(get_commit_range "$dropped_commits")
+    
     # Process versions and collect new entries
     exec 3>"$tmpfile"
     while IFS= read -r ver; do
@@ -101,8 +134,16 @@ process_repo() {
         
         echo "Processing version $ver..." >&2
         
-        # Get all commits that deleted files
-        commits=$(git log --diff-filter=D --format="%H" -- "queue-${ver}")
+        # Get all commits that deleted files - commit range before --
+        local git_log_cmd="git log --diff-filter=D --format=%H"
+        if [ -n "$commit_range" ]; then
+            git_log_cmd="$git_log_cmd $commit_range"
+        fi
+        git_log_cmd="$git_log_cmd -- queue-${ver}"
+        
+        # Execute git log and ensure non-empty output
+        commits=$(eval "$git_log_cmd") || continue
+        [ -z "$commits" ] && continue
         
         # Process commits in parallel
         echo "$commits" | \
@@ -114,9 +155,15 @@ process_repo() {
     
     # Create new sorted file with unique entries
     {
-        cat "$dropped_commits"
+        if [ -s "$dropped_commits" ]; then
+            # Keep all but the last line (old commit hash)
+            head -n -1 "$dropped_commits"
+        fi
         cat "$tmpfile"
-    } | sort -V -k1,1 -k2,2 | uniq > "${tmpfile}.sorted"
+    } | sort -rV -k1,1 -k2,2 | uniq > "${tmpfile}.sorted"
+    
+    # Add current HEAD commit as the last line
+    git rev-parse HEAD >> "${tmpfile}.sorted"
     
     # Only update if there are changes
     if ! cmp -s "${tmpfile}.sorted" "$dropped_commits"; then
