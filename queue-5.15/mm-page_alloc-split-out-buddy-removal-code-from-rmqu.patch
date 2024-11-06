@@ -1,0 +1,151 @@
+From fc6b92e69f211e4a3637ec0d4b8a328496c067d8 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 24 Jun 2022 13:54:19 +0100
+Subject: mm/page_alloc: split out buddy removal code from rmqueue into
+ separate helper
+
+From: Mel Gorman <mgorman@techsingularity.net>
+
+[ Upstream commit 589d9973c1d2c3344a94a57441071340b0c71097 ]
+
+This is a preparation page to allow the buddy removal code to be reused in
+a later patch.
+
+No functional change.
+
+Link: https://lkml.kernel.org/r/20220624125423.6126-4-mgorman@techsingularity.net
+Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
+Tested-by: Minchan Kim <minchan@kernel.org>
+Acked-by: Minchan Kim <minchan@kernel.org>
+Reviewed-by: Nicolas Saenz Julienne <nsaenzju@redhat.com>
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
+Tested-by: Yu Zhao <yuzhao@google.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Marcelo Tosatti <mtosatti@redhat.com>
+Cc: Marek Szyprowski <m.szyprowski@samsung.com>
+Cc: Michal Hocko <mhocko@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Stable-dep-of: 281dd25c1a01 ("mm/page_alloc: let GFP_ATOMIC order-0 allocs access highatomic reserves")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ mm/page_alloc.c | 81 ++++++++++++++++++++++++++++---------------------
+ 1 file changed, 47 insertions(+), 34 deletions(-)
+
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 264cb1914ab5b..ae628574dc9fc 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -3597,6 +3597,43 @@ static inline void zone_statistics(struct zone *preferred_zone, struct zone *z,
+ #endif
+ }
+ 
++static __always_inline
++struct page *rmqueue_buddy(struct zone *preferred_zone, struct zone *zone,
++			   unsigned int order, unsigned int alloc_flags,
++			   int migratetype)
++{
++	struct page *page;
++	unsigned long flags;
++
++	do {
++		page = NULL;
++		spin_lock_irqsave(&zone->lock, flags);
++		/*
++		 * order-0 request can reach here when the pcplist is skipped
++		 * due to non-CMA allocation context. HIGHATOMIC area is
++		 * reserved for high-order atomic allocation, so order-0
++		 * request should skip it.
++		 */
++		if (order > 0 && alloc_flags & ALLOC_HARDER)
++			page = __rmqueue_smallest(zone, order, MIGRATE_HIGHATOMIC);
++		if (!page) {
++			page = __rmqueue(zone, order, migratetype, alloc_flags);
++			if (!page) {
++				spin_unlock_irqrestore(&zone->lock, flags);
++				return NULL;
++			}
++		}
++		__mod_zone_freepage_state(zone, -(1 << order),
++					  get_pcppage_migratetype(page));
++		spin_unlock_irqrestore(&zone->lock, flags);
++	} while (check_new_pages(page, order));
++
++	__count_zid_vm_events(PGALLOC, page_zonenum(page), 1 << order);
++	zone_statistics(preferred_zone, zone, 1);
++
++	return page;
++}
++
+ /* Remove page from the per-cpu list, caller must protect the list */
+ static inline
+ struct page *__rmqueue_pcplist(struct zone *zone, unsigned int order,
+@@ -3677,9 +3714,14 @@ struct page *rmqueue(struct zone *preferred_zone,
+ 			gfp_t gfp_flags, unsigned int alloc_flags,
+ 			int migratetype)
+ {
+-	unsigned long flags;
+ 	struct page *page;
+ 
++	/*
++	 * We most definitely don't want callers attempting to
++	 * allocate greater than order-1 page units with __GFP_NOFAIL.
++	 */
++	WARN_ON_ONCE((gfp_flags & __GFP_NOFAIL) && (order > 1));
++
+ 	if (likely(pcp_allowed_order(order))) {
+ 		/*
+ 		 * MIGRATE_MOVABLE pcplist could have the pages on CMA area and
+@@ -3693,35 +3735,10 @@ struct page *rmqueue(struct zone *preferred_zone,
+ 		}
+ 	}
+ 
+-	/*
+-	 * We most definitely don't want callers attempting to
+-	 * allocate greater than order-1 page units with __GFP_NOFAIL.
+-	 */
+-	WARN_ON_ONCE((gfp_flags & __GFP_NOFAIL) && (order > 1));
+-
+-	do {
+-		page = NULL;
+-		spin_lock_irqsave(&zone->lock, flags);
+-		/*
+-		 * order-0 request can reach here when the pcplist is skipped
+-		 * due to non-CMA allocation context. HIGHATOMIC area is
+-		 * reserved for high-order atomic allocation, so order-0
+-		 * request should skip it.
+-		 */
+-		if (order > 0 && alloc_flags & ALLOC_HARDER)
+-			page = __rmqueue_smallest(zone, order, MIGRATE_HIGHATOMIC);
+-		if (!page) {
+-			page = __rmqueue(zone, order, migratetype, alloc_flags);
+-			if (!page)
+-				goto failed;
+-		}
+-		__mod_zone_freepage_state(zone, -(1 << order),
+-					  get_pcppage_migratetype(page));
+-		spin_unlock_irqrestore(&zone->lock, flags);
+-	} while (check_new_pages(page, order));
+-
+-	__count_zid_vm_events(PGALLOC, page_zonenum(page), 1 << order);
+-	zone_statistics(preferred_zone, zone, 1);
++	page = rmqueue_buddy(preferred_zone, zone, order, alloc_flags,
++							migratetype);
++	if (unlikely(!page))
++		return NULL;
+ 
+ out:
+ 	/* Separate test+clear to avoid unnecessary atomics */
+@@ -3732,10 +3749,6 @@ struct page *rmqueue(struct zone *preferred_zone,
+ 
+ 	VM_BUG_ON_PAGE(page && bad_range(zone, page), page);
+ 	return page;
+-
+-failed:
+-	spin_unlock_irqrestore(&zone->lock, flags);
+-	return NULL;
+ }
+ 
+ #ifdef CONFIG_FAIL_PAGE_ALLOC
+-- 
+2.43.0
+
