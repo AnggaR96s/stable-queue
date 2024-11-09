@@ -3,20 +3,32 @@
 # Get number of CPUs for parallel processing
 NR_CPUS=$(nproc)
 
-# Function to extract the first SHA1 from changelog
+# Function to extract the first SHA1 from changelog body
 extract_sha1() {
     local content="$1"
-    # Look for first 40-character hex string in the content
-    echo "$content" | grep -o -m 1 '[0-9a-f]\{40\}' || echo "NO_SHA"
+    # Skip everything until the first blank line (end of commit metadata)
+    # Then look for first 40-character hex string
+    awk '
+        BEGIN { found_blank = 0 }
+        /^$/ { found_blank = 1; next }
+        found_blank == 1 {
+            if (match($0, /[0-9a-f]{40}/, m)) {
+                print m[0]
+                exit
+            }
+        }
+    ' <<< "$content" || echo "NO_SHA"
 }
 
 # Function to check if a file was moved rather than deleted
 is_moved() {
     local file="$1"
     local commit="$2"
+    local ver="$3"
     
     # Check if the file appears in the same commit with R status (rename)
-    git log -1 --format=%H --full-history --diff-filter=R -- "$file" | grep -q "$commit"
+    # Look in both queue-${ver} and releases/${ver}.*
+    git log -1 --format=%H --full-history --diff-filter=R -- "$file" "releases/${ver}.*" | grep -q "$commit"
 }
 
 # Function to check if upstream id exists in releases directory
@@ -24,8 +36,8 @@ is_readded() {
     local ver="$1"
     local upstream_id="$2"
     
-    # Direct grep on releases/${ver}.* pattern
-    grep -q "$upstream_id" releases/${ver}.* 2>/dev/null
+    # Recursive grep on releases/${ver}.* pattern
+    grep -r -q "$upstream_id" releases/${ver}.* 2>/dev/null
     return $?
 }
 
@@ -87,7 +99,7 @@ process_commit() {
         [ -z "$file" ] && continue
         
         # Get commit content and SHA1 first to minimize git operations
-        content=$(git show "$commit^:$file" 2>/dev/null) || continue
+        content=$(git show --format="%B" "$commit^:$file" 2>/dev/null) || continue
         sha1=$(extract_sha1 "$content")
         [ "$sha1" = "NO_SHA" ] && continue
         
@@ -97,7 +109,7 @@ process_commit() {
         fi
         
         # Check if file was moved rather than deleted
-        if ! is_moved "$file" "$commit"; then
+        if ! is_moved "$file" "$commit" "$ver"; then
             # Check if file exists in the latest commit
             if ! git show HEAD:"$file" &>/dev/null; then
                 # Only output if the patch wasn't readded
