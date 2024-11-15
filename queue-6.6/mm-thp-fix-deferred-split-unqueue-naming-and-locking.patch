@@ -1,0 +1,461 @@
+From f8f931bba0f92052cf842b7e30917b1afcc77d5a Mon Sep 17 00:00:00 2001
+From: Hugh Dickins <hughd@google.com>
+Date: Sun, 27 Oct 2024 13:02:13 -0700
+Subject: mm/thp: fix deferred split unqueue naming and locking
+
+From: Hugh Dickins <hughd@google.com>
+
+commit f8f931bba0f92052cf842b7e30917b1afcc77d5a upstream.
+
+Recent changes are putting more pressure on THP deferred split queues:
+under load revealing long-standing races, causing list_del corruptions,
+"Bad page state"s and worse (I keep BUGs in both of those, so usually
+don't get to see how badly they end up without).  The relevant recent
+changes being 6.8's mTHP, 6.10's mTHP swapout, and 6.12's mTHP swapin,
+improved swap allocation, and underused THP splitting.
+
+Before fixing locking: rename misleading folio_undo_large_rmappable(),
+which does not undo large_rmappable, to folio_unqueue_deferred_split(),
+which is what it does.  But that and its out-of-line __callee are mm
+internals of very limited usability: add comment and WARN_ON_ONCEs to
+check usage; and return a bool to say if a deferred split was unqueued,
+which can then be used in WARN_ON_ONCEs around safety checks (sparing
+callers the arcane conditionals in __folio_unqueue_deferred_split()).
+
+Just omit the folio_unqueue_deferred_split() from free_unref_folios(), all
+of whose callers now call it beforehand (and if any forget then bad_page()
+will tell) - except for its caller put_pages_list(), which itself no
+longer has any callers (and will be deleted separately).
+
+Swapout: mem_cgroup_swapout() has been resetting folio->memcg_data 0
+without checking and unqueueing a THP folio from deferred split list;
+which is unfortunate, since the split_queue_lock depends on the memcg
+(when memcg is enabled); so swapout has been unqueueing such THPs later,
+when freeing the folio, using the pgdat's lock instead: potentially
+corrupting the memcg's list.  __remove_mapping() has frozen refcount to 0
+here, so no problem with calling folio_unqueue_deferred_split() before
+resetting memcg_data.
+
+That goes back to 5.4 commit 87eaceb3faa5 ("mm: thp: make deferred split
+shrinker memcg aware"): which included a check on swapcache before adding
+to deferred queue, but no check on deferred queue before adding THP to
+swapcache.  That worked fine with the usual sequence of events in reclaim
+(though there were a couple of rare ways in which a THP on deferred queue
+could have been swapped out), but 6.12 commit dafff3f4c850 ("mm: split
+underused THPs") avoids splitting underused THPs in reclaim, which makes
+swapcache THPs on deferred queue commonplace.
+
+Keep the check on swapcache before adding to deferred queue?  Yes: it is
+no longer essential, but preserves the existing behaviour, and is likely
+to be a worthwhile optimization (vmstat showed much more traffic on the
+queue under swapping load if the check was removed); update its comment.
+
+Memcg-v1 move (deprecated): mem_cgroup_move_account() has been changing
+folio->memcg_data without checking and unqueueing a THP folio from the
+deferred list, sometimes corrupting "from" memcg's list, like swapout.
+Refcount is non-zero here, so folio_unqueue_deferred_split() can only be
+used in a WARN_ON_ONCE to validate the fix, which must be done earlier:
+mem_cgroup_move_charge_pte_range() first try to split the THP (splitting
+of course unqueues), or skip it if that fails.  Not ideal, but moving
+charge has been requested, and khugepaged should repair the THP later:
+nobody wants new custom unqueueing code just for this deprecated case.
+
+The 87eaceb3faa5 commit did have the code to move from one deferred list
+to another (but was not conscious of its unsafety while refcount non-0);
+but that was removed by 5.6 commit fac0516b5534 ("mm: thp: don't need care
+deferred split queue in memcg charge move path"), which argued that the
+existence of a PMD mapping guarantees that the THP cannot be on a deferred
+list.  As above, false in rare cases, and now commonly false.
+
+Backport to 6.11 should be straightforward.  Earlier backports must take
+care that other _deferred_list fixes and dependencies are included.  There
+is not a strong case for backports, but they can fix cornercases.
+
+Link: https://lkml.kernel.org/r/8dc111ae-f6db-2da7-b25c-7a20b1effe3b@google.com
+Fixes: 87eaceb3faa5 ("mm: thp: make deferred split shrinker memcg aware")
+Fixes: dafff3f4c850 ("mm: split underused THPs")
+Signed-off-by: Hugh Dickins <hughd@google.com>
+Acked-by: David Hildenbrand <david@redhat.com>
+Reviewed-by: Yang Shi <shy828301@gmail.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Chris Li <chrisl@kernel.org>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Kefeng Wang <wangkefeng.wang@huawei.com>
+Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Nhat Pham <nphamcs@gmail.com>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Usama Arif <usamaarif642@gmail.com>
+Cc: Wei Yang <richard.weiyang@gmail.com>
+Cc: Zi Yan <ziy@nvidia.com>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+[ Upstream commit itself does not apply cleanly, because there
+  are fewer calls to folio_undo_large_rmappable() in this tree
+  (in particular, folio migration does not migrate memcg charge),
+  and mm/memcontrol-v1.c has not been split out of mm/memcontrol.c.
+  This single commit is merged from upstream commits:
+  23e4883248f0 ("mm: add page_rmappable_folio() wrapper")
+  ec056cef76a5 ("mm/readahead: do not allow order-1 folio")
+  8897277acfef ("mm: support order-1 folios in the page cache")
+  b7b098cf00a2 ("mm: always initialise folio->_deferred_list")
+  593a10dabe08 ("mm: refactor folio_undo_large_rmappable()")
+  f8f931bba0f9 ("mm/thp: fix deferred split unqueue naming and locking")
+  With list_del_init() replacing list_del() like in:
+  c010d47f107f ("mm: thp: split huge page to any lower order pages")
+  9bcef5973e31 ("mm: memcg: fix split queue list crash when large folio migration") ]
+Signed-off-by: Hugh Dickins <hughd@google.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ mm/filemap.c     |    2 -
+ mm/huge_memory.c |   59 ++++++++++++++++++++++++++++++++++---------------------
+ mm/hugetlb.c     |    1 
+ mm/internal.h    |   27 ++++++++++++++++++++++++-
+ mm/memcontrol.c  |   29 +++++++++++++++++++++++++++
+ mm/mempolicy.c   |   17 ++-------------
+ mm/page_alloc.c  |   21 +++++++------------
+ mm/readahead.c   |   11 ++--------
+ 8 files changed, 107 insertions(+), 60 deletions(-)
+
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -1957,8 +1957,6 @@ no_page:
+ 			gfp_t alloc_gfp = gfp;
+ 
+ 			err = -ENOMEM;
+-			if (order == 1)
+-				order = 0;
+ 			if (order > 0)
+ 				alloc_gfp |= __GFP_NORETRY | __GFP_NOWARN;
+ 			folio = filemap_alloc_folio(alloc_gfp, order);
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -569,8 +569,8 @@ struct deferred_split *get_deferred_spli
+ 
+ void folio_prep_large_rmappable(struct folio *folio)
+ {
+-	VM_BUG_ON_FOLIO(folio_order(folio) < 2, folio);
+-	INIT_LIST_HEAD(&folio->_deferred_list);
++	if (!folio || !folio_test_large(folio))
++		return;
+ 	folio_set_large_rmappable(folio);
+ }
+ 
+@@ -2720,9 +2720,10 @@ int split_huge_page_to_list(struct page
+ 	/* Prevent deferred_split_scan() touching ->_refcount */
+ 	spin_lock(&ds_queue->split_queue_lock);
+ 	if (folio_ref_freeze(folio, 1 + extra_pins)) {
+-		if (!list_empty(&folio->_deferred_list)) {
++		if (folio_order(folio) > 1 &&
++		    !list_empty(&folio->_deferred_list)) {
+ 			ds_queue->split_queue_len--;
+-			list_del(&folio->_deferred_list);
++			list_del_init(&folio->_deferred_list);
+ 		}
+ 		spin_unlock(&ds_queue->split_queue_lock);
+ 		if (mapping) {
+@@ -2766,26 +2767,38 @@ out:
+ 	return ret;
+ }
+ 
+-void folio_undo_large_rmappable(struct folio *folio)
++/*
++ * __folio_unqueue_deferred_split() is not to be called directly:
++ * the folio_unqueue_deferred_split() inline wrapper in mm/internal.h
++ * limits its calls to those folios which may have a _deferred_list for
++ * queueing THP splits, and that list is (racily observed to be) non-empty.
++ *
++ * It is unsafe to call folio_unqueue_deferred_split() until folio refcount is
++ * zero: because even when split_queue_lock is held, a non-empty _deferred_list
++ * might be in use on deferred_split_scan()'s unlocked on-stack list.
++ *
++ * If memory cgroups are enabled, split_queue_lock is in the mem_cgroup: it is
++ * therefore important to unqueue deferred split before changing folio memcg.
++ */
++bool __folio_unqueue_deferred_split(struct folio *folio)
+ {
+ 	struct deferred_split *ds_queue;
+ 	unsigned long flags;
++	bool unqueued = false;
+ 
+-	/*
+-	 * At this point, there is no one trying to add the folio to
+-	 * deferred_list. If folio is not in deferred_list, it's safe
+-	 * to check without acquiring the split_queue_lock.
+-	 */
+-	if (data_race(list_empty(&folio->_deferred_list)))
+-		return;
++	WARN_ON_ONCE(folio_ref_count(folio));
++	WARN_ON_ONCE(!mem_cgroup_disabled() && !folio_memcg(folio));
+ 
+ 	ds_queue = get_deferred_split_queue(folio);
+ 	spin_lock_irqsave(&ds_queue->split_queue_lock, flags);
+ 	if (!list_empty(&folio->_deferred_list)) {
+ 		ds_queue->split_queue_len--;
+-		list_del(&folio->_deferred_list);
++		list_del_init(&folio->_deferred_list);
++		unqueued = true;
+ 	}
+ 	spin_unlock_irqrestore(&ds_queue->split_queue_lock, flags);
++
++	return unqueued;	/* useful for debug warnings */
+ }
+ 
+ void deferred_split_folio(struct folio *folio)
+@@ -2796,17 +2809,19 @@ void deferred_split_folio(struct folio *
+ #endif
+ 	unsigned long flags;
+ 
+-	VM_BUG_ON_FOLIO(folio_order(folio) < 2, folio);
++	/*
++	 * Order 1 folios have no space for a deferred list, but we also
++	 * won't waste much memory by not adding them to the deferred list.
++	 */
++	if (folio_order(folio) <= 1)
++		return;
+ 
+ 	/*
+-	 * The try_to_unmap() in page reclaim path might reach here too,
+-	 * this may cause a race condition to corrupt deferred split queue.
+-	 * And, if page reclaim is already handling the same folio, it is
+-	 * unnecessary to handle it again in shrinker.
+-	 *
+-	 * Check the swapcache flag to determine if the folio is being
+-	 * handled by page reclaim since THP swap would add the folio into
+-	 * swap cache before calling try_to_unmap().
++	 * Exclude swapcache: originally to avoid a corrupt deferred split
++	 * queue. Nowadays that is fully prevented by mem_cgroup_swapout();
++	 * but if page reclaim is already handling the same folio, it is
++	 * unnecessary to handle it again in the shrinker, so excluding
++	 * swapcache here may still be a useful optimization.
+ 	 */
+ 	if (folio_test_swapcache(folio))
+ 		return;
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -1795,6 +1795,7 @@ static void __update_and_free_hugetlb_fo
+ 		destroy_compound_gigantic_folio(folio, huge_page_order(h));
+ 		free_gigantic_folio(folio, huge_page_order(h));
+ 	} else {
++		INIT_LIST_HEAD(&folio->_deferred_list);
+ 		__free_pages(&folio->page, huge_page_order(h));
+ 	}
+ }
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -413,7 +413,30 @@ static inline void folio_set_order(struc
+ #endif
+ }
+ 
+-void folio_undo_large_rmappable(struct folio *folio);
++bool __folio_unqueue_deferred_split(struct folio *folio);
++static inline bool folio_unqueue_deferred_split(struct folio *folio)
++{
++	if (folio_order(folio) <= 1 || !folio_test_large_rmappable(folio))
++		return false;
++
++	/*
++	 * At this point, there is no one trying to add the folio to
++	 * deferred_list. If folio is not in deferred_list, it's safe
++	 * to check without acquiring the split_queue_lock.
++	 */
++	if (data_race(list_empty(&folio->_deferred_list)))
++		return false;
++
++	return __folio_unqueue_deferred_split(folio);
++}
++
++static inline struct folio *page_rmappable_folio(struct page *page)
++{
++	struct folio *folio = (struct folio *)page;
++
++	folio_prep_large_rmappable(folio);
++	return folio;
++}
+ 
+ static inline void prep_compound_head(struct page *page, unsigned int order)
+ {
+@@ -423,6 +446,8 @@ static inline void prep_compound_head(st
+ 	atomic_set(&folio->_entire_mapcount, -1);
+ 	atomic_set(&folio->_nr_pages_mapped, 0);
+ 	atomic_set(&folio->_pincount, 0);
++	if (order > 1)
++		INIT_LIST_HEAD(&folio->_deferred_list);
+ }
+ 
+ static inline void prep_compound_tail(struct page *head, int tail_idx)
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -5873,6 +5873,8 @@ static int mem_cgroup_move_account(struc
+ 	css_get(&to->css);
+ 	css_put(&from->css);
+ 
++	/* Warning should never happen, so don't worry about refcount non-0 */
++	WARN_ON_ONCE(folio_unqueue_deferred_split(folio));
+ 	folio->memcg_data = (unsigned long)to;
+ 
+ 	__folio_memcg_unlock(from);
+@@ -6237,7 +6239,10 @@ static int mem_cgroup_move_charge_pte_ra
+ 	enum mc_target_type target_type;
+ 	union mc_target target;
+ 	struct page *page;
++	struct folio *folio;
++	bool tried_split_before = false;
+ 
++retry_pmd:
+ 	ptl = pmd_trans_huge_lock(pmd, vma);
+ 	if (ptl) {
+ 		if (mc.precharge < HPAGE_PMD_NR) {
+@@ -6247,6 +6252,28 @@ static int mem_cgroup_move_charge_pte_ra
+ 		target_type = get_mctgt_type_thp(vma, addr, *pmd, &target);
+ 		if (target_type == MC_TARGET_PAGE) {
+ 			page = target.page;
++			folio = page_folio(page);
++			/*
++			 * Deferred split queue locking depends on memcg,
++			 * and unqueue is unsafe unless folio refcount is 0:
++			 * split or skip if on the queue? first try to split.
++			 */
++			if (!list_empty(&folio->_deferred_list)) {
++				spin_unlock(ptl);
++				if (!tried_split_before)
++					split_folio(folio);
++				folio_unlock(folio);
++				folio_put(folio);
++				if (tried_split_before)
++					return 0;
++				tried_split_before = true;
++				goto retry_pmd;
++			}
++			/*
++			 * So long as that pmd lock is held, the folio cannot
++			 * be racily added to the _deferred_list, because
++			 * page_remove_rmap() will find it still pmdmapped.
++			 */
+ 			if (isolate_lru_page(page)) {
+ 				if (!mem_cgroup_move_account(page, true,
+ 							     mc.from, mc.to)) {
+@@ -7199,6 +7226,7 @@ static void uncharge_folio(struct folio
+ 			ug->nr_memory += nr_pages;
+ 		ug->pgpgout++;
+ 
++		WARN_ON_ONCE(folio_unqueue_deferred_split(folio));
+ 		folio->memcg_data = 0;
+ 	}
+ 
+@@ -7492,6 +7520,7 @@ void mem_cgroup_swapout(struct folio *fo
+ 	VM_BUG_ON_FOLIO(oldid, folio);
+ 	mod_memcg_state(swap_memcg, MEMCG_SWAP, nr_entries);
+ 
++	folio_unqueue_deferred_split(folio);
+ 	folio->memcg_data = 0;
+ 
+ 	if (!mem_cgroup_is_root(memcg))
+--- a/mm/mempolicy.c
++++ b/mm/mempolicy.c
+@@ -2200,10 +2200,7 @@ struct folio *vma_alloc_folio(gfp_t gfp,
+ 		mpol_cond_put(pol);
+ 		gfp |= __GFP_COMP;
+ 		page = alloc_page_interleave(gfp, order, nid);
+-		folio = (struct folio *)page;
+-		if (folio && order > 1)
+-			folio_prep_large_rmappable(folio);
+-		goto out;
++		return page_rmappable_folio(page);
+ 	}
+ 
+ 	if (pol->mode == MPOL_PREFERRED_MANY) {
+@@ -2213,10 +2210,7 @@ struct folio *vma_alloc_folio(gfp_t gfp,
+ 		gfp |= __GFP_COMP;
+ 		page = alloc_pages_preferred_many(gfp, order, node, pol);
+ 		mpol_cond_put(pol);
+-		folio = (struct folio *)page;
+-		if (folio && order > 1)
+-			folio_prep_large_rmappable(folio);
+-		goto out;
++		return page_rmappable_folio(page);
+ 	}
+ 
+ 	if (unlikely(IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE) && hugepage)) {
+@@ -2310,12 +2304,7 @@ EXPORT_SYMBOL(alloc_pages);
+ 
+ struct folio *folio_alloc(gfp_t gfp, unsigned order)
+ {
+-	struct page *page = alloc_pages(gfp | __GFP_COMP, order);
+-	struct folio *folio = (struct folio *)page;
+-
+-	if (folio && order > 1)
+-		folio_prep_large_rmappable(folio);
+-	return folio;
++	return page_rmappable_folio(alloc_pages(gfp | __GFP_COMP, order));
+ }
+ EXPORT_SYMBOL(folio_alloc);
+ 
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -600,9 +600,7 @@ void destroy_large_folio(struct folio *f
+ 		return;
+ 	}
+ 
+-	if (folio_test_large_rmappable(folio))
+-		folio_undo_large_rmappable(folio);
+-
++	folio_unqueue_deferred_split(folio);
+ 	mem_cgroup_uncharge(folio);
+ 	free_the_page(&folio->page, folio_order(folio));
+ }
+@@ -1002,10 +1000,11 @@ static int free_tail_page_prepare(struct
+ 		}
+ 		break;
+ 	case 2:
+-		/*
+-		 * the second tail page: ->mapping is
+-		 * deferred_list.next -- ignore value.
+-		 */
++		/* the second tail page: deferred_list overlaps ->mapping */
++		if (unlikely(!list_empty(&folio->_deferred_list))) {
++			bad_page(page, "on deferred list");
++			goto out;
++		}
+ 		break;
+ 	default:
+ 		if (page->mapping != TAIL_MAPPING) {
+@@ -4464,12 +4463,8 @@ struct folio *__folio_alloc(gfp_t gfp, u
+ 		nodemask_t *nodemask)
+ {
+ 	struct page *page = __alloc_pages(gfp | __GFP_COMP, order,
+-			preferred_nid, nodemask);
+-	struct folio *folio = (struct folio *)page;
+-
+-	if (folio && order > 1)
+-		folio_prep_large_rmappable(folio);
+-	return folio;
++					preferred_nid, nodemask);
++	return page_rmappable_folio(page);
+ }
+ EXPORT_SYMBOL(__folio_alloc);
+ 
+--- a/mm/readahead.c
++++ b/mm/readahead.c
+@@ -514,16 +514,11 @@ void page_cache_ra_order(struct readahea
+ 		unsigned int order = new_order;
+ 
+ 		/* Align with smaller pages if needed */
+-		if (index & ((1UL << order) - 1)) {
++		if (index & ((1UL << order) - 1))
+ 			order = __ffs(index);
+-			if (order == 1)
+-				order = 0;
+-		}
+ 		/* Don't allocate pages past EOF */
+-		while (index + (1UL << order) - 1 > limit) {
+-			if (--order == 1)
+-				order = 0;
+-		}
++		while (index + (1UL << order) - 1 > limit)
++			order--;
+ 		err = ra_alloc_folio(ractl, index, mark, order, gfp);
+ 		if (err)
+ 			break;
