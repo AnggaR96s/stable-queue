@@ -1,4 +1,4 @@
-From f8f931bba0f92052cf842b7e30917b1afcc77d5a Mon Sep 17 00:00:00 2001
+From e6d53c04ceb5677d25e9c052f6d3f5959284b2fa Mon Sep 17 00:00:00 2001
 From: Hugh Dickins <hughd@google.com>
 Date: Sun, 27 Oct 2024 13:02:13 -0700
 Subject: mm/thp: fix deferred split unqueue naming and locking
@@ -95,72 +95,23 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 [ Upstream commit itself does not apply cleanly, because there
   are fewer calls to folio_undo_large_rmappable() in this tree
   (in particular, folio migration does not migrate memcg charge),
-  and mm/memcontrol-v1.c has not been split out of mm/memcontrol.c.
-  This single commit is merged from upstream commits:
-  23e4883248f0 ("mm: add page_rmappable_folio() wrapper")
-  ec056cef76a5 ("mm/readahead: do not allow order-1 folio")
-  8897277acfef ("mm: support order-1 folios in the page cache")
-  b7b098cf00a2 ("mm: always initialise folio->_deferred_list")
-  593a10dabe08 ("mm: refactor folio_undo_large_rmappable()")
-  f8f931bba0f9 ("mm/thp: fix deferred split unqueue naming and locking")
-  With list_del_init() replacing list_del() like in:
-  c010d47f107f ("mm: thp: split huge page to any lower order pages")
-  9bcef5973e31 ("mm: memcg: fix split queue list crash when large folio migration") ]
+  and mm/memcontrol-v1.c has not been split out of mm/memcontrol.c. ]
 Signed-off-by: Hugh Dickins <hughd@google.com>
 Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
 ---
- mm/filemap.c     |    2 -
- mm/huge_memory.c |   59 ++++++++++++++++++++++++++++++++++---------------------
- mm/hugetlb.c     |    1 
- mm/internal.h    |   27 ++++++++++++++++++++++++-
- mm/memcontrol.c  |   29 +++++++++++++++++++++++++++
- mm/mempolicy.c   |   17 ++-------------
- mm/page_alloc.c  |   21 +++++++------------
- mm/readahead.c   |   11 ++--------
- 8 files changed, 107 insertions(+), 60 deletions(-)
+ mm/huge_memory.c |   35 ++++++++++++++++++++++++++---------
+ mm/internal.h    |   10 +++++-----
+ mm/memcontrol.c  |   32 +++++++++++++++++++++++++++++---
+ mm/page_alloc.c  |    2 +-
+ 4 files changed, 61 insertions(+), 18 deletions(-)
 
---- a/mm/filemap.c
-+++ b/mm/filemap.c
-@@ -1957,8 +1957,6 @@ no_page:
- 			gfp_t alloc_gfp = gfp;
- 
- 			err = -ENOMEM;
--			if (order == 1)
--				order = 0;
- 			if (order > 0)
- 				alloc_gfp |= __GFP_NORETRY | __GFP_NOWARN;
- 			folio = filemap_alloc_folio(alloc_gfp, order);
 --- a/mm/huge_memory.c
 +++ b/mm/huge_memory.c
-@@ -569,8 +569,8 @@ struct deferred_split *get_deferred_spli
- 
- void folio_prep_large_rmappable(struct folio *folio)
- {
--	VM_BUG_ON_FOLIO(folio_order(folio) < 2, folio);
--	INIT_LIST_HEAD(&folio->_deferred_list);
-+	if (!folio || !folio_test_large(folio))
-+		return;
- 	folio_set_large_rmappable(folio);
- }
- 
-@@ -2720,9 +2720,10 @@ int split_huge_page_to_list(struct page
- 	/* Prevent deferred_split_scan() touching ->_refcount */
- 	spin_lock(&ds_queue->split_queue_lock);
- 	if (folio_ref_freeze(folio, 1 + extra_pins)) {
--		if (!list_empty(&folio->_deferred_list)) {
-+		if (folio_order(folio) > 1 &&
-+		    !list_empty(&folio->_deferred_list)) {
- 			ds_queue->split_queue_len--;
--			list_del(&folio->_deferred_list);
-+			list_del_init(&folio->_deferred_list);
- 		}
- 		spin_unlock(&ds_queue->split_queue_lock);
- 		if (mapping) {
-@@ -2766,26 +2767,38 @@ out:
+@@ -2767,18 +2767,38 @@ out:
  	return ret;
  }
  
--void folio_undo_large_rmappable(struct folio *folio)
+-void __folio_undo_large_rmappable(struct folio *folio)
 +/*
 + * __folio_unqueue_deferred_split() is not to be called directly:
 + * the folio_unqueue_deferred_split() inline wrapper in mm/internal.h
@@ -179,14 +130,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
  	struct deferred_split *ds_queue;
  	unsigned long flags;
 +	bool unqueued = false;
- 
--	/*
--	 * At this point, there is no one trying to add the folio to
--	 * deferred_list. If folio is not in deferred_list, it's safe
--	 * to check without acquiring the split_queue_lock.
--	 */
--	if (data_race(list_empty(&folio->_deferred_list)))
--		return;
++
 +	WARN_ON_ONCE(folio_ref_count(folio));
 +	WARN_ON_ONCE(!mem_cgroup_disabled() && !folio_memcg(folio));
  
@@ -194,8 +138,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
  	spin_lock_irqsave(&ds_queue->split_queue_lock, flags);
  	if (!list_empty(&folio->_deferred_list)) {
  		ds_queue->split_queue_len--;
--		list_del(&folio->_deferred_list);
-+		list_del_init(&folio->_deferred_list);
+ 		list_del_init(&folio->_deferred_list);
 +		unqueued = true;
  	}
  	spin_unlock_irqrestore(&ds_queue->split_queue_lock, flags);
@@ -204,17 +147,8 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
  }
  
  void deferred_split_folio(struct folio *folio)
-@@ -2796,17 +2809,19 @@ void deferred_split_folio(struct folio *
- #endif
- 	unsigned long flags;
- 
--	VM_BUG_ON_FOLIO(folio_order(folio) < 2, folio);
-+	/*
-+	 * Order 1 folios have no space for a deferred list, but we also
-+	 * won't waste much memory by not adding them to the deferred list.
-+	 */
-+	if (folio_order(folio) <= 1)
-+		return;
+@@ -2797,14 +2817,11 @@ void deferred_split_folio(struct folio *
+ 		return;
  
  	/*
 -	 * The try_to_unmap() in page reclaim path might reach here too,
@@ -233,59 +167,35 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
  	 */
  	if (folio_test_swapcache(folio))
  		return;
---- a/mm/hugetlb.c
-+++ b/mm/hugetlb.c
-@@ -1795,6 +1795,7 @@ static void __update_and_free_hugetlb_fo
- 		destroy_compound_gigantic_folio(folio, huge_page_order(h));
- 		free_gigantic_folio(folio, huge_page_order(h));
- 	} else {
-+		INIT_LIST_HEAD(&folio->_deferred_list);
- 		__free_pages(&folio->page, huge_page_order(h));
- 	}
- }
 --- a/mm/internal.h
 +++ b/mm/internal.h
-@@ -413,7 +413,30 @@ static inline void folio_set_order(struc
+@@ -413,11 +413,11 @@ static inline void folio_set_order(struc
  #endif
  }
  
--void folio_undo_large_rmappable(struct folio *folio);
+-void __folio_undo_large_rmappable(struct folio *folio);
+-static inline void folio_undo_large_rmappable(struct folio *folio)
 +bool __folio_unqueue_deferred_split(struct folio *folio);
 +static inline bool folio_unqueue_deferred_split(struct folio *folio)
-+{
-+	if (folio_order(folio) <= 1 || !folio_test_large_rmappable(folio))
-+		return false;
-+
-+	/*
-+	 * At this point, there is no one trying to add the folio to
-+	 * deferred_list. If folio is not in deferred_list, it's safe
-+	 * to check without acquiring the split_queue_lock.
-+	 */
-+	if (data_race(list_empty(&folio->_deferred_list)))
-+		return false;
-+
-+	return __folio_unqueue_deferred_split(folio);
-+}
-+
-+static inline struct folio *page_rmappable_folio(struct page *page)
-+{
-+	struct folio *folio = (struct folio *)page;
-+
-+	folio_prep_large_rmappable(folio);
-+	return folio;
-+}
- 
- static inline void prep_compound_head(struct page *page, unsigned int order)
  {
-@@ -423,6 +446,8 @@ static inline void prep_compound_head(st
- 	atomic_set(&folio->_entire_mapcount, -1);
- 	atomic_set(&folio->_nr_pages_mapped, 0);
- 	atomic_set(&folio->_pincount, 0);
-+	if (order > 1)
-+		INIT_LIST_HEAD(&folio->_deferred_list);
+ 	if (folio_order(folio) <= 1 || !folio_test_large_rmappable(folio))
+-		return;
++		return false;
+ 
+ 	/*
+ 	 * At this point, there is no one trying to add the folio to
+@@ -425,9 +425,9 @@ static inline void folio_undo_large_rmap
+ 	 * to check without acquiring the split_queue_lock.
+ 	 */
+ 	if (data_race(list_empty(&folio->_deferred_list)))
+-		return;
++		return false;
+ 
+-	__folio_undo_large_rmappable(folio);
++	return __folio_unqueue_deferred_split(folio);
  }
  
- static inline void prep_compound_tail(struct page *head, int tail_idx)
+ static inline struct folio *page_rmappable_folio(struct page *page)
 --- a/mm/memcontrol.c
 +++ b/mm/memcontrol.c
 @@ -5873,6 +5873,8 @@ static int mem_cgroup_move_account(struc
@@ -337,7 +247,17 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
  			if (isolate_lru_page(page)) {
  				if (!mem_cgroup_move_account(page, true,
  							     mc.from, mc.to)) {
-@@ -7199,6 +7226,7 @@ static void uncharge_folio(struct folio
+@@ -7153,9 +7180,6 @@ static void uncharge_folio(struct folio
+ 	struct obj_cgroup *objcg;
+ 
+ 	VM_BUG_ON_FOLIO(folio_test_lru(folio), folio);
+-	VM_BUG_ON_FOLIO(folio_order(folio) > 1 &&
+-			!folio_test_hugetlb(folio) &&
+-			!list_empty(&folio->_deferred_list), folio);
+ 
+ 	/*
+ 	 * Nobody should be changing or seriously looking at
+@@ -7202,6 +7226,7 @@ static void uncharge_folio(struct folio
  			ug->nr_memory += nr_pages;
  		ug->pgpgout++;
  
@@ -345,7 +265,7 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
  		folio->memcg_data = 0;
  	}
  
-@@ -7492,6 +7520,7 @@ void mem_cgroup_swapout(struct folio *fo
+@@ -7495,6 +7520,7 @@ void mem_cgroup_swapout(struct folio *fo
  	VM_BUG_ON_FOLIO(oldid, folio);
  	mod_memcg_state(swap_memcg, MEMCG_SWAP, nr_entries);
  
@@ -353,109 +273,14 @@ Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
  	folio->memcg_data = 0;
  
  	if (!mem_cgroup_is_root(memcg))
---- a/mm/mempolicy.c
-+++ b/mm/mempolicy.c
-@@ -2200,10 +2200,7 @@ struct folio *vma_alloc_folio(gfp_t gfp,
- 		mpol_cond_put(pol);
- 		gfp |= __GFP_COMP;
- 		page = alloc_page_interleave(gfp, order, nid);
--		folio = (struct folio *)page;
--		if (folio && order > 1)
--			folio_prep_large_rmappable(folio);
--		goto out;
-+		return page_rmappable_folio(page);
- 	}
- 
- 	if (pol->mode == MPOL_PREFERRED_MANY) {
-@@ -2213,10 +2210,7 @@ struct folio *vma_alloc_folio(gfp_t gfp,
- 		gfp |= __GFP_COMP;
- 		page = alloc_pages_preferred_many(gfp, order, node, pol);
- 		mpol_cond_put(pol);
--		folio = (struct folio *)page;
--		if (folio && order > 1)
--			folio_prep_large_rmappable(folio);
--		goto out;
-+		return page_rmappable_folio(page);
- 	}
- 
- 	if (unlikely(IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE) && hugepage)) {
-@@ -2310,12 +2304,7 @@ EXPORT_SYMBOL(alloc_pages);
- 
- struct folio *folio_alloc(gfp_t gfp, unsigned order)
- {
--	struct page *page = alloc_pages(gfp | __GFP_COMP, order);
--	struct folio *folio = (struct folio *)page;
--
--	if (folio && order > 1)
--		folio_prep_large_rmappable(folio);
--	return folio;
-+	return page_rmappable_folio(alloc_pages(gfp | __GFP_COMP, order));
- }
- EXPORT_SYMBOL(folio_alloc);
- 
 --- a/mm/page_alloc.c
 +++ b/mm/page_alloc.c
-@@ -600,9 +600,7 @@ void destroy_large_folio(struct folio *f
+@@ -600,7 +600,7 @@ void destroy_large_folio(struct folio *f
  		return;
  	}
  
--	if (folio_test_large_rmappable(folio))
--		folio_undo_large_rmappable(folio);
--
+-	folio_undo_large_rmappable(folio);
 +	folio_unqueue_deferred_split(folio);
  	mem_cgroup_uncharge(folio);
  	free_the_page(&folio->page, folio_order(folio));
  }
-@@ -1002,10 +1000,11 @@ static int free_tail_page_prepare(struct
- 		}
- 		break;
- 	case 2:
--		/*
--		 * the second tail page: ->mapping is
--		 * deferred_list.next -- ignore value.
--		 */
-+		/* the second tail page: deferred_list overlaps ->mapping */
-+		if (unlikely(!list_empty(&folio->_deferred_list))) {
-+			bad_page(page, "on deferred list");
-+			goto out;
-+		}
- 		break;
- 	default:
- 		if (page->mapping != TAIL_MAPPING) {
-@@ -4464,12 +4463,8 @@ struct folio *__folio_alloc(gfp_t gfp, u
- 		nodemask_t *nodemask)
- {
- 	struct page *page = __alloc_pages(gfp | __GFP_COMP, order,
--			preferred_nid, nodemask);
--	struct folio *folio = (struct folio *)page;
--
--	if (folio && order > 1)
--		folio_prep_large_rmappable(folio);
--	return folio;
-+					preferred_nid, nodemask);
-+	return page_rmappable_folio(page);
- }
- EXPORT_SYMBOL(__folio_alloc);
- 
---- a/mm/readahead.c
-+++ b/mm/readahead.c
-@@ -514,16 +514,11 @@ void page_cache_ra_order(struct readahea
- 		unsigned int order = new_order;
- 
- 		/* Align with smaller pages if needed */
--		if (index & ((1UL << order) - 1)) {
-+		if (index & ((1UL << order) - 1))
- 			order = __ffs(index);
--			if (order == 1)
--				order = 0;
--		}
- 		/* Don't allocate pages past EOF */
--		while (index + (1UL << order) - 1 > limit) {
--			if (--order == 1)
--				order = 0;
--		}
-+		while (index + (1UL << order) - 1 > limit)
-+			order--;
- 		err = ra_alloc_folio(ractl, index, mark, order, gfp);
- 		if (err)
- 			break;
