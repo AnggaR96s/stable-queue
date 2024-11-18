@@ -13,13 +13,53 @@ should_ignore_mail() {
     local mbox_file="$1"
     local from=$(formail -xFrom: < "$mbox_file" | sed -e 's/^[[:space:]]*//g' -e 's/[[:space:]]*$//g')
 
+    # Check if output file already exists
+    local response_file="$HOME/Mail/stable/respo/$(basename ${mbox_file}).response"
+    if [ -f "$response_file" ]; then
+        echo "Response file already exists: $response_file"
+        return 0
+    fi
+
     # List of authors to ignore
     if [[ "$from" =~ ^"Sasha Levin".*$ ]] || \
-       [[ "$from" =~ ^"Linux Kernel Distribution System".*s ]] || \
+       [[ "$from" =~ ^"Linux Kernel Distribution System".*$ ]] || \
        [[ "$from" =~ ^"Greg Kroah-Hartman".*$ ]]; then
         return 0
     fi
     return 1
+}
+
+# Function to check if mail contains a git patch
+is_git_patch() {
+    local mbox_file="$1"
+
+    # We need to use formail -c to process the entire email including headers and body
+    formail -c < "$mbox_file" | awk '
+        BEGIN {
+            found=0
+            p=0
+            in_headers=1
+            has_patch_subject=0
+            has_diff=0
+        }
+
+        # Track when we move from email headers to body
+        in_headers && /^$/ { in_headers=0; next }
+
+        # Look for [PATCH] in subject line while in headers
+        in_headers && /^Subject:.*\[PATCH/ { has_patch_subject=1; next }
+
+        # Look for patch separator
+        !in_headers && /^---$/ { p=NR; next }
+
+        # Look for diff or index after separator
+        p && (/^diff --git/ || /^index [0-9a-f]/) { has_diff=1; exit }
+
+        # Exit if we go too far past the separator
+        NR > p+20 && p { exit }
+
+        END { exit !(has_patch_subject && has_diff) }
+    '
 }
 
 # Function to decode UTF-8 email subject
@@ -43,7 +83,7 @@ decode_subject() {
 # Function to extract series info from subject
 extract_series_info() {
     local subject="$1"
-    # Updated pattern to better match [PATCH ...X/N] format
+    # Pattern to match [PATCH X/N] format
     local part_pattern='\[PATCH.*[[:space:]]([0-9]+)/([0-9]+)\]'
     
     if [[ $subject =~ $part_pattern ]]; then
@@ -71,10 +111,10 @@ get_in_reply_to() {
 get_series_dir() {
     local message_id="$1"
     local in_reply_to="$2"
-    
+
     # Use the first message's ID (either this message if it's first, or the one it replies to)
     local series_id="${in_reply_to:-$message_id}"
-    
+
     # Create a safe directory name from the message ID
     echo "${series_id}" | sed 's/[<>]//g' | tr -c '[:alnum:]' '_'
 }
@@ -84,7 +124,7 @@ store_patch() {
     local mbox_file="$1"
     local series_dir="$2"
     local part="$3"
-    
+
     mkdir -p "$series_dir"
     cp "$mbox_file" "$series_dir/$part.mbox"
 }
@@ -93,7 +133,7 @@ store_patch() {
 is_series_complete() {
     local series_dir="$1"
     local total_parts="$2"
-    
+
     for ((i=1; i<=total_parts; i++)); do
         if [ ! -f "$series_dir/$i.mbox" ]; then
             return 1
@@ -105,12 +145,25 @@ is_series_complete() {
 # Function to clean subject for searching
 clean_subject() {
     local subject="$1"
-    # Remove parts between square brackets, remove newlines, and trim whitespace
-    echo "$subject" | \
-        sed -E 's/\[[^]]*\]//g' | \
-        tr -d '\n' | \
-        sed -E 's/^[[:space:]]+|[[:space:]]+$//g' | \
-        sed -E 's/[[:space:]]+/ /g'  # Collapse multiple spaces into one
+    local cleaned_subject
+
+    # Special handling for FAILED patch subjects
+    if [[ "$subject" =~ FAILED:.*\"([^\"]+)\".*failed[[:space:]]to[[:space:]]apply ]]; then
+        # Extract the actual patch subject from within quotes
+        cleaned_subject="${BASH_REMATCH[1]}"
+    else
+        # Regular subject cleaning
+        cleaned_subject=$(echo "$subject" | \
+            sed -E 's/\[[^]]*\]//g' | \
+            tr '\n' ' ' | \
+            tr -s ' ' | \
+            sed -E 's/^[[:space:]]+|[[:space:]]+$//g')  # Trim whitespace
+    fi
+
+    # Remove leading "Re: " if present
+    cleaned_subject=$(echo "$cleaned_subject" | sed -E 's/^Re: *//')
+
+    echo "$cleaned_subject"
 }
 
 # Function to find commit by subject in origin/master
@@ -118,16 +171,11 @@ find_commit_by_subject() {
     local subject="$1"
     local linux_dir="$2"
     local cleaned_subject
-    
+
     cd "$linux_dir"
-    
-    # Clean the subject
     cleaned_subject=$(clean_subject "$subject")
-    
-    # Escape quotes and special characters for grep
     cleaned_subject=$(printf '%s' "$cleaned_subject" | sed 's/[[\.*^$/]/\\&/g')
-    
-    # Search in origin/master for the first match
+
     git log origin/master --format="%H" --grep="^${cleaned_subject}$" -1
 }
 
@@ -136,23 +184,19 @@ apply_series_patches() {
     local series_dir="$1"
     local current_part="$2"
     local linux_dir="$3"
-    local result=0
-    
+
+    cd "$linux_dir"
+
     # Apply all patches up to but not including the current one
     for ((i=1; i<current_part; i++)); do
         local patch_file="$series_dir/$i.mbox"
-        if [ ! -f "$patch_file" ]; then
-            echo "Error: Missing patch $i in series"
-            return 1
-        fi
-        
-        if ! git am "$patch_file" >/dev/null 2>&1; then
+        if [ ! -f "$patch_file" ] || ! git am "$patch_file" >/dev/null 2>&1; then
             echo "Error: Failed to apply patch $i in series"
             git am --abort >/dev/null 2>&1
             return 1
         fi
     done
-    
+
     return 0
 }
 
@@ -161,25 +205,21 @@ extract_kernel_versions() {
     local subject="$1"
     local active_versions_file="$HOME/stable-queue/active_kernel_versions"
     local found_versions=()
-    
-    # Decode subject if it's UTF-8 encoded
     local decoded_subject
+
     decoded_subject=$(decode_subject "$subject")
-    
-    # Read active kernel versions
+
     while IFS= read -r version; do
-        if echo "$decoded_subject" | grep -q "$version"; then
+        if echo "$decoded_subject" | grep -q "\\b${version}\\b\|${version}[.-]"; then
             found_versions+=("$version")
         fi
-    done < "$active_versions_file"
-    
-    # If we found any versions, print them space-separated
+    done < <(sort -rV "$active_versions_file")
+
     if [ ${#found_versions[@]} -gt 0 ]; then
         echo "${found_versions[*]}"
         return 0
     fi
-    
-    # If no versions found, return all active versions
+
     cat "$active_versions_file"
 }
 
@@ -187,25 +227,23 @@ extract_kernel_versions() {
 extract_commit_sha1() {
     local email_body="$1"
     local sha1=""
-    
-    # Try pattern: "commit ${sha1} upstream"
+
     sha1=$(echo "$email_body" | grep -E "commit [0-9a-f]{40} upstream" | \
            sed -E 's/.*commit ([0-9a-f]{40}) upstream.*/\1/')
-    
+
     if [ -n "$sha1" ]; then
         echo "$sha1"
         return 0
     fi
-    
-    # Try pattern: "[ Upstream commit ${sha1} ]"
+
     sha1=$(echo "$email_body" | grep -E "\[ Upstream commit [0-9a-f]{40} \]" | \
            sed -E 's/.*\[ Upstream commit ([0-9a-f]{40}) \].*/\1/')
-    
+
     if [ -n "$sha1" ]; then
         echo "$sha1"
         return 0
     fi
-    
+
     return 1
 }
 
@@ -213,15 +251,74 @@ extract_commit_sha1() {
 get_commit_author() {
     local linux_dir="$1"
     local sha1="$2"
-    
+
     cd "$linux_dir"
     git log -1 --format="%an <%ae>" "$sha1"
 }
 
-# Function to extract patch author
-extract_patch_author() {
-    local mbox_file="$1"
-    formail -xFrom: < "$mbox_file" | sed -e 's/^[ \t]*//'
+# Function to get sorted kernel versions
+get_sorted_versions() {
+    sort -rV "$HOME/stable-queue/active_kernel_versions"
+}
+
+# Function to check if version1 is newer than version2
+is_version_newer() {
+    local v1="$1"
+    local v2="$2"
+    
+    if [ "$(echo -e "$v1\n$v2" | sort -V | tail -n1)" = "$v1" ]; then
+        return 0
+    fi
+    return 1
+}
+
+# Function to check newer kernels for commit
+check_newer_kernels() {
+    local sha1="$1"
+    local target_versions="$2"
+    local linux_dir="$3"
+    local -n c_results=$4
+    
+    cd "$linux_dir"
+    local all_versions=($(get_sorted_versions))
+    local target_array=($target_versions)
+    local newest_target=${target_array[0]}
+    local results=()
+    
+    for version in "${all_versions[@]}"; do
+        if is_version_newer "$version" "$newest_target"; then
+            local branch="pending-${version}"
+            if git rev-parse --verify "$branch" >/dev/null 2>&1; then
+                git checkout -q "$branch"
+                
+                # First try the exact SHA1
+                if git rev-list HEAD | grep -q "^$sha1$"; then
+                    results+=("$version.y | Present (exact SHA1)")
+                else
+                    # Try to find by subject if SHA1 not found
+                    local subject=$(git log -1 --format=%s "$sha1")
+                    if [ -n "$subject" ]; then
+                        local found_commit=$(git log --format=%H --grep="^${subject}$" -1)
+                        if [ -n "$found_commit" ]; then
+                            results+=("$version.y | Present (different SHA1: ${found_commit:0:12})")
+                        else
+                            results+=("$version.y | Not found")
+                        fi
+                    else
+                        results+=("$version.y | Not found")
+                    fi
+                fi
+            else
+                results+=("$version.y | Branch not found")
+            fi
+        fi
+    done
+    
+    if [ ${#results[@]} -gt 0 ]; then
+        c_results+=("")
+        c_results+=("Status in newer kernel trees:")
+        c_results+=("${results[@]}")
+    fi
 }
 
 # Function to validate commit exists in upstream
@@ -230,14 +327,7 @@ validate_commit() {
     local linux_dir="$2"
 
     cd "$linux_dir"
-
-    # Check if commit exists in origin/master without checking out
-    if ! git rev-list origin/master | grep -q "^$sha1"; then
-        echo "Error: Commit $sha1 not found in origin/master"
-        return 1
-    fi
-
-    return 0
+    git rev-list origin/master | grep -q "^$sha1"
 }
 
 # Function to compare patch with upstream
@@ -246,20 +336,14 @@ compare_with_upstream() {
     local sha1="$2"
     local linux_dir="$3"
 
-    # Skip if no valid SHA1 or if it's our temporary SHA1
     if [[ ! $sha1 =~ ^[0-9a-f]{40}$ ]] || [ "$sha1" = "0000000000000000000000000000000000000000" ]; then
         return 0
     fi
 
     cd "$linux_dir"
-
-    # Create temporary file
     TEMP_PATCH=$(mktemp)
-
-    # Extract just the patch part from the mbox
     formail -I "" < "$mbox_file" | sed '1,/^$/d' > "$TEMP_PATCH"
 
-    # Get the diff between our patch and the upstream commit
     git format-patch -k --stdout --no-signature "${sha1}^..${sha1}" | \
     sed '1,/^$/d' | diff -u - "$TEMP_PATCH" || true
 }
@@ -277,10 +361,8 @@ test_commit_on_branch() {
     local result=0
 
     cd "$linux_dir"
-
     local branch="stable/linux-${version}.y"
-
-    echo "Testing commit $sha1 on branch $branch..."
+    local temp_branch="temp-${version}-${sha1:0:8}"
 
     # Try to checkout the stable branch
     if ! git checkout -q "$branch" 2>/dev/null; then
@@ -288,11 +370,9 @@ test_commit_on_branch() {
         return 1
     fi
 
-    # Create temporary branch for testing
-    local temp_branch="temp-${version}-${sha1:0:8}"
     git checkout -b "$temp_branch"
 
-    # If this is part of a series, apply previous patches
+    # Apply series patches if needed
     if [ -n "$series_dir" ] && [ "$current_part" -gt 1 ]; then
         if ! apply_series_patches "$series_dir" "$current_part" "$linux_dir"; then
             results+=("stable/linux-${version}.y | Failed (series apply) | N/A")
@@ -302,7 +382,7 @@ test_commit_on_branch() {
         fi
     fi
 
-    # Try to apply the current patch
+    # Apply current patch
     if ! git am "$mbox_file" >/dev/null 2>&1; then
         git am --abort >/dev/null 2>&1
         results+=("stable/linux-${version}.y | Failed | N/A")
@@ -327,7 +407,6 @@ test_commit_on_branch() {
         results+=("stable/linux-${version}.y | Success | Success")
     fi
 
-    # Clean up temporary branch
     git checkout -q "$branch"
     git branch -D "$temp_branch"
 
@@ -375,7 +454,7 @@ process_patch() {
         local patch_author=$(extract_patch_author "$mbox_file")
         local commit_author=$(get_commit_author "$LINUX_DIR" "$found_sha1")
         if [ "$patch_author" != "$commit_author" ]; then
-            author_mismatch="Patch author: $patch_author"$'\n'"Commit author: $commit_author"
+            author_mismatch="Backport author: $patch_author"$'\n'"Commit author: $commit_author"
         fi
     fi
 
@@ -392,10 +471,17 @@ process_patch() {
         fi
     done
 
+    # Check newer kernels if we have a valid SHA1
+    local -a newer_kernel_results=()
+    if [[ "$found_sha1" =~ ^[0-9a-f]{40}$ ]] && [ "$found_sha1" != "0000000000000000000000000000000000000000" ]; then
+        check_newer_kernels "$found_sha1" "$kernel_versions" "$LINUX_DIR" newer_kernel_results
+    fi
+
     # Generate response for this patch
     generate_response "$mbox_file" "$claimed_sha1" "$found_sha1" \
                      "$(printf '%s\n' "${p_results[@]}")" "$diff_output" \
-                     "$author_mismatch" "$(printf '%s\n' "${p_errors[@]}")"
+                     "$author_mismatch" "$(printf '%s\n' "${p_errors[@]}")" \
+                     "$(printf '%s\n' "${newer_kernel_results[@]}")"
 
     return $failed
 }
@@ -421,6 +507,12 @@ test_series() {
     return $failed
 }
 
+# Function to extract patch author
+extract_patch_author() {
+    local mbox_file="$1"
+    formail -xFrom: < "$mbox_file" | sed -e 's/^[ \t]*//'
+}
+
 # Function to generate email response
 generate_response() {
     local mbox_file="$1"
@@ -430,6 +522,7 @@ generate_response() {
     local diff_output="$5"
     local author_mismatch="$6"
     local build_errors="$7"
+    local newer_kernel_results="$8"
     local response_file="$HOME/Mail/stable/respo/$(basename ${mbox_file}).response"
 
     {
@@ -437,8 +530,22 @@ generate_response() {
         formail -X From: -X Subject: -X Message-ID: -X Date: < "$mbox_file"
         echo "In-Reply-To: $(formail -xMessage-ID: < "$mbox_file")"
         echo "From: $(git config user.name) <$(git config user.email)>"
-	local orig_subject=$(formail -xSubject: < "$mbox_file" | sed -e 's/^[[:space:]]*//g' -e 's/[[:space:]]*$//g')
-        echo "Subject: Re: $orig_subject"
+
+        # Use original subject line directly from the email, just add Re: if needed
+        local orig_subject=$(formail -xSubject: < "$mbox_file" | \
+            tr '\n' ' ' | \
+            tr -s ' ' | \
+            sed -e 's/^[[:space:]]*//g' -e 's/[[:space:]]*$//g')
+
+        # Only add "Re: " if it's not already there
+        if [[ ! "$orig_subject" =~ ^Re: ]]; then
+            echo "Subject: Re: $orig_subject"
+        else
+            echo "Subject: $orig_subject"
+        fi
+
+        echo
+        echo "[ Sasha's backport helper bot ]"
         echo
         echo "Hi,"
         echo
@@ -474,6 +581,20 @@ generate_response() {
             echo "No upstream commit was identified. Using temporary commit for testing."
         fi
         echo
+
+	# Add newer kernel check results if available
+        if [ -n "$newer_kernel_results" ]; then
+            echo "Commit in newer trees:"
+	    echo
+            echo "|-----------------|----------------------------------------------|"
+            while IFS='|' read -r version status; do
+                if [ -n "$version" ] && [ -n "$status" ]; then
+                    printf "| %-15s | %-44s |\n" "$version" "$status"
+                fi
+            done <<< "$newer_kernel_results"
+	    echo "|-----------------|----------------------------------------------|"
+	    echo
+        fi
 
         # Add diff if there are differences and we have a valid SHA1
         if [ -n "$diff_output" ] && [[ "$found_sha1" =~ ^[0-9a-f]{40}$ ]] && \
@@ -519,9 +640,6 @@ cleanup() {
     fi
 }
 
-# Set up trap for cleanup
-trap cleanup EXIT ERR
-
 # Main script
 main() {
     if [ $# -ne 1 ]; then
@@ -555,6 +673,12 @@ main() {
         exit 0
     fi
 
+    # Check if mail contains a git patch
+    if ! is_git_patch "$MBOX_FILE"; then
+        echo "Skipping mail: not a git patch"
+        exit 0
+    fi
+
     # Extract subject and series information
     subject=$(formail -xSubject: < "$MBOX_FILE")
     if [ -z "$subject" ]; then
@@ -576,23 +700,23 @@ main() {
     series_info=$(extract_series_info "$subject")
     if [ -n "$series_info" ]; then
         read current_part total_parts <<< "$series_info"
-        
+
         # Skip 0/N patches
         if [ "$current_part" -eq 0 ]; then
             echo "Skipping 0/$total_parts patch"
             exit 0
         fi
-        
+
         # Get message IDs and determine series directory
         message_id=$(get_message_id "$MBOX_FILE")
         in_reply_to=$(get_in_reply_to "$MBOX_FILE")
         series_dir="$PENDING_DIR/$(get_series_dir "$message_id" "$in_reply_to")"
-        
+
         # Store this patch
         store_patch "$MBOX_FILE" "$series_dir" "$current_part"
-        
+
         echo "Processing part $current_part of $total_parts"
-        
+
         # Check if series is now complete
         if is_series_complete "$series_dir" "$total_parts"; then
             # Try to find SHA1 in the email body
@@ -664,10 +788,11 @@ main() {
         fi
     fi
 
-    rm "$MBOX_FILE"
-
     exit $failed
 }
+
+# Set up trap for cleanup
+trap cleanup EXIT ERR
 
 # Run main and capture its exit status
 main "$@"
