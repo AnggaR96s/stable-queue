@@ -122,7 +122,7 @@ extract_series_info() {
     local subject="$1"
     # Pattern to match [PATCH X/N] format
     local part_pattern='\[PATCH.*[[:space:]]([0-9]+)/([0-9]+)\]'
-    
+   
     if [[ $subject =~ $part_pattern ]]; then
         local current="${BASH_REMATCH[1]}"
         local total="${BASH_REMATCH[2]}"
@@ -176,11 +176,17 @@ generate_patch_filename() {
     echo "${part}-${clean_sender}-${timestamp}-${clean_subject}-${clean_message_id}.mbox"
 }
 
+# Function to strip leading zeros from a number
+strip_leading_zeros() {
+    local num="$1"
+    echo "$((10#$num))"  # Force base-10 interpretation
+}
+
 # Function to store patch in series directory
 store_patch() {
     local mbox_file="$1"
     local series_dir="$2"
-    local part="$3"
+    local part=$(strip_leading_zeros "$3")
 
     # Extract additional information for filename
     local subject=$(formail -xSubject: < "$mbox_file" | tr '\n' ' ')
@@ -280,7 +286,8 @@ extract_kernel_versions() {
     decoded_subject=$(decode_subject "$subject")
 
     while IFS= read -r version; do
-        if echo "$decoded_subject" | grep -q "\\b${version}\\b\|${version}[.-]"; then
+        # Check for both with and without v prefix
+        if echo "$decoded_subject" | grep -q "\\b${version}\\b\|${version}[.-]\|\\bv${version}\\b\|v${version}[.-]"; then
             found_versions+=("$version")
         fi
     done < <(sort -rV "$active_versions_file")
@@ -335,7 +342,7 @@ get_sorted_versions() {
 is_version_newer() {
     local v1="$1"
     local v2="$2"
-    
+   
     if [ "$(echo -e "$v1\n$v2" | sort -V | tail -n1)" = "$v1" ]; then
         return 0
     fi
@@ -348,32 +355,32 @@ check_newer_kernels() {
     local target_versions="$2"
     local linux_dir="$3"
     local -n c_results=$4
-    
+   
     cd "$linux_dir"
     local all_versions=($(get_sorted_versions))
     local target_array=($target_versions)
     local newest_target=${target_array[0]}
     local temp_dir=$(mktemp -d)
     local pids=()
-    
+   
     # Function to check a single branch and write results to temp file
     check_single_branch() {
         local version="$1"
         local branch="pending-${version}"
         local result_file="$temp_dir/$version"
-        
+       
         # Check if branch exists
         if ! git rev-parse --verify "$branch" >/dev/null 2>&1; then
             echo "$version.y | Branch not found" > "$result_file"
             return
         fi
-        
+       
         # Check if commit is an ancestor using merge-base
         if [ "$(git merge-base "$branch" "$sha1")" = "$sha1" ]; then
             echo "$version.y | Present (exact SHA1)" > "$result_file"
             return
         fi
-        
+       
         # Try to find by subject if SHA1 not found
         local subject
         subject=$(git log -1 --format=%s "$sha1")
@@ -390,7 +397,7 @@ check_newer_kernels() {
             echo "$version.y | Not found" > "$result_file"
         fi
     }
-    
+   
     # Launch parallel processes for each relevant version
     for version in "${all_versions[@]}"; do
         if is_version_newer "$version" "$newest_target"; then
@@ -398,12 +405,12 @@ check_newer_kernels() {
             pids+=($!)
         fi
     done
-    
+   
     # Wait for all processes to complete
     for pid in "${pids[@]}"; do
         wait "$pid"
     done
-    
+   
     # Collect results in order
     local results=()
     for version in "${all_versions[@]}"; do
@@ -413,10 +420,10 @@ check_newer_kernels() {
             fi
         fi
     done
-    
+   
     # Clean up
     rm -rf "$temp_dir"
-    
+   
     if [ ${#results[@]} -gt 0 ]; then
         c_results+=("")
         c_results+=("Status in newer kernel trees:")
@@ -438,17 +445,104 @@ compare_with_upstream() {
     local mbox_file="$1"
     local sha1="$2"
     local linux_dir="$3"
+    local debug_output=()
 
     if [[ ! $sha1 =~ ^[0-9a-f]{40}$ ]] || [ "$sha1" = "0000000000000000000000000000000000000000" ]; then
         return 0
     fi
 
     cd "$linux_dir"
-    TEMP_PATCH=$(mktemp)
-    formail -I "" < "$mbox_file" | sed '1,/^$/d' > "$TEMP_PATCH"
-
-    git format-patch -k --stdout --no-signature "${sha1}^..${sha1}" | \
-    sed '1,/^$/d' | diff -u - "$TEMP_PATCH" || true
+   
+    # Extract subject to determine target kernel versions
+    local subject=$(formail -xSubject: < "$mbox_file")
+    local kernel_versions=($(extract_kernel_versions "$subject"))
+   
+    if [ ${#kernel_versions[@]} -eq 0 ]; then
+        debug_output+=("No kernel versions found in subject, cannot compare")
+        printf '%s\n' "${debug_output[@]}"
+        return 1
+    fi
+   
+    # Use the newest version for comparison since it's closest to upstream
+    local version=${kernel_versions[0]}
+    local stable_branch="stable/linux-${version}.y"
+    local temp_branch="temp-compare-${version}-$(date +%s)"
+    local current_branch=$(git rev-parse --abbrev-ref HEAD)
+   
+    # Try to check out the stable branch
+    if ! git checkout -q "$stable_branch" 2>/dev/null; then
+        debug_output+=("Failed to find stable branch ${stable_branch}")
+        printf '%s\n' "${debug_output[@]}"
+        return 1
+    fi
+   
+    # Create temporary branch based on the stable branch
+    git checkout -b "$temp_branch" >/dev/null 2>&1
+   
+    if git am "$mbox_file" >/dev/null 2>&1; then
+        # Get the SHA1 of our newly applied patch
+        local new_sha1=$(git rev-parse HEAD)
+       
+        debug_output+=("")
+       
+        # Compare the ranges using range-diff
+        if ! git range-diff "${sha1}^".."$sha1" "${new_sha1}^".."$new_sha1"; then
+            debug_output+=("Failed to generate range-diff")
+        fi
+       
+        # Clean up after range-diff
+        git checkout -q "$current_branch"
+        git branch -D "$temp_branch" >/dev/null 2>&1
+    else
+        # Clean up failed git-am
+        git am --abort >/dev/null 2>&1
+        git checkout -q "$current_branch"
+        git branch -D "$temp_branch" >/dev/null 2>&1
+       
+        debug_output+=("Failed to apply patch cleanly, falling back to interdiff...")
+        debug_output+=("")
+       
+        # Fall back to interdiff
+        TEMP_PATCH=$(mktemp)
+        UPSTREAM_PATCH=$(mktemp)
+        FILTERED_PATCH=$(mktemp)
+        FILTERED_UPSTREAM=$(mktemp)
+       
+        # Extract patch content from mbox
+        formail -I "" < "$mbox_file" | sed '1,/^$/d' > "$TEMP_PATCH"
+       
+        # Get upstream patch
+        git format-patch -k --stdout --no-signature "${sha1}^..${sha1}" | \
+        sed '1,/^$/d' > "$UPSTREAM_PATCH"
+       
+        # Filter out metadata lines that might cause comparison issues
+        for file in "$TEMP_PATCH" "$UPSTREAM_PATCH"; do
+            output_file="${file/PATCH/FILTERED}"
+            sed -E '/^(index |diff --git |new file mode |deleted file mode |old mode |new mode )/d' "$file" > "$output_file"
+        done
+       
+        # Run interdiff
+        if ! interdiff "$FILTERED_UPSTREAM" "$FILTERED_PATCH" 2>"${TEMP_PATCH}.err"; then
+            # If interdiff fails, include error output
+            if [ -s "${TEMP_PATCH}.err" ]; then
+                debug_output+=("interdiff error output:")
+                debug_output+=("$(cat "${TEMP_PATCH}.err")")
+            fi
+           
+            # Fall back to standard diff
+            debug_output+=("interdiff failed, falling back to standard diff...")
+            if ! diff -u "$FILTERED_UPSTREAM" "$FILTERED_PATCH" >"${TEMP_PATCH}.diff"; then
+                if [ -s "${TEMP_PATCH}.diff" ]; then
+                    debug_output+=("$(cat "${TEMP_PATCH}.diff")")
+                fi
+            fi
+        fi
+       
+        # Clean up temporary files
+        rm -f "$TEMP_PATCH" "$UPSTREAM_PATCH" "$FILTERED_PATCH" "$FILTERED_UPSTREAM" "${TEMP_PATCH}.err" "${TEMP_PATCH}.diff"
+    fi
+   
+    printf '%s\n' "${debug_output[@]}"
 }
 
 # Function to test commit on a branch
@@ -537,9 +631,9 @@ process_patch() {
         cd "$LINUX_DIR"
         local temp_branch="temp-series-check-$(date +%s)"
         local current_branch=$(git rev-parse --abbrev-ref HEAD)
-        
+       
         git checkout -b "$temp_branch" >/dev/null 2>&1
-        
+       
         if ! apply_series_patches "$series_dir" "$current_part" "$LINUX_DIR"; then
             git checkout -q "$current_branch"
             git branch -D "$temp_branch" >/dev/null 2>&1
@@ -547,7 +641,7 @@ process_patch() {
             p_errors+=("Error: Cannot proceed - previous patches in series failed to apply")
             return 1
         fi
-        
+       
         git checkout -q "$current_branch"
         git branch -D "$temp_branch" >/dev/null 2>&1
     fi
