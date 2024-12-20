@@ -8,16 +8,16 @@ extract_sha1() {
     local content="$1"
     # Skip everything until the first blank line (end of commit metadata)
     # Then look for first 40-character hex string
-    awk '
+    echo "$content" | awk '
         BEGIN { found_blank = 0 }
         /^$/ { found_blank = 1; next }
         found_blank == 1 {
-            if (match($0, /[0-9a-f]{40}/, m)) {
-                print m[0]
+            if (match($0, /[0-9a-f]{40}/)) {
+                print substr($0, RSTART, RLENGTH)
                 exit
             }
         }
-    ' <<< "$content" || echo "NO_SHA"
+    ' || echo "NO_SHA"
 }
 
 # Function to check if a file was moved rather than deleted
