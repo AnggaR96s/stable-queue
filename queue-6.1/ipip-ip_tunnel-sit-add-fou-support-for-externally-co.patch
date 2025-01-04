@@ -1,0 +1,196 @@
+From 79c5da8bae4167890b64a888990d2346df9058fe Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 7 Apr 2023 15:38:53 +0200
+Subject: ipip,ip_tunnel,sit: Add FOU support for externally controlled ipip
+ devices
+
+From: Christian Ehrig <cehrig@cloudflare.com>
+
+[ Upstream commit ac931d4cdec3df8b6eac3bc40a6871123021f078 ]
+
+Today ipip devices in collect-metadata mode don't allow for sending FOU
+or GUE encapsulated packets. This patch lifts the restriction by adding
+a struct ip_tunnel_encap to the tunnel metadata.
+
+On the egress path, the members of this struct can be set by the
+bpf_skb_set_fou_encap kfunc via a BPF tc-hook. Instead of dropping packets
+wishing to use additional UDP encapsulation, ip_md_tunnel_xmit now
+evaluates the contents of this struct and adds the corresponding FOU or
+GUE header. Furthermore, it is making sure that additional header bytes
+are taken into account for PMTU discovery.
+
+On the ingress path, an ipip device in collect-metadata mode will fill this
+struct and a BPF tc-hook can obtain the information via a call to the
+bpf_skb_get_fou_encap kfunc.
+
+The minor change to ip_tunnel_encap, which now takes a pointer to
+struct ip_tunnel_encap instead of struct ip_tunnel, allows us to control
+FOU encap type and parameters on a per packet-level.
+
+Signed-off-by: Christian Ehrig <cehrig@cloudflare.com>
+Link: https://lore.kernel.org/r/cfea47de655d0f870248abf725932f851b53960a.1680874078.git.cehrig@cloudflare.com
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Stable-dep-of: b5a7b661a073 ("net: Fix netns for ip_tunnel_init_flow()")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/net/ip_tunnels.h | 28 +++++++++++++++-------------
+ net/ipv4/ip_tunnel.c     | 22 ++++++++++++++++++++--
+ net/ipv4/ipip.c          |  1 +
+ net/ipv6/sit.c           |  2 +-
+ 4 files changed, 37 insertions(+), 16 deletions(-)
+
+diff --git a/include/net/ip_tunnels.h b/include/net/ip_tunnels.h
+index f1ba369306fe..84751313b826 100644
+--- a/include/net/ip_tunnels.h
++++ b/include/net/ip_tunnels.h
+@@ -57,6 +57,13 @@ struct ip_tunnel_key {
+ 	__u8			flow_flags;
+ };
+ 
++struct ip_tunnel_encap {
++	u16			type;
++	u16			flags;
++	__be16			sport;
++	__be16			dport;
++};
++
+ /* Flags for ip_tunnel_info mode. */
+ #define IP_TUNNEL_INFO_TX	0x01	/* represents tx tunnel parameters */
+ #define IP_TUNNEL_INFO_IPV6	0x02	/* key contains IPv6 addresses */
+@@ -66,9 +73,9 @@ struct ip_tunnel_key {
+ #define IP_TUNNEL_OPTS_MAX					\
+ 	GENMASK((sizeof_field(struct ip_tunnel_info,		\
+ 			      options_len) * BITS_PER_BYTE) - 1, 0)
+-
+ struct ip_tunnel_info {
+ 	struct ip_tunnel_key	key;
++	struct ip_tunnel_encap	encap;
+ #ifdef CONFIG_DST_CACHE
+ 	struct dst_cache	dst_cache;
+ #endif
+@@ -86,13 +93,6 @@ struct ip_tunnel_6rd_parm {
+ };
+ #endif
+ 
+-struct ip_tunnel_encap {
+-	u16			type;
+-	u16			flags;
+-	__be16			sport;
+-	__be16			dport;
+-};
+-
+ struct ip_tunnel_prl_entry {
+ 	struct ip_tunnel_prl_entry __rcu *next;
+ 	__be32				addr;
+@@ -293,6 +293,7 @@ struct ip_tunnel *ip_tunnel_lookup(struct ip_tunnel_net *itn,
+ 				   __be32 remote, __be32 local,
+ 				   __be32 key);
+ 
++void ip_tunnel_md_udp_encap(struct sk_buff *skb, struct ip_tunnel_info *info);
+ int ip_tunnel_rcv(struct ip_tunnel *tunnel, struct sk_buff *skb,
+ 		  const struct tnl_ptk_info *tpi, struct metadata_dst *tun_dst,
+ 		  bool log_ecn_error);
+@@ -405,22 +406,23 @@ static inline int ip_encap_hlen(struct ip_tunnel_encap *e)
+ 	return hlen;
+ }
+ 
+-static inline int ip_tunnel_encap(struct sk_buff *skb, struct ip_tunnel *t,
++static inline int ip_tunnel_encap(struct sk_buff *skb,
++				  struct ip_tunnel_encap *e,
+ 				  u8 *protocol, struct flowi4 *fl4)
+ {
+ 	const struct ip_tunnel_encap_ops *ops;
+ 	int ret = -EINVAL;
+ 
+-	if (t->encap.type == TUNNEL_ENCAP_NONE)
++	if (e->type == TUNNEL_ENCAP_NONE)
+ 		return 0;
+ 
+-	if (t->encap.type >= MAX_IPTUN_ENCAP_OPS)
++	if (e->type >= MAX_IPTUN_ENCAP_OPS)
+ 		return -EINVAL;
+ 
+ 	rcu_read_lock();
+-	ops = rcu_dereference(iptun_encaps[t->encap.type]);
++	ops = rcu_dereference(iptun_encaps[e->type]);
+ 	if (likely(ops && ops->build_header))
+-		ret = ops->build_header(skb, &t->encap, protocol, fl4);
++		ret = ops->build_header(skb, e, protocol, fl4);
+ 	rcu_read_unlock();
+ 
+ 	return ret;
+diff --git a/net/ipv4/ip_tunnel.c b/net/ipv4/ip_tunnel.c
+index 3445e576b05b..d56cfb6c3da4 100644
+--- a/net/ipv4/ip_tunnel.c
++++ b/net/ipv4/ip_tunnel.c
+@@ -359,6 +359,20 @@ static struct ip_tunnel *ip_tunnel_create(struct net *net,
+ 	return ERR_PTR(err);
+ }
+ 
++void ip_tunnel_md_udp_encap(struct sk_buff *skb, struct ip_tunnel_info *info)
++{
++	const struct iphdr *iph = ip_hdr(skb);
++	const struct udphdr *udph;
++
++	if (iph->protocol != IPPROTO_UDP)
++		return;
++
++	udph = (struct udphdr *)((__u8 *)iph + (iph->ihl << 2));
++	info->encap.sport = udph->source;
++	info->encap.dport = udph->dest;
++}
++EXPORT_SYMBOL(ip_tunnel_md_udp_encap);
++
+ int ip_tunnel_rcv(struct ip_tunnel *tunnel, struct sk_buff *skb,
+ 		  const struct tnl_ptk_info *tpi, struct metadata_dst *tun_dst,
+ 		  bool log_ecn_error)
+@@ -599,7 +613,11 @@ void ip_md_tunnel_xmit(struct sk_buff *skb, struct net_device *dev,
+ 			    tunnel_id_to_key32(key->tun_id), RT_TOS(tos),
+ 			    dev_net(dev), 0, skb->mark, skb_get_hash(skb),
+ 			    key->flow_flags);
+-	if (tunnel->encap.type != TUNNEL_ENCAP_NONE)
++
++	if (!tunnel_hlen)
++		tunnel_hlen = ip_encap_hlen(&tun_info->encap);
++
++	if (ip_tunnel_encap(skb, &tun_info->encap, &proto, &fl4) < 0)
+ 		goto tx_error;
+ 
+ 	use_cache = ip_tunnel_dst_cache_usable(skb, tun_info);
+@@ -759,7 +777,7 @@ void ip_tunnel_xmit(struct sk_buff *skb, struct net_device *dev,
+ 			    dev_net(dev), tunnel->parms.link,
+ 			    tunnel->fwmark, skb_get_hash(skb), 0);
+ 
+-	if (ip_tunnel_encap(skb, tunnel, &protocol, &fl4) < 0)
++	if (ip_tunnel_encap(skb, &tunnel->encap, &protocol, &fl4) < 0)
+ 		goto tx_error;
+ 
+ 	if (connected && md) {
+diff --git a/net/ipv4/ipip.c b/net/ipv4/ipip.c
+index 180f9daf5bec..1cf35c50cdf4 100644
+--- a/net/ipv4/ipip.c
++++ b/net/ipv4/ipip.c
+@@ -241,6 +241,7 @@ static int ipip_tunnel_rcv(struct sk_buff *skb, u8 ipproto)
+ 			tun_dst = ip_tun_rx_dst(skb, 0, 0, 0);
+ 			if (!tun_dst)
+ 				return 0;
++			ip_tunnel_md_udp_encap(skb, &tun_dst->u.tun_info);
+ 		}
+ 		skb_reset_mac_header(skb);
+ 
+diff --git a/net/ipv6/sit.c b/net/ipv6/sit.c
+index 3ffb6a5b1f82..cc24cefdb85c 100644
+--- a/net/ipv6/sit.c
++++ b/net/ipv6/sit.c
+@@ -1024,7 +1024,7 @@ static netdev_tx_t ipip6_tunnel_xmit(struct sk_buff *skb,
+ 		ttl = iph6->hop_limit;
+ 	tos = INET_ECN_encapsulate(tos, ipv6_get_dsfield(iph6));
+ 
+-	if (ip_tunnel_encap(skb, tunnel, &protocol, &fl4) < 0) {
++	if (ip_tunnel_encap(skb, &tunnel->encap, &protocol, &fl4) < 0) {
+ 		ip_rt_put(rt);
+ 		goto tx_error;
+ 	}
+-- 
+2.39.5
+
