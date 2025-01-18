@@ -1,0 +1,128 @@
+From 039c791e9909d74f105be85678fe8fa91f341989 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 6 Feb 2024 14:42:57 +0000
+Subject: net: add exit_batch_rtnl() method
+
+From: Eric Dumazet <edumazet@google.com>
+
+[ Upstream commit fd4f101edbd9f99567ab2adb1f2169579ede7c13 ]
+
+Many (struct pernet_operations)->exit_batch() methods have
+to acquire rtnl.
+
+In presence of rtnl mutex pressure, this makes cleanup_net()
+very slow.
+
+This patch adds a new exit_batch_rtnl() method to reduce
+number of rtnl acquisitions from cleanup_net().
+
+exit_batch_rtnl() handlers are called while rtnl is locked,
+and devices to be killed can be queued in a list provided
+as their second argument.
+
+A single unregister_netdevice_many() is called right
+before rtnl is released.
+
+exit_batch_rtnl() handlers are called before ->exit() and
+->exit_batch() handlers.
+
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Reviewed-by: Antoine Tenart <atenart@kernel.org>
+Link: https://lore.kernel.org/r/20240206144313.2050392-2-edumazet@google.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Stable-dep-of: 46841c7053e6 ("gtp: Use for_each_netdev_rcu() in gtp_genl_dump_pdp().")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/net/net_namespace.h |  3 +++
+ net/core/net_namespace.c    | 31 ++++++++++++++++++++++++++++++-
+ 2 files changed, 33 insertions(+), 1 deletion(-)
+
+diff --git a/include/net/net_namespace.h b/include/net/net_namespace.h
+index 167e390ac9d4e..0d61b452b9082 100644
+--- a/include/net/net_namespace.h
++++ b/include/net/net_namespace.h
+@@ -382,6 +382,9 @@ struct pernet_operations {
+ 	void (*pre_exit)(struct net *net);
+ 	void (*exit)(struct net *net);
+ 	void (*exit_batch)(struct list_head *net_exit_list);
++	/* Following method is called with RTNL held. */
++	void (*exit_batch_rtnl)(struct list_head *net_exit_list,
++				struct list_head *dev_kill_list);
+ 	unsigned int *id;
+ 	size_t size;
+ };
+diff --git a/net/core/net_namespace.c b/net/core/net_namespace.c
+index c4bcedc06822b..e6585a758edd4 100644
+--- a/net/core/net_namespace.c
++++ b/net/core/net_namespace.c
+@@ -325,8 +325,9 @@ static __net_init int setup_net(struct net *net, struct user_namespace *user_ns)
+ {
+ 	/* Must be called with pernet_ops_rwsem held */
+ 	const struct pernet_operations *ops, *saved_ops;
+-	int error = 0;
+ 	LIST_HEAD(net_exit_list);
++	LIST_HEAD(dev_kill_list);
++	int error = 0;
+ 
+ 	refcount_set(&net->count, 1);
+ 	refcount_set(&net->passive, 1);
+@@ -359,6 +360,15 @@ static __net_init int setup_net(struct net *net, struct user_namespace *user_ns)
+ 
+ 	synchronize_rcu();
+ 
++	ops = saved_ops;
++	rtnl_lock();
++	list_for_each_entry_continue_reverse(ops, &pernet_list, list) {
++		if (ops->exit_batch_rtnl)
++			ops->exit_batch_rtnl(&net_exit_list, &dev_kill_list);
++	}
++	unregister_netdevice_many(&dev_kill_list);
++	rtnl_unlock();
++
+ 	ops = saved_ops;
+ 	list_for_each_entry_continue_reverse(ops, &pernet_list, list)
+ 		ops_exit_list(ops, &net_exit_list);
+@@ -563,6 +573,7 @@ static void cleanup_net(struct work_struct *work)
+ 	struct net *net, *tmp, *last;
+ 	struct llist_node *net_kill_list;
+ 	LIST_HEAD(net_exit_list);
++	LIST_HEAD(dev_kill_list);
+ 
+ 	/* Atomically snapshot the list of namespaces to cleanup */
+ 	net_kill_list = llist_del_all(&cleanup_list);
+@@ -603,6 +614,14 @@ static void cleanup_net(struct work_struct *work)
+ 	 */
+ 	synchronize_rcu();
+ 
++	rtnl_lock();
++	list_for_each_entry_reverse(ops, &pernet_list, list) {
++		if (ops->exit_batch_rtnl)
++			ops->exit_batch_rtnl(&net_exit_list, &dev_kill_list);
++	}
++	unregister_netdevice_many(&dev_kill_list);
++	rtnl_unlock();
++
+ 	/* Run all of the network namespace exit methods */
+ 	list_for_each_entry_reverse(ops, &pernet_list, list)
+ 		ops_exit_list(ops, &net_exit_list);
+@@ -1150,7 +1169,17 @@ static void free_exit_list(struct pernet_operations *ops, struct list_head *net_
+ {
+ 	ops_pre_exit_list(ops, net_exit_list);
+ 	synchronize_rcu();
++
++	if (ops->exit_batch_rtnl) {
++		LIST_HEAD(dev_kill_list);
++
++		rtnl_lock();
++		ops->exit_batch_rtnl(net_exit_list, &dev_kill_list);
++		unregister_netdevice_many(&dev_kill_list);
++		rtnl_unlock();
++	}
+ 	ops_exit_list(ops, net_exit_list);
++
+ 	ops_free_list(ops, net_exit_list);
+ }
+ 
+-- 
+2.39.5
+
