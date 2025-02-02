@@ -1,0 +1,524 @@
+From 97555d996913bcb2fe19b9e57c856045aa05c737 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 27 Mar 2023 19:11:51 +0000
+Subject: vsock: support sockmap
+
+From: Bobby Eshleman <bobby.eshleman@bytedance.com>
+
+[ Upstream commit 634f1a7110b439c65fd8a809171c1d2d28bcea6f ]
+
+This patch adds sockmap support for vsock sockets. It is intended to be
+usable by all transports, but only the virtio and loopback transports
+are implemented.
+
+SOCK_STREAM, SOCK_DGRAM, and SOCK_SEQPACKET are all supported.
+
+Signed-off-by: Bobby Eshleman <bobby.eshleman@bytedance.com>
+Acked-by: Michael S. Tsirkin <mst@redhat.com>
+Reviewed-by: Stefano Garzarella <sgarzare@redhat.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Stable-dep-of: fcdd2242c023 ("vsock: Keep the binding until socket destruction")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/vhost/vsock.c                   |   1 +
+ include/linux/virtio_vsock.h            |   1 +
+ include/net/af_vsock.h                  |  17 +++
+ net/vmw_vsock/Makefile                  |   1 +
+ net/vmw_vsock/af_vsock.c                |  64 ++++++++-
+ net/vmw_vsock/virtio_transport.c        |   2 +
+ net/vmw_vsock/virtio_transport_common.c |  25 ++++
+ net/vmw_vsock/vsock_bpf.c               | 174 ++++++++++++++++++++++++
+ net/vmw_vsock/vsock_loopback.c          |   2 +
+ 9 files changed, 281 insertions(+), 6 deletions(-)
+ create mode 100644 net/vmw_vsock/vsock_bpf.c
+
+diff --git a/drivers/vhost/vsock.c b/drivers/vhost/vsock.c
+index c00f5821d6ecb..3248612e3f1bb 100644
+--- a/drivers/vhost/vsock.c
++++ b/drivers/vhost/vsock.c
+@@ -439,6 +439,7 @@ static struct virtio_transport vhost_transport = {
+ 		.notify_send_post_enqueue = virtio_transport_notify_send_post_enqueue,
+ 		.notify_buffer_size       = virtio_transport_notify_buffer_size,
+ 
++		.read_skb = virtio_transport_read_skb,
+ 	},
+ 
+ 	.send_pkt = vhost_transport_send_pkt,
+diff --git a/include/linux/virtio_vsock.h b/include/linux/virtio_vsock.h
+index 3f9c166113063..c58453699ee98 100644
+--- a/include/linux/virtio_vsock.h
++++ b/include/linux/virtio_vsock.h
+@@ -245,4 +245,5 @@ u32 virtio_transport_get_credit(struct virtio_vsock_sock *vvs, u32 wanted);
+ void virtio_transport_put_credit(struct virtio_vsock_sock *vvs, u32 credit);
+ void virtio_transport_deliver_tap_pkt(struct sk_buff *skb);
+ int virtio_transport_purge_skbs(void *vsk, struct sk_buff_head *list);
++int virtio_transport_read_skb(struct vsock_sock *vsk, skb_read_actor_t read_actor);
+ #endif /* _LINUX_VIRTIO_VSOCK_H */
+diff --git a/include/net/af_vsock.h b/include/net/af_vsock.h
+index 568a87c5e0d0f..0e7504a42925f 100644
+--- a/include/net/af_vsock.h
++++ b/include/net/af_vsock.h
+@@ -75,6 +75,7 @@ struct vsock_sock {
+ 	void *trans;
+ };
+ 
++s64 vsock_connectible_has_data(struct vsock_sock *vsk);
+ s64 vsock_stream_has_data(struct vsock_sock *vsk);
+ s64 vsock_stream_has_space(struct vsock_sock *vsk);
+ struct sock *vsock_create_connected(struct sock *parent);
+@@ -173,6 +174,9 @@ struct vsock_transport {
+ 
+ 	/* Addressing. */
+ 	u32 (*get_local_cid)(void);
++
++	/* Read a single skb */
++	int (*read_skb)(struct vsock_sock *, skb_read_actor_t);
+ };
+ 
+ /**** CORE ****/
+@@ -225,5 +229,18 @@ int vsock_init_tap(void);
+ int vsock_add_tap(struct vsock_tap *vt);
+ int vsock_remove_tap(struct vsock_tap *vt);
+ void vsock_deliver_tap(struct sk_buff *build_skb(void *opaque), void *opaque);
++int vsock_connectible_recvmsg(struct socket *sock, struct msghdr *msg, size_t len,
++			      int flags);
++int vsock_dgram_recvmsg(struct socket *sock, struct msghdr *msg,
++			size_t len, int flags);
++
++#ifdef CONFIG_BPF_SYSCALL
++extern struct proto vsock_proto;
++int vsock_bpf_update_proto(struct sock *sk, struct sk_psock *psock, bool restore);
++void __init vsock_bpf_build_proto(void);
++#else
++static inline void __init vsock_bpf_build_proto(void)
++{}
++#endif
+ 
+ #endif /* __AF_VSOCK_H__ */
+diff --git a/net/vmw_vsock/Makefile b/net/vmw_vsock/Makefile
+index 6a943ec95c4a5..5da74c4a9f1d1 100644
+--- a/net/vmw_vsock/Makefile
++++ b/net/vmw_vsock/Makefile
+@@ -8,6 +8,7 @@ obj-$(CONFIG_HYPERV_VSOCKETS) += hv_sock.o
+ obj-$(CONFIG_VSOCKETS_LOOPBACK) += vsock_loopback.o
+ 
+ vsock-y += af_vsock.o af_vsock_tap.o vsock_addr.o
++vsock-$(CONFIG_BPF_SYSCALL) += vsock_bpf.o
+ 
+ vsock_diag-y += diag.o
+ 
+diff --git a/net/vmw_vsock/af_vsock.c b/net/vmw_vsock/af_vsock.c
+index 88b5702a0a47c..e0107c873f261 100644
+--- a/net/vmw_vsock/af_vsock.c
++++ b/net/vmw_vsock/af_vsock.c
+@@ -118,10 +118,13 @@ static void vsock_sk_destruct(struct sock *sk);
+ static int vsock_queue_rcv_skb(struct sock *sk, struct sk_buff *skb);
+ 
+ /* Protocol family. */
+-static struct proto vsock_proto = {
++struct proto vsock_proto = {
+ 	.name = "AF_VSOCK",
+ 	.owner = THIS_MODULE,
+ 	.obj_size = sizeof(struct vsock_sock),
++#ifdef CONFIG_BPF_SYSCALL
++	.psock_update_sk_prot = vsock_bpf_update_proto,
++#endif
+ };
+ 
+ /* The default peer timeout indicates how long we will wait for a peer response
+@@ -880,7 +883,7 @@ s64 vsock_stream_has_data(struct vsock_sock *vsk)
+ }
+ EXPORT_SYMBOL_GPL(vsock_stream_has_data);
+ 
+-static s64 vsock_connectible_has_data(struct vsock_sock *vsk)
++s64 vsock_connectible_has_data(struct vsock_sock *vsk)
+ {
+ 	struct sock *sk = sk_vsock(vsk);
+ 
+@@ -892,6 +895,7 @@ static s64 vsock_connectible_has_data(struct vsock_sock *vsk)
+ 	else
+ 		return vsock_stream_has_data(vsk);
+ }
++EXPORT_SYMBOL_GPL(vsock_connectible_has_data);
+ 
+ s64 vsock_stream_has_space(struct vsock_sock *vsk)
+ {
+@@ -1152,6 +1156,13 @@ static __poll_t vsock_poll(struct file *file, struct socket *sock,
+ 	return mask;
+ }
+ 
++static int vsock_read_skb(struct sock *sk, skb_read_actor_t read_actor)
++{
++	struct vsock_sock *vsk = vsock_sk(sk);
++
++	return vsk->transport->read_skb(vsk, read_actor);
++}
++
+ static int vsock_dgram_sendmsg(struct socket *sock, struct msghdr *msg,
+ 			       size_t len)
+ {
+@@ -1263,18 +1274,42 @@ static int vsock_dgram_connect(struct socket *sock,
+ 	memcpy(&vsk->remote_addr, remote_addr, sizeof(vsk->remote_addr));
+ 	sock->state = SS_CONNECTED;
+ 
++	/* sock map disallows redirection of non-TCP sockets with sk_state !=
++	 * TCP_ESTABLISHED (see sock_map_redirect_allowed()), so we set
++	 * TCP_ESTABLISHED here to allow redirection of connected vsock dgrams.
++	 *
++	 * This doesn't seem to be abnormal state for datagram sockets, as the
++	 * same approach can be see in other datagram socket types as well
++	 * (such as unix sockets).
++	 */
++	sk->sk_state = TCP_ESTABLISHED;
++
+ out:
+ 	release_sock(sk);
+ 	return err;
+ }
+ 
+-static int vsock_dgram_recvmsg(struct socket *sock, struct msghdr *msg,
+-			       size_t len, int flags)
++int vsock_dgram_recvmsg(struct socket *sock, struct msghdr *msg,
++			size_t len, int flags)
+ {
+-	struct vsock_sock *vsk = vsock_sk(sock->sk);
++#ifdef CONFIG_BPF_SYSCALL
++	const struct proto *prot;
++#endif
++	struct vsock_sock *vsk;
++	struct sock *sk;
++
++	sk = sock->sk;
++	vsk = vsock_sk(sk);
++
++#ifdef CONFIG_BPF_SYSCALL
++	prot = READ_ONCE(sk->sk_prot);
++	if (prot != &vsock_proto)
++		return prot->recvmsg(sk, msg, len, flags, NULL);
++#endif
+ 
+ 	return vsk->transport->dgram_dequeue(vsk, msg, len, flags);
+ }
++EXPORT_SYMBOL_GPL(vsock_dgram_recvmsg);
+ 
+ static const struct proto_ops vsock_dgram_ops = {
+ 	.family = PF_VSOCK,
+@@ -1293,6 +1328,7 @@ static const struct proto_ops vsock_dgram_ops = {
+ 	.recvmsg = vsock_dgram_recvmsg,
+ 	.mmap = sock_no_mmap,
+ 	.sendpage = sock_no_sendpage,
++	.read_skb = vsock_read_skb,
+ };
+ 
+ static int vsock_transport_cancel_pkt(struct vsock_sock *vsk)
+@@ -2106,13 +2142,16 @@ static int __vsock_seqpacket_recvmsg(struct sock *sk, struct msghdr *msg,
+ 	return err;
+ }
+ 
+-static int
++int
+ vsock_connectible_recvmsg(struct socket *sock, struct msghdr *msg, size_t len,
+ 			  int flags)
+ {
+ 	struct sock *sk;
+ 	struct vsock_sock *vsk;
+ 	const struct vsock_transport *transport;
++#ifdef CONFIG_BPF_SYSCALL
++	const struct proto *prot;
++#endif
+ 	int err;
+ 
+ 	sk = sock->sk;
+@@ -2163,6 +2202,14 @@ vsock_connectible_recvmsg(struct socket *sock, struct msghdr *msg, size_t len,
+ 		goto out;
+ 	}
+ 
++#ifdef CONFIG_BPF_SYSCALL
++	prot = READ_ONCE(sk->sk_prot);
++	if (prot != &vsock_proto) {
++		release_sock(sk);
++		return prot->recvmsg(sk, msg, len, flags, NULL);
++	}
++#endif
++
+ 	if (sk->sk_type == SOCK_STREAM)
+ 		err = __vsock_stream_recvmsg(sk, msg, len, flags);
+ 	else
+@@ -2172,6 +2219,7 @@ vsock_connectible_recvmsg(struct socket *sock, struct msghdr *msg, size_t len,
+ 	release_sock(sk);
+ 	return err;
+ }
++EXPORT_SYMBOL_GPL(vsock_connectible_recvmsg);
+ 
+ static int vsock_set_rcvlowat(struct sock *sk, int val)
+ {
+@@ -2212,6 +2260,7 @@ static const struct proto_ops vsock_stream_ops = {
+ 	.mmap = sock_no_mmap,
+ 	.sendpage = sock_no_sendpage,
+ 	.set_rcvlowat = vsock_set_rcvlowat,
++	.read_skb = vsock_read_skb,
+ };
+ 
+ static const struct proto_ops vsock_seqpacket_ops = {
+@@ -2233,6 +2282,7 @@ static const struct proto_ops vsock_seqpacket_ops = {
+ 	.recvmsg = vsock_connectible_recvmsg,
+ 	.mmap = sock_no_mmap,
+ 	.sendpage = sock_no_sendpage,
++	.read_skb = vsock_read_skb,
+ };
+ 
+ static int vsock_create(struct net *net, struct socket *sock,
+@@ -2372,6 +2422,8 @@ static int __init vsock_init(void)
+ 		goto err_unregister_proto;
+ 	}
+ 
++	vsock_bpf_build_proto();
++
+ 	return 0;
+ 
+ err_unregister_proto:
+diff --git a/net/vmw_vsock/virtio_transport.c b/net/vmw_vsock/virtio_transport.c
+index 5434c9f11d28d..21d1fad4ad0e2 100644
+--- a/net/vmw_vsock/virtio_transport.c
++++ b/net/vmw_vsock/virtio_transport.c
+@@ -458,6 +458,8 @@ static struct virtio_transport virtio_transport = {
+ 		.notify_send_pre_enqueue  = virtio_transport_notify_send_pre_enqueue,
+ 		.notify_send_post_enqueue = virtio_transport_notify_send_post_enqueue,
+ 		.notify_buffer_size       = virtio_transport_notify_buffer_size,
++
++		.read_skb = virtio_transport_read_skb,
+ 	},
+ 
+ 	.send_pkt = virtio_transport_send_pkt,
+diff --git a/net/vmw_vsock/virtio_transport_common.c b/net/vmw_vsock/virtio_transport_common.c
+index a65da57fe26fd..a713a21abf59c 100644
+--- a/net/vmw_vsock/virtio_transport_common.c
++++ b/net/vmw_vsock/virtio_transport_common.c
+@@ -1435,6 +1435,31 @@ int virtio_transport_purge_skbs(void *vsk, struct sk_buff_head *queue)
+ }
+ EXPORT_SYMBOL_GPL(virtio_transport_purge_skbs);
+ 
++int virtio_transport_read_skb(struct vsock_sock *vsk, skb_read_actor_t recv_actor)
++{
++	struct virtio_vsock_sock *vvs = vsk->trans;
++	struct sock *sk = sk_vsock(vsk);
++	struct sk_buff *skb;
++	int off = 0;
++	int copied;
++	int err;
++
++	spin_lock_bh(&vvs->rx_lock);
++	/* Use __skb_recv_datagram() for race-free handling of the receive. It
++	 * works for types other than dgrams.
++	 */
++	skb = __skb_recv_datagram(sk, &vvs->rx_queue, MSG_DONTWAIT, &off, &err);
++	spin_unlock_bh(&vvs->rx_lock);
++
++	if (!skb)
++		return err;
++
++	copied = recv_actor(sk, skb);
++	kfree_skb(skb);
++	return copied;
++}
++EXPORT_SYMBOL_GPL(virtio_transport_read_skb);
++
+ MODULE_LICENSE("GPL v2");
+ MODULE_AUTHOR("Asias He");
+ MODULE_DESCRIPTION("common code for virtio vsock");
+diff --git a/net/vmw_vsock/vsock_bpf.c b/net/vmw_vsock/vsock_bpf.c
+new file mode 100644
+index 0000000000000..a3c97546ab84a
+--- /dev/null
++++ b/net/vmw_vsock/vsock_bpf.c
+@@ -0,0 +1,174 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2022 Bobby Eshleman <bobby.eshleman@bytedance.com>
++ *
++ * Based off of net/unix/unix_bpf.c
++ */
++
++#include <linux/bpf.h>
++#include <linux/module.h>
++#include <linux/skmsg.h>
++#include <linux/socket.h>
++#include <linux/wait.h>
++#include <net/af_vsock.h>
++#include <net/sock.h>
++
++#define vsock_sk_has_data(__sk, __psock)				\
++		({	!skb_queue_empty(&(__sk)->sk_receive_queue) ||	\
++			!skb_queue_empty(&(__psock)->ingress_skb) ||	\
++			!list_empty(&(__psock)->ingress_msg);		\
++		})
++
++static struct proto *vsock_prot_saved __read_mostly;
++static DEFINE_SPINLOCK(vsock_prot_lock);
++static struct proto vsock_bpf_prot;
++
++static bool vsock_has_data(struct sock *sk, struct sk_psock *psock)
++{
++	struct vsock_sock *vsk = vsock_sk(sk);
++	s64 ret;
++
++	ret = vsock_connectible_has_data(vsk);
++	if (ret > 0)
++		return true;
++
++	return vsock_sk_has_data(sk, psock);
++}
++
++static bool vsock_msg_wait_data(struct sock *sk, struct sk_psock *psock, long timeo)
++{
++	bool ret;
++
++	DEFINE_WAIT_FUNC(wait, woken_wake_function);
++
++	if (sk->sk_shutdown & RCV_SHUTDOWN)
++		return true;
++
++	if (!timeo)
++		return false;
++
++	add_wait_queue(sk_sleep(sk), &wait);
++	sk_set_bit(SOCKWQ_ASYNC_WAITDATA, sk);
++	ret = vsock_has_data(sk, psock);
++	if (!ret) {
++		wait_woken(&wait, TASK_INTERRUPTIBLE, timeo);
++		ret = vsock_has_data(sk, psock);
++	}
++	sk_clear_bit(SOCKWQ_ASYNC_WAITDATA, sk);
++	remove_wait_queue(sk_sleep(sk), &wait);
++	return ret;
++}
++
++static int __vsock_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags)
++{
++	struct socket *sock = sk->sk_socket;
++	int err;
++
++	if (sk->sk_type == SOCK_STREAM || sk->sk_type == SOCK_SEQPACKET)
++		err = vsock_connectible_recvmsg(sock, msg, len, flags);
++	else if (sk->sk_type == SOCK_DGRAM)
++		err = vsock_dgram_recvmsg(sock, msg, len, flags);
++	else
++		err = -EPROTOTYPE;
++
++	return err;
++}
++
++static int vsock_bpf_recvmsg(struct sock *sk, struct msghdr *msg,
++			     size_t len, int flags, int *addr_len)
++{
++	struct sk_psock *psock;
++	int copied;
++
++	psock = sk_psock_get(sk);
++	if (unlikely(!psock))
++		return __vsock_recvmsg(sk, msg, len, flags);
++
++	lock_sock(sk);
++	if (vsock_has_data(sk, psock) && sk_psock_queue_empty(psock)) {
++		release_sock(sk);
++		sk_psock_put(sk, psock);
++		return __vsock_recvmsg(sk, msg, len, flags);
++	}
++
++	copied = sk_msg_recvmsg(sk, psock, msg, len, flags);
++	while (copied == 0) {
++		long timeo = sock_rcvtimeo(sk, flags & MSG_DONTWAIT);
++
++		if (!vsock_msg_wait_data(sk, psock, timeo)) {
++			copied = -EAGAIN;
++			break;
++		}
++
++		if (sk_psock_queue_empty(psock)) {
++			release_sock(sk);
++			sk_psock_put(sk, psock);
++			return __vsock_recvmsg(sk, msg, len, flags);
++		}
++
++		copied = sk_msg_recvmsg(sk, psock, msg, len, flags);
++	}
++
++	release_sock(sk);
++	sk_psock_put(sk, psock);
++
++	return copied;
++}
++
++/* Copy of original proto with updated sock_map methods */
++static struct proto vsock_bpf_prot = {
++	.close = sock_map_close,
++	.recvmsg = vsock_bpf_recvmsg,
++	.sock_is_readable = sk_msg_is_readable,
++	.unhash = sock_map_unhash,
++};
++
++static void vsock_bpf_rebuild_protos(struct proto *prot, const struct proto *base)
++{
++	*prot        = *base;
++	prot->close  = sock_map_close;
++	prot->recvmsg = vsock_bpf_recvmsg;
++	prot->sock_is_readable = sk_msg_is_readable;
++}
++
++static void vsock_bpf_check_needs_rebuild(struct proto *ops)
++{
++	/* Paired with the smp_store_release() below. */
++	if (unlikely(ops != smp_load_acquire(&vsock_prot_saved))) {
++		spin_lock_bh(&vsock_prot_lock);
++		if (likely(ops != vsock_prot_saved)) {
++			vsock_bpf_rebuild_protos(&vsock_bpf_prot, ops);
++			/* Make sure proto function pointers are updated before publishing the
++			 * pointer to the struct.
++			 */
++			smp_store_release(&vsock_prot_saved, ops);
++		}
++		spin_unlock_bh(&vsock_prot_lock);
++	}
++}
++
++int vsock_bpf_update_proto(struct sock *sk, struct sk_psock *psock, bool restore)
++{
++	struct vsock_sock *vsk;
++
++	if (restore) {
++		sk->sk_write_space = psock->saved_write_space;
++		sock_replace_proto(sk, psock->sk_proto);
++		return 0;
++	}
++
++	vsk = vsock_sk(sk);
++	if (!vsk->transport)
++		return -ENODEV;
++
++	if (!vsk->transport->read_skb)
++		return -EOPNOTSUPP;
++
++	vsock_bpf_check_needs_rebuild(psock->sk_proto);
++	sock_replace_proto(sk, &vsock_bpf_prot);
++	return 0;
++}
++
++void __init vsock_bpf_build_proto(void)
++{
++	vsock_bpf_rebuild_protos(&vsock_bpf_prot, &vsock_proto);
++}
+diff --git a/net/vmw_vsock/vsock_loopback.c b/net/vmw_vsock/vsock_loopback.c
+index 89905c092645a..e3afc0c866f55 100644
+--- a/net/vmw_vsock/vsock_loopback.c
++++ b/net/vmw_vsock/vsock_loopback.c
+@@ -91,6 +91,8 @@ static struct virtio_transport loopback_transport = {
+ 		.notify_send_pre_enqueue  = virtio_transport_notify_send_pre_enqueue,
+ 		.notify_send_post_enqueue = virtio_transport_notify_send_post_enqueue,
+ 		.notify_buffer_size       = virtio_transport_notify_buffer_size,
++
++		.read_skb = virtio_transport_read_skb,
+ 	},
+ 
+ 	.send_pkt = vsock_loopback_send_pkt,
+-- 
+2.39.5
+
