@@ -1,0 +1,231 @@
+From 71884617a75ed903c04c09be4f759f634e9127f0 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 12 Oct 2023 00:39:55 +0200
+Subject: ptp: support multiple timestamp event readers
+
+From: Xabier Marquiegui <reibax@gmail.com>
+
+[ Upstream commit 8f5de6fb245326704f37d91780b9a10253a8a100 ]
+
+Use linked lists to create one event queue per open file. This enables
+simultaneous readers for timestamp event queues.
+
+Signed-off-by: Xabier Marquiegui <reibax@gmail.com>
+Suggested-by: Richard Cochran <richardcochran@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Stable-dep-of: 19ae40f572a9 ("ptp: Properly handle compat ioctls")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/ptp/ptp_chardev.c | 68 ++++++++++++++++++++++++++++-----------
+ drivers/ptp/ptp_clock.c   |  6 ++--
+ drivers/ptp/ptp_private.h |  1 -
+ drivers/ptp/ptp_sysfs.c   |  9 +++---
+ 4 files changed, 55 insertions(+), 29 deletions(-)
+
+diff --git a/drivers/ptp/ptp_chardev.c b/drivers/ptp/ptp_chardev.c
+index 82b5a68d1ca34..3c795fee49262 100644
+--- a/drivers/ptp/ptp_chardev.c
++++ b/drivers/ptp/ptp_chardev.c
+@@ -104,6 +104,31 @@ int ptp_set_pinfunc(struct ptp_clock *ptp, unsigned int pin,
+ 
+ int ptp_open(struct posix_clock_context *pccontext, fmode_t fmode)
+ {
++	struct ptp_clock *ptp =
++		container_of(pccontext->clk, struct ptp_clock, clock);
++	struct timestamp_event_queue *queue;
++
++	queue = kzalloc(sizeof(*queue), GFP_KERNEL);
++	if (!queue)
++		return -EINVAL;
++	spin_lock_init(&queue->lock);
++	list_add_tail(&queue->qlist, &ptp->tsevqs);
++	pccontext->private_clkdata = queue;
++	return 0;
++}
++
++int ptp_release(struct posix_clock_context *pccontext)
++{
++	struct timestamp_event_queue *queue = pccontext->private_clkdata;
++	unsigned long flags;
++
++	if (queue) {
++		pccontext->private_clkdata = NULL;
++		spin_lock_irqsave(&queue->lock, flags);
++		list_del(&queue->qlist);
++		spin_unlock_irqrestore(&queue->lock, flags);
++		kfree(queue);
++	}
+ 	return 0;
+ }
+ 
+@@ -439,10 +464,11 @@ __poll_t ptp_poll(struct posix_clock_context *pccontext, struct file *fp,
+ 		container_of(pccontext->clk, struct ptp_clock, clock);
+ 	struct timestamp_event_queue *queue;
+ 
+-	poll_wait(fp, &ptp->tsev_wq, wait);
++	queue = pccontext->private_clkdata;
++	if (!queue)
++		return EPOLLERR;
+ 
+-	/* Extract only the first element in the queue list */
+-	queue = list_first_entry(&ptp->tsevqs, struct timestamp_event_queue, qlist);
++	poll_wait(fp, &ptp->tsev_wq, wait);
+ 
+ 	return queue_cnt(queue) ? EPOLLIN : 0;
+ }
+@@ -460,36 +486,36 @@ ssize_t ptp_read(struct posix_clock_context *pccontext, uint rdflags,
+ 	size_t qcnt, i;
+ 	int result;
+ 
+-	/* Extract only the first element in the queue list */
+-	queue = list_first_entry(&ptp->tsevqs, struct timestamp_event_queue,
+-				 qlist);
++	queue = pccontext->private_clkdata;
++	if (!queue) {
++		result = -EINVAL;
++		goto exit;
++	}
+ 
+-	if (cnt % sizeof(struct ptp_extts_event) != 0)
+-		return -EINVAL;
++	if (cnt % sizeof(struct ptp_extts_event) != 0) {
++		result = -EINVAL;
++		goto exit;
++	}
+ 
+ 	if (cnt > EXTTS_BUFSIZE)
+ 		cnt = EXTTS_BUFSIZE;
+ 
+ 	cnt = cnt / sizeof(struct ptp_extts_event);
+ 
+-	if (mutex_lock_interruptible(&ptp->tsevq_mux))
+-		return -ERESTARTSYS;
+-
+ 	if (wait_event_interruptible(ptp->tsev_wq,
+ 				     ptp->defunct || queue_cnt(queue))) {
+-		mutex_unlock(&ptp->tsevq_mux);
+ 		return -ERESTARTSYS;
+ 	}
+ 
+ 	if (ptp->defunct) {
+-		mutex_unlock(&ptp->tsevq_mux);
+-		return -ENODEV;
++		result = -ENODEV;
++		goto exit;
+ 	}
+ 
+ 	event = kmalloc(EXTTS_BUFSIZE, GFP_KERNEL);
+ 	if (!event) {
+-		mutex_unlock(&ptp->tsevq_mux);
+-		return -ENOMEM;
++		result = -ENOMEM;
++		goto exit;
+ 	}
+ 
+ 	spin_lock_irqsave(&queue->lock, flags);
+@@ -509,12 +535,16 @@ ssize_t ptp_read(struct posix_clock_context *pccontext, uint rdflags,
+ 
+ 	cnt = cnt * sizeof(struct ptp_extts_event);
+ 
+-	mutex_unlock(&ptp->tsevq_mux);
+-
+ 	result = cnt;
+-	if (copy_to_user(buf, event, cnt))
++	if (copy_to_user(buf, event, cnt)) {
+ 		result = -EFAULT;
++		goto free_event;
++	}
+ 
++free_event:
+ 	kfree(event);
++exit:
++	if (result < 0)
++		ptp_release(pccontext);
+ 	return result;
+ }
+diff --git a/drivers/ptp/ptp_clock.c b/drivers/ptp/ptp_clock.c
+index ff40f902f706f..c677a45474360 100644
+--- a/drivers/ptp/ptp_clock.c
++++ b/drivers/ptp/ptp_clock.c
+@@ -163,6 +163,7 @@ static struct posix_clock_operations ptp_clock_ops = {
+ 	.clock_settime	= ptp_clock_settime,
+ 	.ioctl		= ptp_ioctl,
+ 	.open		= ptp_open,
++	.release	= ptp_release,
+ 	.poll		= ptp_poll,
+ 	.read		= ptp_read,
+ };
+@@ -175,7 +176,6 @@ static void ptp_clock_release(struct device *dev)
+ 
+ 	ptp_cleanup_pin_groups(ptp);
+ 	kfree(ptp->vclock_index);
+-	mutex_destroy(&ptp->tsevq_mux);
+ 	mutex_destroy(&ptp->pincfg_mux);
+ 	mutex_destroy(&ptp->n_vclocks_mux);
+ 	/* Delete first entry */
+@@ -235,9 +235,8 @@ struct ptp_clock *ptp_clock_register(struct ptp_clock_info *info,
+ 	queue = kzalloc(sizeof(*queue), GFP_KERNEL);
+ 	if (!queue)
+ 		goto no_memory_queue;
+-	spin_lock_init(&queue->lock);
+ 	list_add_tail(&queue->qlist, &ptp->tsevqs);
+-	mutex_init(&ptp->tsevq_mux);
++	spin_lock_init(&queue->lock);
+ 	mutex_init(&ptp->pincfg_mux);
+ 	mutex_init(&ptp->n_vclocks_mux);
+ 	init_waitqueue_head(&ptp->tsev_wq);
+@@ -323,7 +322,6 @@ struct ptp_clock *ptp_clock_register(struct ptp_clock_info *info,
+ 	if (ptp->kworker)
+ 		kthread_destroy_worker(ptp->kworker);
+ kworker_err:
+-	mutex_destroy(&ptp->tsevq_mux);
+ 	mutex_destroy(&ptp->pincfg_mux);
+ 	mutex_destroy(&ptp->n_vclocks_mux);
+ 	list_del(&queue->qlist);
+diff --git a/drivers/ptp/ptp_private.h b/drivers/ptp/ptp_private.h
+index a469623f22751..baee5123dc22f 100644
+--- a/drivers/ptp/ptp_private.h
++++ b/drivers/ptp/ptp_private.h
+@@ -38,7 +38,6 @@ struct ptp_clock {
+ 	struct pps_device *pps_source;
+ 	long dialed_frequency; /* remembers the frequency adjustment */
+ 	struct list_head tsevqs; /* timestamp fifo list */
+-	struct mutex tsevq_mux; /* one process at a time reading the fifo */
+ 	struct mutex pincfg_mux; /* protect concurrent info->pin_config access */
+ 	wait_queue_head_t tsev_wq;
+ 	int defunct; /* tells readers to go away when clock is being removed */
+diff --git a/drivers/ptp/ptp_sysfs.c b/drivers/ptp/ptp_sysfs.c
+index 2b2caca45a7d7..5986cb0c502c9 100644
+--- a/drivers/ptp/ptp_sysfs.c
++++ b/drivers/ptp/ptp_sysfs.c
+@@ -70,15 +70,15 @@ static ssize_t extts_fifo_show(struct device *dev,
+ 	size_t qcnt;
+ 	int cnt = 0;
+ 
++	cnt = list_count_nodes(&ptp->tsevqs);
++	if (cnt <= 0)
++		goto out;
++
+ 	/* The sysfs fifo will always draw from the fist queue */
+ 	queue = list_first_entry(&ptp->tsevqs, struct timestamp_event_queue,
+ 				 qlist);
+ 
+ 	memset(&event, 0, sizeof(event));
+-
+-	if (mutex_lock_interruptible(&ptp->tsevq_mux))
+-		return -ERESTARTSYS;
+-
+ 	spin_lock_irqsave(&queue->lock, flags);
+ 	qcnt = queue_cnt(queue);
+ 	if (qcnt) {
+@@ -94,7 +94,6 @@ static ssize_t extts_fifo_show(struct device *dev,
+ 	cnt = snprintf(page, PAGE_SIZE, "%u %lld %u\n",
+ 		       event.index, event.t.sec, event.t.nsec);
+ out:
+-	mutex_unlock(&ptp->tsevq_mux);
+ 	return cnt;
+ }
+ static DEVICE_ATTR(fifo, 0444, extts_fifo_show, NULL);
+-- 
+2.39.5
+

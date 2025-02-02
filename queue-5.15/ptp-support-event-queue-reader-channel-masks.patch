@@ -1,0 +1,195 @@
+From aa92e17a6bc056b506704a3fbaf3c553ffdc4ff6 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 12 Oct 2023 00:39:56 +0200
+Subject: ptp: support event queue reader channel masks
+
+From: Xabier Marquiegui <reibax@gmail.com>
+
+[ Upstream commit c5a445b1e9347b14752b01f1a304bd7a2f260acc ]
+
+On systems with multiple timestamp event channels, some readers might
+want to receive only a subset of those channels.
+
+Add the necessary modifications to support timestamp event channel
+filtering, including two IOCTL operations:
+
+- Clear all channels
+- Enable one channel
+
+The mask modification operations will be applied exclusively on the
+event queue assigned to the file descriptor used on the IOCTL operation,
+so the typical procedure to have a reader receiving only a subset of the
+enabled channels would be:
+
+- Open device file
+- ioctl: clear all channels
+- ioctl: enable one channel
+- start reading
+
+Calling the enable one channel ioctl more than once will result in
+multiple enabled channels.
+
+Signed-off-by: Xabier Marquiegui <reibax@gmail.com>
+Suggested-by: Richard Cochran <richardcochran@gmail.com>
+Suggested-by: Vinicius Costa Gomes <vinicius.gomes@intel.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Stable-dep-of: 19ae40f572a9 ("ptp: Properly handle compat ioctls")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/ptp/ptp_chardev.c      | 26 ++++++++++++++++++++++++++
+ drivers/ptp/ptp_clock.c        | 12 ++++++++++--
+ drivers/ptp/ptp_private.h      |  3 +++
+ include/uapi/linux/ptp_clock.h |  2 ++
+ 4 files changed, 41 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/ptp/ptp_chardev.c b/drivers/ptp/ptp_chardev.c
+index 3c795fee49262..c48b9379ca094 100644
+--- a/drivers/ptp/ptp_chardev.c
++++ b/drivers/ptp/ptp_chardev.c
+@@ -111,6 +111,12 @@ int ptp_open(struct posix_clock_context *pccontext, fmode_t fmode)
+ 	queue = kzalloc(sizeof(*queue), GFP_KERNEL);
+ 	if (!queue)
+ 		return -EINVAL;
++	queue->mask = bitmap_alloc(PTP_MAX_CHANNELS, GFP_KERNEL);
++	if (!queue->mask) {
++		kfree(queue);
++		return -EINVAL;
++	}
++	bitmap_set(queue->mask, 0, PTP_MAX_CHANNELS);
+ 	spin_lock_init(&queue->lock);
+ 	list_add_tail(&queue->qlist, &ptp->tsevqs);
+ 	pccontext->private_clkdata = queue;
+@@ -127,6 +133,7 @@ int ptp_release(struct posix_clock_context *pccontext)
+ 		spin_lock_irqsave(&queue->lock, flags);
+ 		list_del(&queue->qlist);
+ 		spin_unlock_irqrestore(&queue->lock, flags);
++		bitmap_free(queue->mask);
+ 		kfree(queue);
+ 	}
+ 	return 0;
+@@ -142,6 +149,7 @@ long ptp_ioctl(struct posix_clock_context *pccontext, unsigned int cmd,
+ 	struct system_device_crosststamp xtstamp;
+ 	struct ptp_clock_info *ops = ptp->info;
+ 	struct ptp_sys_offset *sysoff = NULL;
++	struct timestamp_event_queue *tsevq;
+ 	struct ptp_system_timestamp sts;
+ 	struct ptp_clock_request req;
+ 	struct ptp_clock_caps caps;
+@@ -151,6 +159,8 @@ long ptp_ioctl(struct posix_clock_context *pccontext, unsigned int cmd,
+ 	struct timespec64 ts;
+ 	int enable, err = 0;
+ 
++	tsevq = pccontext->private_clkdata;
++
+ 	switch (cmd) {
+ 
+ 	case PTP_CLOCK_GETCAPS:
+@@ -446,6 +456,22 @@ long ptp_ioctl(struct posix_clock_context *pccontext, unsigned int cmd,
+ 		mutex_unlock(&ptp->pincfg_mux);
+ 		break;
+ 
++	case PTP_MASK_CLEAR_ALL:
++		bitmap_clear(tsevq->mask, 0, PTP_MAX_CHANNELS);
++		break;
++
++	case PTP_MASK_EN_SINGLE:
++		if (copy_from_user(&i, (void __user *)arg, sizeof(i))) {
++			err = -EFAULT;
++			break;
++		}
++		if (i >= PTP_MAX_CHANNELS) {
++			err = -EFAULT;
++			break;
++		}
++		set_bit(i, tsevq->mask);
++		break;
++
+ 	default:
+ 		err = -ENOTTY;
+ 		break;
+diff --git a/drivers/ptp/ptp_clock.c b/drivers/ptp/ptp_clock.c
+index c677a45474360..1e398fe5694db 100644
+--- a/drivers/ptp/ptp_clock.c
++++ b/drivers/ptp/ptp_clock.c
+@@ -184,6 +184,7 @@ static void ptp_clock_release(struct device *dev)
+ 	spin_lock_irqsave(&tsevq->lock, flags);
+ 	list_del(&tsevq->qlist);
+ 	spin_unlock_irqrestore(&tsevq->lock, flags);
++	bitmap_free(tsevq->mask);
+ 	kfree(tsevq);
+ 	ida_free(&ptp_clocks_map, ptp->index);
+ 	kfree(ptp);
+@@ -236,6 +237,10 @@ struct ptp_clock *ptp_clock_register(struct ptp_clock_info *info,
+ 	if (!queue)
+ 		goto no_memory_queue;
+ 	list_add_tail(&queue->qlist, &ptp->tsevqs);
++	queue->mask = bitmap_alloc(PTP_MAX_CHANNELS, GFP_KERNEL);
++	if (!queue->mask)
++		goto no_memory_bitmap;
++	bitmap_set(queue->mask, 0, PTP_MAX_CHANNELS);
+ 	spin_lock_init(&queue->lock);
+ 	mutex_init(&ptp->pincfg_mux);
+ 	mutex_init(&ptp->n_vclocks_mux);
+@@ -324,6 +329,8 @@ struct ptp_clock *ptp_clock_register(struct ptp_clock_info *info,
+ kworker_err:
+ 	mutex_destroy(&ptp->pincfg_mux);
+ 	mutex_destroy(&ptp->n_vclocks_mux);
++	bitmap_free(queue->mask);
++no_memory_bitmap:
+ 	list_del(&queue->qlist);
+ 	kfree(queue);
+ no_memory_queue:
+@@ -378,9 +385,10 @@ void ptp_clock_event(struct ptp_clock *ptp, struct ptp_clock_event *event)
+ 		break;
+ 
+ 	case PTP_CLOCK_EXTTS:
+-		/* Enqueue timestamp on all queues */
++		/* Enqueue timestamp on selected queues */
+ 		list_for_each_entry(tsevq, &ptp->tsevqs, qlist) {
+-			enqueue_external_timestamp(tsevq, event);
++			if (test_bit((unsigned int)event->index, tsevq->mask))
++				enqueue_external_timestamp(tsevq, event);
+ 		}
+ 		wake_up_interruptible(&ptp->tsev_wq);
+ 		break;
+diff --git a/drivers/ptp/ptp_private.h b/drivers/ptp/ptp_private.h
+index baee5123dc22f..cc95f49abce5f 100644
+--- a/drivers/ptp/ptp_private.h
++++ b/drivers/ptp/ptp_private.h
+@@ -16,10 +16,12 @@
+ #include <linux/ptp_clock_kernel.h>
+ #include <linux/time.h>
+ #include <linux/list.h>
++#include <linux/bitmap.h>
+ 
+ #define PTP_MAX_TIMESTAMPS 128
+ #define PTP_BUF_TIMESTAMPS 30
+ #define PTP_DEFAULT_MAX_VCLOCKS 20
++#define PTP_MAX_CHANNELS 2048
+ 
+ struct timestamp_event_queue {
+ 	struct ptp_extts_event buf[PTP_MAX_TIMESTAMPS];
+@@ -27,6 +29,7 @@ struct timestamp_event_queue {
+ 	int tail;
+ 	spinlock_t lock;
+ 	struct list_head qlist;
++	unsigned long *mask;
+ };
+ 
+ struct ptp_clock {
+diff --git a/include/uapi/linux/ptp_clock.h b/include/uapi/linux/ptp_clock.h
+index 1d108d597f66d..2c4a479084b14 100644
+--- a/include/uapi/linux/ptp_clock.h
++++ b/include/uapi/linux/ptp_clock.h
+@@ -223,6 +223,8 @@ struct ptp_pin_desc {
+ 	_IOWR(PTP_CLK_MAGIC, 17, struct ptp_sys_offset_precise)
+ #define PTP_SYS_OFFSET_EXTENDED2 \
+ 	_IOWR(PTP_CLK_MAGIC, 18, struct ptp_sys_offset_extended)
++#define PTP_MASK_CLEAR_ALL  _IO(PTP_CLK_MAGIC, 19)
++#define PTP_MASK_EN_SINGLE  _IOW(PTP_CLK_MAGIC, 20, unsigned int)
+ 
+ struct ptp_extts_event {
+ 	struct ptp_clock_time t; /* Time event occured. */
+-- 
+2.39.5
+
