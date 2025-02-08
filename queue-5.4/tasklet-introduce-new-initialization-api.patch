@@ -1,0 +1,158 @@
+From be070df934703d1cb5c7e2a7ea7cb1a49f11834a Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Sun, 29 Sep 2019 18:30:13 +0200
+Subject: tasklet: Introduce new initialization API
+
+From: Romain Perier <romain.perier@gmail.com>
+
+[ Upstream commit 12cc923f1ccc1df467e046b02a72c2b3b321b6a2 ]
+
+Nowadays, modern kernel subsystems that use callbacks pass the data
+structure associated with a given callback as argument to the callback.
+The tasklet subsystem remains one which passes an arbitrary unsigned
+long to the callback function. This has several problems:
+
+- This keeps an extra field for storing the argument in each tasklet
+  data structure, it bloats the tasklet_struct structure with a redundant
+  .data field
+
+- No type checking can be performed on this argument. Instead of
+  using container_of() like other callback subsystems, it forces callbacks
+  to do explicit type cast of the unsigned long argument into the required
+  object type.
+
+- Buffer overflows can overwrite the .func and the .data field, so
+  an attacker can easily overwrite the function and its first argument
+  to whatever it wants.
+
+Add a new tasklet initialization API, via DECLARE_TASKLET() and
+tasklet_setup(), which will replace the existing ones.
+
+This work is greatly inspired by the timer_struct conversion series,
+see commit e99e88a9d2b0 ("treewide: setup_timer() -> timer_setup()")
+
+To avoid problems with both -Wcast-function-type (which is enabled in
+the kernel via -Wextra is several subsystems), and with mismatched
+function prototypes when build with Control Flow Integrity enabled,
+this adds the "use_callback" member to let the tasklet caller choose
+which union member to call through. Once all old API uses are removed,
+this and the .data member will be removed as well. (On 64-bit this does
+not grow the struct size as the new member fills the hole after atomic_t,
+which is also "int" sized.)
+
+Signed-off-by: Romain Perier <romain.perier@gmail.com>
+Co-developed-by: Allen Pais <allen.lkml@gmail.com>
+Signed-off-by: Allen Pais <allen.lkml@gmail.com>
+Reviewed-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Acked-by: Thomas Gleixner <tglx@linutronix.de>
+Co-developed-by: Kees Cook <keescook@chromium.org>
+Signed-off-by: Kees Cook <keescook@chromium.org>
+Stable-dep-of: 90b7f2961798 ("net: usb: rtl8150: enable basic endpoint checking")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/linux/interrupt.h | 28 +++++++++++++++++++++++++++-
+ kernel/softirq.c          | 18 +++++++++++++++++-
+ 2 files changed, 44 insertions(+), 2 deletions(-)
+
+diff --git a/include/linux/interrupt.h b/include/linux/interrupt.h
+index 01517747214a4..b70a35b97210d 100644
+--- a/include/linux/interrupt.h
++++ b/include/linux/interrupt.h
+@@ -575,6 +575,9 @@ static inline struct task_struct *this_cpu_ksoftirqd(void)
+ 
+ /* Tasklets --- multithreaded analogue of BHs.
+ 
++   This API is deprecated. Please consider using threaded IRQs instead:
++   https://lore.kernel.org/lkml/20200716081538.2sivhkj4hcyrusem@linutronix.de
++
+    Main feature differing them of generic softirqs: tasklet
+    is running only on one CPU simultaneously.
+ 
+@@ -598,10 +601,31 @@ struct tasklet_struct
+ 	struct tasklet_struct *next;
+ 	unsigned long state;
+ 	atomic_t count;
+-	void (*func)(unsigned long);
++	bool use_callback;
++	union {
++		void (*func)(unsigned long data);
++		void (*callback)(struct tasklet_struct *t);
++	};
+ 	unsigned long data;
+ };
+ 
++#define DECLARE_TASKLET(name, _callback)		\
++struct tasklet_struct name = {				\
++	.count = ATOMIC_INIT(0),			\
++	.callback = _callback,				\
++	.use_callback = true,				\
++}
++
++#define DECLARE_TASKLET_DISABLED(name, _callback)	\
++struct tasklet_struct name = {				\
++	.count = ATOMIC_INIT(1),			\
++	.callback = _callback,				\
++	.use_callback = true,				\
++}
++
++#define from_tasklet(var, callback_tasklet, tasklet_fieldname)	\
++	container_of(callback_tasklet, typeof(*var), tasklet_fieldname)
++
+ #define DECLARE_TASKLET_OLD(name, _func)		\
+ struct tasklet_struct name = {				\
+ 	.count = ATOMIC_INIT(0),			\
+@@ -681,6 +705,8 @@ extern void tasklet_kill(struct tasklet_struct *t);
+ extern void tasklet_kill_immediate(struct tasklet_struct *t, unsigned int cpu);
+ extern void tasklet_init(struct tasklet_struct *t,
+ 			 void (*func)(unsigned long), unsigned long data);
++extern void tasklet_setup(struct tasklet_struct *t,
++			  void (*callback)(struct tasklet_struct *));
+ 
+ /*
+  * Autoprobing for irqs:
+diff --git a/kernel/softirq.c b/kernel/softirq.c
+index 0427a86743a46..c5518b39cb4e5 100644
+--- a/kernel/softirq.c
++++ b/kernel/softirq.c
+@@ -520,7 +520,10 @@ static void tasklet_action_common(struct softirq_action *a,
+ 				if (!test_and_clear_bit(TASKLET_STATE_SCHED,
+ 							&t->state))
+ 					BUG();
+-				t->func(t->data);
++				if (t->use_callback)
++					t->callback(t);
++				else
++					t->func(t->data);
+ 				tasklet_unlock(t);
+ 				continue;
+ 			}
+@@ -546,6 +549,18 @@ static __latent_entropy void tasklet_hi_action(struct softirq_action *a)
+ 	tasklet_action_common(a, this_cpu_ptr(&tasklet_hi_vec), HI_SOFTIRQ);
+ }
+ 
++void tasklet_setup(struct tasklet_struct *t,
++		   void (*callback)(struct tasklet_struct *))
++{
++	t->next = NULL;
++	t->state = 0;
++	atomic_set(&t->count, 0);
++	t->callback = callback;
++	t->use_callback = true;
++	t->data = 0;
++}
++EXPORT_SYMBOL(tasklet_setup);
++
+ void tasklet_init(struct tasklet_struct *t,
+ 		  void (*func)(unsigned long), unsigned long data)
+ {
+@@ -553,6 +568,7 @@ void tasklet_init(struct tasklet_struct *t,
+ 	t->state = 0;
+ 	atomic_set(&t->count, 0);
+ 	t->func = func;
++	t->use_callback = false;
+ 	t->data = data;
+ }
+ EXPORT_SYMBOL(tasklet_init);
+-- 
+2.39.5
+
