@@ -1,0 +1,132 @@
+From de89111213a3fb4751245214dc4dd590ed153d29 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 12 Feb 2025 01:02:09 +0200
+Subject: MIPS: fix mips_get_syscall_arg() for o32
+
+From: Dmitry V. Levin <ldv@strace.io>
+
+[ Upstream commit 733a90561ad0a4a74035d2d627098da85d43b592 ]
+
+This makes ptrace/get_syscall_info selftest pass on mips o32 and
+mips64 o32 by fixing the following two test assertions:
+
+1. get_syscall_info test assertion on mips o32:
+  # get_syscall_info.c:218:get_syscall_info:Expected exp_args[5] (3134521044) == info.entry.args[4] (4911432)
+  # get_syscall_info.c:219:get_syscall_info:wait #1: entry stop mismatch
+
+2. get_syscall_info test assertion on mips64 o32:
+  # get_syscall_info.c:209:get_syscall_info:Expected exp_args[2] (3134324433) == info.entry.args[1] (18446744072548908753)
+  # get_syscall_info.c:210:get_syscall_info:wait #1: entry stop mismatch
+
+The first assertion happens due to mips_get_syscall_arg() trying to access
+another task's context but failing to do it properly because get_user() it
+calls just peeks at the current task's context.  It usually does not crash
+because the default user stack always gets assigned the same VMA, but it
+is pure luck which mips_get_syscall_arg() wouldn't have if e.g. the stack
+was switched (via setcontext(3) or however) or a non-default process's
+thread peeked at, and in any case irrelevant data is obtained just as
+observed with the test case.
+
+mips_get_syscall_arg() ought to be using access_remote_vm() instead to
+retrieve the other task's stack contents, but given that the data has been
+already obtained and saved in `struct pt_regs' it would be an overkill.
+
+The first assertion is fixed for mips o32 by using struct pt_regs.args
+instead of get_user() to obtain syscall arguments.  This approach works
+due to this piece in arch/mips/kernel/scall32-o32.S:
+
+        /*
+         * Ok, copy the args from the luser stack to the kernel stack.
+         */
+
+        .set    push
+        .set    noreorder
+        .set    nomacro
+
+    load_a4: user_lw(t5, 16(t0))		# argument #5 from usp
+    load_a5: user_lw(t6, 20(t0))		# argument #6 from usp
+    load_a6: user_lw(t7, 24(t0))		# argument #7 from usp
+    load_a7: user_lw(t8, 28(t0))		# argument #8 from usp
+    loads_done:
+
+        sw	t5, PT_ARG4(sp)		# argument #5 to ksp
+        sw	t6, PT_ARG5(sp)		# argument #6 to ksp
+        sw	t7, PT_ARG6(sp)		# argument #7 to ksp
+        sw	t8, PT_ARG7(sp)		# argument #8 to ksp
+        .set	pop
+
+        .section __ex_table,"a"
+        PTR_WD	load_a4, bad_stack_a4
+        PTR_WD	load_a5, bad_stack_a5
+        PTR_WD	load_a6, bad_stack_a6
+        PTR_WD	load_a7, bad_stack_a7
+        .previous
+
+arch/mips/kernel/scall64-o32.S has analogous code for mips64 o32 that
+allows fixing the issue by obtaining syscall arguments from struct
+pt_regs.regs[4..11] instead of the erroneous use of get_user().
+
+The second assertion is fixed by truncating 64-bit values to 32-bit
+syscall arguments.
+
+Fixes: c0ff3c53d4f9 ("MIPS: Enable HAVE_ARCH_TRACEHOOK.")
+Signed-off-by: Dmitry V. Levin <ldv@strace.io>
+Signed-off-by: Thomas Bogendoerfer <tsbogend@alpha.franken.de>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ arch/mips/include/asm/syscall.h | 32 ++++++++------------------------
+ 1 file changed, 8 insertions(+), 24 deletions(-)
+
+diff --git a/arch/mips/include/asm/syscall.h b/arch/mips/include/asm/syscall.h
+index ebdf4d910af2f..056aa1b713e23 100644
+--- a/arch/mips/include/asm/syscall.h
++++ b/arch/mips/include/asm/syscall.h
+@@ -57,37 +57,21 @@ static inline void mips_syscall_update_nr(struct task_struct *task,
+ static inline void mips_get_syscall_arg(unsigned long *arg,
+ 	struct task_struct *task, struct pt_regs *regs, unsigned int n)
+ {
+-	unsigned long usp __maybe_unused = regs->regs[29];
+-
++#ifdef CONFIG_32BIT
+ 	switch (n) {
+ 	case 0: case 1: case 2: case 3:
+ 		*arg = regs->regs[4 + n];
+-
+-		return;
+-
+-#ifdef CONFIG_32BIT
+-	case 4: case 5: case 6: case 7:
+-		get_user(*arg, (int *)usp + n);
+ 		return;
+-#endif
+-
+-#ifdef CONFIG_64BIT
+ 	case 4: case 5: case 6: case 7:
+-#ifdef CONFIG_MIPS32_O32
+-		if (test_tsk_thread_flag(task, TIF_32BIT_REGS))
+-			get_user(*arg, (int *)usp + n);
+-		else
+-#endif
+-			*arg = regs->regs[4 + n];
+-
++		*arg = regs->args[n];
+ 		return;
+-#endif
+-
+-	default:
+-		BUG();
+ 	}
+-
+-	unreachable();
++#else
++	*arg = regs->regs[4 + n];
++	if ((IS_ENABLED(CONFIG_MIPS32_O32) &&
++	     test_tsk_thread_flag(task, TIF_32BIT_REGS)))
++		*arg = (unsigned int)*arg;
++#endif
+ }
+ 
+ static inline long syscall_get_error(struct task_struct *task,
+-- 
+2.39.5
+
