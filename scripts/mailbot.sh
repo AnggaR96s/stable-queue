@@ -585,48 +585,7 @@ compare_with_upstream() {
         git am --abort >/dev/null 2>&1
         git checkout -q "$current_branch"
         git branch -D "$temp_branch" >/dev/null 2>&1
-
-        debug_output+=("Failed to apply patch cleanly, falling back to interdiff...")
-        debug_output+=("")
-
-        # Fall back to interdiff
-        TEMP_PATCH=$(mktemp)
-        UPSTREAM_PATCH=$(mktemp)
-        FILTERED_PATCH=$(mktemp)
-        FILTERED_UPSTREAM=$(mktemp)
-
-        # Extract patch content from mbox
-        formail -I "" < "$mbox_file" | sed '1,/^$/d' > "$TEMP_PATCH"
-
-        # Get upstream patch
-        git format-patch -k --stdout --no-signature "${sha1}^..${sha1}" | \
-        sed '1,/^$/d' > "$UPSTREAM_PATCH"
-
-        # Filter out metadata lines that might cause comparison issues
-        for file in "$TEMP_PATCH" "$UPSTREAM_PATCH"; do
-            output_file="${file/PATCH/FILTERED}"
-            sed -E '/^(index |diff --git |new file mode |deleted file mode |old mode |new mode )/d' "$file" > "$output_file"
-        done
-
-        # Run interdiff
-        if ! interdiff "$FILTERED_UPSTREAM" "$FILTERED_PATCH" 2>"${TEMP_PATCH}.err"; then
-            # If interdiff fails, include error output
-            if [ -s "${TEMP_PATCH}.err" ]; then
-                debug_output+=("interdiff error output:")
-                debug_output+=("$(cat "${TEMP_PATCH}.err")")
-            fi
-            
-            # Fall back to standard diff
-            debug_output+=("interdiff failed, falling back to standard diff...")
-            if ! diff -u "$FILTERED_UPSTREAM" "$FILTERED_PATCH" >"${TEMP_PATCH}.diff"; then
-                if [ -s "${TEMP_PATCH}.diff" ]; then
-                    debug_output+=("$(cat "${TEMP_PATCH}.diff")")
-                fi
-            fi
-        fi
-
-        # Clean up temporary files
-        rm -f "$TEMP_PATCH" "$UPSTREAM_PATCH" "$FILTERED_PATCH" "$FILTERED_UPSTREAM" "${TEMP_PATCH}.err" "${TEMP_PATCH}.diff"
+        debug_output+=("Failed to apply patch cleanly.")
     fi
 
     printf '%s\n' "${debug_output[@]}"
@@ -668,8 +627,29 @@ test_commit_on_branch() {
 
     # Apply current patch
     if ! git am "$mbox_file" >/dev/null 2>&1; then
+        # Extract patch content and try to apply with --reject to get .rej files
+        local temp_patch=$(mktemp)
+        formail -I "" < "$mbox_file" | sed '1,/^$/d' > "$temp_patch"
+        git apply --reject "$temp_patch" >/dev/null 2>&1
+        
+        # Find and read any .rej files
+        local reject_content=""
+        while IFS= read -r -d '' rej_file; do
+            reject_content+=$'\n'"$(cat "$rej_file")"
+            rm -f "$rej_file"
+        done < <(find . -name "*.rej" -print0)
+        rm -f "$temp_patch"
+
+        # Clean up
+        git checkout -f >/dev/null 2>&1
         git am --abort >/dev/null 2>&1
         results+=("stable/linux-${version}.y | Failed | N/A")
+        if [ -n "$reject_content" ]; then
+            errors+=("Patch failed to apply on ${branch}. Reject:")
+            errors+=("$reject_content")
+        else
+            errors+=("Patch failed to apply on ${branch} but no reject information available.")
+        fi
         git checkout -q "$branch"
         git branch -D "$temp_branch"
         return 1
@@ -963,12 +943,20 @@ generate_response() {
                 fi
             done <<< "$results"
 
+            # Only check newer branches that are newer than our newest target version
+            local newest_target_version=""
+            for version in $kernel_versions; do
+                if [ -z "$newest_target_version" ] || (( $(echo "$version > $newest_target_version" | bc -l) )); then
+                    newest_target_version="$version"
+                fi
+            done
+
             # Only check newer branches
             while IFS= read -r line; do
                 if [[ "$line" =~ ^([0-9]+\.[0-9]+)\.y ]]; then
                     local branch_version="${BASH_REMATCH[1]}"
                     # Compare versions using bc for proper numeric comparison
-                    if (( $(echo "$branch_version > $target_version" | bc -l) )); then
+                    if (( $(echo "$branch_version > $newest_target_version" | bc -l) )); then
                         newer_count=$((newer_count + 1))
                         if [[ "$line" == *"| Not found"* ]]; then
                             missing_count=$((missing_count + 1))
