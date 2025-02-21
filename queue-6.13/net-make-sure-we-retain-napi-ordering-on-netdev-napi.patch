@@ -1,0 +1,123 @@
+From cbcf8c6d4b7fb6fab20ae92429077352181644eb Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 7 Jan 2025 08:08:39 -0800
+Subject: net: make sure we retain NAPI ordering on netdev->napi_list
+
+From: Jakub Kicinski <kuba@kernel.org>
+
+[ Upstream commit d6c7b03497eef8b66bf0b5572881359913e39787 ]
+
+Netlink code depends on NAPI instances being sorted by ID on
+the netdev list for dump continuation. We need to be able to
+find the position on the list where we left off if dump does
+not fit in a single skb, and in the meantime NAPI instances
+can come and go.
+
+This was trivially true when we were assigning a new ID to every
+new NAPI instance. Since we added the NAPI config API, we try
+to retain the ID previously used for the same queue, but still
+add the new NAPI instance at the start of the list.
+
+This is fine if we reset the entire netdev and all NAPIs get
+removed and added back. If driver replaces a NAPI instance
+during an operation like DEVMEM queue reset, or recreates
+a subset of NAPI instances in other ways we may end up with
+broken ordering, and therefore Netlink dumps with either
+missing or duplicated entries.
+
+At this stage the problem is theoretical. Only two drivers
+support queue API, bnxt and gve. gve recreates NAPIs during
+queue reset, but it doesn't support NAPI config.
+bnxt supports NAPI config but doesn't recreate instances
+during reset.
+
+We need to save the ID in the config as soon as it is assigned
+because otherwise the new NAPI will not know what ID it will
+get at enable time, at the time it is being added.
+
+Reviewed-by: Willem de Bruijn <willemb@google.com>
+Reviewed-by: Eric Dumazet <edumazet@google.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Stable-dep-of: 6bc7e4eb0499 ("Revert "net: skb: introduce and use a single page frag cache"")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ net/core/dev.c | 42 ++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 36 insertions(+), 6 deletions(-)
+
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 2b09714761c62..c5e5b827bb800 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -6766,13 +6766,14 @@ static void napi_restore_config(struct napi_struct *n)
+ 	n->gro_flush_timeout = n->config->gro_flush_timeout;
+ 	n->irq_suspend_timeout = n->config->irq_suspend_timeout;
+ 	/* a NAPI ID might be stored in the config, if so use it. if not, use
+-	 * napi_hash_add to generate one for us. It will be saved to the config
+-	 * in napi_disable.
++	 * napi_hash_add to generate one for us.
+ 	 */
+-	if (n->config->napi_id)
++	if (n->config->napi_id) {
+ 		napi_hash_add_with_id(n, n->config->napi_id);
+-	else
++	} else {
+ 		napi_hash_add(n);
++		n->config->napi_id = n->napi_id;
++	}
+ }
+ 
+ static void napi_save_config(struct napi_struct *n)
+@@ -6780,10 +6781,39 @@ static void napi_save_config(struct napi_struct *n)
+ 	n->config->defer_hard_irqs = n->defer_hard_irqs;
+ 	n->config->gro_flush_timeout = n->gro_flush_timeout;
+ 	n->config->irq_suspend_timeout = n->irq_suspend_timeout;
+-	n->config->napi_id = n->napi_id;
+ 	napi_hash_del(n);
+ }
+ 
++/* Netlink wants the NAPI list to be sorted by ID, if adding a NAPI which will
++ * inherit an existing ID try to insert it at the right position.
++ */
++static void
++netif_napi_dev_list_add(struct net_device *dev, struct napi_struct *napi)
++{
++	unsigned int new_id, pos_id;
++	struct list_head *higher;
++	struct napi_struct *pos;
++
++	new_id = UINT_MAX;
++	if (napi->config && napi->config->napi_id)
++		new_id = napi->config->napi_id;
++
++	higher = &dev->napi_list;
++	list_for_each_entry(pos, &dev->napi_list, dev_list) {
++		if (pos->napi_id >= MIN_NAPI_ID)
++			pos_id = pos->napi_id;
++		else if (pos->config)
++			pos_id = pos->config->napi_id;
++		else
++			pos_id = UINT_MAX;
++
++		if (pos_id <= new_id)
++			break;
++		higher = &pos->dev_list;
++	}
++	list_add_rcu(&napi->dev_list, higher); /* adds after higher */
++}
++
+ void netif_napi_add_weight(struct net_device *dev, struct napi_struct *napi,
+ 			   int (*poll)(struct napi_struct *, int), int weight)
+ {
+@@ -6810,7 +6840,7 @@ void netif_napi_add_weight(struct net_device *dev, struct napi_struct *napi,
+ 	napi->list_owner = -1;
+ 	set_bit(NAPI_STATE_SCHED, &napi->state);
+ 	set_bit(NAPI_STATE_NPSVC, &napi->state);
+-	list_add_rcu(&napi->dev_list, &dev->napi_list);
++	netif_napi_dev_list_add(dev, napi);
+ 
+ 	/* default settings from sysfs are applied to all NAPIs. any per-NAPI
+ 	 * configuration will be loaded in napi_enable
+-- 
+2.39.5
+

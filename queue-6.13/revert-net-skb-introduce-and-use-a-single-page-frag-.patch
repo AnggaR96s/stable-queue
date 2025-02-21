@@ -1,0 +1,234 @@
+From fa448d203fb13c76dc22efb5e7521731b7d0c879 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 18 Feb 2025 19:29:40 +0100
+Subject: Revert "net: skb: introduce and use a single page frag cache"
+
+From: Paolo Abeni <pabeni@redhat.com>
+
+[ Upstream commit 011b0335903832facca86cd8ed05d7d8d94c9c76 ]
+
+This reverts commit dbae2b062824 ("net: skb: introduce and use a single
+page frag cache"). The intended goal of such change was to counter a
+performance regression introduced by commit 3226b158e67c ("net: avoid
+32 x truesize under-estimation for tiny skbs").
+
+Unfortunately, the blamed commit introduces another regression for the
+virtio_net driver. Such a driver calls napi_alloc_skb() with a tiny
+size, so that the whole head frag could fit a 512-byte block.
+
+The single page frag cache uses a 1K fragment for such allocation, and
+the additional overhead, under small UDP packets flood, makes the page
+allocator a bottleneck.
+
+Thanks to commit bf9f1baa279f ("net: add dedicated kmem_cache for
+typical/small skb->head"), this revert does not re-introduce the
+original regression. Actually, in the relevant test on top of this
+revert, I measure a small but noticeable positive delta, just above
+noise level.
+
+The revert itself required some additional mangling due to the
+introduction of the SKB_HEAD_ALIGN() helper and local lock infra in the
+affected code.
+
+Suggested-by: Eric Dumazet <edumazet@google.com>
+Fixes: dbae2b062824 ("net: skb: introduce and use a single page frag cache")
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Link: https://patch.msgid.link/e649212fde9f0fdee23909ca0d14158d32bb7425.1738877290.git.pabeni@redhat.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Stable-dep-of: 6bc7e4eb0499 ("Revert "net: skb: introduce and use a single page frag cache"")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/linux/netdevice.h |   1 -
+ net/core/dev.c            |  17 +++++++
+ net/core/skbuff.c         | 104 ++------------------------------------
+ 3 files changed, 22 insertions(+), 100 deletions(-)
+
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index db4facb384684..48437fd44e32c 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -4050,7 +4050,6 @@ void netif_receive_skb_list(struct list_head *head);
+ gro_result_t napi_gro_receive(struct napi_struct *napi, struct sk_buff *skb);
+ void napi_gro_flush(struct napi_struct *napi, bool flush_old);
+ struct sk_buff *napi_get_frags(struct napi_struct *napi);
+-void napi_get_frags_check(struct napi_struct *napi);
+ gro_result_t napi_gro_frags(struct napi_struct *napi);
+ 
+ static inline void napi_free_frags(struct napi_struct *napi)
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 6dfed2746c528..5e3a82eba041a 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -6814,6 +6814,23 @@ netif_napi_dev_list_add(struct net_device *dev, struct napi_struct *napi)
+ 	list_add_rcu(&napi->dev_list, higher); /* adds after higher */
+ }
+ 
++/* Double check that napi_get_frags() allocates skbs with
++ * skb->head being backed by slab, not a page fragment.
++ * This is to make sure bug fixed in 3226b158e67c
++ * ("net: avoid 32 x truesize under-estimation for tiny skbs")
++ * does not accidentally come back.
++ */
++static void napi_get_frags_check(struct napi_struct *napi)
++{
++	struct sk_buff *skb;
++
++	local_bh_disable();
++	skb = napi_get_frags(napi);
++	WARN_ON_ONCE(skb && skb->head_frag);
++	napi_free_frags(napi);
++	local_bh_enable();
++}
++
+ void netif_napi_add_weight_locked(struct net_device *dev,
+ 				  struct napi_struct *napi,
+ 				  int (*poll)(struct napi_struct *, int),
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+index f251a99f8d421..d2697211e00a0 100644
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -223,67 +223,9 @@ static void skb_under_panic(struct sk_buff *skb, unsigned int sz, void *addr)
+ #define NAPI_SKB_CACHE_BULK	16
+ #define NAPI_SKB_CACHE_HALF	(NAPI_SKB_CACHE_SIZE / 2)
+ 
+-#if PAGE_SIZE == SZ_4K
+-
+-#define NAPI_HAS_SMALL_PAGE_FRAG	1
+-#define NAPI_SMALL_PAGE_PFMEMALLOC(nc)	((nc).pfmemalloc)
+-
+-/* specialized page frag allocator using a single order 0 page
+- * and slicing it into 1K sized fragment. Constrained to systems
+- * with a very limited amount of 1K fragments fitting a single
+- * page - to avoid excessive truesize underestimation
+- */
+-
+-struct page_frag_1k {
+-	void *va;
+-	u16 offset;
+-	bool pfmemalloc;
+-};
+-
+-static void *page_frag_alloc_1k(struct page_frag_1k *nc, gfp_t gfp)
+-{
+-	struct page *page;
+-	int offset;
+-
+-	offset = nc->offset - SZ_1K;
+-	if (likely(offset >= 0))
+-		goto use_frag;
+-
+-	page = alloc_pages_node(NUMA_NO_NODE, gfp, 0);
+-	if (!page)
+-		return NULL;
+-
+-	nc->va = page_address(page);
+-	nc->pfmemalloc = page_is_pfmemalloc(page);
+-	offset = PAGE_SIZE - SZ_1K;
+-	page_ref_add(page, offset / SZ_1K);
+-
+-use_frag:
+-	nc->offset = offset;
+-	return nc->va + offset;
+-}
+-#else
+-
+-/* the small page is actually unused in this build; add dummy helpers
+- * to please the compiler and avoid later preprocessor's conditionals
+- */
+-#define NAPI_HAS_SMALL_PAGE_FRAG	0
+-#define NAPI_SMALL_PAGE_PFMEMALLOC(nc)	false
+-
+-struct page_frag_1k {
+-};
+-
+-static void *page_frag_alloc_1k(struct page_frag_1k *nc, gfp_t gfp_mask)
+-{
+-	return NULL;
+-}
+-
+-#endif
+-
+ struct napi_alloc_cache {
+ 	local_lock_t bh_lock;
+ 	struct page_frag_cache page;
+-	struct page_frag_1k page_small;
+ 	unsigned int skb_count;
+ 	void *skb_cache[NAPI_SKB_CACHE_SIZE];
+ };
+@@ -293,23 +235,6 @@ static DEFINE_PER_CPU(struct napi_alloc_cache, napi_alloc_cache) = {
+ 	.bh_lock = INIT_LOCAL_LOCK(bh_lock),
+ };
+ 
+-/* Double check that napi_get_frags() allocates skbs with
+- * skb->head being backed by slab, not a page fragment.
+- * This is to make sure bug fixed in 3226b158e67c
+- * ("net: avoid 32 x truesize under-estimation for tiny skbs")
+- * does not accidentally come back.
+- */
+-void napi_get_frags_check(struct napi_struct *napi)
+-{
+-	struct sk_buff *skb;
+-
+-	local_bh_disable();
+-	skb = napi_get_frags(napi);
+-	WARN_ON_ONCE(!NAPI_HAS_SMALL_PAGE_FRAG && skb && skb->head_frag);
+-	napi_free_frags(napi);
+-	local_bh_enable();
+-}
+-
+ void *__napi_alloc_frag_align(unsigned int fragsz, unsigned int align_mask)
+ {
+ 	struct napi_alloc_cache *nc = this_cpu_ptr(&napi_alloc_cache);
+@@ -816,11 +741,8 @@ struct sk_buff *napi_alloc_skb(struct napi_struct *napi, unsigned int len)
+ 
+ 	/* If requested length is either too small or too big,
+ 	 * we use kmalloc() for skb->head allocation.
+-	 * When the small frag allocator is available, prefer it over kmalloc
+-	 * for small fragments
+ 	 */
+-	if ((!NAPI_HAS_SMALL_PAGE_FRAG &&
+-	     len <= SKB_WITH_OVERHEAD(SKB_SMALL_HEAD_CACHE_SIZE)) ||
++	if (len <= SKB_WITH_OVERHEAD(SKB_SMALL_HEAD_CACHE_SIZE) ||
+ 	    len > SKB_WITH_OVERHEAD(PAGE_SIZE) ||
+ 	    (gfp_mask & (__GFP_DIRECT_RECLAIM | GFP_DMA))) {
+ 		skb = __alloc_skb(len, gfp_mask, SKB_ALLOC_RX | SKB_ALLOC_NAPI,
+@@ -830,32 +752,16 @@ struct sk_buff *napi_alloc_skb(struct napi_struct *napi, unsigned int len)
+ 		goto skb_success;
+ 	}
+ 
++	len = SKB_HEAD_ALIGN(len);
++
+ 	if (sk_memalloc_socks())
+ 		gfp_mask |= __GFP_MEMALLOC;
+ 
+ 	local_lock_nested_bh(&napi_alloc_cache.bh_lock);
+ 	nc = this_cpu_ptr(&napi_alloc_cache);
+-	if (NAPI_HAS_SMALL_PAGE_FRAG && len <= SKB_WITH_OVERHEAD(1024)) {
+-		/* we are artificially inflating the allocation size, but
+-		 * that is not as bad as it may look like, as:
+-		 * - 'len' less than GRO_MAX_HEAD makes little sense
+-		 * - On most systems, larger 'len' values lead to fragment
+-		 *   size above 512 bytes
+-		 * - kmalloc would use the kmalloc-1k slab for such values
+-		 * - Builds with smaller GRO_MAX_HEAD will very likely do
+-		 *   little networking, as that implies no WiFi and no
+-		 *   tunnels support, and 32 bits arches.
+-		 */
+-		len = SZ_1K;
+ 
+-		data = page_frag_alloc_1k(&nc->page_small, gfp_mask);
+-		pfmemalloc = NAPI_SMALL_PAGE_PFMEMALLOC(nc->page_small);
+-	} else {
+-		len = SKB_HEAD_ALIGN(len);
+-
+-		data = page_frag_alloc(&nc->page, len, gfp_mask);
+-		pfmemalloc = page_frag_cache_is_pfmemalloc(&nc->page);
+-	}
++	data = page_frag_alloc(&nc->page, len, gfp_mask);
++	pfmemalloc = page_frag_cache_is_pfmemalloc(&nc->page);
+ 	local_unlock_nested_bh(&napi_alloc_cache.bh_lock);
+ 
+ 	if (unlikely(!data))
+-- 
+2.39.5
+
