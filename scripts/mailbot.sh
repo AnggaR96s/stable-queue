@@ -339,16 +339,36 @@ extract_kernel_versions() {
     local subject="$1"
     local active_versions_file="$HOME/stable-queue/active_kernel_versions"
     local found_versions=()
+    local range_start=""
+    local range_end=""
 
-    while IFS= read -r version; do
-        # Check for version numbers with optional v prefix in subject
-        if printf "%s" "$subject" | grep -E -q "(^|[^0-9])${version}([^0-9]|$)|(^|[[:space:]]|\[)v${version}([^0-9]|$)"; then
-            found_versions+=("$version")
-        fi
-    done < "$active_versions_file"
+    # First check for version ranges (e.g., "5.10-6.1" or "5.10.y-6.1.y")
+    if [[ "$subject" =~ (^|[^0-9.])([0-9]+\.[0-9]+)(\.y)?-([0-9]+\.[0-9]+)(\.y)?([^0-9.]|$) ]]; then
+        range_start="${BASH_REMATCH[2]}"
+        range_end="${BASH_REMATCH[4]}"
+        # Read all versions and filter those within range
+        while IFS= read -r version; do
+            if (( $(echo "$version >= $range_start" | bc -l) )) && \
+               (( $(echo "$version <= $range_end" | bc -l) )); then
+                found_versions+=("$version")
+            fi
+        done < "$active_versions_file"
+    fi
+
+    # If no range found, check for individual versions
+    if [ ${#found_versions[@]} -eq 0 ]; then
+        while IFS= read -r version; do
+            # Check for version numbers with optional v prefix and optional .y suffix
+            # Use a more strict pattern that requires the exact X.Y or X.Y.y format
+            if printf "%s" "$subject" | grep -E -q "(^|[^0-9.])${version}(\.y)?([^0-9.]|$)|(^|[[:space:]]|\[)v${version}(\.y)?([^0-9.]|$)"; then
+                found_versions+=("$version")
+            fi
+        done < "$active_versions_file"
+    fi
 
     if [ ${#found_versions[@]} -gt 0 ]; then
-        echo "${found_versions[*]}"
+        # Sort versions in ascending order
+        printf "%s\n" "${found_versions[@]}" | sort -V | tr '\n' ' ' | sed 's/ $//'
         return 0
     fi
 
@@ -532,6 +552,8 @@ compare_with_upstream() {
     local mbox_file="$1"
     local sha1="$2"
     local linux_dir="$3"
+    local series_dir="$4"
+    local current_part="$5"
     local debug_output=()
 
     if [[ ! $sha1 =~ ^[0-9a-f]{40}$ ]] || [ "$sha1" = "0000000000000000000000000000000000000000" ]; then
@@ -565,6 +587,17 @@ compare_with_upstream() {
 
     # Create temporary branch based on the stable branch
     git checkout -b "$temp_branch" >/dev/null 2>&1
+
+    # If this is part of a series, apply previous patches first
+    if [ -n "$series_dir" ] && [ "$current_part" -gt 1 ]; then
+        if ! apply_series_patches "$series_dir" "$current_part" "$linux_dir"; then
+            debug_output+=("Failed to apply previous patches in series")
+            git checkout -q "$current_branch"
+            git branch -D "$temp_branch" >/dev/null 2>&1
+            printf '%s\n' "${debug_output[@]}"
+            return 1
+        fi
+    fi
 
     if git am "$mbox_file" >/dev/null 2>&1; then
         # Get the SHA1 of our newly applied patch
@@ -740,6 +773,17 @@ process_patch() {
     local -n p_errors=$5
     local failed=0
 
+    # Extract series info first
+    local subject=$(formail -xSubject: < "$mbox_file")
+    local series_info=$(extract_series_info "$subject")
+    local is_series_part=0
+    local total_parts=0
+    
+    if [ -n "$series_info" ]; then
+        read current_part total_parts <<< "$series_info"
+        is_series_part=1
+    fi
+
     # If this is part of a series and not the first patch, verify previous patches can be applied
     if [ -n "$series_dir" ] && [ "$current_part" -gt 1 ]; then
         # Try to apply previous patches in a temporary branch
@@ -754,6 +798,8 @@ process_patch() {
             git branch -D "$temp_branch" >/dev/null 2>&1
             p_results+=("All branches | Failed (previous patches in series failed to apply) | N/A")
             p_errors+=("Error: Cannot proceed - previous patches in series failed to apply")
+            p_errors+=("This is part ${current_part}/${total_parts} of a series.")
+            p_errors+=("Please ensure all previous patches in the series apply cleanly.")
             return 1
         fi
 
@@ -800,7 +846,7 @@ Commit author: $commit_author"
 
     # Compare with upstream if we have a valid SHA1
     if [[ "$found_sha1" =~ ^[0-9a-f]{40}$ ]] && [ "$found_sha1" != "0000000000000000000000000000000000000000" ]; then
-        diff_output=$(compare_with_upstream "$mbox_file" "$found_sha1" "$LINUX_DIR")
+        diff_output=$(compare_with_upstream "$mbox_file" "$found_sha1" "$LINUX_DIR" "$series_dir" "$current_part")
     fi
 
     # Test on each kernel version
@@ -897,6 +943,16 @@ generate_response() {
         # Add summary section to determine if there are issues
         local has_issues=0
         local summary=()
+        local is_series_part=0
+        local series_info=$(extract_series_info "$orig_subject")
+        
+        if [ -n "$series_info" ]; then
+            read current_part total_parts <<< "$series_info"
+            is_series_part=1
+            if [ "$current_part" -gt 1 ]; then
+                summary+=("ℹ️ This is part ${current_part}/${total_parts} of a series")
+            fi
+        fi
 
         # Check for build failures
         if [[ "$results" == *"| Failed"* ]]; then
@@ -960,7 +1016,11 @@ generate_response() {
                         newer_count=$((newer_count + 1))
                         if [[ "$line" == *"| Not found"* ]]; then
                             missing_count=$((missing_count + 1))
+                            has_issues=1
+                            summary+=("ℹ️ Patch is missing in ${branch_version}.y (ignore if backport was sent)")
                         fi
+                        # Add this line to newer_kernel_results regardless of status
+                        newer_kernel_results+=("$line")
                     fi
                 fi
             done <<< "$newer_kernel_results"
@@ -969,7 +1029,7 @@ generate_response() {
             if [ $missing_count -gt 0 ] && [ $missing_count -eq $newer_count ]; then
                 missing_in_newer=1
                 has_issues=1
-                summary+=("⚠️ Commit missing in some newer stable branches")
+                summary+=("⚠️ Commit missing in all newer stable branches")
             fi
         fi
 
@@ -1064,6 +1124,11 @@ generate_response() {
         fi
 
         # Print results table
+        if [ $is_series_part -eq 1 ] && [ "$current_part" -gt 1 ] && [ $has_issues -eq 1 ]; then
+            echo "NOTE: These results are for this patch alone. Full series testing will be"
+            echo "performed when all parts are received."
+            echo
+        fi
         echo "Results of testing on various branches:"
         echo
         printf "| %-25s | %-11s | %-10s |\n" "Branch" "Patch Apply" "Build Test"
