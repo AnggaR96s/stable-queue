@@ -342,14 +342,27 @@ extract_kernel_versions() {
     local range_start=""
     local range_end=""
 
-    # First check for version ranges (e.g., "5.10-6.1" or "5.10.y-6.1.y")
-    if [[ "$subject" =~ (^|[^0-9.])([0-9]+\.[0-9]+)(\.y)?-([0-9]+\.[0-9]+)(\.y)?([^0-9.]|$) ]]; then
-        range_start="${BASH_REMATCH[2]}"
-        range_end="${BASH_REMATCH[4]}"
+    # First check for version ranges (e.g., "5.10-6.1" or "5.10.y-6.1.y" or "v5.10-v6.1" or "v6.1-v5.4")
+    if [[ "$subject" =~ (^|[^0-9.])(v)?([0-9]+\.[0-9]+)(\.y)?-(v)?([0-9]+\.[0-9]+)(\.y)?([^0-9.]|$) ]]; then
+        local ver1="${BASH_REMATCH[3]}"
+        local ver2="${BASH_REMATCH[6]}"
+        
+        # Determine which is higher and lower for the range check
+        if [ "$(printf "%s\n%s" "$ver1" "$ver2" | sort -V | head -n1)" = "$ver2" ]; then
+            range_start="$ver2"
+            range_end="$ver1"
+        else
+            range_start="$ver1"
+            range_end="$ver2"
+        fi
+        
         # Read all versions and filter those within range
         while IFS= read -r version; do
-            if (( $(echo "$version >= $range_start" | bc -l) )) && \
-               (( $(echo "$version <= $range_end" | bc -l) )); then
+            # Version is in range if:
+            # 1. It's >= range_start (version is not smallest when sorted with range_start)
+            # 2. It's <= range_end (version is not largest when sorted with range_end)
+            if [ "$(printf "%s\n%s" "$range_start" "$version" | sort -V | head -n1)" = "$range_start" ] && \
+               [ "$(printf "%s\n%s" "$version" "$range_end" | sort -V | head -n1)" = "$version" ]; then
                 found_versions+=("$version")
             fi
         done < "$active_versions_file"
@@ -368,7 +381,8 @@ extract_kernel_versions() {
 
     if [ ${#found_versions[@]} -gt 0 ]; then
         # Sort versions in ascending order
-        printf "%s\n" "${found_versions[@]}" | sort -V | tr '\n' ' ' | sed 's/ $//'
+        result=$(printf "%s\n" "${found_versions[@]}" | sort -V | tr '\n' ' ' | sed 's/ $//')
+        echo "$result"
         return 0
     fi
 
@@ -380,16 +394,19 @@ extract_commit_sha1() {
     local email_body="$1"
     local sha1=""
 
-    sha1=$(echo "$email_body" | grep -E "commit [0-9a-f]{40} upstream" | \
-           sed -E 's/.*commit ([0-9a-f]{40}) upstream.*/\1/')
+    # First pattern: Look for "commit [SHA1] upstream" with case insensitivity
+    # Using -i flag makes grep ignore case when matching
+    sha1=$(echo "$email_body" | grep -i -E "commit [0-9a-f]{40} upstream" | \
+           sed -E 's/.*[Cc][Oo][Mm][Mm][Ii][Tt] ([0-9a-f]{40}) [Uu][Pp][Ss][Tt][Rr][Ee][Aa][Mm].*/\1/')
 
     if [ -n "$sha1" ]; then
         echo "$sha1"
         return 0
     fi
 
-    sha1=$(echo "$email_body" | grep -E "\[ Upstream commit [0-9a-f]{40} \]" | \
-           sed -E 's/.*\[ Upstream commit ([0-9a-f]{40}) \].*/\1/')
+    # Second pattern: Look for "[ Upstream commit [SHA1] ]" with case insensitivity
+    sha1=$(echo "$email_body" | grep -i -E "\[[[:space:]]*upstream[[:space:]]+commit[[:space:]]+[0-9a-f]{40}[[:space:]]*\]" | \
+           sed -E 's/.*\[[[:space:]]*[Uu][Pp][Ss][Tt][Rr][Ee][Aa][Mm][[:space:]]+[Cc][Oo][Mm][Mm][Ii][Tt][[:space:]]+([0-9a-f]{40})[[:space:]]*\].*/\1/')
 
     if [ -n "$sha1" ]; then
         echo "$sha1"
@@ -519,20 +536,15 @@ check_newer_kernels() {
         wait "$pid"
     done
 
-    # Collect results in order
-    local results=()
+    # Clear the results array
+    c_results=()
+    
+    # Collect results in order (from newest to oldest)
     for version in "${checked_versions[@]}"; do
         if [ -f "$temp_dir/$version" ]; then
-            results+=("$(cat "$temp_dir/$version")")
+            c_results+=("$(cat "$temp_dir/$version")")
         fi
     done
-
-    # Add results only if we found newer versions
-    if [ ${#results[@]} -gt 0 ]; then
-        c_results+=("")
-        c_results+=("Status in newer kernel trees:")
-        c_results+=("${results[@]}")
-    fi
 
     # Clean up
     rm -rf "$temp_dir"
@@ -985,21 +997,12 @@ generate_response() {
         fi
 
         # Check for missing commits in newer stable branches
-        if [ -n "$newer_kernel_results" ]; then
+        if [ -n "$newer_kernel_results" ] && [ "${#newer_kernel_results[@]}" -gt 0 ]; then
             local missing_in_newer=0
             local missing_count=0
             local newer_count=0
             
-            # Extract target version from results
-            local target_version=""
-            while IFS='|' read -r branch status build; do
-                if [[ "$branch" =~ linux-([0-9]+\.[0-9]+)\.y ]]; then
-                    target_version="${BASH_REMATCH[1]}"
-                    break
-                fi
-            done <<< "$results"
-
-            # Only check newer branches that are newer than our newest target version
+            # Extract target versions from kernel_versions
             local newest_target_version=""
             for version in $kernel_versions; do
                 if [ -z "$newest_target_version" ] || (( $(echo "$version > $newest_target_version" | bc -l) )); then
@@ -1007,11 +1010,11 @@ generate_response() {
                 fi
             done
 
-            # Only check newer branches
-            while IFS= read -r line; do
+            # Check each line of newer kernel results
+            for line in "${newer_kernel_results[@]}"; do
                 if [[ "$line" =~ ^([0-9]+\.[0-9]+)\.y ]]; then
                     local branch_version="${BASH_REMATCH[1]}"
-                    # Compare versions using bc for proper numeric comparison
+                    # Only process if actually newer than our target
                     if (( $(echo "$branch_version > $newest_target_version" | bc -l) )); then
                         newer_count=$((newer_count + 1))
                         if [[ "$line" == *"| Not found"* ]]; then
@@ -1019,15 +1022,12 @@ generate_response() {
                             has_issues=1
                             summary+=("ℹ️ Patch is missing in ${branch_version}.y (ignore if backport was sent)")
                         fi
-                        # Add this line to newer_kernel_results regardless of status
-                        newer_kernel_results+=("$line")
                     fi
                 fi
-            done <<< "$newer_kernel_results"
+            done
 
             # Only set missing_in_newer if ALL newer branches are missing the commit
-            if [ $missing_count -gt 0 ] && [ $missing_count -eq $newer_count ]; then
-                missing_in_newer=1
+            if [ $missing_count -gt 0 ] && [ $missing_count -eq $newer_count ] && [ $newer_count -gt 0 ]; then
                 has_issues=1
                 summary+=("⚠️ Commit missing in all newer stable branches")
             fi
@@ -1097,8 +1097,9 @@ generate_response() {
         echo
 
         # Add newer kernel check results if available
-        if [ -n "$newer_kernel_results" ]; then
-            echo "$newer_kernel_results"
+        if [ -n "$newer_kernel_results" ] && [ "${#newer_kernel_results[@]}" -gt 0 ]; then
+            echo "Status in newer kernel trees:"
+            printf '%s\n' "${newer_kernel_results[@]}"
             echo
         fi
 
