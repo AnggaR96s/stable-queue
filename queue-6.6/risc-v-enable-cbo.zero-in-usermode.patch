@@ -1,0 +1,169 @@
+From d6bb44688fa0585c8488b6a3f24583ad66ed8c2f Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 18 Sep 2023 15:15:21 +0200
+Subject: RISC-V: Enable cbo.zero in usermode
+
+From: Andrew Jones <ajones@ventanamicro.com>
+
+[ Upstream commit 43c16d51a19b0ba2ed66978d5924d486ec1e42bc ]
+
+When Zicboz is present, enable its instruction (cbo.zero) in
+usermode by setting its respective senvcfg bit. We don't bother
+trying to set this bit per-task, which would also require an
+interface for tasks to request enabling and/or disabling. Instead,
+permanently set the bit for each hart which has the extension when
+bringing it online.
+
+This patch also introduces riscv_cpu_has_extension_[un]likely()
+functions to check a specific hart's ISA bitmap for extensions.
+Prior to checking the specific hart's bitmap in these functions
+we try the bitmap which represents the LCD of extensions, but only
+when we know it will use its optimized, alternatives path by gating
+its call on CONFIG_RISCV_ALTERNATIVE. When alternatives are used, the
+compiler ensures that the invocation of the LCD search becomes a
+constant true or false. When it's true, even the new functions will
+completely vanish from their callsites. OTOH, when the LCD check is
+false, we need to do a search of the hart's ISA bitmap. Had we also
+checked the LCD bitmap without the use of alternatives, then we would
+have ended up with two bitmap searches instead of one.
+
+Signed-off-by: Andrew Jones <ajones@ventanamicro.com>
+Reviewed-by: Conor Dooley <conor.dooley@microchip.com>
+Link: https://lore.kernel.org/r/20230918131518.56803-10-ajones@ventanamicro.com
+Signed-off-by: Palmer Dabbelt <palmer@rivosinc.com>
+Stable-dep-of: 564fc8eb6f78 ("riscv: signal: fix signal_minsigstksz")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ arch/riscv/include/asm/cpufeature.h |  1 +
+ arch/riscv/include/asm/csr.h        |  1 +
+ arch/riscv/include/asm/hwcap.h      | 16 ++++++++++++++++
+ arch/riscv/kernel/cpufeature.c      |  6 ++++++
+ arch/riscv/kernel/setup.c           |  4 ++++
+ arch/riscv/kernel/smpboot.c         |  4 ++++
+ 6 files changed, 32 insertions(+)
+
+diff --git a/arch/riscv/include/asm/cpufeature.h b/arch/riscv/include/asm/cpufeature.h
+index d0345bd659c94..13b7d35648a9c 100644
+--- a/arch/riscv/include/asm/cpufeature.h
++++ b/arch/riscv/include/asm/cpufeature.h
+@@ -31,5 +31,6 @@ DECLARE_PER_CPU(long, misaligned_access_speed);
+ extern struct riscv_isainfo hart_isa[NR_CPUS];
+ 
+ void check_unaligned_access(int cpu);
++void riscv_user_isa_enable(void);
+ 
+ #endif
+diff --git a/arch/riscv/include/asm/csr.h b/arch/riscv/include/asm/csr.h
+index 777cb8299551c..5fba25db82d2a 100644
+--- a/arch/riscv/include/asm/csr.h
++++ b/arch/riscv/include/asm/csr.h
+@@ -275,6 +275,7 @@
+ #define CSR_SIE			0x104
+ #define CSR_STVEC		0x105
+ #define CSR_SCOUNTEREN		0x106
++#define CSR_SENVCFG		0x10a
+ #define CSR_SSCRATCH		0x140
+ #define CSR_SEPC		0x141
+ #define CSR_SCAUSE		0x142
+diff --git a/arch/riscv/include/asm/hwcap.h b/arch/riscv/include/asm/hwcap.h
+index f4157034efa9c..e215d3399a179 100644
+--- a/arch/riscv/include/asm/hwcap.h
++++ b/arch/riscv/include/asm/hwcap.h
+@@ -70,6 +70,7 @@
+ #ifndef __ASSEMBLY__
+ 
+ #include <linux/jump_label.h>
++#include <asm/cpufeature.h>
+ 
+ unsigned long riscv_get_elf_hwcap(void);
+ 
+@@ -137,6 +138,21 @@ riscv_has_extension_unlikely(const unsigned long ext)
+ 	return true;
+ }
+ 
++static __always_inline bool riscv_cpu_has_extension_likely(int cpu, const unsigned long ext)
++{
++	if (IS_ENABLED(CONFIG_RISCV_ALTERNATIVE) && riscv_has_extension_likely(ext))
++		return true;
++
++	return __riscv_isa_extension_available(hart_isa[cpu].isa, ext);
++}
++
++static __always_inline bool riscv_cpu_has_extension_unlikely(int cpu, const unsigned long ext)
++{
++	if (IS_ENABLED(CONFIG_RISCV_ALTERNATIVE) && riscv_has_extension_unlikely(ext))
++		return true;
++
++	return __riscv_isa_extension_available(hart_isa[cpu].isa, ext);
++}
+ #endif
+ 
+ #endif /* _ASM_RISCV_HWCAP_H */
+diff --git a/arch/riscv/kernel/cpufeature.c b/arch/riscv/kernel/cpufeature.c
+index bb5fb2b820a21..a6b6bbf3f8598 100644
+--- a/arch/riscv/kernel/cpufeature.c
++++ b/arch/riscv/kernel/cpufeature.c
+@@ -676,6 +676,12 @@ static int check_unaligned_access_boot_cpu(void)
+ 
+ arch_initcall(check_unaligned_access_boot_cpu);
+ 
++void riscv_user_isa_enable(void)
++{
++	if (riscv_cpu_has_extension_unlikely(smp_processor_id(), RISCV_ISA_EXT_ZICBOZ))
++		csr_set(CSR_SENVCFG, ENVCFG_CBZE);
++}
++
+ #ifdef CONFIG_RISCV_ALTERNATIVE
+ /*
+  * Alternative patch sites consider 48 bits when determining when to patch
+diff --git a/arch/riscv/kernel/setup.c b/arch/riscv/kernel/setup.c
+index ff802d100a571..89ff6395dadbc 100644
+--- a/arch/riscv/kernel/setup.c
++++ b/arch/riscv/kernel/setup.c
+@@ -26,6 +26,7 @@
+ #include <asm/acpi.h>
+ #include <asm/alternative.h>
+ #include <asm/cacheflush.h>
++#include <asm/cpufeature.h>
+ #include <asm/cpu_ops.h>
+ #include <asm/early_ioremap.h>
+ #include <asm/pgtable.h>
+@@ -307,10 +308,13 @@ void __init setup_arch(char **cmdline_p)
+ 	riscv_fill_hwcap();
+ 	init_rt_signal_env();
+ 	apply_boot_alternatives();
++
+ 	if (IS_ENABLED(CONFIG_RISCV_ISA_ZICBOM) &&
+ 	    riscv_isa_extension_available(NULL, ZICBOM))
+ 		riscv_noncoherent_supported();
+ 	riscv_set_dma_cache_alignment();
++
++	riscv_user_isa_enable();
+ }
+ 
+ static int __init topology_init(void)
+diff --git a/arch/riscv/kernel/smpboot.c b/arch/riscv/kernel/smpboot.c
+index 1b8da4e40a4d6..d1b0a6fc3adfc 100644
+--- a/arch/riscv/kernel/smpboot.c
++++ b/arch/riscv/kernel/smpboot.c
+@@ -25,6 +25,8 @@
+ #include <linux/of.h>
+ #include <linux/sched/task_stack.h>
+ #include <linux/sched/mm.h>
++
++#include <asm/cpufeature.h>
+ #include <asm/cpu_ops.h>
+ #include <asm/cpufeature.h>
+ #include <asm/irq.h>
+@@ -253,6 +255,8 @@ asmlinkage __visible void smp_callin(void)
+ 			elf_hwcap &= ~COMPAT_HWCAP_ISA_V;
+ 	}
+ 
++	riscv_user_isa_enable();
++
+ 	/*
+ 	 * Remote TLB flushes are ignored while the CPU is offline, so emit
+ 	 * a local TLB flush right now just in case.
+-- 
+2.39.5
+
