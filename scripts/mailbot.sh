@@ -1021,12 +1021,13 @@ generate_response() {
                             missing_count=$((missing_count + 1))
                             has_issues=1
                             summary+=("ℹ️ Patch is missing in ${branch_version}.y (ignore if backport was sent)")
+                        # Commit is present, don't count as missing for branches where it's found
                         fi
                     fi
                 fi
             done
 
-            # Only set missing_in_newer if ALL newer branches are missing the commit
+            # Only set missing_in_newer if ALL newer branches are missing the commit AND there are newer branches
             if [ $missing_count -gt 0 ] && [ $missing_count -eq $newer_count ] && [ $newer_count -gt 0 ]; then
                 has_issues=1
                 summary+=("⚠️ Commit missing in all newer stable branches")
