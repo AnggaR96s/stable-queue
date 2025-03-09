@@ -1,0 +1,220 @@
+From 72fecd3b278bbe1df4a004b5dd5b8c721b2a4183 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 4 Mar 2025 13:51:38 +0000
+Subject: fs/pipe: Read pipe->{head,tail} atomically outside pipe->mutex
+
+From: Linus Torvalds <torvalds@linux-foundation.org>
+
+[ Upstream commit 3d252160b818045f3a152b13756f6f37ca34639d ]
+
+pipe_readable(), pipe_writable(), and pipe_poll() can read "pipe->head"
+and "pipe->tail" outside of "pipe->mutex" critical section. When the
+head and the tail are read individually in that order, there is a window
+for interruption between the two reads in which both the head and the
+tail can be updated by concurrent readers and writers.
+
+One of the problematic scenarios observed with hackbench running
+multiple groups on a large server on a particular pipe inode is as
+follows:
+
+    pipe->head = 36
+    pipe->tail = 36
+
+    hackbench-118762  [057] .....  1029.550548: pipe_write: *wakes up: pipe not full*
+    hackbench-118762  [057] .....  1029.550548: pipe_write: head: 36 -> 37 [tail: 36]
+    hackbench-118762  [057] .....  1029.550548: pipe_write: *wake up next reader 118740*
+    hackbench-118762  [057] .....  1029.550548: pipe_write: *wake up next writer 118768*
+
+    hackbench-118768  [206] .....  1029.55055X: pipe_write: *writer wakes up*
+    hackbench-118768  [206] .....  1029.55055X: pipe_write: head = READ_ONCE(pipe->head) [37]
+    ... CPU 206 interrupted (exact wakeup was not traced but 118768 did read head at 37 in traces)
+
+    hackbench-118740  [057] .....  1029.550558: pipe_read:  *reader wakes up: pipe is not empty*
+    hackbench-118740  [057] .....  1029.550558: pipe_read:  tail: 36 -> 37 [head = 37]
+    hackbench-118740  [057] .....  1029.550559: pipe_read:  *pipe is empty; wakeup writer 118768*
+    hackbench-118740  [057] .....  1029.550559: pipe_read:  *sleeps*
+
+    hackbench-118766  [185] .....  1029.550592: pipe_write: *New writer comes in*
+    hackbench-118766  [185] .....  1029.550592: pipe_write: head: 37 -> 38 [tail: 37]
+    hackbench-118766  [185] .....  1029.550592: pipe_write: *wakes up reader 118766*
+
+    hackbench-118740  [185] .....  1029.550598: pipe_read:  *reader wakes up; pipe not empty*
+    hackbench-118740  [185] .....  1029.550599: pipe_read:  tail: 37 -> 38 [head: 38]
+    hackbench-118740  [185] .....  1029.550599: pipe_read:  *pipe is empty*
+    hackbench-118740  [185] .....  1029.550599: pipe_read:  *reader sleeps; wakeup writer 118768*
+
+    ... CPU 206 switches back to writer
+    hackbench-118768  [206] .....  1029.550601: pipe_write: tail = READ_ONCE(pipe->tail) [38]
+    hackbench-118768  [206] .....  1029.550601: pipe_write: pipe_full()? (u32)(37 - 38) >= 16? Yes
+    hackbench-118768  [206] .....  1029.550601: pipe_write: *writer goes back to sleep*
+
+    [ Tasks 118740 and 118768 can then indefinitely wait on each other. ]
+
+The unsigned arithmetic in pipe_occupancy() wraps around when
+"pipe->tail > pipe->head" leading to pipe_full() returning true despite
+the pipe being empty.
+
+The case of genuine wraparound of "pipe->head" is handled since pipe
+buffer has data allowing readers to make progress until the pipe->tail
+wraps too after which the reader will wakeup a sleeping writer, however,
+mistaking the pipe to be full when it is in fact empty can lead to
+readers and writers waiting on each other indefinitely.
+
+This issue became more problematic and surfaced as a hang in hackbench
+after the optimization in commit aaec5a95d596 ("pipe_read: don't wake up
+the writer if the pipe is still full") significantly reduced the number
+of spurious wakeups of writers that had previously helped mask the
+issue.
+
+To avoid missing any updates between the reads of "pipe->head" and
+"pipe->write", unionize the two with a single unsigned long
+"pipe->head_tail" member that can be loaded atomically.
+
+Using "pipe->head_tail" to read the head and the tail ensures the
+lockless checks do not miss any updates to the head or the tail and
+since those two are only updated under "pipe->mutex", it ensures that
+the head is always ahead of, or equal to the tail resulting in correct
+calculations.
+
+  [ prateek: commit log, testing on x86 platforms. ]
+
+Reported-and-debugged-by: Swapnil Sapkal <swapnil.sapkal@amd.com>
+Closes: https://lore.kernel.org/lkml/e813814e-7094-4673-bc69-731af065a0eb@amd.com/
+Reported-by: Alexey Gladkov <legion@kernel.org>
+Closes: https://lore.kernel.org/all/Z8Wn0nTvevLRG_4m@example.org/
+Fixes: 8cefc107ca54 ("pipe: Use head and tail pointers for the ring, not cursor and length")
+Tested-by: Swapnil Sapkal <swapnil.sapkal@amd.com>
+Reviewed-by: Oleg Nesterov <oleg@redhat.com>
+Tested-by: Alexey Gladkov <legion@kernel.org>
+Signed-off-by: K Prateek Nayak <kprateek.nayak@amd.com>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/pipe.c                 | 19 ++++++++-----------
+ include/linux/pipe_fs_i.h | 39 +++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 45 insertions(+), 13 deletions(-)
+
+diff --git a/fs/pipe.c b/fs/pipe.c
+index 12b22c2723b7e..0b2b6ccb8ec52 100644
+--- a/fs/pipe.c
++++ b/fs/pipe.c
+@@ -210,11 +210,10 @@ static const struct pipe_buf_operations anon_pipe_buf_ops = {
+ /* Done while waiting without holding the pipe lock - thus the READ_ONCE() */
+ static inline bool pipe_readable(const struct pipe_inode_info *pipe)
+ {
+-	unsigned int head = READ_ONCE(pipe->head);
+-	unsigned int tail = READ_ONCE(pipe->tail);
++	union pipe_index idx = { .head_tail = READ_ONCE(pipe->head_tail) };
+ 	unsigned int writers = READ_ONCE(pipe->writers);
+ 
+-	return !pipe_empty(head, tail) || !writers;
++	return !pipe_empty(idx.head, idx.tail) || !writers;
+ }
+ 
+ static inline unsigned int pipe_update_tail(struct pipe_inode_info *pipe,
+@@ -416,11 +415,10 @@ static inline int is_packetized(struct file *file)
+ /* Done while waiting without holding the pipe lock - thus the READ_ONCE() */
+ static inline bool pipe_writable(const struct pipe_inode_info *pipe)
+ {
+-	unsigned int head = READ_ONCE(pipe->head);
+-	unsigned int tail = READ_ONCE(pipe->tail);
++	union pipe_index idx = { .head_tail = READ_ONCE(pipe->head_tail) };
+ 	unsigned int max_usage = READ_ONCE(pipe->max_usage);
+ 
+-	return !pipe_full(head, tail, max_usage) ||
++	return !pipe_full(idx.head, idx.tail, max_usage) ||
+ 		!READ_ONCE(pipe->readers);
+ }
+ 
+@@ -658,7 +656,7 @@ pipe_poll(struct file *filp, poll_table *wait)
+ {
+ 	__poll_t mask;
+ 	struct pipe_inode_info *pipe = filp->private_data;
+-	unsigned int head, tail;
++	union pipe_index idx;
+ 
+ 	/* Epoll has some historical nasty semantics, this enables them */
+ 	WRITE_ONCE(pipe->poll_usage, true);
+@@ -679,19 +677,18 @@ pipe_poll(struct file *filp, poll_table *wait)
+ 	 * if something changes and you got it wrong, the poll
+ 	 * table entry will wake you up and fix it.
+ 	 */
+-	head = READ_ONCE(pipe->head);
+-	tail = READ_ONCE(pipe->tail);
++	idx.head_tail = READ_ONCE(pipe->head_tail);
+ 
+ 	mask = 0;
+ 	if (filp->f_mode & FMODE_READ) {
+-		if (!pipe_empty(head, tail))
++		if (!pipe_empty(idx.head, idx.tail))
+ 			mask |= EPOLLIN | EPOLLRDNORM;
+ 		if (!pipe->writers && filp->f_pipe != pipe->w_counter)
+ 			mask |= EPOLLHUP;
+ 	}
+ 
+ 	if (filp->f_mode & FMODE_WRITE) {
+-		if (!pipe_full(head, tail, pipe->max_usage))
++		if (!pipe_full(idx.head, idx.tail, pipe->max_usage))
+ 			mask |= EPOLLOUT | EPOLLWRNORM;
+ 		/*
+ 		 * Most Unices do not set EPOLLERR for FIFOs but on Linux they
+diff --git a/include/linux/pipe_fs_i.h b/include/linux/pipe_fs_i.h
+index 8ff23bf5a8197..3cc4f8eab853f 100644
+--- a/include/linux/pipe_fs_i.h
++++ b/include/linux/pipe_fs_i.h
+@@ -31,6 +31,33 @@ struct pipe_buffer {
+ 	unsigned long private;
+ };
+ 
++/*
++ * Really only alpha needs 32-bit fields, but
++ * might as well do it for 64-bit architectures
++ * since that's what we've historically done,
++ * and it makes 'head_tail' always be a simple
++ * 'unsigned long'.
++ */
++#ifdef CONFIG_64BIT
++typedef unsigned int pipe_index_t;
++#else
++typedef unsigned short pipe_index_t;
++#endif
++
++/*
++ * We have to declare this outside 'struct pipe_inode_info',
++ * but then we can't use 'union pipe_index' for an anonymous
++ * union, so we end up having to duplicate this declaration
++ * below. Annoying.
++ */
++union pipe_index {
++	unsigned long head_tail;
++	struct {
++		pipe_index_t head;
++		pipe_index_t tail;
++	};
++};
++
+ /**
+  *	struct pipe_inode_info - a linux kernel pipe
+  *	@mutex: mutex protecting the whole thing
+@@ -58,8 +85,16 @@ struct pipe_buffer {
+ struct pipe_inode_info {
+ 	struct mutex mutex;
+ 	wait_queue_head_t rd_wait, wr_wait;
+-	unsigned int head;
+-	unsigned int tail;
++
++	/* This has to match the 'union pipe_index' above */
++	union {
++		unsigned long head_tail;
++		struct {
++			pipe_index_t head;
++			pipe_index_t tail;
++		};
++	};
++
+ 	unsigned int max_usage;
+ 	unsigned int ring_size;
+ 	unsigned int nr_accounted;
+-- 
+2.39.5
+
