@@ -998,7 +998,6 @@ generate_response() {
 
         # Check for missing commits in newer stable branches
         if [ -n "$newer_kernel_results" ] && [ "${#newer_kernel_results[@]}" -gt 0 ]; then
-            local missing_in_newer=0
             local missing_count=0
             local newer_count=0
             
@@ -1010,24 +1009,36 @@ generate_response() {
                 fi
             done
 
-            # Check each line of newer kernel results
+            # Parse results and track which versions have missing patches
+            local missing_versions=()
+            local present_versions=()
+            
+            # Analyze newer kernel results to determine which versions are missing the patch
             for line in "${newer_kernel_results[@]}"; do
                 if [[ "$line" =~ ^([0-9]+\.[0-9]+)\.y ]]; then
                     local branch_version="${BASH_REMATCH[1]}"
                     # Only process if actually newer than our target
                     if (( $(echo "$branch_version > $newest_target_version" | bc -l) )); then
                         newer_count=$((newer_count + 1))
-                        if [[ "$line" == *"| Not found"* ]]; then
+                        
+                        # Categorize based on presence
+                        if [[ "$line" == *"| Present"* ]]; then
+                            present_versions+=("$branch_version")
+                        elif [[ "$line" == *"| Not found"* ]]; then
+                            missing_versions+=("$branch_version")
                             missing_count=$((missing_count + 1))
-                            has_issues=1
-                            summary+=("ℹ️ Patch is missing in ${branch_version}.y (ignore if backport was sent)")
-                        # Commit is present, don't count as missing for branches where it's found
                         fi
                     fi
                 fi
             done
+            
+            # Only add missing versions to summary
+            for version in "${missing_versions[@]}"; do
+                has_issues=1
+                summary+=("ℹ️ Patch is missing in ${version}.y (ignore if backport was sent)")
+            done
 
-            # Only set missing_in_newer if ALL newer branches are missing the commit AND there are newer branches
+            # Only add "missing in all newer branches" if ALL newer branches are missing the commit
             if [ $missing_count -gt 0 ] && [ $missing_count -eq $newer_count ] && [ $newer_count -gt 0 ]; then
                 has_issues=1
                 summary+=("⚠️ Commit missing in all newer stable branches")
