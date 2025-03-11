@@ -1,0 +1,153 @@
+From stable+bounces-120016-greg=kroah.com@vger.kernel.org Sun Mar  2 13:47:38 2025
+From: fdmanana@kernel.org
+Date: Sun,  2 Mar 2025 12:47:27 +0000
+Subject: btrfs: bring back the incorrectly removed extent buffer lock recursion support
+To: linux-btrfs@vger.kernel.org
+Cc: pkoroau@gmail.com, dsterba@suse.com, stable@vger.kernel.org
+Message-ID: <10637efdde5420993dd0611e3d3d5d8de6937e3b.1740919455.git.fdmanana@suse.com>
+
+From: Filipe Manana <fdmanana@suse.com>
+
+Commit 51b03b7473a0 ("btrfs: locking: remove the recursion handling code")
+from the 5.10.233 stable tree removed the support for extent buffer lock
+recursion, but we need that code because in 5.10.x we load the free space
+cache synchronously - while modifying the extent tree and holding a write
+lock on some extent buffer, we may need to load the free space cache,
+which requires acquiring read locks on the extent tree and therefore
+result in a deadlock in case we need to read lock an extent buffer we had
+write locked while modifying the extent tree.
+
+Backporting that commit from Linus' tree is therefore wrong, and was done
+so in order to backport upstream commit 97e86631bccd ("btrfs: don't set
+lock_owner when locking extent buffer for reading"). However we should
+have instead had the commit adapted to the 5.10 stable tree instead.
+
+Note that the backport of that dependency is ok only for stable trees
+5.11+, because in those tree the space cache loading code is not
+synchronous anymore, so there is no need to have the lock recursion
+and indeed there are no users of the extent buffer lock recursion
+support. In other words, the backport is only valid for kernel releases
+that have the asynchrounous free space cache loading support, which
+was introduced in kernel 5.11 with commit e747853cae3a ("btrfs: load
+free space cache asynchronously").
+
+This was causing deadlocks and reported by a user (see below Link tag).
+
+So revert commit 51b03b7473a0 ("btrfs: locking: remove the recursion
+handling code") while not undoing what commit d5a30a6117ea ("btrfs: don't
+set lock_owner when locking extent buffer for reading") from the 5.10.x
+stable tree did.
+
+Reported-by: pk <pkoroau@gmail.com>
+Link: https://lore.kernel.org/linux-btrfs/CAMNwjEKH6znTHE5hMc5er2dFs5ypw4Szx6TMDMb0H76yFq5DGQ@mail.gmail.com/
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/btrfs/locking.c |   68 +++++++++++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 64 insertions(+), 4 deletions(-)
+
+--- a/fs/btrfs/locking.c
++++ b/fs/btrfs/locking.c
+@@ -25,18 +25,43 @@
+  * - reader/reader sharing
+  * - try-lock semantics for readers and writers
+  *
+- * The rwsem implementation does opportunistic spinning which reduces number of
+- * times the locking task needs to sleep.
++ * Additionally we need one level nesting recursion, see below. The rwsem
++ * implementation does opportunistic spinning which reduces number of times the
++ * locking task needs to sleep.
++ *
++ *
++ * Lock recursion
++ * --------------
++ *
++ * A write operation on a tree might indirectly start a look up on the same
++ * tree.  This can happen when btrfs_cow_block locks the tree and needs to
++ * lookup free extents.
++ *
++ * btrfs_cow_block
++ *   ..
++ *   alloc_tree_block_no_bg_flush
++ *     btrfs_alloc_tree_block
++ *       btrfs_reserve_extent
++ *         ..
++ *         load_free_space_cache
++ *           ..
++ *           btrfs_lookup_file_extent
++ *             btrfs_search_slot
++ *
+  */
+ 
+ /*
+  * __btrfs_tree_read_lock - lock extent buffer for read
+  * @eb:		the eb to be locked
+  * @nest:	the nesting level to be used for lockdep
+- * @recurse:	unused
++ * @recurse:	if this lock is able to be recursed
+  *
+  * This takes the read lock on the extent buffer, using the specified nesting
+  * level for lockdep purposes.
++ *
++ * If you specify recurse = true, then we will allow this to be taken if we
++ * currently own the lock already.  This should only be used in specific
++ * usecases, and the subsequent unlock will not change the state of the lock.
+  */
+ void __btrfs_tree_read_lock(struct extent_buffer *eb, enum btrfs_lock_nesting nest,
+ 			    bool recurse)
+@@ -46,7 +71,31 @@ void __btrfs_tree_read_lock(struct exten
+ 	if (trace_btrfs_tree_read_lock_enabled())
+ 		start_ns = ktime_get_ns();
+ 
++	if (unlikely(recurse)) {
++		/* First see if we can grab the lock outright */
++		if (down_read_trylock(&eb->lock))
++			goto out;
++
++		/*
++		 * Ok still doesn't necessarily mean we are already holding the
++		 * lock, check the owner.
++		 */
++		if (eb->lock_owner != current->pid) {
++			down_read_nested(&eb->lock, nest);
++			goto out;
++		}
++
++		/*
++		 * Ok we have actually recursed, but we should only be recursing
++		 * once, so blow up if we're already recursed, otherwise set
++		 * ->lock_recursed and carry on.
++		 */
++		BUG_ON(eb->lock_recursed);
++		eb->lock_recursed = true;
++		goto out;
++	}
+ 	down_read_nested(&eb->lock, nest);
++out:
+ 	trace_btrfs_tree_read_lock(eb, start_ns);
+ }
+ 
+@@ -85,11 +134,22 @@ int btrfs_try_tree_write_lock(struct ext
+ }
+ 
+ /*
+- * Release read lock.
++ * Release read lock.  If the read lock was recursed then the lock stays in the
++ * original state that it was before it was recursively locked.
+  */
+ void btrfs_tree_read_unlock(struct extent_buffer *eb)
+ {
+ 	trace_btrfs_tree_read_unlock(eb);
++	/*
++	 * if we're nested, we have the write lock.  No new locking
++	 * is needed as long as we are the lock owner.
++	 * The write unlock will do a barrier for us, and the lock_recursed
++	 * field only matters to the lock owner.
++	 */
++	if (eb->lock_recursed && current->pid == eb->lock_owner) {
++		eb->lock_recursed = false;
++		return;
++	}
+ 	up_read(&eb->lock);
+ }
+ 
