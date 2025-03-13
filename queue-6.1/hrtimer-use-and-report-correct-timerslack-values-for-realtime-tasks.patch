@@ -1,0 +1,167 @@
+From ed4fb6d7ef68111bb539283561953e5c6e9a6e38 Mon Sep 17 00:00:00 2001
+From: Felix Moessbauer <felix.moessbauer@siemens.com>
+Date: Wed, 14 Aug 2024 14:10:32 +0200
+Subject: hrtimer: Use and report correct timerslack values for realtime tasks
+
+From: Felix Moessbauer <felix.moessbauer@siemens.com>
+
+commit ed4fb6d7ef68111bb539283561953e5c6e9a6e38 upstream.
+
+The timerslack_ns setting is used to specify how much the hardware
+timers should be delayed, to potentially dispatch multiple timers in a
+single interrupt. This is a performance optimization. Timers of
+realtime tasks (having a realtime scheduling policy) should not be
+delayed.
+
+This logic was inconsitently applied to the hrtimers, leading to delays
+of realtime tasks which used timed waits for events (e.g. condition
+variables). Due to the downstream override of the slack for rt tasks,
+the procfs reported incorrect (non-zero) timerslack_ns values.
+
+This is changed by setting the timer_slack_ns task attribute to 0 for
+all tasks with a rt policy. By that, downstream users do not need to
+specially handle rt tasks (w.r.t. the slack), and the procfs entry
+shows the correct value of "0". Setting non-zero slack values (either
+via procfs or PR_SET_TIMERSLACK) on tasks with a rt policy is ignored,
+as stated in "man 2 PR_SET_TIMERSLACK":
+
+  Timer slack is not applied to threads that are scheduled under a
+  real-time scheduling policy (see sched_setscheduler(2)).
+
+The special handling of timerslack on rt tasks in downstream users
+is removed as well.
+
+Signed-off-by: Felix Moessbauer <felix.moessbauer@siemens.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Link: https://lore.kernel.org/all/20240814121032.368444-2-felix.moessbauer@siemens.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/proc/base.c        |    9 +++++----
+ fs/select.c           |   11 ++++-------
+ kernel/sched/core.c   |    8 ++++++++
+ kernel/sys.c          |    2 ++
+ kernel/time/hrtimer.c |   18 +++---------------
+ 5 files changed, 22 insertions(+), 26 deletions(-)
+
+--- a/fs/proc/base.c
++++ b/fs/proc/base.c
+@@ -2633,10 +2633,11 @@ static ssize_t timerslack_ns_write(struc
+ 	}
+ 
+ 	task_lock(p);
+-	if (slack_ns == 0)
+-		p->timer_slack_ns = p->default_timer_slack_ns;
+-	else
+-		p->timer_slack_ns = slack_ns;
++	if (task_is_realtime(p))
++		slack_ns = 0;
++	else if (slack_ns == 0)
++		slack_ns = p->default_timer_slack_ns;
++	p->timer_slack_ns = slack_ns;
+ 	task_unlock(p);
+ 
+ out:
+--- a/fs/select.c
++++ b/fs/select.c
+@@ -77,19 +77,16 @@ u64 select_estimate_accuracy(struct time
+ {
+ 	u64 ret;
+ 	struct timespec64 now;
++	u64 slack = current->timer_slack_ns;
+ 
+-	/*
+-	 * Realtime tasks get a slack of 0 for obvious reasons.
+-	 */
+-
+-	if (rt_task(current))
++	if (slack == 0)
+ 		return 0;
+ 
+ 	ktime_get_ts64(&now);
+ 	now = timespec64_sub(*tv, now);
+ 	ret = __estimate_accuracy(&now);
+-	if (ret < current->timer_slack_ns)
+-		return current->timer_slack_ns;
++	if (ret < slack)
++		return slack;
+ 	return ret;
+ }
+ 
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -7380,6 +7380,14 @@ static void __setscheduler_params(struct
+ 	else if (fair_policy(policy))
+ 		p->static_prio = NICE_TO_PRIO(attr->sched_nice);
+ 
++	/* rt-policy tasks do not have a timerslack */
++	if (task_is_realtime(p)) {
++		p->timer_slack_ns = 0;
++	} else if (p->timer_slack_ns == 0) {
++		/* when switching back to non-rt policy, restore timerslack */
++		p->timer_slack_ns = p->default_timer_slack_ns;
++	}
++
+ 	/*
+ 	 * __sched_setscheduler() ensures attr->sched_priority == 0 when
+ 	 * !rt_policy. Always setting this ensures that things like
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@ -2477,6 +2477,8 @@ SYSCALL_DEFINE5(prctl, int, option, unsi
+ 			error = current->timer_slack_ns;
+ 		break;
+ 	case PR_SET_TIMERSLACK:
++		if (task_is_realtime(current))
++			break;
+ 		if (arg2 <= 0)
+ 			current->timer_slack_ns =
+ 					current->default_timer_slack_ns;
+--- a/kernel/time/hrtimer.c
++++ b/kernel/time/hrtimer.c
+@@ -2090,14 +2090,9 @@ long hrtimer_nanosleep(ktime_t rqtp, con
+ 	struct restart_block *restart;
+ 	struct hrtimer_sleeper t;
+ 	int ret = 0;
+-	u64 slack;
+-
+-	slack = current->timer_slack_ns;
+-	if (dl_task(current) || rt_task(current))
+-		slack = 0;
+ 
+ 	hrtimer_init_sleeper_on_stack(&t, clockid, mode);
+-	hrtimer_set_expires_range_ns(&t.timer, rqtp, slack);
++	hrtimer_set_expires_range_ns(&t.timer, rqtp, current->timer_slack_ns);
+ 	ret = do_nanosleep(&t, mode);
+ 	if (ret != -ERESTART_RESTARTBLOCK)
+ 		goto out;
+@@ -2278,7 +2273,7 @@ void __init hrtimers_init(void)
+ /**
+  * schedule_hrtimeout_range_clock - sleep until timeout
+  * @expires:	timeout value (ktime_t)
+- * @delta:	slack in expires timeout (ktime_t) for SCHED_OTHER tasks
++ * @delta:	slack in expires timeout (ktime_t)
+  * @mode:	timer mode
+  * @clock_id:	timer clock to be used
+  */
+@@ -2305,13 +2300,6 @@ schedule_hrtimeout_range_clock(ktime_t *
+ 		return -EINTR;
+ 	}
+ 
+-	/*
+-	 * Override any slack passed by the user if under
+-	 * rt contraints.
+-	 */
+-	if (rt_task(current))
+-		delta = 0;
+-
+ 	hrtimer_init_sleeper_on_stack(&t, clock_id, mode);
+ 	hrtimer_set_expires_range_ns(&t.timer, *expires, delta);
+ 	hrtimer_sleeper_start_expires(&t, mode);
+@@ -2331,7 +2319,7 @@ EXPORT_SYMBOL_GPL(schedule_hrtimeout_ran
+ /**
+  * schedule_hrtimeout_range - sleep until timeout
+  * @expires:	timeout value (ktime_t)
+- * @delta:	slack in expires timeout (ktime_t) for SCHED_OTHER tasks
++ * @delta:	slack in expires timeout (ktime_t)
+  * @mode:	timer mode
+  *
+  * Make the current task sleep until the given expiry time has
