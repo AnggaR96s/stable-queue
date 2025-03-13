@@ -59,8 +59,13 @@ import email.quoprimime
 import email.base64mime
 
 def decode_header(text):
+    # Add a maximum iteration count to prevent infinite loops
+    max_iterations = 100
+    iteration = 0
+
     # Handle quoted-printable and base64 encoded UTF-8 headers
-    while "=?UTF-8?" in text:
+    while "=?UTF-8?" in text and iteration < max_iterations:
+        iteration += 1
         start = text.find("=?UTF-8?")
         end = text.find("?=", start) + 2
         if end <= 1:  # No closing "?=" found
@@ -71,6 +76,8 @@ def decode_header(text):
             # Extract encoding type (B or Q) and encoded text
             parts = encoded_part.split("?")
             if len(parts) != 5:
+                # Skip this part and continue with the rest of the text
+                text = text[:start] + text[end:]
                 continue
 
             charset, encoding, encoded_text = parts[1:4]
@@ -79,13 +86,34 @@ def decode_header(text):
             elif encoding.upper() == "Q":
                 decoded = email.quoprimime.header_decode(encoded_text)
             else:
+                # Skip unsupported encoding
+                text = text[:start] + text[end:]
                 continue
 
             # Replace encoded part with decoded text
-            text = text[:start] + decoded.decode(charset) + text[end:]
+            new_text = text[:start] + decoded.decode(charset) + text[end:]
+
+            # Ensure we made progress
+            if new_text == text:
+                # If no change happened, skip this part to avoid infinite loop
+                text = text[:start] + text[end:]
+            else:
+                text = new_text
+
         except Exception:
-            # If decoding fails, leave as-is
+            # If decoding fails, skip this part
+            text = text[:start] + text[end:]
             continue
+
+    # If we hit the maximum iterations, fall back to using standard library
+    if iteration >= max_iterations:
+        try:
+            # Try the standard Python email.header module as a fallback
+            decoded_parts = email.header.decode_header(text)
+            return str(email.header.make_header(decoded_parts))
+        except Exception:
+            # If even that fails, return as is
+            pass
 
     return text
 
@@ -237,7 +265,15 @@ generate_patch_filename() {
 # Function to strip leading zeros from a number
 strip_leading_zeros() {
     local num="$1"
-    echo "$((10#$num))"  # Force base-10 interpretation
+    # Use parameter expansion to remove leading zeros
+    # Then use 10#$num to ensure base-10 interpretation
+    num="${num##0}"
+    # If num is empty, it was zero, so return 0
+    if [ -z "$num" ]; then
+        echo "0"
+    else
+        echo "$((10#$num))"  # Force base-10 interpretation
+    fi
 }
 
 # Function to store patch in series directory
@@ -346,7 +382,7 @@ extract_kernel_versions() {
     if [[ "$subject" =~ (^|[^0-9.])(v)?([0-9]+\.[0-9]+)(\.y)?-(v)?([0-9]+\.[0-9]+)(\.y)?([^0-9.]|$) ]]; then
         local ver1="${BASH_REMATCH[3]}"
         local ver2="${BASH_REMATCH[6]}"
-        
+
         # Determine which is higher and lower for the range check
         if [ "$(printf "%s\n%s" "$ver1" "$ver2" | sort -V | head -n1)" = "$ver2" ]; then
             range_start="$ver2"
@@ -355,7 +391,7 @@ extract_kernel_versions() {
             range_start="$ver1"
             range_end="$ver2"
         fi
-        
+
         # Read all versions and filter those within range
         while IFS= read -r version; do
             # Version is in range if:
@@ -523,8 +559,10 @@ check_newer_kernels() {
 
     # Launch parallel processes for each relevant version
     for version in "${all_versions[@]}"; do
-        # Only check versions newer than our target using bc for proper numeric comparison
-        if (( $(echo "$version > $newest_target" | bc -l) )); then
+        # Only check versions newer than our target using sort -V for proper semantic version comparison
+        # If version is newer than newest_target, it will be the second item when sorted
+        if [ "$(printf "%s\n%s" "$newest_target" "$version" | sort -V | head -n1)" = "$newest_target" ] && \
+           [ "$newest_target" != "$version" ]; then
             check_single_branch "$version" &
             pids+=($!)
             checked_versions+=("$version")
@@ -538,7 +576,7 @@ check_newer_kernels() {
 
     # Clear the results array
     c_results=()
-    
+
     # Collect results in order (from newest to oldest)
     for version in "${checked_versions[@]}"; do
         if [ -f "$temp_dir/$version" ]; then
@@ -676,7 +714,7 @@ test_commit_on_branch() {
         local temp_patch=$(mktemp)
         formail -I "" < "$mbox_file" | sed '1,/^$/d' > "$temp_patch"
         git apply --reject "$temp_patch" >/dev/null 2>&1
-        
+
         # Find and read any .rej files
         local reject_content=""
         while IFS= read -r -d '' rej_file; do
@@ -729,10 +767,10 @@ check_fixes_for_commit() {
     local -n result_array=$3
 
     cd "$linux_dir"
-    
+
     # Look for commits with Fixes: tag pointing to our commit
     local fixes_commits=$(git log origin/master --grep="Fixes: ${sha1:0:12}" --format="%H %s")
-    
+
     if [ -n "$fixes_commits" ]; then
         result_array+=("Found fixes commits:")
         while IFS= read -r line; do
@@ -750,20 +788,20 @@ check_if_reverted() {
     local -n result_array=$3
 
     cd "$linux_dir"
-    
+
     # Look for revert commits in subject and body
     local revert_commits=$(git log origin/master --grep="This reverts commit ${sha1:0:12}\|^Revert \".*${sha1:0:12}.*\"" --format="%H %s")
-    
+
     # Also look for Fixes: tags in revert commits
     local fixes_reverts=$(git log origin/master --grep="^Revert.*\|Fixes: ${sha1:0:12}" --format="%H %B" | \
                          awk -v sha="$sha1" '
                          /^[0-9a-f]{40}/ { commit=$1; subject=$0; sub(/^[0-9a-f]{40}[[:space:]]*/, "", subject); }
                          /^Revert/ && /Fixes: '"${sha1:0:12}"'/ { print commit " " subject; }
                          ')
-    
+
     # Combine both results
     local all_reverts=$(printf "%s\n%s" "$revert_commits" "$fixes_reverts" | sort -u)
-    
+
     if [ -n "$all_reverts" ]; then
         result_array+=("Found revert commits:")
         while IFS= read -r line; do
@@ -790,7 +828,7 @@ process_patch() {
     local series_info=$(extract_series_info "$subject")
     local is_series_part=0
     local total_parts=0
-    
+
     if [ -n "$series_info" ]; then
         read current_part total_parts <<< "$series_info"
         is_series_part=1
@@ -957,7 +995,7 @@ generate_response() {
         local summary=()
         local is_series_part=0
         local series_info=$(extract_series_info "$orig_subject")
-        
+
         if [ -n "$series_info" ]; then
             read current_part total_parts <<< "$series_info"
             is_series_part=1
@@ -1000,7 +1038,7 @@ generate_response() {
         if [ -n "$newer_kernel_results" ] && [ "${#newer_kernel_results[@]}" -gt 0 ]; then
             local missing_count=0
             local newer_count=0
-            
+
             # Extract target versions from kernel_versions
             local newest_target_version=""
             for version in $kernel_versions; do
@@ -1012,7 +1050,7 @@ generate_response() {
             # Parse results and track which versions have missing patches
             local missing_versions=()
             local present_versions=()
-            
+
             # Analyze newer kernel results to determine which versions are missing the patch
             for line in "${newer_kernel_results[@]}"; do
                 if [[ "$line" =~ ^([0-9]+\.[0-9]+)\.y ]]; then
@@ -1020,7 +1058,7 @@ generate_response() {
                     # Only process if actually newer than our target
                     if (( $(echo "$branch_version > $newest_target_version" | bc -l) )); then
                         newer_count=$((newer_count + 1))
-                        
+
                         # Categorize based on presence
                         if [[ "$line" == *"| Present"* ]]; then
                             present_versions+=("$branch_version")
@@ -1031,7 +1069,7 @@ generate_response() {
                     fi
                 fi
             done
-            
+
             # Only add missing versions to summary
             for version in "${missing_versions[@]}"; do
                 has_issues=1
