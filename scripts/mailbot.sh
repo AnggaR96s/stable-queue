@@ -7,6 +7,84 @@ set -E
 LINUX_DIR="$HOME/linux"
 TEMP_PATCH=""
 PENDING_DIR="$HOME/pending/series"
+WORKTREE_DIR="$HOME/git-worktrees"
+
+# Function to create a temporary git worktree
+create_git_worktree() {
+    local base_branch="$1"
+    local branch_name="$2"
+    local linux_dir="$3"
+
+    mkdir -p "$WORKTREE_DIR"
+
+    # Generate a unique path with timestamp
+    local worktree_path="${WORKTREE_DIR}/${branch_name}-$(date +%s)"
+
+    # If the directory already exists for some reason, remove it
+    if [ -d "$worktree_path" ]; then
+        rm -rf "$worktree_path"
+    fi
+
+    cd "$linux_dir"
+
+    # Verify the base branch exists
+    if ! git rev-parse --verify "$base_branch" >/dev/null 2>&1; then
+        echo "Error: Branch $base_branch does not exist" >&2
+        return 1
+    fi
+
+    # Create the worktree
+    local worktree_result=$(git worktree add --detach "$worktree_path" "$base_branch" 2>&1)
+    if [ $? -ne 0 ]; then
+        echo "Error creating worktree: $worktree_result" >&2
+        return 1
+    fi
+
+    echo "$worktree_path"
+}
+
+# Function to remove a git worktree
+remove_git_worktree() {
+    local worktree_path="$1"
+    local linux_dir="$2"
+
+    # Check if the worktree path exists
+    if [ ! -d "$worktree_path" ]; then
+        return 0
+    fi
+
+    cd "$linux_dir"
+
+    # First make sure any ongoing git operations are aborted
+    cd "$worktree_path" 2>/dev/null
+    if [ $? -eq 0 ]; then
+        # If there's a rebase in progress, abort it
+        if [ -d ".git/rebase-apply" ]; then
+            git rebase --abort >/dev/null 2>&1
+        fi
+
+        # If there's an am in progress, abort it
+        if [ -d ".git/rebase-apply" ]; then
+            git am --abort >/dev/null 2>&1
+        fi
+
+        # Reset and clean the worktree
+        git reset --hard >/dev/null 2>&1
+        git clean -fdx >/dev/null 2>&1
+
+        cd "$linux_dir"
+    fi
+
+    # Try to remove the worktree
+    if ! git worktree remove --force "$worktree_path" >/dev/null 2>&1; then
+        # If git worktree remove fails, try more aggressive cleanup
+        echo "Warning: Failed to remove worktree via git, using rm -rf" >&2
+        rm -rf "$worktree_path"
+
+        # Prune the worktree list
+        git worktree prune >/dev/null 2>&1
+    fi
+}
 
 # Function to generate unique message ID
 generate_message_id() {
@@ -353,15 +431,33 @@ find_commit_by_subject() {
 apply_series_patches() {
     local series_dir="$1"
     local current_part="$2"
-    local linux_dir="$3"
+    local worktree_path="$3"
 
-    cd "$linux_dir"
+    cd "$worktree_path"
+
+    # Clean up any previous rebase-apply directory that might exist
+    if [ -d ".git/rebase-apply" ]; then
+        rm -rf ".git/rebase-apply"
+    fi
+
+    # Reset to ensure clean state
+    git reset --hard >/dev/null 2>&1
 
     # Apply all patches up to but not including the current one
     for ((i=1; i<current_part; i++)); do
         local patch_file="$series_dir/$i.mbox"
-        if [ ! -f "$patch_file" ] || ! git am "$patch_file" >/dev/null 2>&1; then
+        if [ ! -f "$patch_file" ]; then
+            echo "Error: Patch file $i does not exist in series"
+            return 1
+        fi
+
+        # Try to apply the patch
+        local apply_result=$(git am "$patch_file" 2>&1)
+        if [ $? -ne 0 ]; then
             echo "Error: Failed to apply patch $i in series"
+            echo "Error details: $apply_result"
+
+            # Make sure to clean up
             git am --abort >/dev/null 2>&1
             return 1
         fi
@@ -594,7 +690,7 @@ validate_commit() {
     local linux_dir="$2"
 
     cd "$linux_dir"
-    git rev-list origin/master | grep -q "^$sha1"
+    git merge-base --is-ancestor "$sha1" origin/master
 }
 
 # Function to compare patch with upstream
@@ -626,30 +722,41 @@ compare_with_upstream() {
     local version=${kernel_versions[0]}
     local stable_branch="stable/linux-${version}.y"
     local temp_branch="temp-compare-${version}-$(date +%s)"
-    local current_branch=$(git rev-parse --abbrev-ref HEAD)
 
-    # Try to check out the stable branch
-    if ! git checkout -q "$stable_branch" 2>/dev/null; then
-        debug_output+=("Failed to find stable branch ${stable_branch}")
+    # Create a worktree instead of checking out branches
+    local worktree_path=$(create_git_worktree "$stable_branch" "$temp_branch" "$linux_dir")
+
+    if [ -z "$worktree_path" ]; then
+        debug_output+=("Failed to create worktree for ${stable_branch}")
         printf '%s\n' "${debug_output[@]}"
         return 1
     fi
 
-    # Create temporary branch based on the stable branch
-    git checkout -b "$temp_branch" >/dev/null 2>&1
+    cd "$worktree_path"
+
+    # Clean up any previous rebase-apply directory that might exist
+    if [ -d ".git/rebase-apply" ]; then
+        rm -rf ".git/rebase-apply"
+    fi
+
+    # Reset to ensure clean state
+    git reset --hard >/dev/null 2>&1
 
     # If this is part of a series, apply previous patches first
     if [ -n "$series_dir" ] && [ "$current_part" -gt 1 ]; then
-        if ! apply_series_patches "$series_dir" "$current_part" "$linux_dir"; then
-            debug_output+=("Failed to apply previous patches in series")
-            git checkout -q "$current_branch"
-            git branch -D "$temp_branch" >/dev/null 2>&1
+        if ! apply_series_patches "$series_dir" "$current_part" "$worktree_path"; then
+            debug_output+=("Failed to apply previous patches in series for comparison only.")
+            debug_output+=("This doesn't affect the main patch testing.")
+            cd "$linux_dir"
+            remove_git_worktree "$worktree_path" "$linux_dir"
             printf '%s\n' "${debug_output[@]}"
             return 1
         fi
     fi
 
-    if git am "$mbox_file" >/dev/null 2>&1; then
+    # Try to apply the patch
+    local apply_result=$(git am "$mbox_file" 2>&1)
+    if [ $? -eq 0 ]; then
         # Get the SHA1 of our newly applied patch
         local new_sha1=$(git rev-parse HEAD)
 
@@ -657,18 +764,20 @@ compare_with_upstream() {
 
         # Compare the ranges using range-diff
         if ! git range-diff "${sha1}^".."$sha1" "${new_sha1}^".."$new_sha1"; then
-            debug_output+=("Failed to generate range-diff")
+            debug_output+=("Failed to generate range-diff, but patch applies cleanly.")
         fi
 
         # Clean up after range-diff
-        git checkout -q "$current_branch"
-        git branch -D "$temp_branch" >/dev/null 2>&1
+        cd "$linux_dir"
+        remove_git_worktree "$worktree_path" "$linux_dir"
     else
         # Clean up failed git-am
         git am --abort >/dev/null 2>&1
-        git checkout -q "$current_branch"
-        git branch -D "$temp_branch" >/dev/null 2>&1
-        debug_output+=("Failed to apply patch cleanly.")
+        cd "$linux_dir"
+        remove_git_worktree "$worktree_path" "$linux_dir"
+        debug_output+=("Note: Couldn't generate comparison with upstream commit.")
+        debug_output+=("This is just for the diff comparison and doesn't affect the patch application.")
+        debug_output+=("Error: $apply_result")
     fi
 
     printf '%s\n' "${debug_output[@]}"
@@ -690,26 +799,37 @@ test_commit_on_branch() {
     local branch="stable/linux-${version}.y"
     local temp_branch="temp-${version}-${sha1:0:8}"
 
-    # Try to checkout the stable branch
-    if ! git checkout -q "$branch" 2>/dev/null; then
+    # Create a worktree instead of checking out branches
+    local worktree_path=$(create_git_worktree "$branch" "$temp_branch" "$linux_dir")
+
+    if [ -z "$worktree_path" ]; then
         results+=("stable/linux-${version}.y | Failed (branch not found) | N/A")
         return 1
     fi
 
-    git checkout -b "$temp_branch"
+    cd "$worktree_path"
+
+    # Clean up any previous rebase-apply directory that might exist
+    if [ -d ".git/rebase-apply" ]; then
+        rm -rf ".git/rebase-apply"
+    fi
+
+    # Reset to ensure clean state
+    git reset --hard >/dev/null 2>&1
 
     # Apply series patches if needed
     if [ -n "$series_dir" ] && [ "$current_part" -gt 1 ]; then
-        if ! apply_series_patches "$series_dir" "$current_part" "$linux_dir"; then
+        if ! apply_series_patches "$series_dir" "$current_part" "$worktree_path"; then
             results+=("stable/linux-${version}.y | Failed (series apply) | N/A")
-            git checkout -q "$branch"
-            git branch -D "$temp_branch"
+            cd "$linux_dir"
+            remove_git_worktree "$worktree_path" "$linux_dir"
             return 1
         fi
     fi
 
     # Apply current patch
-    if ! git am "$mbox_file" >/dev/null 2>&1; then
+    local apply_result=$(git am "$mbox_file" 2>&1)
+    if [ $? -ne 0 ]; then
         # Extract patch content and try to apply with --reject to get .rej files
         local temp_patch=$(mktemp)
         formail -I "" < "$mbox_file" | sed '1,/^$/d' > "$temp_patch"
@@ -731,10 +851,10 @@ test_commit_on_branch() {
             errors+=("Patch failed to apply on ${branch}. Reject:")
             errors+=("$reject_content")
         else
-            errors+=("Patch failed to apply on ${branch} but no reject information available.")
+            errors+=("Patch failed to apply on ${branch}: $apply_result")
         fi
-        git checkout -q "$branch"
-        git branch -D "$temp_branch"
+        cd "$linux_dir"
+        remove_git_worktree "$worktree_path" "$linux_dir"
         return 1
     fi
 
@@ -754,8 +874,8 @@ test_commit_on_branch() {
         results+=("stable/linux-${version}.y | Success | Success")
     fi
 
-    git checkout -q "$branch"
-    git branch -D "$temp_branch"
+    cd "$linux_dir"
+    remove_git_worktree "$worktree_path" "$linux_dir"
 
     return $result
 }
@@ -821,6 +941,7 @@ process_patch() {
     local current_part="$3"
     local -n p_results=$4
     local -n p_errors=$5
+    local worktree_path="$6"  # Optional worktree path when called from test_series
     local failed=0
 
     # Extract series info first
@@ -835,17 +956,24 @@ process_patch() {
     fi
 
     # If this is part of a series and not the first patch, verify previous patches can be applied
-    if [ -n "$series_dir" ] && [ "$current_part" -gt 1 ]; then
-        # Try to apply previous patches in a temporary branch
+    # Skip this check if we're called from test_series with a provided worktree
+    if [ -n "$series_dir" ] && [ "$current_part" -gt 1 ] && [ -z "$worktree_path" ]; then
+        # Try to apply previous patches in a temporary worktree
         cd "$LINUX_DIR"
         local temp_branch="temp-series-check-$(date +%s)"
-        local current_branch=$(git rev-parse --abbrev-ref HEAD)
 
-        git checkout -b "$temp_branch" >/dev/null 2>&1
+        # Create a worktree
+        worktree_path=$(create_git_worktree "HEAD" "$temp_branch" "$LINUX_DIR")
 
-        if ! apply_series_patches "$series_dir" "$current_part" "$LINUX_DIR"; then
-            git checkout -q "$current_branch"
-            git branch -D "$temp_branch" >/dev/null 2>&1
+        if [ -z "$worktree_path" ]; then
+            p_results+=("All branches | Failed (could not create worktree) | N/A")
+            p_errors+=("Error: Cannot proceed - failed to create worktree")
+            return 1
+        fi
+
+        if ! apply_series_patches "$series_dir" "$current_part" "$worktree_path"; then
+            cd "$LINUX_DIR"
+            remove_git_worktree "$worktree_path" "$LINUX_DIR"
             p_results+=("All branches | Failed (previous patches in series failed to apply) | N/A")
             p_errors+=("Error: Cannot proceed - previous patches in series failed to apply")
             p_errors+=("This is part ${current_part}/${total_parts} of a series.")
@@ -853,8 +981,9 @@ process_patch() {
             return 1
         fi
 
-        git checkout -q "$current_branch"
-        git branch -D "$temp_branch" >/dev/null 2>&1
+        cd "$LINUX_DIR"
+        remove_git_worktree "$worktree_path" "$LINUX_DIR"
+        worktree_path=""  # Reset to empty after cleanup
     fi
 
     # Extract subject to get kernel versions
@@ -900,12 +1029,73 @@ Commit author: $commit_author"
     fi
 
     # Test on each kernel version
-    for version in $kernel_versions; do
-        if ! test_commit_on_branch "$found_sha1" "$version" "$LINUX_DIR" "$mbox_file" \
-                                  "$series_dir" "$current_part" p_results p_errors; then
-            failed=1
+    # Skip individual testing if we're called with a worktree (as part of test_series)
+    if [ -z "$worktree_path" ]; then
+        for version in $kernel_versions; do
+            if ! test_commit_on_branch "$found_sha1" "$version" "$LINUX_DIR" "$mbox_file" \
+                                      "$series_dir" "$current_part" p_results p_errors; then
+                failed=1
+            fi
+        done
+    else
+        # If we have a worktree provided, just test applying the patch to it
+        cd "$worktree_path"
+
+        # Get the actual branch name for reporting
+        local branch_name=""
+
+        # First try to extract from the worktree path which should have the format temp-series-VERSION-timestamp
+        if [[ "$worktree_path" =~ temp-series-([0-9]+\.[0-9]+)- ]]; then
+            branch_name="${BASH_REMATCH[1]}"
+        # Fallback to checking the git branch
+        else
+            # Get current git branch
+            branch_name=$(git symbolic-ref --short HEAD 2>/dev/null || git rev-parse --short HEAD)
+            # Extract version if it's in the branch name
+            if [[ "$branch_name" =~ linux-([0-9]+\.[0-9]+)\.y ]]; then
+                branch_name="${BASH_REMATCH[1]}"
+            fi
         fi
-    done
+
+        # Default if we couldn't determine the branch
+        local full_branch_name="Current branch"
+        if [ -n "$branch_name" ]; then
+            full_branch_name="stable/linux-${branch_name}.y"
+        fi
+
+        # Clean up any previous rebase-apply directory that might exist
+        if [ -d ".git/rebase-apply" ]; then
+            rm -rf ".git/rebase-apply"
+        fi
+
+        # Reset to ensure clean state
+        git reset --hard >/dev/null 2>&1
+
+        # Try to apply the patch
+        local apply_result=$(git am "$mbox_file" 2>&1)
+        if [ $? -ne 0 ]; then
+            p_results+=("$full_branch_name | Failed to apply | N/A")
+            p_errors+=("Error applying patch to worktree: $apply_result")
+            git am --abort >/dev/null 2>&1
+            failed=1
+        else
+            # Run build test
+            if ! stable build; then
+                if [ -f ~/errors-linus-next ]; then
+                    local build_error=$(cat ~/errors-linus-next)
+                    p_results+=("$full_branch_name | Success | Failed")
+                    p_errors+=("Build error:")
+                    p_errors+=("$(echo "$build_error" | sed 's/^/    /')")
+                    p_errors+=("")
+                else
+                    p_results+=("$full_branch_name | Success | Failed (no log)")
+                fi
+                failed=1
+            else
+                p_results+=("$full_branch_name | Success | Success")
+            fi
+        fi
+    fi
 
     # Check newer kernels if we have a valid SHA1
     local -a newer_kernel_results=()
@@ -939,17 +1129,64 @@ test_series() {
     local linux_dir="$3"
     local failed=0
 
-    # Process each patch in the series
-    for ((i=1; i<=total_parts; i++)); do
-        local mbox_file="$series_dir/$i.mbox"
-        declare -a patch_results=()
-        declare -a patch_errors=()
+    # Get the first patch to determine target kernel versions
+    local first_patch="$series_dir/1.mbox"
+    if [ ! -f "$first_patch" ]; then
+        echo "Error: First patch in series not found: $first_patch"
+        return 1
+    fi
 
-        if ! process_patch "$mbox_file" "$series_dir" "$i" patch_results patch_errors; then
-            failed=1
-            # Early return on series failure to prevent infinite loop
-            return $failed
-        fi
+    # Extract subject and kernel versions from first patch
+    local subject=$(formail -xSubject: < "$first_patch")
+    local kernel_versions=$(extract_kernel_versions "$subject")
+
+    if [ -z "$kernel_versions" ]; then
+        echo "Error: Cannot determine target kernel versions from patch subject"
+        return 1
+    fi
+
+    # Process each kernel version
+    for version in $kernel_versions; do
+        local stable_branch="stable/linux-${version}.y"
+        echo "Testing series on $stable_branch..."
+
+        # Process each patch in the series
+        for ((i=1; i<=total_parts; i++)); do
+            local mbox_file="$series_dir/$i.mbox"
+            declare -a patch_results=()
+            declare -a patch_errors=()
+
+            # Create a worktree for this branch
+            # Use a naming convention that includes the version for easier extraction later
+            local temp_branch="temp-series-${version}-$(date +%s)"
+            local worktree_path=$(create_git_worktree "$stable_branch" "$temp_branch" "$linux_dir")
+
+            if [ -z "$worktree_path" ]; then
+                echo "Error: Failed to create worktree for branch $stable_branch"
+                failed=1
+                continue
+            fi
+
+            # If not the first patch, apply previous patches
+            if [ $i -gt 1 ]; then
+                if ! apply_series_patches "$series_dir" "$i" "$worktree_path"; then
+                    echo "Error: Failed to apply previous patches in series on $stable_branch"
+                    remove_git_worktree "$worktree_path" "$linux_dir"
+                    failed=1
+                    break
+                fi
+            fi
+
+            # Now process the current patch
+            if ! process_patch "$mbox_file" "$series_dir" "$i" patch_results patch_errors "$worktree_path"; then
+                failed=1
+                remove_git_worktree "$worktree_path" "$linux_dir"
+                break
+            fi
+
+            # Clean up worktree after testing each patch
+            remove_git_worktree "$worktree_path" "$linux_dir"
+        done
     done
 
     return $failed
@@ -1032,55 +1269,6 @@ generate_response() {
         if [ -n "$revert_results" ]; then
             has_issues=1
             summary+=("❌ Commit was reverted in mainline")
-        fi
-
-        # Check for missing commits in newer stable branches
-        if [ -n "$newer_kernel_results" ] && [ "${#newer_kernel_results[@]}" -gt 0 ]; then
-            local missing_count=0
-            local newer_count=0
-
-            # Extract target versions from kernel_versions
-            local newest_target_version=""
-            for version in $kernel_versions; do
-                if [ -z "$newest_target_version" ] || (( $(echo "$version > $newest_target_version" | bc -l) )); then
-                    newest_target_version="$version"
-                fi
-            done
-
-            # Parse results and track which versions have missing patches
-            local missing_versions=()
-            local present_versions=()
-
-            # Analyze newer kernel results to determine which versions are missing the patch
-            for line in "${newer_kernel_results[@]}"; do
-                if [[ "$line" =~ ^([0-9]+\.[0-9]+)\.y ]]; then
-                    local branch_version="${BASH_REMATCH[1]}"
-                    # Only process if actually newer than our target
-                    if (( $(echo "$branch_version > $newest_target_version" | bc -l) )); then
-                        newer_count=$((newer_count + 1))
-
-                        # Categorize based on presence
-                        if [[ "$line" == *"| Present"* ]]; then
-                            present_versions+=("$branch_version")
-                        elif [[ "$line" == *"| Not found"* ]]; then
-                            missing_versions+=("$branch_version")
-                            missing_count=$((missing_count + 1))
-                        fi
-                    fi
-                fi
-            done
-
-            # Only add missing versions to summary
-            for version in "${missing_versions[@]}"; do
-                has_issues=1
-                summary+=("ℹ️ Patch is missing in ${version}.y (ignore if backport was sent)")
-            done
-
-            # Only add "missing in all newer branches" if ALL newer branches are missing the commit
-            if [ $missing_count -gt 0 ] && [ $missing_count -eq $newer_count ] && [ $newer_count -gt 0 ]; then
-                has_issues=1
-                summary+=("⚠️ Commit missing in all newer stable branches")
-            fi
         fi
 
         # Add appropriate email headers based on whether there are issues
@@ -1167,7 +1355,12 @@ generate_response() {
         # Add diff if there are differences and we have a valid SHA1
         if [ -n "$diff_output" ] && [[ "$found_sha1" =~ ^[0-9a-f]{40}$ ]] && \
            [ "$found_sha1" != "0000000000000000000000000000000000000000" ]; then
-            echo "Note: The patch differs from the upstream commit:"
+            # Check if this is just a failure message rather than actual diff
+            if [[ "$diff_output" == *"Couldn't generate comparison"* ]]; then
+                echo "Note: Could not generate a diff with upstream commit:"
+            else
+                echo "Note: The patch differs from the upstream commit:"
+            fi
             echo "---"
             echo "$diff_output"
             echo "---"
@@ -1202,15 +1395,42 @@ generate_response() {
     echo "Response written to $response_file"
 }
 
-# Cleanup function to restore git state
+# Cleanup function to remove any remaining worktrees
 cleanup() {
     if [ -d "$LINUX_DIR" ]; then
         cd "$LINUX_DIR"
-        if [ -f ".git/rebase-apply/patch" ]; then
-            git am --abort >/dev/null 2>&1 || true
+        # Remove any worktrees we created
+        if [ -d "$WORKTREE_DIR" ]; then
+            for worktree in "$WORKTREE_DIR"/*; do
+                if [ -d "$worktree" ]; then
+                    # Try to cleanup any git operations first
+                    if [ -d "$worktree/.git" ]; then
+                        cd "$worktree" 2>/dev/null
+                        if [ $? -eq 0 ]; then
+                            # Abort any in-progress git operations
+                            git am --abort >/dev/null 2>&1
+                            git rebase --abort >/dev/null 2>&1
+                            git reset --hard >/dev/null 2>&1
+                            cd "$LINUX_DIR"
+                        fi
+                    fi
+
+                    # Now try to remove via git
+                    if ! git worktree remove --force "$worktree" >/dev/null 2>&1; then
+                        # If that fails, use rm -rf
+                        rm -rf "$worktree"
+                    fi
+                fi
+            done
+
+            # Try to remove the directory
+            rm -rf "$WORKTREE_DIR" 2>/dev/null || true
+
+            # Prune any worktree references
+            git worktree prune >/dev/null 2>&1
         fi
-        # Clean up any temporary branches
-        git branch | grep '^temp-' | xargs -r git branch -D >/dev/null 2>&1 || true
+
+        # Clean up any temp patch file
         rm -f "$TEMP_PATCH" 2>/dev/null || true
     fi
 }
@@ -1319,13 +1539,17 @@ main() {
         if is_series_complete "$series_dir" "$total_parts"; then
             echo "Series complete, testing all patches..."
             if ! test_series "$series_dir" "$total_parts" "$LINUX_DIR"; then
+                echo "Series testing failed. See logs for details."
                 failed=1
+            else
+                echo "Series testing completed successfully."
             fi
             # Clean up series directory regardless of result
             rm -rf "$series_dir"
             exit $failed
         else
             echo "Series incomplete, waiting for remaining patches..."
+            echo "Processed part $current_part of $total_parts"
             exit 0
         fi
     else
