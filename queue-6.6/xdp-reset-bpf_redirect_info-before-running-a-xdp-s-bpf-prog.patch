@@ -1,0 +1,64 @@
+From bigeasy@linutronix.de  Tue Apr 22 12:41:17 2025
+From: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Date: Mon, 17 Mar 2025 14:38:13 +0100
+Subject: [PATCH stable] xdp: Reset bpf_redirect_info before running a xdp's BPF prog.
+To: Greg KH <gregkh@linuxfoundation.org>, stable@vger.kernel.org
+Cc: netdev@vger.kernel.org, bpf@vger.kernel.org, "Ricardo Cañuelo Navarro" <rcn@igalia.com>, "Alexei Starovoitov" <ast@kernel.org>, "Andrii Nakryiko" <andrii@kernel.org>, "Daniel Borkmann" <daniel@iogearbox.net>, "David S. Miller" <davem@davemloft.net>, "Jakub Kicinski" <kuba@kernel.org>, "Jesper Dangaard Brouer" <hawk@kernel.org>, "John Fastabend" <john.fastabend@gmail.com>, "Thomas Gleixner" <tglx@linutronix.de>, "Toke Høiland-Jørgensen" <toke@kernel.org>
+Message-ID: <20250317133813.OwHVKUKe@linutronix.de>
+Content-Disposition: inline
+
+From: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+
+Ricardo reported a KASAN discovered use after free in v6.6-stable.
+
+The syzbot starts a BPF program via xdp_test_run_batch() which assigns
+ri->tgt_value via dev_hash_map_redirect() and the return code isn't
+XDP_REDIRECT it looks like nonsense. So the output in
+bpf_warn_invalid_xdp_action() appears once.
+Then the TUN driver runs another BPF program (on the same CPU) which
+returns XDP_REDIRECT without setting ri->tgt_value first. It invokes
+bpf_trace_printk() to print four characters and obtain the required
+return value. This is enough to get xdp_do_redirect() invoked which
+then accesses the pointer in tgt_value which might have been already
+deallocated.
+
+This problem does not affect upstream because since commit
+	401cb7dae8130 ("net: Reference bpf_redirect_info via task_struct on PREEMPT_RT.")
+
+the per-CPU variable is referenced via task's task_struct and exists on
+the stack during NAPI callback. Therefore it is cleared once before the
+first invocation and remains valid within the RCU section of the NAPI
+callback.
+
+Instead of performing the huge backport of the commit (plus its fix ups)
+here is an alternative version which only resets the variable in
+question prior invoking the BPF program.
+
+Acked-by: Toke HÃ¸iland-JÃ¸rgensen <toke@kernel.org>
+Reported-by: Ricardo CaÃ±uelo Navarro <rcn@igalia.com>
+Closes: https://lore.kernel.org/all/20250226-20250204-kasan-slab-use-after-free-read-in-dev_map_enqueue__submit-v3-0-360efec441ba@igalia.com/
+Fixes: 97f91a7cf04ff ("bpf: add bpf_redirect_map helper routine")
+Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/net/xdp.h |    9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+--- a/include/net/xdp.h
++++ b/include/net/xdp.h
+@@ -486,7 +486,14 @@ static __always_inline u32 bpf_prog_run_
+ 	 * under local_bh_disable(), which provides the needed RCU protection
+ 	 * for accessing map entries.
+ 	 */
+-	u32 act = __bpf_prog_run(prog, xdp, BPF_DISPATCHER_FUNC(xdp));
++	struct bpf_redirect_info *ri = this_cpu_ptr(&bpf_redirect_info);
++	u32 act;
++
++	if (ri->map_id || ri->map_type) {
++		ri->map_id = 0;
++		ri->map_type = BPF_MAP_TYPE_UNSPEC;
++	}
++	act = __bpf_prog_run(prog, xdp, BPF_DISPATCHER_FUNC(xdp));
+ 
+ 	if (static_branch_unlikely(&bpf_master_redirect_enabled_key)) {
+ 		if (act == XDP_TX && netif_is_bond_slave(xdp->rxq->dev))
