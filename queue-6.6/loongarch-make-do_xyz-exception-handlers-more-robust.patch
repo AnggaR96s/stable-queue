@@ -1,0 +1,140 @@
+From b3b6c6b863f868056bdf0f4561a546fd5aff4f5e Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 24 Apr 2025 20:15:41 +0800
+Subject: LoongArch: Make do_xyz() exception handlers more robust
+
+From: Tiezhu Yang <yangtiezhu@loongson.cn>
+
+[ Upstream commit cc73cc6bcdb5f959670e3ff9abdc62461452ddff ]
+
+Currently, interrupts need to be disabled before single-step mode is
+set, it requires that CSR_PRMD_PIE be cleared in save_local_irqflag()
+which is called by setup_singlestep(), this is reasonable.
+
+But in the first kprobe breakpoint exception, if the irq is enabled at
+the beginning of do_bp(), it will not be disabled at the end of do_bp()
+due to the CSR_PRMD_PIE has been cleared in save_local_irqflag(). So for
+this case, it may corrupt exception context when restoring the exception
+after do_bp() in handle_bp(), this is not reasonable.
+
+In order to restore exception safely in handle_bp(), it needs to ensure
+the irq is disabled at the end of do_bp(), so just add a local variable
+to record the original interrupt status in the parent context, then use
+it as the check condition to enable and disable irq in do_bp().
+
+While at it, do the similar thing for other do_xyz() exception handlers
+to make them more robust.
+
+Fixes: 6d4cc40fb5f5 ("LoongArch: Add kprobes support")
+Suggested-by: Jinyang He <hejinyang@loongson.cn>
+Suggested-by: Huacai Chen <chenhuacai@loongson.cn>
+Co-developed-by: Tianyang Zhang <zhangtianyang@loongson.cn>
+Signed-off-by: Tianyang Zhang <zhangtianyang@loongson.cn>
+Signed-off-by: Tiezhu Yang <yangtiezhu@loongson.cn>
+Signed-off-by: Huacai Chen <chenhuacai@loongson.cn>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ arch/loongarch/kernel/traps.c | 20 ++++++++++++--------
+ 1 file changed, 12 insertions(+), 8 deletions(-)
+
+diff --git a/arch/loongarch/kernel/traps.c b/arch/loongarch/kernel/traps.c
+index d59052c03d9b7..2b4b99b4e6c94 100644
+--- a/arch/loongarch/kernel/traps.c
++++ b/arch/loongarch/kernel/traps.c
+@@ -527,9 +527,10 @@ asmlinkage void noinstr do_ale(struct pt_regs *regs)
+ 	die_if_kernel("Kernel ale access", regs);
+ 	force_sig_fault(SIGBUS, BUS_ADRALN, (void __user *)regs->csr_badvaddr);
+ #else
++	bool pie = regs_irqs_disabled(regs);
+ 	unsigned int *pc;
+ 
+-	if (regs->csr_prmd & CSR_PRMD_PIE)
++	if (!pie)
+ 		local_irq_enable();
+ 
+ 	perf_sw_event(PERF_COUNT_SW_ALIGNMENT_FAULTS, 1, regs, regs->csr_badvaddr);
+@@ -556,7 +557,7 @@ asmlinkage void noinstr do_ale(struct pt_regs *regs)
+ 	die_if_kernel("Kernel ale access", regs);
+ 	force_sig_fault(SIGBUS, BUS_ADRALN, (void __user *)regs->csr_badvaddr);
+ out:
+-	if (regs->csr_prmd & CSR_PRMD_PIE)
++	if (!pie)
+ 		local_irq_disable();
+ #endif
+ 	irqentry_exit(regs, state);
+@@ -588,12 +589,13 @@ static void bug_handler(struct pt_regs *regs)
+ asmlinkage void noinstr do_bce(struct pt_regs *regs)
+ {
+ 	bool user = user_mode(regs);
++	bool pie = regs_irqs_disabled(regs);
+ 	unsigned long era = exception_era(regs);
+ 	u64 badv = 0, lower = 0, upper = ULONG_MAX;
+ 	union loongarch_instruction insn;
+ 	irqentry_state_t state = irqentry_enter(regs);
+ 
+-	if (regs->csr_prmd & CSR_PRMD_PIE)
++	if (!pie)
+ 		local_irq_enable();
+ 
+ 	current->thread.trap_nr = read_csr_excode();
+@@ -659,7 +661,7 @@ asmlinkage void noinstr do_bce(struct pt_regs *regs)
+ 	force_sig_bnderr((void __user *)badv, (void __user *)lower, (void __user *)upper);
+ 
+ out:
+-	if (regs->csr_prmd & CSR_PRMD_PIE)
++	if (!pie)
+ 		local_irq_disable();
+ 
+ 	irqentry_exit(regs, state);
+@@ -677,11 +679,12 @@ asmlinkage void noinstr do_bce(struct pt_regs *regs)
+ asmlinkage void noinstr do_bp(struct pt_regs *regs)
+ {
+ 	bool user = user_mode(regs);
++	bool pie = regs_irqs_disabled(regs);
+ 	unsigned int opcode, bcode;
+ 	unsigned long era = exception_era(regs);
+ 	irqentry_state_t state = irqentry_enter(regs);
+ 
+-	if (regs->csr_prmd & CSR_PRMD_PIE)
++	if (!pie)
+ 		local_irq_enable();
+ 
+ 	if (__get_inst(&opcode, (u32 *)era, user))
+@@ -747,7 +750,7 @@ asmlinkage void noinstr do_bp(struct pt_regs *regs)
+ 	}
+ 
+ out:
+-	if (regs->csr_prmd & CSR_PRMD_PIE)
++	if (!pie)
+ 		local_irq_disable();
+ 
+ 	irqentry_exit(regs, state);
+@@ -982,6 +985,7 @@ static void init_restore_lbt(void)
+ 
+ asmlinkage void noinstr do_lbt(struct pt_regs *regs)
+ {
++	bool pie = regs_irqs_disabled(regs);
+ 	irqentry_state_t state = irqentry_enter(regs);
+ 
+ 	/*
+@@ -991,7 +995,7 @@ asmlinkage void noinstr do_lbt(struct pt_regs *regs)
+ 	 * (including the user using 'MOVGR2GCSR' to turn on TM, which
+ 	 * will not trigger the BTE), we need to check PRMD first.
+ 	 */
+-	if (regs->csr_prmd & CSR_PRMD_PIE)
++	if (!pie)
+ 		local_irq_enable();
+ 
+ 	if (!cpu_has_lbt) {
+@@ -1005,7 +1009,7 @@ asmlinkage void noinstr do_lbt(struct pt_regs *regs)
+ 	preempt_enable();
+ 
+ out:
+-	if (regs->csr_prmd & CSR_PRMD_PIE)
++	if (!pie)
+ 		local_irq_disable();
+ 
+ 	irqentry_exit(regs, state);
+-- 
+2.39.5
+
