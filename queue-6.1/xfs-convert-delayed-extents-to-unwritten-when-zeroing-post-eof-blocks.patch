@@ -1,0 +1,105 @@
+From stable+bounces-139238-greg=kroah.com@vger.kernel.org Wed Apr 30 23:32:16 2025
+From: Leah Rumancik <leah.rumancik@gmail.com>
+Date: Wed, 30 Apr 2025 14:26:58 -0700
+Subject: xfs: convert delayed extents to unwritten when zeroing post eof blocks
+To: stable@vger.kernel.org
+Cc: xfs-stable@lists.linux.dev, chandan.babu@oracle.com, catherine.hoang@oracle.com, djwong@kernel.org, Zhang Yi <yi.zhang@huawei.com>, Dave Chinner <david@fromorbit.com>, Christoph Hellwig <hch@lst.de>, Chandan Babu R <chandanbabu@kernel.org>, Leah Rumancik <leah.rumancik@gmail.com>
+Message-ID: <20250430212704.2905795-12-leah.rumancik@gmail.com>
+
+From: Zhang Yi <yi.zhang@huawei.com>
+
+[ Upstream commit 5ce5674187c345dc31534d2024c09ad8ef29b7ba ]
+
+Current clone operation could be non-atomic if the destination of a file
+is beyond EOF, user could get a file with corrupted (zeroed) data on
+crash.
+
+The problem is about preallocations. If you write some data into a file:
+
+	[A...B)
+
+and XFS decides to preallocate some post-eof blocks, then it can create
+a delayed allocation reservation:
+
+	[A.........D)
+
+The writeback path tries to convert delayed extents to real ones by
+allocating blocks. If there aren't enough contiguous free space, we can
+end up with two extents, the first real and the second still delalloc:
+
+	[A....C)[C.D)
+
+After that, both the in-memory and the on-disk file sizes are still B.
+If we clone into the range [E...F) from another file:
+
+	[A....C)[C.D)      [E...F)
+
+then xfs_reflink_zero_posteof() calls iomap_zero_range() to zero out the
+range [B, E) beyond EOF and flush it. Since [C, D) is still a delalloc
+extent, its pagecache will be zeroed and both the in-memory and on-disk
+size will be updated to D after flushing but before cloning. This is
+wrong, because the user can see the size change and read the zeroes
+while the clone operation is ongoing.
+
+We need to keep the in-memory and on-disk size before the clone
+operation starts, so instead of writing zeroes through the page cache
+for delayed ranges beyond EOF, we convert these ranges to unwritten and
+invalidate any cached data over that range beyond EOF.
+
+Suggested-by: Dave Chinner <david@fromorbit.com>
+Signed-off-by: Zhang Yi <yi.zhang@huawei.com>
+Reviewed-by: "Darrick J. Wong" <djwong@kernel.org>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Chandan Babu R <chandanbabu@kernel.org>
+Signed-off-by: Leah Rumancik <leah.rumancik@gmail.com>
+Acked-by: "Darrick J. Wong" <djwong@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/xfs/xfs_iomap.c |   29 +++++++++++++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+--- a/fs/xfs/xfs_iomap.c
++++ b/fs/xfs/xfs_iomap.c
+@@ -997,6 +997,24 @@ xfs_buffered_write_iomap_begin(
+ 	}
+ 
+ 	/*
++	 * For zeroing, trim a delalloc extent that extends beyond the EOF
++	 * block.  If it starts beyond the EOF block, convert it to an
++	 * unwritten extent.
++	 */
++	if ((flags & IOMAP_ZERO) && imap.br_startoff <= offset_fsb &&
++	    isnullstartblock(imap.br_startblock)) {
++		xfs_fileoff_t eof_fsb = XFS_B_TO_FSB(mp, XFS_ISIZE(ip));
++
++		if (offset_fsb >= eof_fsb)
++			goto convert_delay;
++		if (end_fsb > eof_fsb) {
++			end_fsb = eof_fsb;
++			xfs_trim_extent(&imap, offset_fsb,
++					end_fsb - offset_fsb);
++		}
++	}
++
++	/*
+ 	 * Search the COW fork extent list even if we did not find a data fork
+ 	 * extent.  This serves two purposes: first this implements the
+ 	 * speculative preallocation using cowextsize, so that we also unshare
+@@ -1138,6 +1156,17 @@ found_imap:
+ 	xfs_iunlock(ip, lockmode);
+ 	return xfs_bmbt_to_iomap(ip, iomap, &imap, flags, 0, seq);
+ 
++convert_delay:
++	xfs_iunlock(ip, lockmode);
++	truncate_pagecache(inode, offset);
++	error = xfs_bmapi_convert_delalloc(ip, XFS_DATA_FORK, offset,
++					   iomap, NULL);
++	if (error)
++		return error;
++
++	trace_xfs_iomap_alloc(ip, offset, count, XFS_DATA_FORK, &imap);
++	return 0;
++
+ found_cow:
+ 	seq = xfs_iomap_inode_sequence(ip, 0);
+ 	if (imap.br_startoff <= offset_fsb) {
