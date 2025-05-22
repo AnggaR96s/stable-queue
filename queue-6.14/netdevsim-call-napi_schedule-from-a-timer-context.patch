@@ -1,0 +1,98 @@
+From bc86ccb1060c6e2f099354b406e9d492b2300b21 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 19 Feb 2025 08:41:20 -0800
+Subject: netdevsim: call napi_schedule from a timer context
+
+From: Breno Leitao <leitao@debian.org>
+
+[ Upstream commit bf3624cf1c3708284c53ed99a1c43f2e104dc2dd ]
+
+The netdevsim driver was experiencing NOHZ tick-stop errors during packet
+transmission due to pending softirq work when calling napi_schedule().
+This issue was observed when running the netconsole selftest, which
+triggered the following error message:
+
+  NOHZ tick-stop error: local softirq work is pending, handler #08!!!
+
+To fix this issue, introduce a timer that schedules napi_schedule()
+from a timer context instead of calling it directly from the TX path.
+
+Create an hrtimer for each queue and kick it from the TX path,
+which then schedules napi_schedule() from the timer context.
+
+Suggested-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Breno Leitao <leitao@debian.org>
+Link: https://patch.msgid.link/20250219-netdevsim-v3-1-811e2b8abc4c@debian.org
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/net/netdevsim/netdev.c    | 21 ++++++++++++++++++++-
+ drivers/net/netdevsim/netdevsim.h |  1 +
+ 2 files changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/netdevsim/netdev.c b/drivers/net/netdevsim/netdev.c
+index 42f247cbdceec..e4c0d77849b82 100644
+--- a/drivers/net/netdevsim/netdev.c
++++ b/drivers/net/netdevsim/netdev.c
+@@ -87,7 +87,8 @@ static netdev_tx_t nsim_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	if (unlikely(nsim_forward_skb(peer_dev, skb, rq) == NET_RX_DROP))
+ 		goto out_drop_cnt;
+ 
+-	napi_schedule(&rq->napi);
++	if (!hrtimer_active(&rq->napi_timer))
++		hrtimer_start(&rq->napi_timer, us_to_ktime(5), HRTIMER_MODE_REL);
+ 
+ 	rcu_read_unlock();
+ 	u64_stats_update_begin(&ns->syncp);
+@@ -426,6 +427,22 @@ static int nsim_init_napi(struct netdevsim *ns)
+ 	return err;
+ }
+ 
++static enum hrtimer_restart nsim_napi_schedule(struct hrtimer *timer)
++{
++	struct nsim_rq *rq;
++
++	rq = container_of(timer, struct nsim_rq, napi_timer);
++	napi_schedule(&rq->napi);
++
++	return HRTIMER_NORESTART;
++}
++
++static void nsim_rq_timer_init(struct nsim_rq *rq)
++{
++	hrtimer_init(&rq->napi_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++	rq->napi_timer.function = nsim_napi_schedule;
++}
++
+ static void nsim_enable_napi(struct netdevsim *ns)
+ {
+ 	struct net_device *dev = ns->netdev;
+@@ -615,11 +632,13 @@ static struct nsim_rq *nsim_queue_alloc(void)
+ 		return NULL;
+ 
+ 	skb_queue_head_init(&rq->skb_queue);
++	nsim_rq_timer_init(rq);
+ 	return rq;
+ }
+ 
+ static void nsim_queue_free(struct nsim_rq *rq)
+ {
++	hrtimer_cancel(&rq->napi_timer);
+ 	skb_queue_purge_reason(&rq->skb_queue, SKB_DROP_REASON_QUEUE_PURGE);
+ 	kfree(rq);
+ }
+diff --git a/drivers/net/netdevsim/netdevsim.h b/drivers/net/netdevsim/netdevsim.h
+index 96d54c08043d3..e757f85ed8617 100644
+--- a/drivers/net/netdevsim/netdevsim.h
++++ b/drivers/net/netdevsim/netdevsim.h
+@@ -97,6 +97,7 @@ struct nsim_rq {
+ 	struct napi_struct napi;
+ 	struct sk_buff_head skb_queue;
+ 	struct page_pool *page_pool;
++	struct hrtimer napi_timer;
+ };
+ 
+ struct netdevsim {
+-- 
+2.39.5
+

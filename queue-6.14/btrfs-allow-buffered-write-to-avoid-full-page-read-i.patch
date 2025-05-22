@@ -1,0 +1,122 @@
+From de0860d610aaaee77a8c5c713c41fea584ac83b3 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 30 Oct 2024 17:04:02 +1030
+Subject: btrfs: allow buffered write to avoid full page read if it's block
+ aligned
+
+From: Qu Wenruo <wqu@suse.com>
+
+[ Upstream commit 0d31ca6584f21821c708752d379871b9fce2dc48 ]
+
+[BUG]
+Since the support of block size (sector size) < page size for btrfs,
+test case generic/563 fails with 4K block size and 64K page size:
+
+  --- tests/generic/563.out	2024-04-25 18:13:45.178550333 +0930
+  +++ /home/adam/xfstests-dev/results//generic/563.out.bad	2024-09-30 09:09:16.155312379 +0930
+  @@ -3,7 +3,8 @@
+   read is in range
+   write is in range
+   write -> read/write
+  -read is in range
+  +read has value of 8388608
+  +read is NOT in range -33792 .. 33792
+   write is in range
+  ...
+
+[CAUSE]
+The test case creates a 8MiB file, then does buffered write into the 8MiB
+using 4K block size, to overwrite the whole file.
+
+On 4K page sized systems, since the write range covers the full block and
+page, btrfs will not bother reading the page, just like what XFS and EXT4
+do.
+
+But on 64K page sized systems, although the 4K sized write is still block
+aligned, it's not page aligned anymore, thus btrfs will read the full
+page, which will be accounted by cgroup and fail the test.
+
+As the test case itself expects such 4K block aligned write should not
+trigger any read.
+
+Such expected behavior is an optimization to reduce folio reads when
+possible, and unfortunately btrfs does not implement such optimization.
+
+[FIX]
+To skip the full page read, we need to do the following modification:
+
+- Do not trigger full page read as long as the buffered write is block
+  aligned
+  This is pretty simple by modifying the check inside
+  prepare_uptodate_page().
+
+- Skip already uptodate blocks during full page read
+  Or we can lead to the following data corruption:
+
+  0       32K        64K
+  |///////|          |
+
+  Where the file range [0, 32K) is dirtied by buffered write, the
+  remaining range [32K, 64K) is not.
+
+  When reading the full page, since [0,32K) is only dirtied but not
+  written back, there is no data extent map for it, but a hole covering
+  [0, 64k).
+
+  If we continue reading the full page range [0, 64K), the dirtied range
+  will be filled with 0 (since there is only a hole covering the whole
+  range).
+  This causes the dirtied range to get lost.
+
+With this optimization, btrfs can pass generic/563 even if the page size
+is larger than fs block size.
+
+Reviewed-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: Qu Wenruo <wqu@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/btrfs/extent_io.c | 4 ++++
+ fs/btrfs/file.c      | 5 +++--
+ 2 files changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+index 06922529f19dc..13b5359ea1b77 100644
+--- a/fs/btrfs/extent_io.c
++++ b/fs/btrfs/extent_io.c
+@@ -974,6 +974,10 @@ static int btrfs_do_readpage(struct folio *folio, struct extent_map **em_cached,
+ 			end_folio_read(folio, true, cur, iosize);
+ 			break;
+ 		}
++		if (btrfs_folio_test_uptodate(fs_info, folio, cur, blocksize)) {
++			end_folio_read(folio, true, cur, blocksize);
++			continue;
++		}
+ 		em = get_extent_map(BTRFS_I(inode), folio, cur, end - cur + 1, em_cached);
+ 		if (IS_ERR(em)) {
+ 			end_folio_read(folio, false, cur, end + 1 - cur);
+diff --git a/fs/btrfs/file.c b/fs/btrfs/file.c
+index cd4e40a719186..61ad1a79e5698 100644
+--- a/fs/btrfs/file.c
++++ b/fs/btrfs/file.c
+@@ -804,14 +804,15 @@ static int prepare_uptodate_folio(struct inode *inode, struct folio *folio, u64
+ {
+ 	u64 clamp_start = max_t(u64, pos, folio_pos(folio));
+ 	u64 clamp_end = min_t(u64, pos + len, folio_pos(folio) + folio_size(folio));
++	const u32 blocksize = inode_to_fs_info(inode)->sectorsize;
+ 	int ret = 0;
+ 
+ 	if (folio_test_uptodate(folio))
+ 		return 0;
+ 
+ 	if (!force_uptodate &&
+-	    IS_ALIGNED(clamp_start, PAGE_SIZE) &&
+-	    IS_ALIGNED(clamp_end, PAGE_SIZE))
++	    IS_ALIGNED(clamp_start, blocksize) &&
++	    IS_ALIGNED(clamp_end, blocksize))
+ 		return 0;
+ 
+ 	ret = btrfs_read_folio(NULL, folio);
+-- 
+2.39.5
+
