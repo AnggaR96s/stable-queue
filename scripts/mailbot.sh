@@ -290,6 +290,9 @@ extract_series_info() {
     if [[ $subject =~ $part_pattern ]]; then
         local current="${BASH_REMATCH[1]}"
         local total="${BASH_REMATCH[2]}"
+        # Remove leading zeros to avoid octal interpretation
+        current=$((10#$current))
+        total=$((10#$total))
         echo "$current $total"
         return 0
     fi
