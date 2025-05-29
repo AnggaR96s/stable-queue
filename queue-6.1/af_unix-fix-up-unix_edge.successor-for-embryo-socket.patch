@@ -1,0 +1,134 @@
+From stable+bounces-145892-greg=kroah.com@vger.kernel.org Wed May 21 17:40:20 2025
+From: Lee Jones <lee@kernel.org>
+Date: Wed, 21 May 2025 16:27:14 +0100
+Subject: af_unix: Fix up unix_edge.successor for embryo socket.
+To: lee@kernel.org, "David S. Miller" <davem@davemloft.net>, Eric Dumazet <edumazet@google.com>, Jakub Kicinski <kuba@kernel.org>, Paolo Abeni <pabeni@redhat.com>, Christian Brauner <brauner@kernel.org>, Kuniyuki Iwashima <kuniyu@amazon.com>, Alexander Mikhalitsyn <aleksandr.mikhalitsyn@canonical.com>, Jens Axboe <axboe@kernel.dk>, Sasha Levin <sashal@kernel.org>, Michal Luczaj <mhal@rbox.co>, Rao Shoaib <Rao.Shoaib@oracle.com>, Simon Horman <horms@kernel.org>, linux-kernel@vger.kernel.org, netdev@vger.kernel.org
+Cc: stable@vger.kernel.org
+Message-ID: <20250521152920.1116756-16-lee@kernel.org>
+
+From: Kuniyuki Iwashima <kuniyu@amazon.com>
+
+commit dcf70df2048d27c5d186f013f101a4aefd63aa41 upstream.
+
+To garbage collect inflight AF_UNIX sockets, we must define the
+cyclic reference appropriately.  This is a bit tricky if the loop
+consists of embryo sockets.
+
+Suppose that the fd of AF_UNIX socket A is passed to D and the fd B
+to C and that C and D are embryo sockets of A and B, respectively.
+It may appear that there are two separate graphs, A (-> D) and
+B (-> C), but this is not correct.
+
+     A --. .-- B
+          X
+     C <-' `-> D
+
+Now, D holds A's refcount, and C has B's refcount, so unix_release()
+will never be called for A and B when we close() them.  However, no
+one can call close() for D and C to free skbs holding refcounts of A
+and B because C/D is in A/B's receive queue, which should have been
+purged by unix_release() for A and B.
+
+So, here's another type of cyclic reference.  When a fd of an AF_UNIX
+socket is passed to an embryo socket, the reference is indirectly held
+by its parent listening socket.
+
+  .-> A                            .-> B
+  |   `- sk_receive_queue          |   `- sk_receive_queue
+  |      `- skb                    |      `- skb
+  |         `- sk == C             |         `- sk == D
+  |            `- sk_receive_queue |           `- sk_receive_queue
+  |               `- skb +---------'               `- skb +-.
+  |                                                         |
+  `---------------------------------------------------------'
+
+Technically, the graph must be denoted as A <-> B instead of A (-> D)
+and B (-> C) to find such a cyclic reference without touching each
+socket's receive queue.
+
+  .-> A --. .-- B <-.
+  |        X        |  ==  A <-> B
+  `-- C <-' `-> D --'
+
+We apply this fixup during GC by fetching the real successor by
+unix_edge_successor().
+
+When we call accept(), we clear unix_sock.listener under unix_gc_lock
+not to confuse GC.
+
+Signed-off-by: Kuniyuki Iwashima <kuniyu@amazon.com>
+Acked-by: Paolo Abeni <pabeni@redhat.com>
+Link: https://lore.kernel.org/r/20240325202425.60930-9-kuniyu@amazon.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Lee Jones <lee@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/net/af_unix.h |    1 +
+ net/unix/af_unix.c    |    2 +-
+ net/unix/garbage.c    |   20 +++++++++++++++++++-
+ 3 files changed, 21 insertions(+), 2 deletions(-)
+
+--- a/include/net/af_unix.h
++++ b/include/net/af_unix.h
+@@ -24,6 +24,7 @@ void unix_inflight(struct user_struct *u
+ void unix_notinflight(struct user_struct *user, struct file *fp);
+ void unix_add_edges(struct scm_fp_list *fpl, struct unix_sock *receiver);
+ void unix_del_edges(struct scm_fp_list *fpl);
++void unix_update_edges(struct unix_sock *receiver);
+ int unix_prepare_fpl(struct scm_fp_list *fpl);
+ void unix_destroy_fpl(struct scm_fp_list *fpl);
+ void unix_gc(void);
+--- a/net/unix/af_unix.c
++++ b/net/unix/af_unix.c
+@@ -1679,7 +1679,7 @@ static int unix_accept(struct socket *so
+ 	}
+ 
+ 	tsk = skb->sk;
+-	unix_sk(tsk)->listener = NULL;
++	unix_update_edges(unix_sk(tsk));
+ 	skb_free_datagram(sk, skb);
+ 	wake_up_interruptible(&unix_sk(sk)->peer_wait);
+ 
+--- a/net/unix/garbage.c
++++ b/net/unix/garbage.c
+@@ -101,6 +101,17 @@ struct unix_sock *unix_get_socket(struct
+ 	return NULL;
+ }
+ 
++static struct unix_vertex *unix_edge_successor(struct unix_edge *edge)
++{
++	/* If an embryo socket has a fd,
++	 * the listener indirectly holds the fd's refcnt.
++	 */
++	if (edge->successor->listener)
++		return unix_sk(edge->successor->listener)->vertex;
++
++	return edge->successor->vertex;
++}
++
+ static LIST_HEAD(unix_unvisited_vertices);
+ 
+ enum unix_vertex_index {
+@@ -209,6 +220,13 @@ out:
+ 	fpl->inflight = false;
+ }
+ 
++void unix_update_edges(struct unix_sock *receiver)
++{
++	spin_lock(&unix_gc_lock);
++	receiver->listener = NULL;
++	spin_unlock(&unix_gc_lock);
++}
++
+ int unix_prepare_fpl(struct scm_fp_list *fpl)
+ {
+ 	struct unix_vertex *vertex;
+@@ -268,7 +286,7 @@ next_vertex:
+ 
+ 	/* Explore neighbour vertices (receivers of the current vertex's fd). */
+ 	list_for_each_entry(edge, &vertex->edges, vertex_entry) {
+-		struct unix_vertex *next_vertex = edge->successor->vertex;
++		struct unix_vertex *next_vertex = unix_edge_successor(edge);
+ 
+ 		if (!next_vertex)
+ 			continue;

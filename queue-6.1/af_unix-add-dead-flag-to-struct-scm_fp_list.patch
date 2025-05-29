@@ -1,0 +1,110 @@
+From stable+bounces-145902-greg=kroah.com@vger.kernel.org Wed May 21 17:44:05 2025
+From: Lee Jones <lee@kernel.org>
+Date: Wed, 21 May 2025 16:27:24 +0100
+Subject: af_unix: Add dead flag to struct scm_fp_list.
+To: lee@kernel.org, "David S. Miller" <davem@davemloft.net>, Eric Dumazet <edumazet@google.com>, Jakub Kicinski <kuba@kernel.org>, Paolo Abeni <pabeni@redhat.com>, Christian Brauner <brauner@kernel.org>, Kuniyuki Iwashima <kuniyu@amazon.com>, Jens Axboe <axboe@kernel.dk>, Alexander Mikhalitsyn <aleksandr.mikhalitsyn@canonical.com>, Sasha Levin <sashal@kernel.org>, Michal Luczaj <mhal@rbox.co>, Rao Shoaib <Rao.Shoaib@oracle.com>, Pavel Begunkov <asml.silence@gmail.com>, linux-kernel@vger.kernel.org, netdev@vger.kernel.org
+Cc: stable@vger.kernel.org
+Message-ID: <20250521152920.1116756-26-lee@kernel.org>
+
+From: Kuniyuki Iwashima <kuniyu@amazon.com>
+
+commit 7172dc93d621d5dc302d007e95ddd1311ec64283 upstream.
+
+Commit 1af2dface5d2 ("af_unix: Don't access successor in unix_del_edges()
+during GC.") fixed use-after-free by avoid accessing edge->successor while
+GC is in progress.
+
+However, there could be a small race window where another process could
+call unix_del_edges() while gc_in_progress is true and __skb_queue_purge()
+is on the way.
+
+So, we need another marker for struct scm_fp_list which indicates if the
+skb is garbage-collected.
+
+This patch adds dead flag in struct scm_fp_list and set it true before
+calling __skb_queue_purge().
+
+Fixes: 1af2dface5d2 ("af_unix: Don't access successor in unix_del_edges() during GC.")
+Signed-off-by: Kuniyuki Iwashima <kuniyu@amazon.com>
+Acked-by: Paolo Abeni <pabeni@redhat.com>
+Link: https://lore.kernel.org/r/20240508171150.50601-1-kuniyu@amazon.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Lee Jones <lee@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/net/scm.h  |    1 +
+ net/core/scm.c     |    1 +
+ net/unix/garbage.c |   14 ++++++++++----
+ 3 files changed, 12 insertions(+), 4 deletions(-)
+
+--- a/include/net/scm.h
++++ b/include/net/scm.h
+@@ -31,6 +31,7 @@ struct scm_fp_list {
+ 	short			max;
+ #ifdef CONFIG_UNIX
+ 	bool			inflight;
++	bool			dead;
+ 	struct list_head	vertices;
+ 	struct unix_edge	*edges;
+ #endif
+--- a/net/core/scm.c
++++ b/net/core/scm.c
+@@ -91,6 +91,7 @@ static int scm_fp_copy(struct cmsghdr *c
+ 		fpl->user = NULL;
+ #if IS_ENABLED(CONFIG_UNIX)
+ 		fpl->inflight = false;
++		fpl->dead = false;
+ 		fpl->edges = NULL;
+ 		INIT_LIST_HEAD(&fpl->vertices);
+ #endif
+--- a/net/unix/garbage.c
++++ b/net/unix/garbage.c
+@@ -158,13 +158,11 @@ static void unix_add_edge(struct scm_fp_
+ 	unix_update_graph(unix_edge_successor(edge));
+ }
+ 
+-static bool gc_in_progress;
+-
+ static void unix_del_edge(struct scm_fp_list *fpl, struct unix_edge *edge)
+ {
+ 	struct unix_vertex *vertex = edge->predecessor->vertex;
+ 
+-	if (!gc_in_progress)
++	if (!fpl->dead)
+ 		unix_update_graph(unix_edge_successor(edge));
+ 
+ 	list_del(&edge->vertex_entry);
+@@ -240,7 +238,7 @@ void unix_del_edges(struct scm_fp_list *
+ 		unix_del_edge(fpl, edge);
+ 	} while (i < fpl->count_unix);
+ 
+-	if (!gc_in_progress) {
++	if (!fpl->dead) {
+ 		receiver = fpl->edges[0].successor;
+ 		receiver->scm_stat.nr_unix_fds -= fpl->count_unix;
+ 	}
+@@ -559,9 +557,12 @@ static void unix_walk_scc_fast(struct sk
+ 	list_replace_init(&unix_visited_vertices, &unix_unvisited_vertices);
+ }
+ 
++static bool gc_in_progress;
++
+ static void __unix_gc(struct work_struct *work)
+ {
+ 	struct sk_buff_head hitlist;
++	struct sk_buff *skb;
+ 
+ 	spin_lock(&unix_gc_lock);
+ 
+@@ -579,6 +580,11 @@ static void __unix_gc(struct work_struct
+ 
+ 	spin_unlock(&unix_gc_lock);
+ 
++	skb_queue_walk(&hitlist, skb) {
++		if (UNIXCB(skb).fp)
++			UNIXCB(skb).fp->dead = true;
++	}
++
+ 	__skb_queue_purge(&hitlist);
+ skip_gc:
+ 	WRITE_ONCE(gc_in_progress, false);
