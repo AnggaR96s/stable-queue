@@ -1,0 +1,158 @@
+From stable+bounces-145862-greg=kroah.com@vger.kernel.org Wed May 21 16:54:49 2025
+From: Lee Jones <lee@kernel.org>
+Date: Wed, 21 May 2025 14:45:23 +0000
+Subject: af_unix: Save O(n) setup of Tarjan's algo.
+To: lee@kernel.org, "David S. Miller" <davem@davemloft.net>, Eric Dumazet <edumazet@google.com>, Jakub Kicinski <kuba@kernel.org>, Paolo Abeni <pabeni@redhat.com>, Kuniyuki Iwashima <kuniyu@amazon.com>, Jens Axboe <axboe@kernel.dk>, Sasha Levin <sashal@kernel.org>, Michal Luczaj <mhal@rbox.co>, Rao Shoaib <Rao.Shoaib@oracle.com>, Simon Horman <horms@kernel.org>, linux-kernel@vger.kernel.org, netdev@vger.kernel.org
+Cc: stable@vger.kernel.org
+Message-ID: <20250521144803.2050504-16-lee@kernel.org>
+
+From: Kuniyuki Iwashima <kuniyu@amazon.com>
+
+commit ba31b4a4e1018f5844c6eb31734976e2184f2f9a upstream.
+
+Before starting Tarjan's algorithm, we need to mark all vertices
+as unvisited.  We can save this O(n) setup by reserving two special
+indices (0, 1) and using two variables.
+
+The first time we link a vertex to unix_unvisited_vertices, we set
+unix_vertex_unvisited_index to index.
+
+During DFS, we can see that the index of unvisited vertices is the
+same as unix_vertex_unvisited_index.
+
+When we finalise SCC later, we set unix_vertex_grouped_index to each
+vertex's index.
+
+Then, we can know (i) that the vertex is on the stack if the index
+of a visited vertex is >= 2 and (ii) that it is not on the stack and
+belongs to a different SCC if the index is unix_vertex_grouped_index.
+
+After the whole algorithm, all indices of vertices are set as
+unix_vertex_grouped_index.
+
+Next time we start DFS, we know that all unvisited vertices have
+unix_vertex_grouped_index, and we can use unix_vertex_unvisited_index
+as the not-on-stack marker.
+
+To use the same variable in __unix_walk_scc(), we can swap
+unix_vertex_(grouped|unvisited)_index at the end of Tarjan's
+algorithm.
+
+Signed-off-by: Kuniyuki Iwashima <kuniyu@amazon.com>
+Acked-by: Paolo Abeni <pabeni@redhat.com>
+Link: https://lore.kernel.org/r/20240325202425.60930-10-kuniyu@amazon.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Lee Jones <lee@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/net/af_unix.h |    1 -
+ net/unix/garbage.c    |   26 +++++++++++++++-----------
+ 2 files changed, 15 insertions(+), 12 deletions(-)
+
+--- a/include/net/af_unix.h
++++ b/include/net/af_unix.h
+@@ -37,7 +37,6 @@ struct unix_vertex {
+ 	unsigned long out_degree;
+ 	unsigned long index;
+ 	unsigned long lowlink;
+-	bool on_stack;
+ };
+ 
+ struct unix_edge {
+--- a/net/unix/garbage.c
++++ b/net/unix/garbage.c
+@@ -115,16 +115,20 @@ static struct unix_vertex *unix_edge_suc
+ static LIST_HEAD(unix_unvisited_vertices);
+ 
+ enum unix_vertex_index {
+-	UNIX_VERTEX_INDEX_UNVISITED,
++	UNIX_VERTEX_INDEX_MARK1,
++	UNIX_VERTEX_INDEX_MARK2,
+ 	UNIX_VERTEX_INDEX_START,
+ };
+ 
++static unsigned long unix_vertex_unvisited_index = UNIX_VERTEX_INDEX_MARK1;
++
+ static void unix_add_edge(struct scm_fp_list *fpl, struct unix_edge *edge)
+ {
+ 	struct unix_vertex *vertex = edge->predecessor->vertex;
+ 
+ 	if (!vertex) {
+ 		vertex = list_first_entry(&fpl->vertices, typeof(*vertex), entry);
++		vertex->index = unix_vertex_unvisited_index;
+ 		vertex->out_degree = 0;
+ 		INIT_LIST_HEAD(&vertex->edges);
+ 
+@@ -265,6 +269,7 @@ void unix_destroy_fpl(struct scm_fp_list
+ }
+ 
+ static LIST_HEAD(unix_visited_vertices);
++static unsigned long unix_vertex_grouped_index = UNIX_VERTEX_INDEX_MARK2;
+ 
+ static void __unix_walk_scc(struct unix_vertex *vertex)
+ {
+@@ -274,10 +279,10 @@ static void __unix_walk_scc(struct unix_
+ 	LIST_HEAD(edge_stack);
+ 
+ next_vertex:
+-	/* Push vertex to vertex_stack.
++	/* Push vertex to vertex_stack and mark it as on-stack
++	 * (index >= UNIX_VERTEX_INDEX_START).
+ 	 * The vertex will be popped when finalising SCC later.
+ 	 */
+-	vertex->on_stack = true;
+ 	list_add(&vertex->scc_entry, &vertex_stack);
+ 
+ 	vertex->index = index;
+@@ -291,7 +296,7 @@ next_vertex:
+ 		if (!next_vertex)
+ 			continue;
+ 
+-		if (next_vertex->index == UNIX_VERTEX_INDEX_UNVISITED) {
++		if (next_vertex->index == unix_vertex_unvisited_index) {
+ 			/* Iterative deepening depth first search
+ 			 *
+ 			 *   1. Push a forward edge to edge_stack and set
+@@ -317,7 +322,7 @@ prev_vertex:
+ 			 * to skip SCC finalisation.
+ 			 */
+ 			vertex->lowlink = min(vertex->lowlink, next_vertex->lowlink);
+-		} else if (next_vertex->on_stack) {
++		} else if (next_vertex->index != unix_vertex_grouped_index) {
+ 			/* Loop detected by a back/cross edge.
+ 			 *
+ 			 * The successor is on vertex_stack, so two vertices are
+@@ -344,7 +349,8 @@ prev_vertex:
+ 			/* Don't restart DFS from this vertex in unix_walk_scc(). */
+ 			list_move_tail(&vertex->entry, &unix_visited_vertices);
+ 
+-			vertex->on_stack = false;
++			/* Mark vertex as off-stack. */
++			vertex->index = unix_vertex_grouped_index;
+ 		}
+ 
+ 		list_del(&scc);
+@@ -357,20 +363,18 @@ prev_vertex:
+ 
+ static void unix_walk_scc(void)
+ {
+-	struct unix_vertex *vertex;
+-
+-	list_for_each_entry(vertex, &unix_unvisited_vertices, entry)
+-		vertex->index = UNIX_VERTEX_INDEX_UNVISITED;
+-
+ 	/* Visit every vertex exactly once.
+ 	 * __unix_walk_scc() moves visited vertices to unix_visited_vertices.
+ 	 */
+ 	while (!list_empty(&unix_unvisited_vertices)) {
++		struct unix_vertex *vertex;
++
+ 		vertex = list_first_entry(&unix_unvisited_vertices, typeof(*vertex), entry);
+ 		__unix_walk_scc(vertex);
+ 	}
+ 
+ 	list_replace_init(&unix_visited_vertices, &unix_unvisited_vertices);
++	swap(unix_vertex_unvisited_index, unix_vertex_grouped_index);
+ }
+ 
+ static LIST_HEAD(gc_candidates);

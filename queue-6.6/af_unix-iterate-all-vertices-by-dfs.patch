@@ -1,0 +1,155 @@
+From stable+bounces-145858-greg=kroah.com@vger.kernel.org Wed May 21 16:53:24 2025
+From: Lee Jones <lee@kernel.org>
+Date: Wed, 21 May 2025 14:45:19 +0000
+Subject: af_unix: Iterate all vertices by DFS.
+To: lee@kernel.org, "David S. Miller" <davem@davemloft.net>, Eric Dumazet <edumazet@google.com>, Jakub Kicinski <kuba@kernel.org>, Paolo Abeni <pabeni@redhat.com>, Kuniyuki Iwashima <kuniyu@amazon.com>, Jens Axboe <axboe@kernel.dk>, Sasha Levin <sashal@kernel.org>, Michal Luczaj <mhal@rbox.co>, Rao Shoaib <Rao.Shoaib@oracle.com>, Simon Horman <horms@kernel.org>, linux-kernel@vger.kernel.org, netdev@vger.kernel.org
+Cc: stable@vger.kernel.org
+Message-ID: <20250521144803.2050504-12-lee@kernel.org>
+
+From: Kuniyuki Iwashima <kuniyu@amazon.com>
+
+commit 6ba76fd2848e107594ea4f03b737230f74bc23ea upstream.
+
+The new GC will use a depth first search graph algorithm to find
+cyclic references.  The algorithm visits every vertex exactly once.
+
+Here, we implement the DFS part without recursion so that no one
+can abuse it.
+
+unix_walk_scc() marks every vertex unvisited by initialising index
+as UNIX_VERTEX_INDEX_UNVISITED and iterates inflight vertices in
+unix_unvisited_vertices and call __unix_walk_scc() to start DFS from
+an arbitrary vertex.
+
+__unix_walk_scc() iterates all edges starting from the vertex and
+explores the neighbour vertices with DFS using edge_stack.
+
+After visiting all neighbours, __unix_walk_scc() moves the visited
+vertex to unix_visited_vertices so that unix_walk_scc() will not
+restart DFS from the visited vertex.
+
+Signed-off-by: Kuniyuki Iwashima <kuniyu@amazon.com>
+Acked-by: Paolo Abeni <pabeni@redhat.com>
+Link: https://lore.kernel.org/r/20240325202425.60930-6-kuniyu@amazon.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Lee Jones <lee@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/net/af_unix.h |    2 +
+ net/unix/garbage.c    |   74 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 76 insertions(+)
+
+--- a/include/net/af_unix.h
++++ b/include/net/af_unix.h
+@@ -33,12 +33,14 @@ struct unix_vertex {
+ 	struct list_head edges;
+ 	struct list_head entry;
+ 	unsigned long out_degree;
++	unsigned long index;
+ };
+ 
+ struct unix_edge {
+ 	struct unix_sock *predecessor;
+ 	struct unix_sock *successor;
+ 	struct list_head vertex_entry;
++	struct list_head stack_entry;
+ };
+ 
+ struct sock *unix_peer_get(struct sock *sk);
+--- a/net/unix/garbage.c
++++ b/net/unix/garbage.c
+@@ -103,6 +103,11 @@ struct unix_sock *unix_get_socket(struct
+ 
+ static LIST_HEAD(unix_unvisited_vertices);
+ 
++enum unix_vertex_index {
++	UNIX_VERTEX_INDEX_UNVISITED,
++	UNIX_VERTEX_INDEX_START,
++};
++
+ static void unix_add_edge(struct scm_fp_list *fpl, struct unix_edge *edge)
+ {
+ 	struct unix_vertex *vertex = edge->predecessor->vertex;
+@@ -241,6 +246,73 @@ void unix_destroy_fpl(struct scm_fp_list
+ 	unix_free_vertices(fpl);
+ }
+ 
++static LIST_HEAD(unix_visited_vertices);
++
++static void __unix_walk_scc(struct unix_vertex *vertex)
++{
++	unsigned long index = UNIX_VERTEX_INDEX_START;
++	struct unix_edge *edge;
++	LIST_HEAD(edge_stack);
++
++next_vertex:
++	vertex->index = index;
++	index++;
++
++	/* Explore neighbour vertices (receivers of the current vertex's fd). */
++	list_for_each_entry(edge, &vertex->edges, vertex_entry) {
++		struct unix_vertex *next_vertex = edge->successor->vertex;
++
++		if (!next_vertex)
++			continue;
++
++		if (next_vertex->index == UNIX_VERTEX_INDEX_UNVISITED) {
++			/* Iterative deepening depth first search
++			 *
++			 *   1. Push a forward edge to edge_stack and set
++			 *      the successor to vertex for the next iteration.
++			 */
++			list_add(&edge->stack_entry, &edge_stack);
++
++			vertex = next_vertex;
++			goto next_vertex;
++
++			/*   2. Pop the edge directed to the current vertex
++			 *      and restore the ancestor for backtracking.
++			 */
++prev_vertex:
++			edge = list_first_entry(&edge_stack, typeof(*edge), stack_entry);
++			list_del_init(&edge->stack_entry);
++
++			vertex = edge->predecessor->vertex;
++		}
++	}
++
++	/* Don't restart DFS from this vertex in unix_walk_scc(). */
++	list_move_tail(&vertex->entry, &unix_visited_vertices);
++
++	/* Need backtracking ? */
++	if (!list_empty(&edge_stack))
++		goto prev_vertex;
++}
++
++static void unix_walk_scc(void)
++{
++	struct unix_vertex *vertex;
++
++	list_for_each_entry(vertex, &unix_unvisited_vertices, entry)
++		vertex->index = UNIX_VERTEX_INDEX_UNVISITED;
++
++	/* Visit every vertex exactly once.
++	 * __unix_walk_scc() moves visited vertices to unix_visited_vertices.
++	 */
++	while (!list_empty(&unix_unvisited_vertices)) {
++		vertex = list_first_entry(&unix_unvisited_vertices, typeof(*vertex), entry);
++		__unix_walk_scc(vertex);
++	}
++
++	list_replace_init(&unix_visited_vertices, &unix_unvisited_vertices);
++}
++
+ static LIST_HEAD(gc_candidates);
+ static LIST_HEAD(gc_inflight_list);
+ 
+@@ -388,6 +460,8 @@ static void __unix_gc(struct work_struct
+ 
+ 	spin_lock(&unix_gc_lock);
+ 
++	unix_walk_scc();
++
+ 	/* First, select candidates for garbage collection.  Only
+ 	 * in-flight sockets are considered, and from those only ones
+ 	 * which don't have any external reference.
