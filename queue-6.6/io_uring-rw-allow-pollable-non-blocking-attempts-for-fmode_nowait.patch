@@ -1,0 +1,83 @@
+From 759b078e8395322668d9a0023df25ae32f2e356f Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Sun, 6 Oct 2024 10:40:36 -0600
+Subject: io_uring/rw: allow pollable non-blocking attempts for !FMODE_NOWAIT
+
+From: Jens Axboe <axboe@kernel.dk>
+
+Commit f7c9134385331c5ef36252895130aa01a92de907 upstream.
+
+The checking for whether or not io_uring can do a non-blocking read or
+write attempt is gated on FMODE_NOWAIT. However, if the file is
+pollable, it's feasible to just check if it's currently in a state in
+which it can sanely receive or send _some_ data.
+
+This avoids unnecessary io-wq punts, and repeated worthless retries
+before doing that punt, by assuming that some data can get delivered
+or received if poll tells us that is true. It also allows multishot
+reads to properly work with these types of files, enabling a bit of
+a cleanup of the logic that:
+
+c9d952b9103b ("io_uring/rw: fix cflags posting for single issue multishot read")
+
+had to put in place.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ io_uring/rw.c |   22 ++++++++++++++++------
+ 1 file changed, 16 insertions(+), 6 deletions(-)
+
+--- a/io_uring/rw.c
++++ b/io_uring/rw.c
+@@ -28,9 +28,19 @@ struct io_rw {
+ 	rwf_t				flags;
+ };
+ 
+-static inline bool io_file_supports_nowait(struct io_kiocb *req)
++static bool io_file_supports_nowait(struct io_kiocb *req, __poll_t mask)
+ {
+-	return req->flags & REQ_F_SUPPORT_NOWAIT;
++	/* If FMODE_NOWAIT is set for a file, we're golden */
++	if (req->flags & REQ_F_SUPPORT_NOWAIT)
++		return true;
++	/* No FMODE_NOWAIT, if we can poll, check the status */
++	if (io_file_can_poll(req)) {
++		struct poll_table_struct pt = { ._key = mask };
++
++		return vfs_poll(req->file, &pt) & mask;
++	}
++	/* No FMODE_NOWAIT support, and file isn't pollable. Tough luck. */
++	return false;
+ }
+ 
+ #ifdef CONFIG_COMPAT
+@@ -685,8 +695,8 @@ static int io_rw_init_file(struct io_kio
+ 	 * supports async. Otherwise it's impossible to use O_NONBLOCK files
+ 	 * reliably. If not, or it IOCB_NOWAIT is set, don't retry.
+ 	 */
+-	if ((kiocb->ki_flags & IOCB_NOWAIT) ||
+-	    ((file->f_flags & O_NONBLOCK) && !io_file_supports_nowait(req)))
++	if (kiocb->ki_flags & IOCB_NOWAIT ||
++	    ((file->f_flags & O_NONBLOCK && (req->flags & REQ_F_SUPPORT_NOWAIT))))
+ 		req->flags |= REQ_F_NOWAIT;
+ 
+ 	if (ctx->flags & IORING_SETUP_IOPOLL) {
+@@ -752,7 +762,7 @@ static int __io_read(struct io_kiocb *re
+ 
+ 	if (force_nonblock) {
+ 		/* If the file doesn't support async, just async punt */
+-		if (unlikely(!io_file_supports_nowait(req))) {
++		if (unlikely(!io_file_supports_nowait(req, EPOLLIN))) {
+ 			ret = io_setup_async_rw(req, iovec, s, true);
+ 			return ret ?: -EAGAIN;
+ 		}
+@@ -927,7 +937,7 @@ int io_write(struct io_kiocb *req, unsig
+ 
+ 	if (force_nonblock) {
+ 		/* If the file doesn't support async, just async punt */
+-		if (unlikely(!io_file_supports_nowait(req)))
++		if (unlikely(!io_file_supports_nowait(req, EPOLLOUT)))
+ 			goto copy_iov;
+ 
+ 		/* File path supports NOWAIT for non-direct_IO only for block devices. */
