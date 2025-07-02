@@ -862,15 +862,18 @@ test_commit_on_branch() {
     fi
 
     # Run build test
-    if ! stable build; then
-        if [ -f ~/errors-linus-next ]; then
-            local build_error=$(cat ~/errors-linus-next)
-            results+=("stable/linux-${version}.y | Success | Failed")
+    local build_output
+    build_output=$(stable build log 2>&1)
+    local build_ret=$?
+
+    if [ $build_ret -ne 0 ]; then
+        results+=("stable/linux-${version}.y | Success | Failed")
+        if [ -n "$build_output" ]; then
             errors+=("Build error for ${branch}:")
-            errors+=("$(echo "$build_error" | sed 's/^/    /')")
+            errors+=("$(echo "$build_output" | sed 's/^/    /')")
             errors+=("")
         else
-            results+=("stable/linux-${version}.y | Success | Failed (no log)")
+            errors+=("Build error for ${branch}: (no output captured)")
         fi
         result=1
     else
@@ -1083,15 +1086,18 @@ Commit author: $commit_author"
             failed=1
         else
             # Run build test
-            if ! stable build; then
-                if [ -f ~/errors-linus-next ]; then
-                    local build_error=$(cat ~/errors-linus-next)
-                    p_results+=("$full_branch_name | Success | Failed")
+            local build_output
+            build_output=$(stable build log 2>&1)
+            local build_ret=$?
+
+            if [ $build_ret -ne 0 ]; then
+                p_results+=("$full_branch_name | Success | Failed")
+                if [ -n "$build_output" ]; then
                     p_errors+=("Build error:")
-                    p_errors+=("$(echo "$build_error" | sed 's/^/    /')")
+                    p_errors+=("$(echo "$build_output" | sed 's/^/    /')")
                     p_errors+=("")
                 else
-                    p_results+=("$full_branch_name | Success | Failed (no log)")
+                    p_errors+=("Build error: (no output captured)")
                 fi
                 failed=1
             else
