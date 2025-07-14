@@ -1,0 +1,152 @@
+From 28907062b07677367be1e4229fe70a0990bedef9 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Sat, 12 Jul 2025 04:38:08 -0400
+Subject: usb: dwc3: Abort suspend on soft disconnect failure
+
+From: Kuen-Han Tsai <khtsai@google.com>
+
+[ Upstream commit 630a1dec3b0eba2a695b9063f1c205d585cbfec9 ]
+
+When dwc3_gadget_soft_disconnect() fails, dwc3_suspend_common() keeps
+going with the suspend, resulting in a period where the power domain is
+off, but the gadget driver remains connected.  Within this time frame,
+invoking vbus_event_work() will cause an error as it attempts to access
+DWC3 registers for endpoint disabling after the power domain has been
+completely shut down.
+
+Abort the suspend sequence when dwc3_gadget_suspend() cannot halt the
+controller and proceeds with a soft connect.
+
+Fixes: 9f8a67b65a49 ("usb: dwc3: gadget: fix gadget suspend/resume")
+Cc: stable <stable@kernel.org>
+Acked-by: Thinh Nguyen <Thinh.Nguyen@synopsys.com>
+Signed-off-by: Kuen-Han Tsai <khtsai@google.com>
+Link: https://lore.kernel.org/r/20250528100315.2162699-1-khtsai@google.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/usb/dwc3/core.c   | 34 +++++++++++++++++++++++++++-------
+ drivers/usb/dwc3/core.h   |  2 ++
+ drivers/usb/dwc3/gadget.c | 25 ++++++++++++++++++++++---
+ 3 files changed, 51 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/usb/dwc3/core.c b/drivers/usb/dwc3/core.c
+index 3537afd17a26e..102ad4d2d4ebc 100644
+--- a/drivers/usb/dwc3/core.c
++++ b/drivers/usb/dwc3/core.c
+@@ -1733,16 +1733,29 @@ static int dwc3_core_init_for_resume(struct dwc3 *dwc)
+ 
+ static int dwc3_suspend_common(struct dwc3 *dwc, pm_message_t msg)
+ {
+-	unsigned long	flags;
+ 	u32 reg;
++	int ret;
++
++	if (!pm_runtime_suspended(dwc->dev) && !PMSG_IS_AUTO(msg)) {
++		dwc->susphy_state = (dwc3_readl(dwc->regs, DWC3_GUSB2PHYCFG(0)) &
++				    DWC3_GUSB2PHYCFG_SUSPHY) ||
++				    (dwc3_readl(dwc->regs, DWC3_GUSB3PIPECTL(0)) &
++				    DWC3_GUSB3PIPECTL_SUSPHY);
++		/*
++		 * TI AM62 platform requires SUSPHY to be
++		 * enabled for system suspend to work.
++		 */
++		if (!dwc->susphy_state)
++			dwc3_enable_susphy(dwc, true);
++	}
+ 
+ 	switch (dwc->current_dr_role) {
+ 	case DWC3_GCTL_PRTCAP_DEVICE:
+ 		if (pm_runtime_suspended(dwc->dev))
+ 			break;
+-		spin_lock_irqsave(&dwc->lock, flags);
+-		dwc3_gadget_suspend(dwc);
+-		spin_unlock_irqrestore(&dwc->lock, flags);
++		ret = dwc3_gadget_suspend(dwc);
++		if (ret)
++			return ret;
+ 		synchronize_irq(dwc->irq_gadget);
+ 		dwc3_core_exit(dwc);
+ 		break;
+@@ -1773,9 +1786,9 @@ static int dwc3_suspend_common(struct dwc3 *dwc, pm_message_t msg)
+ 			break;
+ 
+ 		if (dwc->current_otg_role == DWC3_OTG_ROLE_DEVICE) {
+-			spin_lock_irqsave(&dwc->lock, flags);
+-			dwc3_gadget_suspend(dwc);
+-			spin_unlock_irqrestore(&dwc->lock, flags);
++			ret = dwc3_gadget_suspend(dwc);
++			if (ret)
++				return ret;
+ 			synchronize_irq(dwc->irq_gadget);
+ 		}
+ 
+@@ -1986,6 +1999,13 @@ static void dwc3_complete(struct device *dev)
+ 		reg |= DWC3_GUCTL3_SPLITDISABLE;
+ 		dwc3_writel(dwc->regs, DWC3_GUCTL3, reg);
+ 	}
++
++	/*
++	 * Restore SUSPHY state to the original setting
++	 * if it was cleared during suspend
++	 */
++	if (!dwc->susphy_state)
++		dwc3_enable_susphy(dwc, false);
+ }
+ #else
+ #define dwc3_complete NULL
+diff --git a/drivers/usb/dwc3/core.h b/drivers/usb/dwc3/core.h
+index 4ccbd2dc1bf81..97d361ab3e86f 100644
+--- a/drivers/usb/dwc3/core.h
++++ b/drivers/usb/dwc3/core.h
+@@ -1269,6 +1269,8 @@ struct dwc3 {
+ 	unsigned		dis_split_quirk:1;
+ 
+ 	u16			imod_interval;
++
++	unsigned		susphy_state:1;
+ };
+ 
+ #define INCRX_BURST_MODE 0
+diff --git a/drivers/usb/dwc3/gadget.c b/drivers/usb/dwc3/gadget.c
+index f3103baa74590..422efb4e61434 100644
+--- a/drivers/usb/dwc3/gadget.c
++++ b/drivers/usb/dwc3/gadget.c
+@@ -4106,12 +4106,31 @@ void dwc3_gadget_exit(struct dwc3 *dwc)
+ 
+ int dwc3_gadget_suspend(struct dwc3 *dwc)
+ {
++	unsigned long		flags;
++	int			ret;
++
+ 	if (!dwc->gadget_driver)
+ 		return 0;
+ 
+-	dwc3_gadget_run_stop(dwc, false, false);
+-	dwc3_disconnect_gadget(dwc);
+-	__dwc3_gadget_stop(dwc);
++	ret = dwc3_gadget_soft_disconnect(dwc);
++	/*
++	 * Attempt to reset the controller's state. Likely no
++	 * communication can be established until the host
++	 * performs a port reset.
++	 */
++	if (ret && dwc->softconnect) {
++		/* Soft connect logic - similar to pullup when is_on is true */
++		dwc3_core_soft_reset(dwc);
++		dwc3_event_buffers_setup(dwc);
++		__dwc3_gadget_start(dwc);
++		dwc3_gadget_run_stop(dwc, true, false);
++		return -EAGAIN;
++	}
++
++	spin_lock_irqsave(&dwc->lock, flags);
++	if (dwc->gadget_driver)
++		dwc3_disconnect_gadget(dwc);
++	spin_unlock_irqrestore(&dwc->lock, flags);
+ 
+ 	return 0;
+ }
+-- 
+2.39.5
+
