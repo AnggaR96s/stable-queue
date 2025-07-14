@@ -1215,6 +1215,13 @@ generate_response() {
     local revert_results="${10}"
     local response_file=$(generate_response_filename "$mbox_file")
 
+    # Check if this is a stable-only commit
+    local email_body=$(formail -I "" < "$mbox_file")
+    local is_stable_only=0
+    if echo "$email_body" | grep -i "stable.only" >/dev/null 2>&1; then
+        is_stable_only=1
+    fi
+
     {
         # Get the From, Subject, Message-ID, and Date from original email for threading
         formail -X From: -X Subject: < "$mbox_file"
@@ -1256,16 +1263,18 @@ generate_response() {
             summary+=("❌ Build failures detected")
         fi
 
-        # Check for missing or unverified commit
-        if [ -z "$found_sha1" ] || [ "$found_sha1" = "0000000000000000000000000000000000000000" ]; then
-            has_issues=1
-            summary+=("⚠️ Could not find matching upstream commit")
-        elif [ -n "$claimed_sha1" ] && [ "$claimed_sha1" != "$found_sha1" ]; then
-            has_issues=1
-            summary+=("⚠️ Provided upstream commit SHA1 does not match found commit")
-        elif [ -z "$claimed_sha1" ] && [ -n "$found_sha1" ]; then
-            has_issues=1
-            summary+=("⚠️ Found matching upstream commit but patch is missing proper reference to it")
+        # Check for missing or unverified commit (skip for stable-only commits)
+        if [ $is_stable_only -eq 0 ]; then
+            if [ -z "$found_sha1" ] || [ "$found_sha1" = "0000000000000000000000000000000000000000" ]; then
+                has_issues=1
+                summary+=("⚠️ Could not find matching upstream commit")
+            elif [ -n "$claimed_sha1" ] && [ "$claimed_sha1" != "$found_sha1" ]; then
+                has_issues=1
+                summary+=("⚠️ Provided upstream commit SHA1 does not match found commit")
+            elif [ -z "$claimed_sha1" ] && [ -n "$found_sha1" ]; then
+                has_issues=1
+                summary+=("⚠️ Found matching upstream commit but patch is missing proper reference to it")
+            fi
         fi
 
         # Check for fixes
@@ -1312,7 +1321,9 @@ generate_response() {
         fi
 
         # Report on SHA1 verification and commit status
-        if [ -n "$claimed_sha1" ]; then
+        if [ $is_stable_only -eq 1 ]; then
+            echo "Note: This is a stable-only commit."
+        elif [ -n "$claimed_sha1" ]; then
             if [ "$claimed_sha1" = "$found_sha1" ]; then
                 echo "The upstream commit SHA1 provided is correct: $claimed_sha1"
                 if [ -n "$author_mismatch" ]; then
