@@ -1,0 +1,163 @@
+From 2a198bbec6913ae1c90ec963750003c6213668c7 Mon Sep 17 00:00:00 2001
+From: Sabrina Dubroca <sd@queasysnail.net>
+Date: Fri, 4 Jul 2025 16:54:34 +0200
+Subject: Revert "xfrm: destroy xfrm_state synchronously on net exit path"
+
+From: Sabrina Dubroca <sd@queasysnail.net>
+
+commit 2a198bbec6913ae1c90ec963750003c6213668c7 upstream.
+
+This reverts commit f75a2804da391571563c4b6b29e7797787332673.
+
+With all states (whether user or kern) removed from the hashtables
+during deletion, there's no need for synchronous destruction of
+states. xfrm6_tunnel states still need to have been destroyed (which
+will be the case when its last user is deleted (not destroyed)) so
+that xfrm6_tunnel_free_spi removes it from the per-netns hashtable
+before the netns is destroyed.
+
+This has the benefit of skipping one synchronize_rcu per state (in
+__xfrm_state_destroy(sync=true)) when we exit a netns.
+
+Signed-off-by: Sabrina Dubroca <sd@queasysnail.net>
+Signed-off-by: Steffen Klassert <steffen.klassert@secunet.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/net/xfrm.h      |   12 +++---------
+ net/ipv6/xfrm6_tunnel.c |    2 +-
+ net/key/af_key.c        |    2 +-
+ net/xfrm/xfrm_state.c   |   23 +++++++++--------------
+ net/xfrm/xfrm_user.c    |    2 +-
+ 5 files changed, 15 insertions(+), 26 deletions(-)
+
+--- a/include/net/xfrm.h
++++ b/include/net/xfrm.h
+@@ -915,7 +915,7 @@ static inline void xfrm_pols_put(struct
+ 		xfrm_pol_put(pols[i]);
+ }
+ 
+-void __xfrm_state_destroy(struct xfrm_state *, bool);
++void __xfrm_state_destroy(struct xfrm_state *);
+ 
+ static inline void __xfrm_state_put(struct xfrm_state *x)
+ {
+@@ -925,13 +925,7 @@ static inline void __xfrm_state_put(stru
+ static inline void xfrm_state_put(struct xfrm_state *x)
+ {
+ 	if (refcount_dec_and_test(&x->refcnt))
+-		__xfrm_state_destroy(x, false);
+-}
+-
+-static inline void xfrm_state_put_sync(struct xfrm_state *x)
+-{
+-	if (refcount_dec_and_test(&x->refcnt))
+-		__xfrm_state_destroy(x, true);
++		__xfrm_state_destroy(x);
+ }
+ 
+ static inline void xfrm_state_hold(struct xfrm_state *x)
+@@ -1769,7 +1763,7 @@ struct xfrmk_spdinfo {
+ 
+ struct xfrm_state *xfrm_find_acq_byseq(struct net *net, u32 mark, u32 seq, u32 pcpu_num);
+ int xfrm_state_delete(struct xfrm_state *x);
+-int xfrm_state_flush(struct net *net, u8 proto, bool task_valid, bool sync);
++int xfrm_state_flush(struct net *net, u8 proto, bool task_valid);
+ int xfrm_dev_state_flush(struct net *net, struct net_device *dev, bool task_valid);
+ int xfrm_dev_policy_flush(struct net *net, struct net_device *dev,
+ 			  bool task_valid);
+--- a/net/ipv6/xfrm6_tunnel.c
++++ b/net/ipv6/xfrm6_tunnel.c
+@@ -334,7 +334,7 @@ static void __net_exit xfrm6_tunnel_net_
+ 	struct xfrm6_tunnel_net *xfrm6_tn = xfrm6_tunnel_pernet(net);
+ 	unsigned int i;
+ 
+-	xfrm_state_flush(net, 0, false, true);
++	xfrm_state_flush(net, IPSEC_PROTO_ANY, false);
+ 	xfrm_flush_gc();
+ 
+ 	for (i = 0; i < XFRM6_TUNNEL_SPI_BYADDR_HSIZE; i++)
+--- a/net/key/af_key.c
++++ b/net/key/af_key.c
+@@ -1766,7 +1766,7 @@ static int pfkey_flush(struct sock *sk,
+ 	if (proto == 0)
+ 		return -EINVAL;
+ 
+-	err = xfrm_state_flush(net, proto, true, false);
++	err = xfrm_state_flush(net, proto, true);
+ 	err2 = unicast_flush_resp(sk, hdr);
+ 	if (err || err2) {
+ 		if (err == -ESRCH) /* empty table - go quietly */
+--- a/net/xfrm/xfrm_state.c
++++ b/net/xfrm/xfrm_state.c
+@@ -592,7 +592,7 @@ void xfrm_state_free(struct xfrm_state *
+ }
+ EXPORT_SYMBOL(xfrm_state_free);
+ 
+-static void ___xfrm_state_destroy(struct xfrm_state *x)
++static void xfrm_state_gc_destroy(struct xfrm_state *x)
+ {
+ 	if (x->mode_cbs && x->mode_cbs->destroy_state)
+ 		x->mode_cbs->destroy_state(x);
+@@ -631,7 +631,7 @@ static void xfrm_state_gc_task(struct wo
+ 	synchronize_rcu();
+ 
+ 	hlist_for_each_entry_safe(x, tmp, &gc_list, gclist)
+-		___xfrm_state_destroy(x);
++		xfrm_state_gc_destroy(x);
+ }
+ 
+ static enum hrtimer_restart xfrm_timer_handler(struct hrtimer *me)
+@@ -795,19 +795,14 @@ void xfrm_dev_state_free(struct xfrm_sta
+ }
+ #endif
+ 
+-void __xfrm_state_destroy(struct xfrm_state *x, bool sync)
++void __xfrm_state_destroy(struct xfrm_state *x)
+ {
+ 	WARN_ON(x->km.state != XFRM_STATE_DEAD);
+ 
+-	if (sync) {
+-		synchronize_rcu();
+-		___xfrm_state_destroy(x);
+-	} else {
+-		spin_lock_bh(&xfrm_state_gc_lock);
+-		hlist_add_head(&x->gclist, &xfrm_state_gc_list);
+-		spin_unlock_bh(&xfrm_state_gc_lock);
+-		schedule_work(&xfrm_state_gc_work);
+-	}
++	spin_lock_bh(&xfrm_state_gc_lock);
++	hlist_add_head(&x->gclist, &xfrm_state_gc_list);
++	spin_unlock_bh(&xfrm_state_gc_lock);
++	schedule_work(&xfrm_state_gc_work);
+ }
+ EXPORT_SYMBOL(__xfrm_state_destroy);
+ 
+@@ -922,7 +917,7 @@ xfrm_dev_state_flush_secctx_check(struct
+ }
+ #endif
+ 
+-int xfrm_state_flush(struct net *net, u8 proto, bool task_valid, bool sync)
++int xfrm_state_flush(struct net *net, u8 proto, bool task_valid)
+ {
+ 	int i, err = 0, cnt = 0;
+ 
+@@ -3275,7 +3270,7 @@ void xfrm_state_fini(struct net *net)
+ 	unsigned int sz;
+ 
+ 	flush_work(&net->xfrm.state_hash_work);
+-	xfrm_state_flush(net, 0, false, true);
++	xfrm_state_flush(net, IPSEC_PROTO_ANY, false);
+ 	flush_work(&xfrm_state_gc_work);
+ 
+ 	WARN_ON(!list_empty(&net->xfrm.state_all));
+--- a/net/xfrm/xfrm_user.c
++++ b/net/xfrm/xfrm_user.c
+@@ -2635,7 +2635,7 @@ static int xfrm_flush_sa(struct sk_buff
+ 	struct xfrm_usersa_flush *p = nlmsg_data(nlh);
+ 	int err;
+ 
+-	err = xfrm_state_flush(net, p->proto, true, false);
++	err = xfrm_state_flush(net, p->proto, true);
+ 	if (err) {
+ 		if (err == -ESRCH) /* empty table */
+ 			return 0;
