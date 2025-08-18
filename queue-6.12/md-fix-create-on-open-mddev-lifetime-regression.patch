@@ -1,0 +1,79 @@
+From 1df1fc845d221eb646539836dbf509eb96b41afd Mon Sep 17 00:00:00 2001
+From: Yu Kuai <yukuai3@huawei.com>
+Date: Wed, 30 Jul 2025 15:33:21 +0800
+Subject: md: fix create on open mddev lifetime regression
+
+From: Yu Kuai <yukuai3@huawei.com>
+
+commit 1df1fc845d221eb646539836dbf509eb96b41afd upstream.
+
+Commit 9e59d609763f ("md: call del_gendisk in control path") moves
+setting MD_DELETED from __mddev_put() to do_md_stop(), however, for the
+case create on open, mddev can be freed without do_md_stop():
+
+1) open
+
+md_probe
+ md_alloc_and_put
+  md_alloc
+   mddev_alloc
+   atomic_set(&mddev->active, 1);
+   mddev->hold_active = UNTIL_IOCTL
+  mddev_put
+   atomic_dec_and_test(&mddev->active)
+    if (mddev->hold_active)
+    -> active is 0, hold_active is set
+md_open
+ mddev_get
+  atomic_inc(&mddev->active);
+
+2) ioctl that is not STOP_ARRAY, for example, GET_ARRAY_INFO:
+
+md_ioctl
+ mddev->hold_active = 0
+
+3) close
+
+md_release
+ mddev_put(mddev);
+  atomic_dec_and_lock(&mddev->active, &all_mddevs_lock)
+  __mddev_put
+  -> hold_active is cleared, mddev will be freed
+  queue_work(md_misc_wq, &mddev->del_work)
+
+Now that MD_DELETED is not set, before mddev is freed by
+mddev_delayed_delete(), md_open can still succeed and break mddev
+lifetime, causing mddev->kobj refcount underflow or mddev uaf
+problem.
+
+Fix this problem by setting MD_DELETED before queuing del_work.
+
+Reported-by: syzbot+9921e319bd6168140b40@syzkaller.appspotmail.com
+Closes: https://lore.kernel.org/all/68894408.a00a0220.26d0e1.0012.GAE@google.com/
+Reported-by: syzbot+fa3a12519f0d3fd4ec16@syzkaller.appspotmail.com
+Closes: https://lore.kernel.org/all/68894408.a00a0220.26d0e1.0013.GAE@google.com/
+Fixes: 9e59d609763f ("md: call del_gendisk in control path")
+Link: https://lore.kernel.org/linux-raid/20250730073321.2583158-1-yukuai1@huaweicloud.com
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Reviewed-by: Paul Menzel <pmenzel@molgen.mpg.de>
+Reviewed-by: Xiao Ni <xni@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/md/md.c |    6 ++++++
+ 1 file changed, 6 insertions(+)
+
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -620,6 +620,12 @@ static void __mddev_put(struct mddev *md
+ 		return;
+ 
+ 	/*
++	 * If array is freed by stopping array, MD_DELETED is set by
++	 * do_md_stop(), MD_DELETED is still set here in case mddev is freed
++	 * directly by closing a mddev that is created by create_on_open.
++	 */
++	set_bit(MD_DELETED, &mddev->flags);
++	/*
+ 	 * Call queue_work inside the spinlock so that flush_workqueue() after
+ 	 * mddev_find will succeed in waiting for the work to be done.
+ 	 */
