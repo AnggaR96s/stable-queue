@@ -1,0 +1,196 @@
+From stable+bounces-165026-greg=kroah.com@vger.kernel.org Tue Jul 29 06:29:04 2025
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 29 Jul 2025 00:28:50 -0400
+Subject: dpaa2-mac: split up initializing the MAC object from connecting to it
+To: stable@vger.kernel.org
+Cc: Ioana Ciornei <ioana.ciornei@nxp.com>, Jakub Kicinski <kuba@kernel.org>, Sasha Levin <sashal@kernel.org>
+Message-ID: <20250729042853.2357022-1-sashal@kernel.org>
+
+From: Ioana Ciornei <ioana.ciornei@nxp.com>
+
+[ Upstream commit 095dca16d92f32150314ef47ea150ed83c5aacd9 ]
+
+Split up the initialization phase of the dpmac object from actually
+configuring the phylink instance, connecting to it and configuring the
+MAC. This is done so that even though the dpni object is connected to a
+dpmac which has link management handled by the firmware we are still
+able to export the MAC counters.
+
+Signed-off-by: Ioana Ciornei <ioana.ciornei@nxp.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Stable-dep-of: ee9f3a81ab08 ("dpaa2-eth: Fix device reference count leak in MAC endpoint handling")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/ethernet/freescale/dpaa2/dpaa2-eth.c |   14 ++++
+ drivers/net/ethernet/freescale/dpaa2/dpaa2-mac.c |   69 ++++++++++++++---------
+ drivers/net/ethernet/freescale/dpaa2/dpaa2-mac.h |    5 +
+ 3 files changed, 59 insertions(+), 29 deletions(-)
+
+--- a/drivers/net/ethernet/freescale/dpaa2/dpaa2-eth.c
++++ b/drivers/net/ethernet/freescale/dpaa2/dpaa2-eth.c
+@@ -4148,15 +4148,24 @@ static int dpaa2_eth_connect_mac(struct
+ 	mac->mc_io = priv->mc_io;
+ 	mac->net_dev = priv->net_dev;
+ 
++	err = dpaa2_mac_open(mac);
++	if (err)
++		goto err_free_mac;
++
+ 	err = dpaa2_mac_connect(mac);
+ 	if (err) {
+ 		netdev_err(priv->net_dev, "Error connecting to the MAC endpoint\n");
+-		kfree(mac);
+-		return err;
++		goto err_close_mac;
+ 	}
+ 	priv->mac = mac;
+ 
+ 	return 0;
++
++err_close_mac:
++	dpaa2_mac_close(mac);
++err_free_mac:
++	kfree(mac);
++	return err;
+ }
+ 
+ static void dpaa2_eth_disconnect_mac(struct dpaa2_eth_priv *priv)
+@@ -4165,6 +4174,7 @@ static void dpaa2_eth_disconnect_mac(str
+ 		return;
+ 
+ 	dpaa2_mac_disconnect(priv->mac);
++	dpaa2_mac_close(priv->mac);
+ 	kfree(priv->mac);
+ 	priv->mac = NULL;
+ }
+--- a/drivers/net/ethernet/freescale/dpaa2/dpaa2-mac.c
++++ b/drivers/net/ethernet/freescale/dpaa2/dpaa2-mac.c
+@@ -302,36 +302,20 @@ static void dpaa2_pcs_destroy(struct dpa
+ 
+ int dpaa2_mac_connect(struct dpaa2_mac *mac)
+ {
+-	struct fsl_mc_device *dpmac_dev = mac->mc_dev;
+ 	struct net_device *net_dev = mac->net_dev;
+ 	struct device_node *dpmac_node;
+ 	struct phylink *phylink;
+-	struct dpmac_attr attr;
+ 	int err;
+ 
+-	err = dpmac_open(mac->mc_io, 0, dpmac_dev->obj_desc.id,
+-			 &dpmac_dev->mc_handle);
+-	if (err || !dpmac_dev->mc_handle) {
+-		netdev_err(net_dev, "dpmac_open() = %d\n", err);
+-		return -ENODEV;
+-	}
+-
+-	err = dpmac_get_attributes(mac->mc_io, 0, dpmac_dev->mc_handle, &attr);
+-	if (err) {
+-		netdev_err(net_dev, "dpmac_get_attributes() = %d\n", err);
+-		goto err_close_dpmac;
+-	}
+-
+-	mac->if_link_type = attr.link_type;
++	mac->if_link_type = mac->attr.link_type;
+ 
+-	dpmac_node = dpaa2_mac_get_node(attr.id);
++	dpmac_node = dpaa2_mac_get_node(mac->attr.id);
+ 	if (!dpmac_node) {
+-		netdev_err(net_dev, "No dpmac@%d node found.\n", attr.id);
+-		err = -ENODEV;
+-		goto err_close_dpmac;
++		netdev_err(net_dev, "No dpmac@%d node found.\n", mac->attr.id);
++		return -ENODEV;
+ 	}
+ 
+-	err = dpaa2_mac_get_if_mode(dpmac_node, attr);
++	err = dpaa2_mac_get_if_mode(dpmac_node, mac->attr);
+ 	if (err < 0) {
+ 		err = -EINVAL;
+ 		goto err_put_node;
+@@ -351,9 +335,9 @@ int dpaa2_mac_connect(struct dpaa2_mac *
+ 		goto err_put_node;
+ 	}
+ 
+-	if (attr.link_type == DPMAC_LINK_TYPE_PHY &&
+-	    attr.eth_if != DPMAC_ETH_IF_RGMII) {
+-		err = dpaa2_pcs_create(mac, dpmac_node, attr.id);
++	if (mac->attr.link_type == DPMAC_LINK_TYPE_PHY &&
++	    mac->attr.eth_if != DPMAC_ETH_IF_RGMII) {
++		err = dpaa2_pcs_create(mac, dpmac_node, mac->attr.id);
+ 		if (err)
+ 			goto err_put_node;
+ 	}
+@@ -389,8 +373,7 @@ err_pcs_destroy:
+ 	dpaa2_pcs_destroy(mac);
+ err_put_node:
+ 	of_node_put(dpmac_node);
+-err_close_dpmac:
+-	dpmac_close(mac->mc_io, 0, dpmac_dev->mc_handle);
++
+ 	return err;
+ }
+ 
+@@ -402,8 +385,40 @@ void dpaa2_mac_disconnect(struct dpaa2_m
+ 	phylink_disconnect_phy(mac->phylink);
+ 	phylink_destroy(mac->phylink);
+ 	dpaa2_pcs_destroy(mac);
++}
++
++int dpaa2_mac_open(struct dpaa2_mac *mac)
++{
++	struct fsl_mc_device *dpmac_dev = mac->mc_dev;
++	struct net_device *net_dev = mac->net_dev;
++	int err;
+ 
+-	dpmac_close(mac->mc_io, 0, mac->mc_dev->mc_handle);
++	err = dpmac_open(mac->mc_io, 0, dpmac_dev->obj_desc.id,
++			 &dpmac_dev->mc_handle);
++	if (err || !dpmac_dev->mc_handle) {
++		netdev_err(net_dev, "dpmac_open() = %d\n", err);
++		return -ENODEV;
++	}
++
++	err = dpmac_get_attributes(mac->mc_io, 0, dpmac_dev->mc_handle,
++				   &mac->attr);
++	if (err) {
++		netdev_err(net_dev, "dpmac_get_attributes() = %d\n", err);
++		goto err_close_dpmac;
++	}
++
++	return 0;
++
++err_close_dpmac:
++	dpmac_close(mac->mc_io, 0, dpmac_dev->mc_handle);
++	return err;
++}
++
++void dpaa2_mac_close(struct dpaa2_mac *mac)
++{
++	struct fsl_mc_device *dpmac_dev = mac->mc_dev;
++
++	dpmac_close(mac->mc_io, 0, dpmac_dev->mc_handle);
+ }
+ 
+ static char dpaa2_mac_ethtool_stats[][ETH_GSTRING_LEN] = {
+--- a/drivers/net/ethernet/freescale/dpaa2/dpaa2-mac.h
++++ b/drivers/net/ethernet/freescale/dpaa2/dpaa2-mac.h
+@@ -17,6 +17,7 @@ struct dpaa2_mac {
+ 	struct dpmac_link_state state;
+ 	struct net_device *net_dev;
+ 	struct fsl_mc_io *mc_io;
++	struct dpmac_attr attr;
+ 
+ 	struct phylink_config phylink_config;
+ 	struct phylink *phylink;
+@@ -28,6 +29,10 @@ struct dpaa2_mac {
+ bool dpaa2_mac_is_type_fixed(struct fsl_mc_device *dpmac_dev,
+ 			     struct fsl_mc_io *mc_io);
+ 
++int dpaa2_mac_open(struct dpaa2_mac *mac);
++
++void dpaa2_mac_close(struct dpaa2_mac *mac);
++
+ int dpaa2_mac_connect(struct dpaa2_mac *mac);
+ 
+ void dpaa2_mac_disconnect(struct dpaa2_mac *mac);
