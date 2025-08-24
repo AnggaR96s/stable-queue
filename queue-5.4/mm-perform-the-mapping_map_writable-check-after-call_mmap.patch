@@ -1,0 +1,119 @@
+From stable+bounces-165155-greg=kroah.com@vger.kernel.org Wed Jul 30 02:59:23 2025
+From: "Isaac J. Manjarres" <isaacmanjarres@google.com>
+Date: Tue, 29 Jul 2025 17:58:08 -0700
+Subject: mm: perform the mapping_map_writable() check after call_mmap()
+To: lorenzo.stoakes@oracle.com, gregkh@linuxfoundation.org,  Muchun Song <muchun.song@linux.dev>, Oscar Salvador <osalvador@suse.de>,  David Hildenbrand <david@redhat.com>, Alexander Viro <viro@zeniv.linux.org.uk>,  Christian Brauner <brauner@kernel.org>, Jan Kara <jack@suse.cz>,  Andrew Morton <akpm@linux-foundation.org>, "Liam R. Howlett" <Liam.Howlett@oracle.com>,  Vlastimil Babka <vbabka@suse.cz>, Mike Rapoport <rppt@kernel.org>, Suren Baghdasaryan <surenb@google.com>,  Michal Hocko <mhocko@suse.com>, Kees Cook <kees@kernel.org>, Ingo Molnar <mingo@redhat.com>,  Peter Zijlstra <peterz@infradead.org>, Juri Lelli <juri.lelli@redhat.com>,  Vincent Guittot <vincent.guittot@linaro.org>, Dietmar Eggemann <dietmar.eggemann@arm.com>,  Steven Rostedt <rostedt@goodmis.org>, Ben Segall <bsegall@google.com>, Mel Gorman <mgorman@suse.de>,  Valentin Schneider <vschneid@redhat.com>, "Matthew Wilcox (Oracle)" <willy@infradead.org>, Jann Horn <jannh@google.com>,  Pedro Falcato <pfalcato@suse.de>, Hugh Dickins <hughd@google.com>,  Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: aliceryhl@google.com, stable@vger.kernel.org,  "Isaac J. Manjarres" <isaacmanjarres@google.com>, kernel-team@android.com, linux-mm@kvack.org,  linux-kernel@vger.kernel.org, linux-fsdevel@vger.kernel.org,  Lorenzo Stoakes <lstoakes@gmail.com>, Andy Lutomirski <luto@kernel.org>,  Mike Kravetz <mike.kravetz@oracle.com>
+Message-ID: <20250730005818.2793577-4-isaacmanjarres@google.com>
+
+From: Lorenzo Stoakes <lstoakes@gmail.com>
+
+[ Upstream commit 158978945f3173b8c1a88f8c5684a629736a57ac ]
+
+In order for a F_SEAL_WRITE sealed memfd mapping to have an opportunity to
+clear VM_MAYWRITE, we must be able to invoke the appropriate
+vm_ops->mmap() handler to do so.  We would otherwise fail the
+mapping_map_writable() check before we had the opportunity to avoid it.
+
+This patch moves this check after the call_mmap() invocation.  Only memfd
+actively denies write access causing a potential failure here (in
+memfd_add_seals()), so there should be no impact on non-memfd cases.
+
+This patch makes the userland-visible change that MAP_SHARED, PROT_READ
+mappings of an F_SEAL_WRITE sealed memfd mapping will now succeed.
+
+There is a delicate situation with cleanup paths assuming that a writable
+mapping must have occurred in circumstances where it may now not have.  In
+order to ensure we do not accidentally mark a writable file unwritable by
+mistake, we explicitly track whether we have a writable mapping and unmap
+only if we do.
+
+[lstoakes@gmail.com: do not set writable_file_mapping in inappropriate case]
+  Link: https://lkml.kernel.org/r/c9eb4cc6-7db4-4c2b-838d-43a0b319a4f0@lucifer.local
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=217238
+Link: https://lkml.kernel.org/r/55e413d20678a1bb4c7cce889062bbb07b0df892.1697116581.git.lstoakes@gmail.com
+Signed-off-by: Lorenzo Stoakes <lstoakes@gmail.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Cc: Alexander Viro <viro@zeniv.linux.org.uk>
+Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: Muchun Song <muchun.song@linux.dev>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Cc: stable@vger.kernel.org
+[isaacmanjarres: added error handling to cleanup the work done by the
+mmap() callback and removed unused label.]
+Signed-off-by: Isaac J. Manjarres <isaacmanjarres@google.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ mm/mmap.c |   22 ++++++++++++++--------
+ 1 file changed, 14 insertions(+), 8 deletions(-)
+
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -1718,6 +1718,7 @@ unsigned long mmap_region(struct file *f
+ {
+ 	struct mm_struct *mm = current->mm;
+ 	struct vm_area_struct *vma, *prev;
++	bool writable_file_mapping = false;
+ 	int error;
+ 	struct rb_node **rb_link, *rb_parent;
+ 	unsigned long charged = 0;
+@@ -1785,11 +1786,6 @@ unsigned long mmap_region(struct file *f
+ 			if (error)
+ 				goto free_vma;
+ 		}
+-		if (is_shared_maywrite(vm_flags)) {
+-			error = mapping_map_writable(file->f_mapping);
+-			if (error)
+-				goto allow_write_and_free_vma;
+-		}
+ 
+ 		/* ->mmap() can change vma->vm_file, but must guarantee that
+ 		 * vma_link() below can deny write-access if VM_DENYWRITE is set
+@@ -1801,6 +1797,14 @@ unsigned long mmap_region(struct file *f
+ 		if (error)
+ 			goto unmap_and_free_vma;
+ 
++		if (vma_is_shared_maywrite(vma)) {
++			error = mapping_map_writable(file->f_mapping);
++			if (error)
++				goto close_and_free_vma;
++
++			writable_file_mapping = true;
++		}
++
+ 		/* Can addr have changed??
+ 		 *
+ 		 * Answer: Yes, several device drivers can do it in their
+@@ -1823,7 +1827,7 @@ unsigned long mmap_region(struct file *f
+ 	vma_link(mm, vma, prev, rb_link, rb_parent);
+ 	/* Once vma denies write, undo our temporary denial count */
+ 	if (file) {
+-		if (is_shared_maywrite(vm_flags))
++		if (writable_file_mapping)
+ 			mapping_unmap_writable(file->f_mapping);
+ 		if (vm_flags & VM_DENYWRITE)
+ 			allow_write_access(file);
+@@ -1858,15 +1862,17 @@ out:
+ 
+ 	return addr;
+ 
++close_and_free_vma:
++	if (vma->vm_ops && vma->vm_ops->close)
++		vma->vm_ops->close(vma);
+ unmap_and_free_vma:
+ 	vma->vm_file = NULL;
+ 	fput(file);
+ 
+ 	/* Undo any partial mapping done by a device driver. */
+ 	unmap_region(mm, vma, prev, vma->vm_start, vma->vm_end);
+-	if (is_shared_maywrite(vm_flags))
++	if (writable_file_mapping)
+ 		mapping_unmap_writable(file->f_mapping);
+-allow_write_and_free_vma:
+ 	if (vm_flags & VM_DENYWRITE)
+ 		allow_write_access(file);
+ free_vma:
