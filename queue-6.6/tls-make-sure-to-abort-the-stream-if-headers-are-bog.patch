@@ -1,0 +1,112 @@
+From 8a15873cf4b7801800c710d6ccf57762291b4e39 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 16 Sep 2025 17:28:13 -0700
+Subject: tls: make sure to abort the stream if headers are bogus
+
+From: Jakub Kicinski <kuba@kernel.org>
+
+[ Upstream commit 0aeb54ac4cd5cf8f60131b4d9ec0b6dc9c27b20d ]
+
+Normally we wait for the socket to buffer up the whole record
+before we service it. If the socket has a tiny buffer, however,
+we read out the data sooner, to prevent connection stalls.
+Make sure that we abort the connection when we find out late
+that the record is actually invalid. Retrying the parsing is
+fine in itself but since we copy some more data each time
+before we parse we can overflow the allocated skb space.
+
+Constructing a scenario in which we're under pressure without
+enough data in the socket to parse the length upfront is quite
+hard. syzbot figured out a way to do this by serving us the header
+in small OOB sends, and then filling in the recvbuf with a large
+normal send.
+
+Make sure that tls_rx_msg_size() aborts strp, if we reach
+an invalid record there's really no way to recover.
+
+Reported-by: Lee Jones <lee@kernel.org>
+Fixes: 84c61fe1a75b ("tls: rx: do not use the standard strparser")
+Reviewed-by: Sabrina Dubroca <sd@queasysnail.net>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Link: https://patch.msgid.link/20250917002814.1743558-1-kuba@kernel.org
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ net/tls/tls.h      |  1 +
+ net/tls/tls_strp.c | 14 +++++++++-----
+ net/tls/tls_sw.c   |  3 +--
+ 3 files changed, 11 insertions(+), 7 deletions(-)
+
+diff --git a/net/tls/tls.h b/net/tls/tls.h
+index 5dc61c85c076e..a3c5c5a59fda6 100644
+--- a/net/tls/tls.h
++++ b/net/tls/tls.h
+@@ -141,6 +141,7 @@ void update_sk_prot(struct sock *sk, struct tls_context *ctx);
+ 
+ int wait_on_pending_writer(struct sock *sk, long *timeo);
+ void tls_err_abort(struct sock *sk, int err);
++void tls_strp_abort_strp(struct tls_strparser *strp, int err);
+ 
+ int tls_set_sw_offload(struct sock *sk, struct tls_context *ctx, int tx);
+ void tls_update_rx_zc_capable(struct tls_context *tls_ctx);
+diff --git a/net/tls/tls_strp.c b/net/tls/tls_strp.c
+index 6ce64a6e4495e..ae723cd6af397 100644
+--- a/net/tls/tls_strp.c
++++ b/net/tls/tls_strp.c
+@@ -12,7 +12,7 @@
+ 
+ static struct workqueue_struct *tls_strp_wq;
+ 
+-static void tls_strp_abort_strp(struct tls_strparser *strp, int err)
++void tls_strp_abort_strp(struct tls_strparser *strp, int err)
+ {
+ 	if (strp->stopped)
+ 		return;
+@@ -210,11 +210,17 @@ static int tls_strp_copyin_frag(struct tls_strparser *strp, struct sk_buff *skb,
+ 				struct sk_buff *in_skb, unsigned int offset,
+ 				size_t in_len)
+ {
++	unsigned int nfrag = skb->len / PAGE_SIZE;
+ 	size_t len, chunk;
+ 	skb_frag_t *frag;
+ 	int sz;
+ 
+-	frag = &skb_shinfo(skb)->frags[skb->len / PAGE_SIZE];
++	if (unlikely(nfrag >= skb_shinfo(skb)->nr_frags)) {
++		DEBUG_NET_WARN_ON_ONCE(1);
++		return -EMSGSIZE;
++	}
++
++	frag = &skb_shinfo(skb)->frags[nfrag];
+ 
+ 	len = in_len;
+ 	/* First make sure we got the header */
+@@ -519,10 +525,8 @@ static int tls_strp_read_sock(struct tls_strparser *strp)
+ 	tls_strp_load_anchor_with_queue(strp, inq);
+ 	if (!strp->stm.full_len) {
+ 		sz = tls_rx_msg_size(strp, strp->anchor);
+-		if (sz < 0) {
+-			tls_strp_abort_strp(strp, sz);
++		if (sz < 0)
+ 			return sz;
+-		}
+ 
+ 		strp->stm.full_len = sz;
+ 
+diff --git a/net/tls/tls_sw.c b/net/tls/tls_sw.c
+index 27ce1feb79e14..435235a351e2f 100644
+--- a/net/tls/tls_sw.c
++++ b/net/tls/tls_sw.c
+@@ -2441,8 +2441,7 @@ int tls_rx_msg_size(struct tls_strparser *strp, struct sk_buff *skb)
+ 	return data_len + TLS_HEADER_SIZE;
+ 
+ read_failure:
+-	tls_err_abort(strp->sk, ret);
+-
++	tls_strp_abort_strp(strp, ret);
+ 	return ret;
+ }
+ 
+-- 
+2.51.0
+
