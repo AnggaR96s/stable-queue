@@ -1,0 +1,95 @@
+From d22d8c2d939d3570a22e01bd1aacc8c551302521 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Thu, 18 Sep 2025 10:21:14 -0600
+Subject: io_uring: include dying ring in task_work "should cancel" state
+
+From: Jens Axboe <axboe@kernel.dk>
+
+Commit 3539b1467e94336d5854ebf976d9627bfb65d6c3 upstream.
+
+When running task_work for an exiting task, rather than perform the
+issue retry attempt, the task_work is canceled. However, this isn't
+done for a ring that has been closed. This can lead to requests being
+successfully completed post the ring being closed, which is somewhat
+confusing and surprising to an application.
+
+Rather than just check the task exit state, also include the ring
+ref state in deciding whether or not to terminate a given request when
+run from task_work.
+
+Cc: stable@vger.kernel.org # 6.1+
+Link: https://github.com/axboe/liburing/discussions/1459
+Reported-by: Benedek Thaler <thaler@thaler.hu>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ io_uring/io_uring.c |   12 ++++++++----
+ io_uring/io_uring.h |    4 ++--
+ io_uring/poll.c     |    2 +-
+ io_uring/timeout.c  |    2 +-
+ 4 files changed, 12 insertions(+), 8 deletions(-)
+
+--- a/io_uring/io_uring.c
++++ b/io_uring/io_uring.c
+@@ -1248,8 +1248,10 @@ static void io_req_task_cancel(struct io
+ 
+ void io_req_task_submit(struct io_kiocb *req, bool *locked)
+ {
+-	io_tw_lock(req->ctx, locked);
+-	if (likely(!io_should_terminate_tw()))
++	struct io_ring_ctx *ctx = req->ctx;
++
++	io_tw_lock(ctx, locked);
++	if (likely(!io_should_terminate_tw(ctx)))
+ 		io_queue_sqe(req);
+ 	else
+ 		io_req_complete_failed(req, -EFAULT);
+@@ -1771,8 +1773,10 @@ static int io_issue_sqe(struct io_kiocb
+ 
+ int io_poll_issue(struct io_kiocb *req, bool *locked)
+ {
+-	io_tw_lock(req->ctx, locked);
+-	if (unlikely(io_should_terminate_tw()))
++	struct io_ring_ctx *ctx = req->ctx;
++
++	io_tw_lock(ctx, locked);
++	if (unlikely(io_should_terminate_tw(ctx)))
+ 		return -EFAULT;
+ 	return io_issue_sqe(req, IO_URING_F_NONBLOCK|IO_URING_F_MULTISHOT);
+ }
+--- a/io_uring/io_uring.h
++++ b/io_uring/io_uring.h
+@@ -403,9 +403,9 @@ static inline bool io_allowed_run_tw(str
+  * 2) PF_KTHREAD is set, in which case the invoker of the task_work is
+  *    our fallback task_work.
+  */
+-static inline bool io_should_terminate_tw(void)
++static inline bool io_should_terminate_tw(struct io_ring_ctx *ctx)
+ {
+-	return current->flags & (PF_KTHREAD | PF_EXITING);
++	return (current->flags & (PF_KTHREAD | PF_EXITING)) || percpu_ref_is_dying(&ctx->refs);
+ }
+ 
+ static inline void io_req_queue_tw_complete(struct io_kiocb *req, s32 res)
+--- a/io_uring/poll.c
++++ b/io_uring/poll.c
+@@ -241,7 +241,7 @@ static int io_poll_check_events(struct i
+ 	struct io_ring_ctx *ctx = req->ctx;
+ 	int v;
+ 
+-	if (unlikely(io_should_terminate_tw()))
++	if (unlikely(io_should_terminate_tw(ctx)))
+ 		return -ECANCELED;
+ 
+ 	do {
+--- a/io_uring/timeout.c
++++ b/io_uring/timeout.c
+@@ -275,7 +275,7 @@ static void io_req_task_link_timeout(str
+ 	int ret = -ENOENT;
+ 
+ 	if (prev) {
+-		if (!io_should_terminate_tw()) {
++		if (!io_should_terminate_tw(req->ctx)) {
+ 			struct io_cancel_data cd = {
+ 				.ctx		= req->ctx,
+ 				.data		= prev->cqe.user_data,
