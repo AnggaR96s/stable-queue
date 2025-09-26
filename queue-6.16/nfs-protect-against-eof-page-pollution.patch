@@ -1,0 +1,194 @@
+From 12b75dc708dd32d03baa5c0aab7dc1be27703b4a Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 4 Sep 2025 18:46:16 -0400
+Subject: NFS: Protect against 'eof page pollution'
+
+From: Trond Myklebust <trond.myklebust@hammerspace.com>
+
+[ Upstream commit b1817b18ff20e69f5accdccefaf78bf5454bede2 ]
+
+This commit fixes the failing xfstest 'generic/363'.
+
+When the user mmaps() an area that extends beyond the end of file, and
+proceeds to write data into the folio that straddles that eof, we're
+required to discard that folio data if the user calls some function that
+extends the file length.
+
+Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/nfs/file.c      | 33 +++++++++++++++++++++++++++++++++
+ fs/nfs/inode.c     |  9 +++++++--
+ fs/nfs/internal.h  |  2 ++
+ fs/nfs/nfs42proc.c | 14 +++++++++++---
+ fs/nfs/nfstrace.h  |  1 +
+ 5 files changed, 54 insertions(+), 5 deletions(-)
+
+diff --git a/fs/nfs/file.c b/fs/nfs/file.c
+index a16a619fb8c33..8cc39a73faff8 100644
+--- a/fs/nfs/file.c
++++ b/fs/nfs/file.c
+@@ -28,6 +28,7 @@
+ #include <linux/mm.h>
+ #include <linux/pagemap.h>
+ #include <linux/gfp.h>
++#include <linux/rmap.h>
+ #include <linux/swap.h>
+ #include <linux/compaction.h>
+ 
+@@ -279,6 +280,37 @@ nfs_file_fsync(struct file *file, loff_t start, loff_t end, int datasync)
+ }
+ EXPORT_SYMBOL_GPL(nfs_file_fsync);
+ 
++void nfs_truncate_last_folio(struct address_space *mapping, loff_t from,
++			     loff_t to)
++{
++	struct folio *folio;
++
++	if (from >= to)
++		return;
++
++	folio = filemap_lock_folio(mapping, from >> PAGE_SHIFT);
++	if (IS_ERR(folio))
++		return;
++
++	if (folio_mkclean(folio))
++		folio_mark_dirty(folio);
++
++	if (folio_test_uptodate(folio)) {
++		loff_t fpos = folio_pos(folio);
++		size_t offset = from - fpos;
++		size_t end = folio_size(folio);
++
++		if (to - fpos < end)
++			end = to - fpos;
++		folio_zero_segment(folio, offset, end);
++		trace_nfs_size_truncate_folio(mapping->host, to);
++	}
++
++	folio_unlock(folio);
++	folio_put(folio);
++}
++EXPORT_SYMBOL_GPL(nfs_truncate_last_folio);
++
+ /*
+  * Decide whether a read/modify/write cycle may be more efficient
+  * then a modify/write/read cycle when writing to a page in the
+@@ -353,6 +385,7 @@ static int nfs_write_begin(struct file *file, struct address_space *mapping,
+ 
+ 	dfprintk(PAGECACHE, "NFS: write_begin(%pD2(%lu), %u@%lld)\n",
+ 		file, mapping->host->i_ino, len, (long long) pos);
++	nfs_truncate_last_folio(mapping, i_size_read(mapping->host), pos);
+ 
+ 	fgp |= fgf_set_order(len);
+ start:
+diff --git a/fs/nfs/inode.c b/fs/nfs/inode.c
+index a32cc45425e28..f6b448666d419 100644
+--- a/fs/nfs/inode.c
++++ b/fs/nfs/inode.c
+@@ -710,6 +710,7 @@ nfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+ {
+ 	struct inode *inode = d_inode(dentry);
+ 	struct nfs_fattr *fattr;
++	loff_t oldsize = i_size_read(inode);
+ 	int error = 0;
+ 
+ 	nfs_inc_stats(inode, NFSIOS_VFSSETATTR);
+@@ -725,7 +726,7 @@ nfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+ 		if (error)
+ 			return error;
+ 
+-		if (attr->ia_size == i_size_read(inode))
++		if (attr->ia_size == oldsize)
+ 			attr->ia_valid &= ~ATTR_SIZE;
+ 	}
+ 
+@@ -773,8 +774,12 @@ nfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+ 	}
+ 
+ 	error = NFS_PROTO(inode)->setattr(dentry, fattr, attr);
+-	if (error == 0)
++	if (error == 0) {
++		if (attr->ia_valid & ATTR_SIZE)
++			nfs_truncate_last_folio(inode->i_mapping, oldsize,
++						attr->ia_size);
+ 		error = nfs_refresh_inode(inode, fattr);
++	}
+ 	nfs_free_fattr(fattr);
+ out:
+ 	trace_nfs_setattr_exit(inode, error);
+diff --git a/fs/nfs/internal.h b/fs/nfs/internal.h
+index 0ef0fc6aba3b3..ae4d039c10d3a 100644
+--- a/fs/nfs/internal.h
++++ b/fs/nfs/internal.h
+@@ -438,6 +438,8 @@ int nfs_file_release(struct inode *, struct file *);
+ int nfs_lock(struct file *, int, struct file_lock *);
+ int nfs_flock(struct file *, int, struct file_lock *);
+ int nfs_check_flags(int);
++void nfs_truncate_last_folio(struct address_space *mapping, loff_t from,
++			     loff_t to);
+ 
+ /* inode.c */
+ extern struct workqueue_struct *nfsiod_workqueue;
+diff --git a/fs/nfs/nfs42proc.c b/fs/nfs/nfs42proc.c
+index 48ee3d5d89c4a..4b0e35a0d89dd 100644
+--- a/fs/nfs/nfs42proc.c
++++ b/fs/nfs/nfs42proc.c
+@@ -138,6 +138,7 @@ int nfs42_proc_allocate(struct file *filep, loff_t offset, loff_t len)
+ 		.rpc_proc = &nfs4_procedures[NFSPROC4_CLNT_ALLOCATE],
+ 	};
+ 	struct inode *inode = file_inode(filep);
++	loff_t oldsize = i_size_read(inode);
+ 	int err;
+ 
+ 	if (!nfs_server_capable(inode, NFS_CAP_ALLOCATE))
+@@ -146,7 +147,11 @@ int nfs42_proc_allocate(struct file *filep, loff_t offset, loff_t len)
+ 	inode_lock(inode);
+ 
+ 	err = nfs42_proc_fallocate(&msg, filep, offset, len);
+-	if (err == -EOPNOTSUPP)
++
++	if (err == 0)
++		nfs_truncate_last_folio(inode->i_mapping, oldsize,
++					offset + len);
++	else if (err == -EOPNOTSUPP)
+ 		NFS_SERVER(inode)->caps &= ~(NFS_CAP_ALLOCATE |
+ 					     NFS_CAP_ZERO_RANGE);
+ 
+@@ -184,6 +189,7 @@ int nfs42_proc_zero_range(struct file *filep, loff_t offset, loff_t len)
+ 		.rpc_proc = &nfs4_procedures[NFSPROC4_CLNT_ZERO_RANGE],
+ 	};
+ 	struct inode *inode = file_inode(filep);
++	loff_t oldsize = i_size_read(inode);
+ 	int err;
+ 
+ 	if (!nfs_server_capable(inode, NFS_CAP_ZERO_RANGE))
+@@ -192,9 +198,11 @@ int nfs42_proc_zero_range(struct file *filep, loff_t offset, loff_t len)
+ 	inode_lock(inode);
+ 
+ 	err = nfs42_proc_fallocate(&msg, filep, offset, len);
+-	if (err == 0)
++	if (err == 0) {
++		nfs_truncate_last_folio(inode->i_mapping, oldsize,
++					offset + len);
+ 		truncate_pagecache_range(inode, offset, (offset + len) -1);
+-	if (err == -EOPNOTSUPP)
++	} else if (err == -EOPNOTSUPP)
+ 		NFS_SERVER(inode)->caps &= ~NFS_CAP_ZERO_RANGE;
+ 
+ 	inode_unlock(inode);
+diff --git a/fs/nfs/nfstrace.h b/fs/nfs/nfstrace.h
+index 7a058bd8c566e..1e4dc632f1800 100644
+--- a/fs/nfs/nfstrace.h
++++ b/fs/nfs/nfstrace.h
+@@ -267,6 +267,7 @@ DECLARE_EVENT_CLASS(nfs_update_size_class,
+ 			TP_ARGS(inode, new_size))
+ 
+ DEFINE_NFS_UPDATE_SIZE_EVENT(truncate);
++DEFINE_NFS_UPDATE_SIZE_EVENT(truncate_folio);
+ DEFINE_NFS_UPDATE_SIZE_EVENT(wcc);
+ DEFINE_NFS_UPDATE_SIZE_EVENT(update);
+ DEFINE_NFS_UPDATE_SIZE_EVENT(grow);
+-- 
+2.51.0
+
