@@ -1,0 +1,92 @@
+From 4174152771bf0d014d58f7d7e148bb0c8830fe53 Mon Sep 17 00:00:00 2001
+From: "Michael S. Tsirkin" <mst@redhat.com>
+Date: Wed, 17 Sep 2025 14:30:44 +0800
+Subject: Revert "vhost/net: Defer TX queue re-enable until after sendmsg"
+
+From: Michael S. Tsirkin <mst@redhat.com>
+
+commit 4174152771bf0d014d58f7d7e148bb0c8830fe53 upstream.
+
+This reverts commit 8c2e6b26ffe243be1e78f5a4bfb1a857d6e6f6d6. It tries
+to defer the notification enabling by moving the logic out of the loop
+after the vhost_tx_batch() when nothing new is spotted. This will
+bring side effects as the new logic would be reused for several other
+error conditions.
+
+One example is the IOTLB: when there's an IOTLB miss, get_tx_bufs()
+might return -EAGAIN and exit the loop and see there's still available
+buffers, so it will queue the tx work again until userspace feed the
+IOTLB entry correctly. This will slowdown the tx processing and
+trigger the TX watchdog in the guest as reported in
+https://lkml.org/lkml/2025/9/10/1596.
+
+To fix, revert the change. A follow up patch will bring the performance
+back in a safe way.
+
+Reported-by: Jon Kohler <jon@nutanix.com>
+Cc: stable@vger.kernel.org
+Fixes: 8c2e6b26ffe2 ("vhost/net: Defer TX queue re-enable until after sendmsg")
+Signed-off-by: Jason Wang <jasowang@redhat.com>
+Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+Message-Id: <20250917063045.2042-2-jasowang@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/vhost/net.c |   30 +++++++++---------------------
+ 1 file changed, 9 insertions(+), 21 deletions(-)
+
+--- a/drivers/vhost/net.c
++++ b/drivers/vhost/net.c
+@@ -760,10 +760,10 @@ static void handle_tx_copy(struct vhost_
+ 	int err;
+ 	int sent_pkts = 0;
+ 	bool sock_can_batch = (sock->sk->sk_sndbuf == INT_MAX);
+-	bool busyloop_intr;
+ 
+ 	do {
+-		busyloop_intr = false;
++		bool busyloop_intr = false;
++
+ 		if (nvq->done_idx == VHOST_NET_BATCH)
+ 			vhost_tx_batch(net, nvq, sock, &msg);
+ 
+@@ -774,10 +774,13 @@ static void handle_tx_copy(struct vhost_
+ 			break;
+ 		/* Nothing new?  Wait for eventfd to tell us they refilled. */
+ 		if (head == vq->num) {
+-			/* Kicks are disabled at this point, break loop and
+-			 * process any remaining batched packets. Queue will
+-			 * be re-enabled afterwards.
+-			 */
++			if (unlikely(busyloop_intr)) {
++				vhost_poll_queue(&vq->poll);
++			} else if (unlikely(vhost_enable_notify(&net->dev,
++								vq))) {
++				vhost_disable_notify(&net->dev, vq);
++				continue;
++			}
+ 			break;
+ 		}
+ 
+@@ -827,22 +830,7 @@ done:
+ 		++nvq->done_idx;
+ 	} while (likely(!vhost_exceeds_weight(vq, ++sent_pkts, total_len)));
+ 
+-	/* Kicks are still disabled, dispatch any remaining batched msgs. */
+ 	vhost_tx_batch(net, nvq, sock, &msg);
+-
+-	if (unlikely(busyloop_intr))
+-		/* If interrupted while doing busy polling, requeue the
+-		 * handler to be fair handle_rx as well as other tasks
+-		 * waiting on cpu.
+-		 */
+-		vhost_poll_queue(&vq->poll);
+-	else
+-		/* All of our work has been completed; however, before
+-		 * leaving the TX handler, do one last check for work,
+-		 * and requeue handler if necessary. If there is no work,
+-		 * queue will be reenabled.
+-		 */
+-		vhost_net_busy_poll_try_queue(net, vq);
+ }
+ 
+ static void handle_tx_zerocopy(struct vhost_net *net, struct socket *sock)
