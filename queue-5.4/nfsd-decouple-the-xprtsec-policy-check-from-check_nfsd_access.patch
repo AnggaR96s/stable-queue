@@ -1,0 +1,186 @@
+From smayhew@redhat.com  Tue Oct 21 20:11:20 2025
+From: Scott Mayhew <smayhew@redhat.com>
+Date: Mon, 20 Oct 2025 16:50:04 -0400
+Subject: nfsd: decouple the xprtsec policy check from check_nfsd_access()
+To: stable@vger.kernel.org
+Cc: chuck.lever@oracle.com
+Message-ID: <20251020205004.1034718-1-smayhew@redhat.com>
+
+From: Scott Mayhew <smayhew@redhat.com>
+
+[ Upstream commit e4f574ca9c6dfa66695bb054ff5df43ecea873ec ]
+
+This is a backport of e4f574ca9c6d specifically for the 6.6-stable
+kernel.  It differs from the upstream version mainly in that it's
+working around the absence of some 6.12-era commits:
+- 1459ad57673b nfsd: Move error code mapping to per-version proc code.
+- 0a183f24a7ae NFSD: Handle @rqstp == NULL in check_nfsd_access()
+- 5e66d2d92a1c nfsd: factor out __fh_verify to allow NULL rqstp to be
+  passed
+
+A while back I had reported that an NFSv3 client could successfully
+mount using '-o xprtsec=none' an export that had been exported with
+'xprtsec=tls:mtls'.  By "successfully" I mean that the mount command
+would succeed and the mount would show up in /proc/mount.  Attempting
+to do anything futher with the mount would be met with NFS3ERR_ACCES.
+
+Transport Layer Security isn't an RPC security flavor or pseudo-flavor,
+so we shouldn't be conflating them when determining whether the access
+checks can be bypassed.  Split check_nfsd_access() into two helpers, and
+have fh_verify() call the helpers directly since fh_verify() has
+logic that allows one or both of the checks to be skipped.  All other
+sites will continue to call check_nfsd_access().
+
+Link: https://lore.kernel.org/linux-nfs/ZjO3Qwf_G87yNXb2@aion/
+Fixes: 9280c5774314 ("NFSD: Handle new xprtsec= export option")
+Signed-off-by: Scott Mayhew <smayhew@redhat.com>
+Acked-by: Chuck Lever <chuck.lever@oracle.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/nfsd/export.c | 60 +++++++++++++++++++++++++++++++++++++++++-------
+ fs/nfsd/export.h |  2 ++
+ fs/nfsd/nfsfh.c  | 12 +++++++++-
+ 3 files changed, 65 insertions(+), 9 deletions(-)
+
+diff --git a/fs/nfsd/export.c b/fs/nfsd/export.c
+index 4b5d998cbc2f..f4e77859aa85 100644
+--- a/fs/nfsd/export.c
++++ b/fs/nfsd/export.c
+@@ -1071,28 +1071,62 @@ static struct svc_export *exp_find(struct cache_detail *cd,
+ 	return exp;
+ }
+ 
+-__be32 check_nfsd_access(struct svc_export *exp, struct svc_rqst *rqstp)
++/**
++ * check_xprtsec_policy - check if access to export is allowed by the
++ * 			  xprtsec policy
++ * @exp: svc_export that is being accessed.
++ * @rqstp: svc_rqst attempting to access @exp.
++ *
++ * Helper function for check_nfsd_access().  Note that callers should be
++ * using check_nfsd_access() instead of calling this function directly.  The
++ * one exception is fh_verify() since it has logic that may result in one
++ * or both of the helpers being skipped.
++ *
++ * Return values:
++ *   %nfs_ok if access is granted, or
++ *   %nfserr_acces or %nfserr_wrongsec if access is denied
++ */
++__be32 check_xprtsec_policy(struct svc_export *exp, struct svc_rqst *rqstp)
+ {
+-	struct exp_flavor_info *f, *end = exp->ex_flavors + exp->ex_nflavors;
+ 	struct svc_xprt *xprt = rqstp->rq_xprt;
+ 
+ 	if (exp->ex_xprtsec_modes & NFSEXP_XPRTSEC_NONE) {
+ 		if (!test_bit(XPT_TLS_SESSION, &xprt->xpt_flags))
+-			goto ok;
++			return nfs_ok;
+ 	}
+ 	if (exp->ex_xprtsec_modes & NFSEXP_XPRTSEC_TLS) {
+ 		if (test_bit(XPT_TLS_SESSION, &xprt->xpt_flags) &&
+ 		    !test_bit(XPT_PEER_AUTH, &xprt->xpt_flags))
+-			goto ok;
++			return nfs_ok;
+ 	}
+ 	if (exp->ex_xprtsec_modes & NFSEXP_XPRTSEC_MTLS) {
+ 		if (test_bit(XPT_TLS_SESSION, &xprt->xpt_flags) &&
+ 		    test_bit(XPT_PEER_AUTH, &xprt->xpt_flags))
+-			goto ok;
++			return nfs_ok;
+ 	}
+-	goto denied;
+ 
+-ok:
++	return rqstp->rq_vers < 4 ? nfserr_acces : nfserr_wrongsec;
++}
++
++/**
++ * check_security_flavor - check if access to export is allowed by the
++ * 			  xprtsec policy
++ * @exp: svc_export that is being accessed.
++ * @rqstp: svc_rqst attempting to access @exp.
++ *
++ * Helper function for check_nfsd_access().  Note that callers should be
++ * using check_nfsd_access() instead of calling this function directly.  The
++ * one exception is fh_verify() since it has logic that may result in one
++ * or both of the helpers being skipped.
++ *
++ * Return values:
++ *   %nfs_ok if access is granted, or
++ *   %nfserr_acces or %nfserr_wrongsec if access is denied
++ */
++__be32 check_security_flavor(struct svc_export *exp, struct svc_rqst *rqstp)
++{
++	struct exp_flavor_info *f, *end = exp->ex_flavors + exp->ex_nflavors;
++
+ 	/* legacy gss-only clients are always OK: */
+ 	if (exp->ex_client == rqstp->rq_gssclient)
+ 		return 0;
+@@ -1117,10 +1151,20 @@ __be32 check_nfsd_access(struct svc_export *exp, struct svc_rqst *rqstp)
+ 	if (nfsd4_spo_must_allow(rqstp))
+ 		return 0;
+ 
+-denied:
+ 	return rqstp->rq_vers < 4 ? nfserr_acces : nfserr_wrongsec;
+ }
+ 
++__be32 check_nfsd_access(struct svc_export *exp, struct svc_rqst *rqstp)
++{
++	__be32 status;
++
++	status = check_xprtsec_policy(exp, rqstp);
++	if (status != nfs_ok)
++		return status;
++
++	return check_security_flavor(exp, rqstp);
++}
++
+ /*
+  * Uses rq_client and rq_gssclient to find an export; uses rq_client (an
+  * auth_unix client) if it's available and has secinfo information;
+diff --git a/fs/nfsd/export.h b/fs/nfsd/export.h
+index ca9dc230ae3d..4a48b2ad5606 100644
+--- a/fs/nfsd/export.h
++++ b/fs/nfsd/export.h
+@@ -100,6 +100,8 @@ struct svc_expkey {
+ #define EX_WGATHER(exp)		((exp)->ex_flags & NFSEXP_GATHERED_WRITES)
+ 
+ int nfsexp_flags(struct svc_rqst *rqstp, struct svc_export *exp);
++__be32 check_xprtsec_policy(struct svc_export *exp, struct svc_rqst *rqstp);
++__be32 check_security_flavor(struct svc_export *exp, struct svc_rqst *rqstp);
+ __be32 check_nfsd_access(struct svc_export *exp, struct svc_rqst *rqstp);
+ 
+ /*
+diff --git a/fs/nfsd/nfsfh.c b/fs/nfsd/nfsfh.c
+index c2495d98c189..283c1a60c846 100644
+--- a/fs/nfsd/nfsfh.c
++++ b/fs/nfsd/nfsfh.c
+@@ -370,6 +370,16 @@ fh_verify(struct svc_rqst *rqstp, struct svc_fh *fhp, umode_t type, int access)
+ 	if (error)
+ 		goto out;
+ 
++	/*
++	 * NLM is allowed to bypass the xprtsec policy check because lockd
++	 * doesn't support xprtsec.
++	 */
++	if (!(access & NFSD_MAY_LOCK)) {
++		error = check_xprtsec_policy(exp, rqstp);
++		if (error)
++			goto out;
++	}
++
+ 	/*
+ 	 * pseudoflavor restrictions are not enforced on NLM,
+ 	 * which clients virtually always use auth_sys for,
+@@ -386,7 +396,7 @@ fh_verify(struct svc_rqst *rqstp, struct svc_fh *fhp, umode_t type, int access)
+ 			&& exp->ex_path.dentry == dentry)
+ 		goto skip_pseudoflavor_check;
+ 
+-	error = check_nfsd_access(exp, rqstp);
++	error = check_security_flavor(exp, rqstp);
+ 	if (error)
+ 		goto out;
+ 
+-- 
+2.47.3
+
