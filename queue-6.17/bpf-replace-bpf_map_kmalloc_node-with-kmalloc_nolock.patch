@@ -1,0 +1,190 @@
+From 6bdff593fefe5d2206a689b580132e55189a3f47 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 14 Oct 2025 17:07:00 -0700
+Subject: bpf: Replace bpf_map_kmalloc_node() with kmalloc_nolock() to allocate
+ bpf_async_cb structures.
+
+From: Alexei Starovoitov <ast@kernel.org>
+
+[ Upstream commit 5fb750e8a9ae123b2034771b864b8a21dbef65cd ]
+
+The following kmemleak splat:
+
+[    8.105530] kmemleak: Trying to color unknown object at 0xff11000100e918c0 as Black
+[    8.106521] Call Trace:
+[    8.106521]  <TASK>
+[    8.106521]  dump_stack_lvl+0x4b/0x70
+[    8.106521]  kvfree_call_rcu+0xcb/0x3b0
+[    8.106521]  ? hrtimer_cancel+0x21/0x40
+[    8.106521]  bpf_obj_free_fields+0x193/0x200
+[    8.106521]  htab_map_update_elem+0x29c/0x410
+[    8.106521]  bpf_prog_cfc8cd0f42c04044_overwrite_cb+0x47/0x4b
+[    8.106521]  bpf_prog_8c30cd7c4db2e963_overwrite_timer+0x65/0x86
+[    8.106521]  bpf_prog_test_run_syscall+0xe1/0x2a0
+
+happens due to the combination of features and fixes, but mainly due to
+commit 6d78b4473cdb ("bpf: Tell memcg to use allow_spinning=false path in bpf_timer_init()")
+It's using __GFP_HIGH, which instructs slub/kmemleak internals to skip
+kmemleak_alloc_recursive() on allocation, so subsequent kfree_rcu()->
+kvfree_call_rcu()->kmemleak_ignore() complains with the above splat.
+
+To fix this imbalance, replace bpf_map_kmalloc_node() with
+kmalloc_nolock() and kfree_rcu() with call_rcu() + kfree_nolock() to
+make sure that the objects allocated with kmalloc_nolock() are freed
+with kfree_nolock() rather than the implicit kfree() that kfree_rcu()
+uses internally.
+
+Note, the kmalloc_nolock() happens under bpf_spin_lock_irqsave(), so
+it will always fail in PREEMPT_RT. This is not an issue at the moment,
+since bpf_timers are disabled in PREEMPT_RT. In the future
+bpf_spin_lock will be replaced with state machine similar to
+bpf_task_work.
+
+Fixes: 6d78b4473cdb ("bpf: Tell memcg to use allow_spinning=false path in bpf_timer_init()")
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Reviewed-by: Shakeel Butt <shakeel.butt@linux.dev>
+Acked-by: Harry Yoo <harry.yoo@oracle.com>
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
+Cc: linux-mm@kvack.org
+Link: https://lore.kernel.org/bpf/20251015000700.28988-1-alexei.starovoitov@gmail.com
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/linux/bpf.h  |  4 ++++
+ kernel/bpf/helpers.c | 25 ++++++++++++++-----------
+ kernel/bpf/syscall.c | 15 +++++++++++++++
+ 3 files changed, 33 insertions(+), 11 deletions(-)
+
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index 84826dc0a3268..6d6fbb057d431 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -2473,6 +2473,8 @@ int bpf_map_alloc_pages(const struct bpf_map *map, int nid,
+ #ifdef CONFIG_MEMCG
+ void *bpf_map_kmalloc_node(const struct bpf_map *map, size_t size, gfp_t flags,
+ 			   int node);
++void *bpf_map_kmalloc_nolock(const struct bpf_map *map, size_t size, gfp_t flags,
++			     int node);
+ void *bpf_map_kzalloc(const struct bpf_map *map, size_t size, gfp_t flags);
+ void *bpf_map_kvcalloc(struct bpf_map *map, size_t n, size_t size,
+ 		       gfp_t flags);
+@@ -2485,6 +2487,8 @@ void __percpu *bpf_map_alloc_percpu(const struct bpf_map *map, size_t size,
+  */
+ #define bpf_map_kmalloc_node(_map, _size, _flags, _node)	\
+ 		kmalloc_node(_size, _flags, _node)
++#define bpf_map_kmalloc_nolock(_map, _size, _flags, _node)	\
++		kmalloc_nolock(_size, _flags, _node)
+ #define bpf_map_kzalloc(_map, _size, _flags)			\
+ 		kzalloc(_size, _flags)
+ #define bpf_map_kvcalloc(_map, _n, _size, _flags)		\
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index 9c750a6a895bf..57129fd8ec544 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -1216,13 +1216,20 @@ static void bpf_wq_work(struct work_struct *work)
+ 	rcu_read_unlock_trace();
+ }
+ 
++static void bpf_async_cb_rcu_free(struct rcu_head *rcu)
++{
++	struct bpf_async_cb *cb = container_of(rcu, struct bpf_async_cb, rcu);
++
++	kfree_nolock(cb);
++}
++
+ static void bpf_wq_delete_work(struct work_struct *work)
+ {
+ 	struct bpf_work *w = container_of(work, struct bpf_work, delete_work);
+ 
+ 	cancel_work_sync(&w->work);
+ 
+-	kfree_rcu(w, cb.rcu);
++	call_rcu(&w->cb.rcu, bpf_async_cb_rcu_free);
+ }
+ 
+ static void bpf_timer_delete_work(struct work_struct *work)
+@@ -1231,13 +1238,13 @@ static void bpf_timer_delete_work(struct work_struct *work)
+ 
+ 	/* Cancel the timer and wait for callback to complete if it was running.
+ 	 * If hrtimer_cancel() can be safely called it's safe to call
+-	 * kfree_rcu(t) right after for both preallocated and non-preallocated
++	 * call_rcu() right after for both preallocated and non-preallocated
+ 	 * maps.  The async->cb = NULL was already done and no code path can see
+ 	 * address 't' anymore. Timer if armed for existing bpf_hrtimer before
+ 	 * bpf_timer_cancel_and_free will have been cancelled.
+ 	 */
+ 	hrtimer_cancel(&t->timer);
+-	kfree_rcu(t, cb.rcu);
++	call_rcu(&t->cb.rcu, bpf_async_cb_rcu_free);
+ }
+ 
+ static int __bpf_async_init(struct bpf_async_kern *async, struct bpf_map *map, u64 flags,
+@@ -1271,11 +1278,7 @@ static int __bpf_async_init(struct bpf_async_kern *async, struct bpf_map *map, u
+ 		goto out;
+ 	}
+ 
+-	/* Allocate via bpf_map_kmalloc_node() for memcg accounting. Until
+-	 * kmalloc_nolock() is available, avoid locking issues by using
+-	 * __GFP_HIGH (GFP_ATOMIC & ~__GFP_RECLAIM).
+-	 */
+-	cb = bpf_map_kmalloc_node(map, size, __GFP_HIGH, map->numa_node);
++	cb = bpf_map_kmalloc_nolock(map, size, 0, map->numa_node);
+ 	if (!cb) {
+ 		ret = -ENOMEM;
+ 		goto out;
+@@ -1316,7 +1319,7 @@ static int __bpf_async_init(struct bpf_async_kern *async, struct bpf_map *map, u
+ 		 * or pinned in bpffs.
+ 		 */
+ 		WRITE_ONCE(async->cb, NULL);
+-		kfree(cb);
++		kfree_nolock(cb);
+ 		ret = -EPERM;
+ 	}
+ out:
+@@ -1581,7 +1584,7 @@ void bpf_timer_cancel_and_free(void *val)
+ 	 * timer _before_ calling us, such that failing to cancel it here will
+ 	 * cause it to possibly use struct hrtimer after freeing bpf_hrtimer.
+ 	 * Therefore, we _need_ to cancel any outstanding timers before we do
+-	 * kfree_rcu, even though no more timers can be armed.
++	 * call_rcu, even though no more timers can be armed.
+ 	 *
+ 	 * Moreover, we need to schedule work even if timer does not belong to
+ 	 * the calling callback_fn, as on two different CPUs, we can end up in a
+@@ -1608,7 +1611,7 @@ void bpf_timer_cancel_and_free(void *val)
+ 		 * completion.
+ 		 */
+ 		if (hrtimer_try_to_cancel(&t->timer) >= 0)
+-			kfree_rcu(t, cb.rcu);
++			call_rcu(&t->cb.rcu, bpf_async_cb_rcu_free);
+ 		else
+ 			queue_work(system_unbound_wq, &t->cb.delete_work);
+ 	} else {
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index 0fbfa8532c392..0002fd4e5ad3f 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -518,6 +518,21 @@ void *bpf_map_kmalloc_node(const struct bpf_map *map, size_t size, gfp_t flags,
+ 	return ptr;
+ }
+ 
++void *bpf_map_kmalloc_nolock(const struct bpf_map *map, size_t size, gfp_t flags,
++			     int node)
++{
++	struct mem_cgroup *memcg, *old_memcg;
++	void *ptr;
++
++	memcg = bpf_map_get_memcg(map);
++	old_memcg = set_active_memcg(memcg);
++	ptr = kmalloc_nolock(size, flags | __GFP_ACCOUNT, node);
++	set_active_memcg(old_memcg);
++	mem_cgroup_put(memcg);
++
++	return ptr;
++}
++
+ void *bpf_map_kzalloc(const struct bpf_map *map, size_t size, gfp_t flags)
+ {
+ 	struct mem_cgroup *memcg, *old_memcg;
+-- 
+2.51.0
+
