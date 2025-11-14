@@ -1,0 +1,99 @@
+From 2a2b12769d424fa67a160a6ad598424521e67f4f Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 14 Nov 2025 14:30:55 +0530
+Subject: cifs: stop writeback extension when change of size is detected
+
+From: Shyam Prasad N <sprasad@microsoft.com>
+
+cifs_extend_writeback can pick up a folio on an extending write which
+has been dirtied, but we have aclamp on the writeback to an i_size
+local variable, which can cause short writes, yet mark the page as clean.
+This can cause a data corruption.
+
+As an example, consider this scenario:
+1. First write to the file happens offset 0 len 5k.
+2. Writeback starts for the range (0-5k).
+3. Writeback locks page 1 in cifs_writepages_begin. But does not lock
+page 2 yet.
+4. Page 2 is now written to by the next write, which extends the file
+by another 5k. Page 2 and 3 are now marked dirty.
+5. Now we reach cifs_extend_writeback, where we extend to include the
+next folio (even if it should be partially written). We will mark page
+2 for writeback.
+6. But after exiting cifs_extend_writeback, we will clamp the
+writeback to i_size, which was 5k when it started. So we write only 1k
+bytes in page 2.
+7. We still will now mark page 2 as flushed and mark it clean. So
+remaining contents of page 2 will not be written to the server (hence
+the hole in that gap, unless that range gets overwritten).
+
+With this patch, we will make sure not extend the writeback anymore
+when a change in the file size is detected.
+
+This fix also changes the error handling of cifs_extend_writeback when
+a folio get fails. We will now stop the extension when a folio get fails.
+
+Cc: stable@kernel.org # v6.3~v6.9
+Signed-off-by: Shyam Prasad N <sprasad@microsoft.com>
+Acked-by: David Howells <dhowells@redhat.com>
+Reported-by: Mark A Whiting <whitingm@opentext.com>
+Signed-off-by: Shyam Prasad N <sprasad@microsoft.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/smb/client/file.c | 18 +++++++++++++++---
+ 1 file changed, 15 insertions(+), 3 deletions(-)
+
+diff --git a/fs/smb/client/file.c b/fs/smb/client/file.c
+index 1058066913dd6..1f0a53738426e 100644
+--- a/fs/smb/client/file.c
++++ b/fs/smb/client/file.c
+@@ -2747,8 +2747,10 @@ static void cifs_extend_writeback(struct address_space *mapping,
+ 				  loff_t start,
+ 				  int max_pages,
+ 				  loff_t max_len,
+-				  size_t *_len)
++				  size_t *_len,
++				  unsigned long long i_size)
+ {
++	struct inode *inode = mapping->host;
+ 	struct folio_batch batch;
+ 	struct folio *folio;
+ 	unsigned int nr_pages;
+@@ -2779,7 +2781,7 @@ static void cifs_extend_writeback(struct address_space *mapping,
+ 
+ 			if (!folio_try_get(folio)) {
+ 				xas_reset(xas);
+-				continue;
++				break;
+ 			}
+ 			nr_pages = folio_nr_pages(folio);
+ 			if (nr_pages > max_pages) {
+@@ -2799,6 +2801,15 @@ static void cifs_extend_writeback(struct address_space *mapping,
+ 				xas_reset(xas);
+ 				break;
+ 			}
++
++			/* if file size is changing, stop extending */
++			if (i_size_read(inode) != i_size) {
++				folio_unlock(folio);
++				folio_put(folio);
++				xas_reset(xas);
++				break;
++			}
++
+ 			if (!folio_test_dirty(folio) ||
+ 			    folio_test_writeback(folio)) {
+ 				folio_unlock(folio);
+@@ -2934,7 +2945,8 @@ static ssize_t cifs_write_back_from_locked_folio(struct address_space *mapping,
+ 
+ 			if (max_pages > 0)
+ 				cifs_extend_writeback(mapping, xas, &count, start,
+-						      max_pages, max_len, &len);
++						      max_pages, max_len, &len,
++						      i_size);
+ 		}
+ 	}
+ 	len = min_t(unsigned long long, len, i_size - start);
+-- 
+2.51.0
+
