@@ -1,0 +1,286 @@
+From 073b10bc6319a3d2b446c2091849b2c7d3d454f9 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 11 Nov 2025 16:11:01 +0900
+Subject: mm/mprotect: delete pmd_none_or_clear_bad_unless_trans_huge()
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+From: Hugh Dickins <hughd@google.com>
+
+commit 670ddd8cdcbd1d07a4571266ae3517f821728c3a upstream.
+
+change_pmd_range() had special pmd_none_or_clear_bad_unless_trans_huge(),
+required to avoid "bad" choices when setting automatic NUMA hinting under
+mmap_read_lock(); but most of that is already covered in pte_offset_map()
+now.  change_pmd_range() just wants a pmd_none() check before wasting time
+on MMU notifiers, then checks on the read-once _pmd value to work out
+what's needed for huge cases.  If change_pte_range() returns -EAGAIN to
+retry if pte_offset_map_lock() fails, nothing more special is needed.
+
+Link: https://lkml.kernel.org/r/725a42a9-91e9-c868-925-e3a5fd40bb4f@google.com
+Signed-off-by: Hugh Dickins <hughd@google.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Anshuman Khandual <anshuman.khandual@arm.com>
+Cc: Axel Rasmussen <axelrasmussen@google.com>
+Cc: Christophe Leroy <christophe.leroy@csgroup.eu>
+Cc: Christoph Hellwig <hch@infradead.org>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: "Huang, Ying" <ying.huang@intel.com>
+Cc: Ira Weiny <ira.weiny@intel.com>
+Cc: Jason Gunthorpe <jgg@ziepe.ca>
+Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: Lorenzo Stoakes <lstoakes@gmail.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: Mike Rapoport (IBM) <rppt@kernel.org>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: Naoya Horiguchi <naoya.horiguchi@nec.com>
+Cc: Pavel Tatashin <pasha.tatashin@soleen.com>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Qi Zheng <zhengqi.arch@bytedance.com>
+Cc: Ralph Campbell <rcampbell@nvidia.com>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: SeongJae Park <sj@kernel.org>
+Cc: Song Liu <song@kernel.org>
+Cc: Steven Price <steven.price@arm.com>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Thomas Hellström <thomas.hellstrom@linux.intel.com>
+Cc: Will Deacon <will@kernel.org>
+Cc: Yang Shi <shy828301@gmail.com>
+Cc: Yu Zhao <yuzhao@google.com>
+Cc: Zack Rusin <zackr@vmware.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+[ Background: It was reported that a bad pmd is seen when automatic NUMA
+  balancing is marking page table entries as prot_numa:
+
+      [2437548.196018] mm/pgtable-generic.c:50: bad pmd 00000000af22fc02(dffffffe71fbfe02)
+      [2437548.235022] Call Trace:
+      [2437548.238234]  <TASK>
+      [2437548.241060]  dump_stack_lvl+0x46/0x61
+      [2437548.245689]  panic+0x106/0x2e5
+      [2437548.249497]  pmd_clear_bad+0x3c/0x3c
+      [2437548.253967]  change_pmd_range.isra.0+0x34d/0x3a7
+      [2437548.259537]  change_p4d_range+0x156/0x20e
+      [2437548.264392]  change_protection_range+0x116/0x1a9
+      [2437548.269976]  change_prot_numa+0x15/0x37
+      [2437548.274774]  task_numa_work+0x1b8/0x302
+      [2437548.279512]  task_work_run+0x62/0x95
+      [2437548.283882]  exit_to_user_mode_loop+0x1a4/0x1a9
+      [2437548.289277]  exit_to_user_mode_prepare+0xf4/0xfc
+      [2437548.294751]  ? sysvec_apic_timer_interrupt+0x34/0x81
+      [2437548.300677]  irqentry_exit_to_user_mode+0x5/0x25
+      [2437548.306153]  asm_sysvec_apic_timer_interrupt+0x16/0x1b
+
+    This is due to a race condition between change_prot_numa() and
+    THP migration because the kernel doesn't check is_swap_pmd() and
+    pmd_trans_huge() atomically:
+
+    change_prot_numa()                      THP migration
+    ======================================================================
+    - change_pmd_range()
+    -> is_swap_pmd() returns false,
+    meaning it's not a PMD migration
+    entry.
+                                      - do_huge_pmd_numa_page()
+                                      -> migrate_misplaced_page() sets
+                                         migration entries for the THP.
+    - change_pmd_range()
+    -> pmd_none_or_clear_bad_unless_trans_huge()
+    -> pmd_none() and pmd_trans_huge() returns false
+    - pmd_none_or_clear_bad_unless_trans_huge()
+    -> pmd_bad() returns true for the migration entry!
+
+  The upstream commit 670ddd8cdcbd ("mm/mprotect: delete
+  pmd_none_or_clear_bad_unless_trans_huge()") closes this race condition
+  by checking is_swap_pmd() and pmd_trans_huge() atomically.
+
+  Backporting note:
+    Unlike the mainline, pte_offset_map_lock() does not check if the pmd
+    entry is a migration entry or a hugepage; acquires PTL unconditionally
+    instead of returning failure. Therefore, it is necessary to keep the
+    !is_swap_pmd() && !pmd_trans_huge() && !pmd_devmap() check before
+    acquiring the PTL.
+
+    After acquiring the lock, open-code the semantics of
+    pte_offset_map_lock() in the mainline kernel; change_pte_range() fails
+    if the pmd value has changed. This requires adding pmd_old parameter
+    (pmd_t value that is read before calling the function) to
+    change_pte_range(). ]
+
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ mm/mprotect.c | 101 +++++++++++++++++++++-----------------------------
+ 1 file changed, 43 insertions(+), 58 deletions(-)
+
+diff --git a/mm/mprotect.c b/mm/mprotect.c
+index 8216f4018ee75..9381179ff8a95 100644
+--- a/mm/mprotect.c
++++ b/mm/mprotect.c
+@@ -73,10 +73,12 @@ static inline bool can_change_pte_writable(struct vm_area_struct *vma,
+ }
+ 
+ static long change_pte_range(struct mmu_gather *tlb,
+-		struct vm_area_struct *vma, pmd_t *pmd, unsigned long addr,
+-		unsigned long end, pgprot_t newprot, unsigned long cp_flags)
++		struct vm_area_struct *vma, pmd_t *pmd, pmd_t pmd_old,
++		unsigned long addr, unsigned long end, pgprot_t newprot,
++		unsigned long cp_flags)
+ {
+ 	pte_t *pte, oldpte;
++	pmd_t pmd_val;
+ 	spinlock_t *ptl;
+ 	long pages = 0;
+ 	int target_node = NUMA_NO_NODE;
+@@ -86,21 +88,15 @@ static long change_pte_range(struct mmu_gather *tlb,
+ 
+ 	tlb_change_page_size(tlb, PAGE_SIZE);
+ 
+-	/*
+-	 * Can be called with only the mmap_lock for reading by
+-	 * prot_numa so we must check the pmd isn't constantly
+-	 * changing from under us from pmd_none to pmd_trans_huge
+-	 * and/or the other way around.
+-	 */
+-	if (pmd_trans_unstable(pmd))
+-		return 0;
+-
+-	/*
+-	 * The pmd points to a regular pte so the pmd can't change
+-	 * from under us even if the mmap_lock is only hold for
+-	 * reading.
+-	 */
+ 	pte = pte_offset_map_lock(vma->vm_mm, pmd, addr, &ptl);
++	/* Make sure pmd didn't change after acquiring ptl */
++	pmd_val = pmd_read_atomic(pmd);
++	/* See pmd_none_or_trans_huge_or_clear_bad for info on barrier */
++	barrier();
++	if (!pmd_same(pmd_old, pmd_val)) {
++		pte_unmap_unlock(pte, ptl);
++		return -EAGAIN;
++	}
+ 
+ 	/* Get target node for single threaded private VMAs */
+ 	if (prot_numa && !(vma->vm_flags & VM_SHARED) &&
+@@ -288,31 +284,6 @@ static long change_pte_range(struct mmu_gather *tlb,
+ 	return pages;
+ }
+ 
+-/*
+- * Used when setting automatic NUMA hinting protection where it is
+- * critical that a numa hinting PMD is not confused with a bad PMD.
+- */
+-static inline int pmd_none_or_clear_bad_unless_trans_huge(pmd_t *pmd)
+-{
+-	pmd_t pmdval = pmd_read_atomic(pmd);
+-
+-	/* See pmd_none_or_trans_huge_or_clear_bad for info on barrier */
+-#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+-	barrier();
+-#endif
+-
+-	if (pmd_none(pmdval))
+-		return 1;
+-	if (pmd_trans_huge(pmdval))
+-		return 0;
+-	if (unlikely(pmd_bad(pmdval))) {
+-		pmd_clear_bad(pmd);
+-		return 1;
+-	}
+-
+-	return 0;
+-}
+-
+ /* Return true if we're uffd wr-protecting file-backed memory, or false */
+ static inline bool
+ uffd_wp_protect_file(struct vm_area_struct *vma, unsigned long cp_flags)
+@@ -360,22 +331,34 @@ static inline long change_pmd_range(struct mmu_gather *tlb,
+ 
+ 	pmd = pmd_offset(pud, addr);
+ 	do {
+-		long this_pages;
+-
++		long ret;
++		pmd_t _pmd;
++again:
+ 		next = pmd_addr_end(addr, end);
++		_pmd = pmd_read_atomic(pmd);
++		/* See pmd_none_or_trans_huge_or_clear_bad for info on barrier */
++#ifdef CONFIG_TRANSPARENT_HUGEPAGE
++		barrier();
++#endif
+ 
+ 		change_pmd_prepare(vma, pmd, cp_flags);
+ 		/*
+ 		 * Automatic NUMA balancing walks the tables with mmap_lock
+ 		 * held for read. It's possible a parallel update to occur
+-		 * between pmd_trans_huge() and a pmd_none_or_clear_bad()
+-		 * check leading to a false positive and clearing.
+-		 * Hence, it's necessary to atomically read the PMD value
+-		 * for all the checks.
++		 * between pmd_trans_huge(), is_swap_pmd(), and
++		 * a pmd_none_or_clear_bad() check leading to a false positive
++		 * and clearing. Hence, it's necessary to atomically read
++		 * the PMD value for all the checks.
+ 		 */
+-		if (!is_swap_pmd(*pmd) && !pmd_devmap(*pmd) &&
+-		     pmd_none_or_clear_bad_unless_trans_huge(pmd))
+-			goto next;
++		if (!is_swap_pmd(_pmd) && !pmd_devmap(_pmd) && !pmd_trans_huge(_pmd)) {
++			if (pmd_none(_pmd))
++				goto next;
++
++			if (pmd_bad(_pmd)) {
++				pmd_clear_bad(pmd);
++				goto next;
++			}
++		}
+ 
+ 		/* invoke the mmu notifier if the pmd is populated */
+ 		if (!range.start) {
+@@ -385,7 +368,7 @@ static inline long change_pmd_range(struct mmu_gather *tlb,
+ 			mmu_notifier_invalidate_range_start(&range);
+ 		}
+ 
+-		if (is_swap_pmd(*pmd) || pmd_trans_huge(*pmd) || pmd_devmap(*pmd)) {
++		if (is_swap_pmd(_pmd) || pmd_trans_huge(_pmd) || pmd_devmap(_pmd)) {
+ 			if ((next - addr != HPAGE_PMD_SIZE) ||
+ 			    uffd_wp_protect_file(vma, cp_flags)) {
+ 				__split_huge_pmd(vma, pmd, addr, false, NULL);
+@@ -400,11 +383,11 @@ static inline long change_pmd_range(struct mmu_gather *tlb,
+ 				 * change_huge_pmd() does not defer TLB flushes,
+ 				 * so no need to propagate the tlb argument.
+ 				 */
+-				int nr_ptes = change_huge_pmd(tlb, vma, pmd,
+-						addr, newprot, cp_flags);
++				ret = change_huge_pmd(tlb, vma, pmd,
++						      addr, newprot, cp_flags);
+ 
+-				if (nr_ptes) {
+-					if (nr_ptes == HPAGE_PMD_NR) {
++				if (ret) {
++					if (ret == HPAGE_PMD_NR) {
+ 						pages += HPAGE_PMD_NR;
+ 						nr_huge_updates++;
+ 					}
+@@ -415,9 +398,11 @@ static inline long change_pmd_range(struct mmu_gather *tlb,
+ 			}
+ 			/* fall through, the trans huge pmd just split */
+ 		}
+-		this_pages = change_pte_range(tlb, vma, pmd, addr, next,
+-					      newprot, cp_flags);
+-		pages += this_pages;
++		ret = change_pte_range(tlb, vma, pmd, _pmd, addr, next,
++				       newprot, cp_flags);
++		if (ret < 0)
++			goto again;
++		pages += ret;
+ next:
+ 		cond_resched();
+ 	} while (pmd++, addr = next, addr != end);
+-- 
+2.51.0
+
