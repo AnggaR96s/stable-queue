@@ -1,0 +1,321 @@
+From leon.huangfu@shopee.com Mon Nov  3 08:53:44 2025
+From: Leon Huang Fu <leon.huangfu@shopee.com>
+Date: Mon,  3 Nov 2025 15:51:35 +0800
+Subject: mm: memcg: restore subtree stats flushing
+To: stable@vger.kernel.org, greg@kroah.com
+Cc: tj@kernel.org, lizefan.x@bytedance.com, hannes@cmpxchg.org, corbet@lwn.net, mhocko@kernel.org, roman.gushchin@linux.dev, shakeelb@google.com, muchun.song@linux.dev, akpm@linux-foundation.org, sjenning@redhat.com, ddstreet@ieee.org, vitaly.wool@konsulko.com, lance.yang@linux.dev, leon.huangfu@shopee.com, shy828301@gmail.com, yosryahmed@google.com, sashal@kernel.org, vishal.moola@gmail.com, cerasuolodomenico@gmail.com, nphamcs@gmail.com, cgroups@vger.kernel.org, linux-doc@vger.kernel.org, linux-kernel@vger.kernel.org, linux-mm@kvack.org, Chris Li <chrisl@kernel.org>, Greg Thelen <gthelen@google.com>, Ivan Babrou <ivan@cloudflare.com>, Michal Koutny <mkoutny@suse.com>, Waiman Long <longman@redhat.com>, Wei Xu <weixugc@google.com>
+Message-ID: <20251103075135.20254-8-leon.huangfu@shopee.com>
+
+From: Yosry Ahmed <yosryahmed@google.com>
+
+[ Upstream commit 7d7ef0a4686abe43cd76a141b340a348f45ecdf2 ]
+
+Stats flushing for memcg currently follows the following rules:
+- Always flush the entire memcg hierarchy (i.e. flush the root).
+- Only one flusher is allowed at a time. If someone else tries to flush
+  concurrently, they skip and return immediately.
+- A periodic flusher flushes all the stats every 2 seconds.
+
+The reason this approach is followed is because all flushes are serialized
+by a global rstat spinlock.  On the memcg side, flushing is invoked from
+userspace reads as well as in-kernel flushers (e.g.  reclaim, refault,
+etc).  This approach aims to avoid serializing all flushers on the global
+lock, which can cause a significant performance hit under high
+concurrency.
+
+This approach has the following problems:
+- Occasionally a userspace read of the stats of a non-root cgroup will
+  be too expensive as it has to flush the entire hierarchy [1].
+- Sometimes the stats accuracy are compromised if there is an ongoing
+  flush, and we skip and return before the subtree of interest is
+  actually flushed, yielding stale stats (by up to 2s due to periodic
+  flushing). This is more visible when reading stats from userspace,
+  but can also affect in-kernel flushers.
+
+The latter problem is particulary a concern when userspace reads stats
+after an event occurs, but gets stats from before the event. Examples:
+- When memory usage / pressure spikes, a userspace OOM handler may look
+  at the stats of different memcgs to select a victim based on various
+  heuristics (e.g. how much private memory will be freed by killing
+  this). Reading stale stats from before the usage spike in this case
+  may cause a wrongful OOM kill.
+- A proactive reclaimer may read the stats after writing to
+  memory.reclaim to measure the success of the reclaim operation. Stale
+  stats from before reclaim may give a false negative.
+- Reading the stats of a parent and a child memcg may be inconsistent
+  (child larger than parent), if the flush doesn't happen when the
+  parent is read, but happens when the child is read.
+
+As for in-kernel flushers, they will occasionally get stale stats.  No
+regressions are currently known from this, but if there are regressions,
+they would be very difficult to debug and link to the source of the
+problem.
+
+This patch aims to fix these problems by restoring subtree flushing, and
+removing the unified/coalesced flushing logic that skips flushing if there
+is an ongoing flush.  This change would introduce a significant regression
+with global stats flushing thresholds.  With per-memcg stats flushing
+thresholds, this seems to perform really well.  The thresholds protect the
+underlying lock from unnecessary contention.
+
+This patch was tested in two ways to ensure the latency of flushing is
+up to par, on a machine with 384 cpus:
+
+- A synthetic test with 5000 concurrent workers in 500 cgroups doing
+  allocations and reclaim, as well as 1000 readers for memory.stat
+  (variation of [2]). No regressions were noticed in the total runtime.
+  Note that significant regressions in this test are observed with
+  global stats thresholds, but not with per-memcg thresholds.
+
+- A synthetic stress test for concurrently reading memcg stats while
+  memory allocation/freeing workers are running in the background,
+  provided by Wei Xu [3]. With 250k threads reading the stats every
+  100ms in 50k cgroups, 99.9% of reads take <= 50us. Less than 0.01%
+  of reads take more than 1ms, and no reads take more than 100ms.
+
+[1] https://lore.kernel.org/lkml/CABWYdi0c6__rh-K7dcM_pkf9BJdTRtAU08M43KO9ME4-dsgfoQ@mail.gmail.com/
+[2] https://lore.kernel.org/lkml/CAJD7tka13M-zVZTyQJYL1iUAYvuQ1fcHbCjcOBZcz6POYTV-4g@mail.gmail.com/
+[3] https://lore.kernel.org/lkml/CAAPL-u9D2b=iF5Lf_cRnKxUfkiEe0AMDTu6yhrUAzX0b6a6rDg@mail.gmail.com/
+
+[akpm@linux-foundation.org: fix mm/zswap.c]
+[yosryahmed@google.com: remove stats flushing mutex]
+  Link: https://lkml.kernel.org/r/CAJD7tkZgP3m-VVPn+fF_YuvXeQYK=tZZjJHj=dzD=CcSSpp2qg@mail.gmail.com
+Link: https://lkml.kernel.org/r/20231129032154.3710765-6-yosryahmed@google.com
+Signed-off-by: Yosry Ahmed <yosryahmed@google.com>
+Tested-by: Domenico Cerasuolo <cerasuolodomenico@gmail.com>
+Acked-by: Shakeel Butt <shakeelb@google.com>
+Cc: Chris Li <chrisl@kernel.org>
+Cc: Greg Thelen <gthelen@google.com>
+Cc: Ivan Babrou <ivan@cloudflare.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Michal Koutny <mkoutny@suse.com>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: Waiman Long <longman@redhat.com>
+Cc: Wei Xu <weixugc@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Leon Huang Fu <leon.huangfu@shopee.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/linux/memcontrol.h |    8 ++---
+ mm/memcontrol.c            |   68 +++++++++++++++++++++++++--------------------
+ mm/vmscan.c                |    2 -
+ mm/workingset.c            |   10 ++++--
+ 4 files changed, 51 insertions(+), 37 deletions(-)
+
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -1039,8 +1039,8 @@ static inline unsigned long lruvec_page_
+ 	return x;
+ }
+ 
+-void mem_cgroup_flush_stats(void);
+-void mem_cgroup_flush_stats_ratelimited(void);
++void mem_cgroup_flush_stats(struct mem_cgroup *memcg);
++void mem_cgroup_flush_stats_ratelimited(struct mem_cgroup *memcg);
+ 
+ void __mod_memcg_lruvec_state(struct lruvec *lruvec, enum node_stat_item idx,
+ 			      int val);
+@@ -1515,11 +1515,11 @@ static inline unsigned long lruvec_page_
+ 	return node_page_state(lruvec_pgdat(lruvec), idx);
+ }
+ 
+-static inline void mem_cgroup_flush_stats(void)
++static inline void mem_cgroup_flush_stats(struct mem_cgroup *memcg)
+ {
+ }
+ 
+-static inline void mem_cgroup_flush_stats_ratelimited(void)
++static inline void mem_cgroup_flush_stats_ratelimited(struct mem_cgroup *memcg)
+ {
+ }
+ 
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -667,7 +667,6 @@ struct memcg_vmstats {
+  */
+ static void flush_memcg_stats_dwork(struct work_struct *w);
+ static DECLARE_DEFERRABLE_WORK(stats_flush_dwork, flush_memcg_stats_dwork);
+-static atomic_t stats_flush_ongoing = ATOMIC_INIT(0);
+ static u64 flush_last_time;
+ 
+ #define FLUSH_TIME (2UL*HZ)
+@@ -728,35 +727,40 @@ static inline void memcg_rstat_updated(s
+ 	}
+ }
+ 
+-static void do_flush_stats(void)
++static void do_flush_stats(struct mem_cgroup *memcg)
+ {
+-	/*
+-	 * We always flush the entire tree, so concurrent flushers can just
+-	 * skip. This avoids a thundering herd problem on the rstat global lock
+-	 * from memcg flushers (e.g. reclaim, refault, etc).
+-	 */
+-	if (atomic_read(&stats_flush_ongoing) ||
+-	    atomic_xchg(&stats_flush_ongoing, 1))
+-		return;
+-
+-	WRITE_ONCE(flush_last_time, jiffies_64);
+-
+-	cgroup_rstat_flush(root_mem_cgroup->css.cgroup);
++	if (mem_cgroup_is_root(memcg))
++		WRITE_ONCE(flush_last_time, jiffies_64);
+ 
+-	atomic_set(&stats_flush_ongoing, 0);
++	cgroup_rstat_flush(memcg->css.cgroup);
+ }
+ 
+-void mem_cgroup_flush_stats(void)
++/*
++ * mem_cgroup_flush_stats - flush the stats of a memory cgroup subtree
++ * @memcg: root of the subtree to flush
++ *
++ * Flushing is serialized by the underlying global rstat lock. There is also a
++ * minimum amount of work to be done even if there are no stat updates to flush.
++ * Hence, we only flush the stats if the updates delta exceeds a threshold. This
++ * avoids unnecessary work and contention on the underlying lock.
++ */
++void mem_cgroup_flush_stats(struct mem_cgroup *memcg)
+ {
+-	if (memcg_should_flush_stats(root_mem_cgroup))
+-		do_flush_stats();
++	if (mem_cgroup_disabled())
++		return;
++
++	if (!memcg)
++		memcg = root_mem_cgroup;
++
++	if (memcg_should_flush_stats(memcg))
++		do_flush_stats(memcg);
+ }
+ 
+-void mem_cgroup_flush_stats_ratelimited(void)
++void mem_cgroup_flush_stats_ratelimited(struct mem_cgroup *memcg)
+ {
+ 	/* Only flush if the periodic flusher is one full cycle late */
+ 	if (time_after64(jiffies_64, READ_ONCE(flush_last_time) + 2*FLUSH_TIME))
+-		mem_cgroup_flush_stats();
++		mem_cgroup_flush_stats(memcg);
+ }
+ 
+ static void flush_memcg_stats_dwork(struct work_struct *w)
+@@ -765,7 +769,7 @@ static void flush_memcg_stats_dwork(stru
+ 	 * Deliberately ignore memcg_should_flush_stats() here so that flushing
+ 	 * in latency-sensitive paths is as cheap as possible.
+ 	 */
+-	do_flush_stats();
++	do_flush_stats(root_mem_cgroup);
+ 	queue_delayed_work(system_unbound_wq, &stats_flush_dwork, FLUSH_TIME);
+ }
+ 
+@@ -1597,7 +1601,7 @@ static void memcg_stat_format(struct mem
+ 	 *
+ 	 * Current memory state:
+ 	 */
+-	mem_cgroup_flush_stats();
++	mem_cgroup_flush_stats(memcg);
+ 
+ 	for (i = 0; i < ARRAY_SIZE(memory_stats); i++) {
+ 		u64 size;
+@@ -4047,7 +4051,7 @@ static int memcg_numa_stat_show(struct s
+ 	int nid;
+ 	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
+ 
+-	mem_cgroup_flush_stats();
++	mem_cgroup_flush_stats(memcg);
+ 
+ 	for (stat = stats; stat < stats + ARRAY_SIZE(stats); stat++) {
+ 		seq_printf(m, "%s=%lu", stat->name,
+@@ -4122,7 +4126,7 @@ static void memcg1_stat_format(struct me
+ 
+ 	BUILD_BUG_ON(ARRAY_SIZE(memcg1_stat_names) != ARRAY_SIZE(memcg1_stats));
+ 
+-	mem_cgroup_flush_stats();
++	mem_cgroup_flush_stats(memcg);
+ 
+ 	for (i = 0; i < ARRAY_SIZE(memcg1_stats); i++) {
+ 		unsigned long nr;
+@@ -4624,7 +4628,7 @@ void mem_cgroup_wb_stats(struct bdi_writ
+ 	struct mem_cgroup *memcg = mem_cgroup_from_css(wb->memcg_css);
+ 	struct mem_cgroup *parent;
+ 
+-	mem_cgroup_flush_stats();
++	mem_cgroup_flush_stats(memcg);
+ 
+ 	*pdirty = memcg_page_state(memcg, NR_FILE_DIRTY);
+ 	*pwriteback = memcg_page_state(memcg, NR_WRITEBACK);
+@@ -6704,7 +6708,7 @@ static int memory_numa_stat_show(struct
+ 	int i;
+ 	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
+ 
+-	mem_cgroup_flush_stats();
++	mem_cgroup_flush_stats(memcg);
+ 
+ 	for (i = 0; i < ARRAY_SIZE(memory_stats); i++) {
+ 		int nid;
+@@ -7868,7 +7872,11 @@ bool obj_cgroup_may_zswap(struct obj_cgr
+ 			break;
+ 		}
+ 
+-		cgroup_rstat_flush(memcg->css.cgroup);
++		/*
++		 * mem_cgroup_flush_stats() ignores small changes. Use
++		 * do_flush_stats() directly to get accurate stats for charging.
++		 */
++		do_flush_stats(memcg);
+ 		pages = memcg_page_state(memcg, MEMCG_ZSWAP_B) / PAGE_SIZE;
+ 		if (pages < max)
+ 			continue;
+@@ -7933,8 +7941,10 @@ void obj_cgroup_uncharge_zswap(struct ob
+ static u64 zswap_current_read(struct cgroup_subsys_state *css,
+ 			      struct cftype *cft)
+ {
+-	cgroup_rstat_flush(css->cgroup);
+-	return memcg_page_state(mem_cgroup_from_css(css), MEMCG_ZSWAP_B);
++	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
++
++	mem_cgroup_flush_stats(memcg);
++	return memcg_page_state(memcg, MEMCG_ZSWAP_B);
+ }
+ 
+ static int zswap_max_show(struct seq_file *m, void *v)
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -2911,7 +2911,7 @@ static void prepare_scan_count(pg_data_t
+ 	 * Flush the memory cgroup stats, so that we read accurate per-memcg
+ 	 * lruvec stats for heuristics.
+ 	 */
+-	mem_cgroup_flush_stats();
++	mem_cgroup_flush_stats(sc->target_mem_cgroup);
+ 
+ 	/*
+ 	 * Determine the scan balance between anon and file LRUs.
+--- a/mm/workingset.c
++++ b/mm/workingset.c
+@@ -464,8 +464,12 @@ bool workingset_test_recent(void *shadow
+ 
+ 	rcu_read_unlock();
+ 
+-	/* Flush stats (and potentially sleep) outside the RCU read section */
+-	mem_cgroup_flush_stats_ratelimited();
++	/*
++	 * Flush stats (and potentially sleep) outside the RCU read section.
++	 * XXX: With per-memcg flushing and thresholding, is ratelimiting
++	 * still needed here?
++	 */
++	mem_cgroup_flush_stats_ratelimited(eviction_memcg);
+ 
+ 	eviction_lruvec = mem_cgroup_lruvec(eviction_memcg, pgdat);
+ 	refault = atomic_long_read(&eviction_lruvec->nonresident_age);
+@@ -676,7 +680,7 @@ static unsigned long count_shadow_nodes(
+ 		struct lruvec *lruvec;
+ 		int i;
+ 
+-		mem_cgroup_flush_stats_ratelimited();
++		mem_cgroup_flush_stats_ratelimited(sc->memcg);
+ 		lruvec = mem_cgroup_lruvec(sc->memcg, NODE_DATA(sc->nid));
+ 		for (pages = 0, i = 0; i < NR_LRU_LISTS; i++)
+ 			pages += lruvec_page_state_local(lruvec,
