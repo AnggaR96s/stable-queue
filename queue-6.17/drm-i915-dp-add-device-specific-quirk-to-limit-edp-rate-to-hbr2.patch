@@ -1,0 +1,152 @@
+From 21c586d9233a1f258e8d437466c441d50885d30f Mon Sep 17 00:00:00 2001
+From: Ankit Nautiyal <ankit.k.nautiyal@intel.com>
+Date: Thu, 10 Jul 2025 10:50:41 +0530
+Subject: drm/i915/dp: Add device specific quirk to limit eDP rate to HBR2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+From: Ankit Nautiyal <ankit.k.nautiyal@intel.com>
+
+commit 21c586d9233a1f258e8d437466c441d50885d30f upstream.
+
+Some ICL/TGL platforms with combo PHY ports suffer from signal integrity
+issues at HBR3. While certain systems include a Parade PS8461 mux to
+mitigate this, its presence cannot be reliably detected. Furthermore,
+broken or missing VBT entries make it unsafe to rely on VBT for enforcing
+link rate limits.
+
+To address this introduce a device specific quirk to cap the eDP link rate
+to HBR2 (540000 kHz). This will override any higher advertised rates from
+the sink or DPCD for specific devices.
+
+Currently, the quirk is added for Dell XPS 13 7390 2-in-1 which is reported
+in gitlab issue #5969 [1].
+
+[1] https://gitlab.freedesktop.org/drm/i915/kernel/-/issues/5969
+
+v2: Align the quirk with the intended quirk name and refactor the
+condition to use min(). (Jani)
+v3: Use condition `rate > 540000`. Drop extra parentheses. (Ville)
+
+Cc: Jani Nikula <jani.nikula@linux.intel.com>
+Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Closes: https://gitlab.freedesktop.org/drm/i915/kernel/-/issues/5969
+Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Signed-off-by: Ankit Nautiyal <ankit.k.nautiyal@intel.com>
+Link: https://lore.kernel.org/r/20250710052041.1238567-3-ankit.k.nautiyal@intel.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/gpu/drm/i915/display/intel_dp.c     |   41 +++++++++++++++++++++++-----
+ drivers/gpu/drm/i915/display/intel_quirks.c |    9 ++++++
+ drivers/gpu/drm/i915/display/intel_quirks.h |    1 
+ 3 files changed, 44 insertions(+), 7 deletions(-)
+
+--- a/drivers/gpu/drm/i915/display/intel_dp.c
++++ b/drivers/gpu/drm/i915/display/intel_dp.c
+@@ -173,10 +173,24 @@ int intel_dp_link_symbol_clock(int rate)
+ 
+ static int max_dprx_rate(struct intel_dp *intel_dp)
+ {
++	struct intel_display *display = to_intel_display(intel_dp);
++	int max_rate;
++
+ 	if (intel_dp_tunnel_bw_alloc_is_enabled(intel_dp))
+-		return drm_dp_tunnel_max_dprx_rate(intel_dp->tunnel);
++		max_rate = drm_dp_tunnel_max_dprx_rate(intel_dp->tunnel);
++	else
++		max_rate = drm_dp_bw_code_to_link_rate(intel_dp->dpcd[DP_MAX_LINK_RATE]);
++
++	/*
++	 * Some platforms + eDP panels may not reliably support HBR3
++	 * due to signal integrity limitations, despite advertising it.
++	 * Cap the link rate to HBR2 to avoid unstable configurations for the
++	 * known machines.
++	 */
++	if (intel_dp_is_edp(intel_dp) && intel_has_quirk(display, QUIRK_EDP_LIMIT_RATE_HBR2))
++		max_rate = min(max_rate, 540000);
+ 
+-	return drm_dp_bw_code_to_link_rate(intel_dp->dpcd[DP_MAX_LINK_RATE]);
++	return max_rate;
+ }
+ 
+ static int max_dprx_lane_count(struct intel_dp *intel_dp)
+@@ -4261,6 +4275,8 @@ static void intel_edp_mso_init(struct in
+ static void
+ intel_edp_set_sink_rates(struct intel_dp *intel_dp)
+ {
++	struct intel_display *display = to_intel_display(intel_dp);
++
+ 	intel_dp->num_sink_rates = 0;
+ 
+ 	if (intel_dp->edp_dpcd[0] >= DP_EDP_14) {
+@@ -4271,10 +4287,7 @@ intel_edp_set_sink_rates(struct intel_dp
+ 				 sink_rates, sizeof(sink_rates));
+ 
+ 		for (i = 0; i < ARRAY_SIZE(sink_rates); i++) {
+-			int val = le16_to_cpu(sink_rates[i]);
+-
+-			if (val == 0)
+-				break;
++			int rate;
+ 
+ 			/* Value read multiplied by 200kHz gives the per-lane
+ 			 * link rate in kHz. The source rates are, however,
+@@ -4282,7 +4295,21 @@ intel_edp_set_sink_rates(struct intel_dp
+ 			 * back to symbols is
+ 			 * (val * 200kHz)*(8/10 ch. encoding)*(1/8 bit to Byte)
+ 			 */
+-			intel_dp->sink_rates[i] = (val * 200) / 10;
++			rate = le16_to_cpu(sink_rates[i]) * 200 / 10;
++
++			if (rate == 0)
++				break;
++
++			/*
++			 * Some platforms cannot reliably drive HBR3 rates due to PHY limitations,
++			 * even if the sink advertises support. Reject any sink rates above HBR2 on
++			 * the known machines for stable output.
++			 */
++			if (rate > 540000 &&
++			    intel_has_quirk(display, QUIRK_EDP_LIMIT_RATE_HBR2))
++				break;
++
++			intel_dp->sink_rates[i] = rate;
+ 		}
+ 		intel_dp->num_sink_rates = i;
+ 	}
+--- a/drivers/gpu/drm/i915/display/intel_quirks.c
++++ b/drivers/gpu/drm/i915/display/intel_quirks.c
+@@ -80,6 +80,12 @@ static void quirk_fw_sync_len(struct int
+ 	drm_info(display->drm, "Applying Fast Wake sync pulse count quirk\n");
+ }
+ 
++static void quirk_edp_limit_rate_hbr2(struct intel_display *display)
++{
++	intel_set_quirk(display, QUIRK_EDP_LIMIT_RATE_HBR2);
++	drm_info(display->drm, "Applying eDP Limit rate to HBR2 quirk\n");
++}
++
+ struct intel_quirk {
+ 	int device;
+ 	int subsystem_vendor;
+@@ -231,6 +237,9 @@ static struct intel_quirk intel_quirks[]
+ 	{ 0x3184, 0x1019, 0xa94d, quirk_increase_ddi_disabled_time },
+ 	/* HP Notebook - 14-r206nv */
+ 	{ 0x0f31, 0x103c, 0x220f, quirk_invert_brightness },
++
++	/* Dell XPS 13 7390 2-in-1 */
++	{ 0x8a12, 0x1028, 0x08b0, quirk_edp_limit_rate_hbr2 },
+ };
+ 
+ static const struct intel_dpcd_quirk intel_dpcd_quirks[] = {
+--- a/drivers/gpu/drm/i915/display/intel_quirks.h
++++ b/drivers/gpu/drm/i915/display/intel_quirks.h
+@@ -20,6 +20,7 @@ enum intel_quirk_id {
+ 	QUIRK_LVDS_SSC_DISABLE,
+ 	QUIRK_NO_PPS_BACKLIGHT_POWER_HOOK,
+ 	QUIRK_FW_SYNC_LEN,
++	QUIRK_EDP_LIMIT_RATE_HBR2,
+ };
+ 
+ void intel_init_quirks(struct intel_display *display);
