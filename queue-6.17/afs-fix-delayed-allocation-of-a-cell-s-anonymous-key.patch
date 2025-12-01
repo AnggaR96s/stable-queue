@@ -1,0 +1,242 @@
+From cd9b0077a8fd60294951b9a8c1f846aa1e892b67 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 28 Nov 2025 10:19:05 +0000
+Subject: afs: Fix delayed allocation of a cell's anonymous key
+
+From: David Howells <dhowells@redhat.com>
+
+[ Upstream commit d27c71257825dced46104eefe42e4d9964bd032e ]
+
+The allocation of a cell's anonymous key is done in a background thread
+along with other cell setup such as doing a DNS upcall.  In the reported
+bug, this is triggered by afs_parse_source() parsing the device name given
+to mount() and calling afs_lookup_cell() with the name of the cell.
+
+The normal key lookup then tries to use the key description on the
+anonymous authentication key as the reference for request_key() - but it
+may not yet be set and so an oops can happen.
+
+This has been made more likely to happen by the fix for dynamic lookup
+failure.
+
+Fix this by firstly allocating a reference name and attaching it to the
+afs_cell record when the record is created.  It can share the memory
+allocation with the cell name (unfortunately it can't just overlap the cell
+name by prepending it with "afs@" as the cell name already has a '.'
+prepended for other purposes).  This reference name is then passed to
+request_key().
+
+Secondly, the anon key is now allocated on demand at the point a key is
+requested in afs_request_key() if it is not already allocated.  A mutex is
+used to prevent multiple allocation for a cell.
+
+Thirdly, make afs_request_key_rcu() return NULL if the anonymous key isn't
+yet allocated (if we need it) and then the caller can return -ECHILD to
+drop out of RCU-mode and afs_request_key() can be called.
+
+Note that the anonymous key is kind of necessary to make the key lookup
+cache work as that doesn't currently cache a negative lookup, but it's
+probably worth some investigation to see if NULL can be used instead.
+
+Fixes: 330e2c514823 ("afs: Fix dynamic lookup to fail on cell lookup failure")
+Reported-by: syzbot+41c68824eefb67cdf00c@syzkaller.appspotmail.com
+Signed-off-by: David Howells <dhowells@redhat.com>
+Link: https://patch.msgid.link/800328.1764325145@warthog.procyon.org.uk
+cc: Marc Dionne <marc.dionne@auristor.com>
+cc: linux-afs@lists.infradead.org
+cc: linux-fsdevel@vger.kernel.org
+Signed-off-by: Christian Brauner <brauner@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/afs/cell.c     | 43 ++++++++----------------------------------
+ fs/afs/internal.h |  1 +
+ fs/afs/security.c | 48 +++++++++++++++++++++++++++++++++++++++--------
+ 3 files changed, 49 insertions(+), 43 deletions(-)
+
+diff --git a/fs/afs/cell.c b/fs/afs/cell.c
+index d9b6fa1088b7b..71c10a05cebe5 100644
+--- a/fs/afs/cell.c
++++ b/fs/afs/cell.c
+@@ -140,7 +140,9 @@ static struct afs_cell *afs_alloc_cell(struct afs_net *net,
+ 		return ERR_PTR(-ENOMEM);
+ 	}
+ 
+-	cell->name = kmalloc(1 + namelen + 1, GFP_KERNEL);
++	/* Allocate the cell name and the key name in one go. */
++	cell->name = kmalloc(1 + namelen + 1 +
++			     4 + namelen + 1, GFP_KERNEL);
+ 	if (!cell->name) {
+ 		kfree(cell);
+ 		return ERR_PTR(-ENOMEM);
+@@ -151,7 +153,11 @@ static struct afs_cell *afs_alloc_cell(struct afs_net *net,
+ 	cell->name_len = namelen;
+ 	for (i = 0; i < namelen; i++)
+ 		cell->name[i] = tolower(name[i]);
+-	cell->name[i] = 0;
++	cell->name[i++] = 0;
++
++	cell->key_desc = cell->name + i;
++	memcpy(cell->key_desc, "afs@", 4);
++	memcpy(cell->key_desc + 4, cell->name, cell->name_len + 1);
+ 
+ 	cell->net = net;
+ 	refcount_set(&cell->ref, 1);
+@@ -710,33 +716,6 @@ void afs_set_cell_timer(struct afs_cell *cell, unsigned int delay_secs)
+ 	timer_reduce(&cell->management_timer, jiffies + delay_secs * HZ);
+ }
+ 
+-/*
+- * Allocate a key to use as a placeholder for anonymous user security.
+- */
+-static int afs_alloc_anon_key(struct afs_cell *cell)
+-{
+-	struct key *key;
+-	char keyname[4 + AFS_MAXCELLNAME + 1], *cp, *dp;
+-
+-	/* Create a key to represent an anonymous user. */
+-	memcpy(keyname, "afs@", 4);
+-	dp = keyname + 4;
+-	cp = cell->name;
+-	do {
+-		*dp++ = tolower(*cp);
+-	} while (*cp++);
+-
+-	key = rxrpc_get_null_key(keyname);
+-	if (IS_ERR(key))
+-		return PTR_ERR(key);
+-
+-	cell->anonymous_key = key;
+-
+-	_debug("anon key %p{%x}",
+-	       cell->anonymous_key, key_serial(cell->anonymous_key));
+-	return 0;
+-}
+-
+ /*
+  * Activate a cell.
+  */
+@@ -746,12 +725,6 @@ static int afs_activate_cell(struct afs_net *net, struct afs_cell *cell)
+ 	struct afs_cell *pcell;
+ 	int ret;
+ 
+-	if (!cell->anonymous_key) {
+-		ret = afs_alloc_anon_key(cell);
+-		if (ret < 0)
+-			return ret;
+-	}
+-
+ 	ret = afs_proc_cell_setup(cell);
+ 	if (ret < 0)
+ 		return ret;
+diff --git a/fs/afs/internal.h b/fs/afs/internal.h
+index 87828d685293f..470e6eef8bd49 100644
+--- a/fs/afs/internal.h
++++ b/fs/afs/internal.h
+@@ -413,6 +413,7 @@ struct afs_cell {
+ 
+ 	u8			name_len;	/* Length of name */
+ 	char			*name;		/* Cell name, case-flattened and NUL-padded */
++	char			*key_desc;	/* Authentication key description */
+ };
+ 
+ /*
+diff --git a/fs/afs/security.c b/fs/afs/security.c
+index 6a7744c9e2a2d..ff8830e6982fb 100644
+--- a/fs/afs/security.c
++++ b/fs/afs/security.c
+@@ -16,6 +16,30 @@
+ 
+ static DEFINE_HASHTABLE(afs_permits_cache, 10);
+ static DEFINE_SPINLOCK(afs_permits_lock);
++static DEFINE_MUTEX(afs_key_lock);
++
++/*
++ * Allocate a key to use as a placeholder for anonymous user security.
++ */
++static int afs_alloc_anon_key(struct afs_cell *cell)
++{
++	struct key *key;
++
++	mutex_lock(&afs_key_lock);
++	if (!cell->anonymous_key) {
++		key = rxrpc_get_null_key(cell->key_desc);
++		if (!IS_ERR(key))
++			cell->anonymous_key = key;
++	}
++	mutex_unlock(&afs_key_lock);
++
++	if (IS_ERR(key))
++		return PTR_ERR(key);
++
++	_debug("anon key %p{%x}",
++	       cell->anonymous_key, key_serial(cell->anonymous_key));
++	return 0;
++}
+ 
+ /*
+  * get a key
+@@ -23,11 +47,12 @@ static DEFINE_SPINLOCK(afs_permits_lock);
+ struct key *afs_request_key(struct afs_cell *cell)
+ {
+ 	struct key *key;
++	int ret;
+ 
+-	_enter("{%x}", key_serial(cell->anonymous_key));
++	_enter("{%s}", cell->key_desc);
+ 
+-	_debug("key %s", cell->anonymous_key->description);
+-	key = request_key_net(&key_type_rxrpc, cell->anonymous_key->description,
++	_debug("key %s", cell->key_desc);
++	key = request_key_net(&key_type_rxrpc, cell->key_desc,
+ 			      cell->net->net, NULL);
+ 	if (IS_ERR(key)) {
+ 		if (PTR_ERR(key) != -ENOKEY) {
+@@ -35,6 +60,12 @@ struct key *afs_request_key(struct afs_cell *cell)
+ 			return key;
+ 		}
+ 
++		if (!cell->anonymous_key) {
++			ret = afs_alloc_anon_key(cell);
++			if (ret < 0)
++				return ERR_PTR(ret);
++		}
++
+ 		/* act as anonymous user */
+ 		_leave(" = {%x} [anon]", key_serial(cell->anonymous_key));
+ 		return key_get(cell->anonymous_key);
+@@ -52,11 +83,10 @@ struct key *afs_request_key_rcu(struct afs_cell *cell)
+ {
+ 	struct key *key;
+ 
+-	_enter("{%x}", key_serial(cell->anonymous_key));
++	_enter("{%s}", cell->key_desc);
+ 
+-	_debug("key %s", cell->anonymous_key->description);
+-	key = request_key_net_rcu(&key_type_rxrpc,
+-				  cell->anonymous_key->description,
++	_debug("key %s", cell->key_desc);
++	key = request_key_net_rcu(&key_type_rxrpc, cell->key_desc,
+ 				  cell->net->net);
+ 	if (IS_ERR(key)) {
+ 		if (PTR_ERR(key) != -ENOKEY) {
+@@ -65,6 +95,8 @@ struct key *afs_request_key_rcu(struct afs_cell *cell)
+ 		}
+ 
+ 		/* act as anonymous user */
++		if (!cell->anonymous_key)
++			return NULL; /* Need to allocate */
+ 		_leave(" = {%x} [anon]", key_serial(cell->anonymous_key));
+ 		return key_get(cell->anonymous_key);
+ 	} else {
+@@ -408,7 +440,7 @@ int afs_permission(struct mnt_idmap *idmap, struct inode *inode,
+ 
+ 	if (mask & MAY_NOT_BLOCK) {
+ 		key = afs_request_key_rcu(vnode->volume->cell);
+-		if (IS_ERR(key))
++		if (IS_ERR_OR_NULL(key))
+ 			return -ECHILD;
+ 
+ 		ret = -ECHILD;
+-- 
+2.51.0
+
