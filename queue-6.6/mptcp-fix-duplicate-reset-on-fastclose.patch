@@ -1,0 +1,116 @@
+From stable+bounces-197529-greg=kroah.com@vger.kernel.org Thu Nov 27 19:28:04 2025
+From: "Matthieu Baerts (NGI0)" <matttbe@kernel.org>
+Date: Thu, 27 Nov 2025 19:27:42 +0100
+Subject: mptcp: fix duplicate reset on fastclose
+To: stable@vger.kernel.org, gregkh@linuxfoundation.org
+Cc: MPTCP Upstream <mptcp@lists.linux.dev>, Paolo Abeni <pabeni@redhat.com>, Geliang Tang <geliang@kernel.org>, "Matthieu Baerts (NGI0)" <matttbe@kernel.org>, Jakub Kicinski <kuba@kernel.org>
+Message-ID: <20251127182741.3577840-2-matttbe@kernel.org>
+
+From: Paolo Abeni <pabeni@redhat.com>
+
+commit ae155060247be8dcae3802a95bd1bdf93ab3215d upstream.
+
+The CI reports sporadic failures of the fastclose self-tests. The root
+cause is a duplicate reset, not carrying the relevant MPTCP option.
+In the failing scenario the bad reset is received by the peer before
+the fastclose one, preventing the reception of the latter.
+
+Indeed there is window of opportunity at fastclose time for the
+following race:
+
+  mptcp_do_fastclose
+    __mptcp_close_ssk
+      __tcp_close()
+        tcp_set_state() [1]
+        tcp_send_active_reset() [2]
+
+After [1] the stack will send reset to in-flight data reaching the now
+closed port. Such reset may race with [2].
+
+Address the issue explicitly sending a single reset on fastclose before
+explicitly moving the subflow to close status.
+
+Fixes: d21f83485518 ("mptcp: use fastclose on more edge scenarios")
+Cc: stable@vger.kernel.org
+Closes: https://github.com/multipath-tcp/mptcp_net-next/issues/596
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Reviewed-by: Geliang Tang <geliang@kernel.org>
+Reviewed-by: Matthieu Baerts (NGI0) <matttbe@kernel.org>
+Signed-off-by: Matthieu Baerts (NGI0) <matttbe@kernel.org>
+Link: https://patch.msgid.link/20251118-net-mptcp-misc-fixes-6-18-rc6-v1-6-806d3781c95f@kernel.org
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+[ No conflicts, but tcp_send_active_reset() doesn't take a 3rd argument
+  (sk_rst_reason) in this version, see commit 5691276b39da ("rstreason:
+  prepare for active reset"). This argument is only helpful for tracing,
+  it is fine to drop it. ]
+Signed-off-by: Matthieu Baerts (NGI0) <matttbe@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/mptcp/protocol.c |   35 ++++++++++++++++++++++-------------
+ 1 file changed, 22 insertions(+), 13 deletions(-)
+
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -2431,7 +2431,6 @@ bool __mptcp_retransmit_pending_data(str
+ 
+ /* flags for __mptcp_close_ssk() */
+ #define MPTCP_CF_PUSH		BIT(1)
+-#define MPTCP_CF_FASTCLOSE	BIT(2)
+ 
+ /* be sure to send a reset only if the caller asked for it, also
+  * clean completely the subflow status when the subflow reaches
+@@ -2442,7 +2441,7 @@ static void __mptcp_subflow_disconnect(s
+ 				       unsigned int flags)
+ {
+ 	if (((1 << ssk->sk_state) & (TCPF_CLOSE | TCPF_LISTEN)) ||
+-	    (flags & MPTCP_CF_FASTCLOSE)) {
++	    subflow->send_fastclose) {
+ 		/* The MPTCP code never wait on the subflow sockets, TCP-level
+ 		 * disconnect should never fail
+ 		 */
+@@ -2489,14 +2488,8 @@ static void __mptcp_close_ssk(struct soc
+ 
+ 	lock_sock_nested(ssk, SINGLE_DEPTH_NESTING);
+ 
+-	if ((flags & MPTCP_CF_FASTCLOSE) && !__mptcp_check_fallback(msk)) {
+-		/* be sure to force the tcp_close path
+-		 * to generate the egress reset
+-		 */
+-		ssk->sk_lingertime = 0;
+-		sock_set_flag(ssk, SOCK_LINGER);
+-		subflow->send_fastclose = 1;
+-	}
++	if (subflow->send_fastclose && ssk->sk_state != TCP_CLOSE)
++		tcp_set_state(ssk, TCP_CLOSE);
+ 
+ 	need_push = (flags & MPTCP_CF_PUSH) && __mptcp_retransmit_pending_data(sk);
+ 	if (!dispose_it) {
+@@ -2809,9 +2802,25 @@ static void mptcp_do_fastclose(struct so
+ 	struct mptcp_sock *msk = mptcp_sk(sk);
+ 
+ 	mptcp_set_state(sk, TCP_CLOSE);
+-	mptcp_for_each_subflow_safe(msk, subflow, tmp)
+-		__mptcp_close_ssk(sk, mptcp_subflow_tcp_sock(subflow),
+-				  subflow, MPTCP_CF_FASTCLOSE);
++
++	/* Explicitly send the fastclose reset as need */
++	if (__mptcp_check_fallback(msk))
++		return;
++
++	mptcp_for_each_subflow_safe(msk, subflow, tmp) {
++		struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
++
++		lock_sock(ssk);
++
++		/* Some subflow socket states don't allow/need a reset.*/
++		if ((1 << ssk->sk_state) & (TCPF_LISTEN | TCPF_CLOSE))
++			goto unlock;
++
++		subflow->send_fastclose = 1;
++		tcp_send_active_reset(ssk, ssk->sk_allocation);
++unlock:
++		release_sock(ssk);
++	}
+ }
+ 
+ static void mptcp_worker(struct work_struct *work)
