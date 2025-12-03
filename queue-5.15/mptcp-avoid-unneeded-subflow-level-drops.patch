@@ -1,0 +1,130 @@
+From stable+bounces-197646-greg=kroah.com@vger.kernel.org Sat Nov 29 17:59:57 2025
+From: "Matthieu Baerts (NGI0)" <matttbe@kernel.org>
+Date: Sat, 29 Nov 2025 17:58:26 +0100
+Subject: mptcp: avoid unneeded subflow-level drops
+To: stable@vger.kernel.org, gregkh@linuxfoundation.org
+Cc: MPTCP Upstream <mptcp@lists.linux.dev>, Paolo Abeni <pabeni@redhat.com>, "Matthieu Baerts (NGI0)" <matttbe@kernel.org>, Jakub Kicinski <kuba@kernel.org>
+Message-ID: <20251129165825.2129168-2-matttbe@kernel.org>
+
+From: Paolo Abeni <pabeni@redhat.com>
+
+commit 4f102d747cadd8f595f2b25882eed9bec1675fb1 upstream.
+
+The rcv window is shared among all the subflows. Currently, MPTCP sync
+the TCP-level rcv window with the MPTCP one at tcp_transmit_skb() time.
+
+The above means that incoming data may sporadically observe outdated
+TCP-level rcv window and being wrongly dropped by TCP.
+
+Address the issue checking for the edge condition before queuing the
+data at TCP level, and eventually syncing the rcv window as needed.
+
+Note that the issue is actually present from the very first MPTCP
+implementation, but backports older than the blamed commit below will
+range from impossible to useless.
+
+Before:
+
+  $ nstat -n; sleep 1; nstat -z TcpExtBeyondWindow
+  TcpExtBeyondWindow              14                 0.0
+
+After:
+
+  $ nstat -n; sleep 1; nstat -z TcpExtBeyondWindow
+  TcpExtBeyondWindow              0                  0.0
+
+Fixes: fa3fe2b15031 ("mptcp: track window announced to peer")
+Cc: stable@vger.kernel.org
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Reviewed-by: Matthieu Baerts (NGI0) <matttbe@kernel.org>
+Signed-off-by: Matthieu Baerts (NGI0) <matttbe@kernel.org>
+Link: https://patch.msgid.link/20251118-net-mptcp-misc-fixes-6-18-rc6-v1-2-806d3781c95f@kernel.org
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+[ Conflicts in options.c, because the new rwin_update() helper has been
+  added after __mptcp_snd_una_update() which is not in this version --
+  see commit -- and then causing conflicts in the context. There were
+  also some conflicts in mptcp_set_rwin(), because commit f3589be0c420
+  ("mptcp: never shrink offered window") is not in this version. Only
+  the update of subflow->rcv_wnd_sent has been added. Also
+  msk->rcv_wnd_sent is a u64 before this commit: in rwin_update(),
+  READ_ONCE() is used instead of atomic64_read(&). ]
+Signed-off-by: Matthieu Baerts (NGI0) <matttbe@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/mptcp/options.c  |   32 ++++++++++++++++++++++++++++++--
+ net/mptcp/protocol.h |    1 +
+ 2 files changed, 31 insertions(+), 2 deletions(-)
+
+--- a/net/mptcp/options.c
++++ b/net/mptcp/options.c
+@@ -1001,6 +1001,31 @@ u64 __mptcp_expand_seq(u64 old_seq, u64
+ 	return cur_seq;
+ }
+ 
++static void rwin_update(struct mptcp_sock *msk, struct sock *ssk,
++			struct sk_buff *skb)
++{
++	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(ssk);
++	struct tcp_sock *tp = tcp_sk(ssk);
++	u64 mptcp_rcv_wnd;
++
++	/* Avoid touching extra cachelines if TCP is going to accept this
++	 * skb without filling the TCP-level window even with a possibly
++	 * outdated mptcp-level rwin.
++	 */
++	if (!skb->len || skb->len < tcp_receive_window(tp))
++		return;
++
++	mptcp_rcv_wnd = READ_ONCE(msk->rcv_wnd_sent);
++	if (!after64(mptcp_rcv_wnd, subflow->rcv_wnd_sent))
++		return;
++
++	/* Some other subflow grew the mptcp-level rwin since rcv_wup,
++	 * resync.
++	 */
++	tp->rcv_wnd += mptcp_rcv_wnd - subflow->rcv_wnd_sent;
++	subflow->rcv_wnd_sent = mptcp_rcv_wnd;
++}
++
+ static void ack_update_msk(struct mptcp_sock *msk,
+ 			   struct sock *ssk,
+ 			   struct mptcp_options_received *mp_opt)
+@@ -1160,6 +1185,7 @@ bool mptcp_incoming_options(struct sock
+ 	 */
+ 	if (mp_opt.use_ack)
+ 		ack_update_msk(msk, sk, &mp_opt);
++	rwin_update(msk, sk, skb);
+ 
+ 	/* Zero-data-length packets are dropped by the caller and not
+ 	 * propagated to the MPTCP layer, so the skb extension does not
+@@ -1212,7 +1238,7 @@ bool mptcp_incoming_options(struct sock
+ static void mptcp_set_rwin(const struct tcp_sock *tp)
+ {
+ 	const struct sock *ssk = (const struct sock *)tp;
+-	const struct mptcp_subflow_context *subflow;
++	struct mptcp_subflow_context *subflow;
+ 	struct mptcp_sock *msk;
+ 	u64 ack_seq;
+ 
+@@ -1221,8 +1247,10 @@ static void mptcp_set_rwin(const struct
+ 
+ 	ack_seq = READ_ONCE(msk->ack_seq) + tp->rcv_wnd;
+ 
+-	if (after64(ack_seq, READ_ONCE(msk->rcv_wnd_sent)))
++	if (after64(ack_seq, READ_ONCE(msk->rcv_wnd_sent))) {
+ 		WRITE_ONCE(msk->rcv_wnd_sent, ack_seq);
++		subflow->rcv_wnd_sent = ack_seq;
++	}
+ }
+ 
+ static void mptcp_track_rwin(const struct tcp_sock *tp)
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -417,6 +417,7 @@ struct mptcp_subflow_context {
+ 	u64	remote_key;
+ 	u64	idsn;
+ 	u64	map_seq;
++	u64	rcv_wnd_sent;
+ 	u32	snd_isn;
+ 	u32	token;
+ 	u32	rel_write_seq;
