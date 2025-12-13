@@ -1,0 +1,118 @@
+From 482cbd4da0a6b7b88dc87fcc4b5f9ba702b8449e Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 4 May 2022 08:35:59 -0700
+Subject: netfilter: nf_conncount: reduce unnecessary GC
+
+From: William Tu <u9012063@gmail.com>
+
+[ Upstream commit d265929930e2ffafc744c0ae05fb70acd53be1ee ]
+
+Currently nf_conncount can trigger garbage collection (GC)
+at multiple places. Each GC process takes a spin_lock_bh
+to traverse the nf_conncount_list. We found that when testing
+port scanning use two parallel nmap, because the number of
+connection increase fast, the nf_conncount_count and its
+subsequent call to __nf_conncount_add take too much time,
+causing several CPU lockup. This happens when user set the
+conntrack limit to +20,000, because the larger the limit,
+the longer the list that GC has to traverse.
+
+The patch mitigate the performance issue by avoiding unnecessary
+GC with a timestamp. Whenever nf_conncount has done a GC,
+a timestamp is updated, and beforce the next time GC is
+triggered, we make sure it's more than a jiffies.
+By doin this we can greatly reduce the CPU cycles and
+avoid the softirq lockup.
+
+To reproduce it in OVS,
+$ ovs-appctl dpctl/ct-set-limits zone=1,limit=20000
+$ ovs-appctl dpctl/ct-get-limits
+
+At another machine, runs two nmap
+$ nmap -p1- <IP>
+$ nmap -p1- <IP>
+
+Signed-off-by: William Tu <u9012063@gmail.com>
+Co-authored-by: Yifeng Sun <pkusunyifeng@gmail.com>
+Reported-by: Greg Rose <gvrose8192@gmail.com>
+Suggested-by: Florian Westphal <fw@strlen.de>
+Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+Stable-dep-of: 69894e5b4c5e ("netfilter: nft_connlimit: update the count if add was skipped")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/net/netfilter/nf_conntrack_count.h |  1 +
+ net/netfilter/nf_conncount.c               | 11 +++++++++++
+ 2 files changed, 12 insertions(+)
+
+diff --git a/include/net/netfilter/nf_conntrack_count.h b/include/net/netfilter/nf_conntrack_count.h
+index 9645b47fa7e41..e227d997fc716 100644
+--- a/include/net/netfilter/nf_conntrack_count.h
++++ b/include/net/netfilter/nf_conntrack_count.h
+@@ -10,6 +10,7 @@ struct nf_conncount_data;
+ 
+ struct nf_conncount_list {
+ 	spinlock_t list_lock;
++	u32 last_gc;		/* jiffies at most recent gc */
+ 	struct list_head head;	/* connections with the same filtering key */
+ 	unsigned int count;	/* length of list */
+ };
+diff --git a/net/netfilter/nf_conncount.c b/net/netfilter/nf_conncount.c
+index a66a27fe7f458..ee808b018e4e1 100644
+--- a/net/netfilter/nf_conncount.c
++++ b/net/netfilter/nf_conncount.c
+@@ -132,6 +132,9 @@ static int __nf_conncount_add(struct net *net,
+ 	struct nf_conn *found_ct;
+ 	unsigned int collect = 0;
+ 
++	if (time_is_after_eq_jiffies((unsigned long)list->last_gc))
++		goto add_new_node;
++
+ 	/* check the saved connections */
+ 	list_for_each_entry_safe(conn, conn_n, &list->head, node) {
+ 		if (collect > CONNCOUNT_GC_MAX_NODES)
+@@ -177,6 +180,7 @@ static int __nf_conncount_add(struct net *net,
+ 		nf_ct_put(found_ct);
+ 	}
+ 
++add_new_node:
+ 	if (WARN_ON_ONCE(list->count > INT_MAX))
+ 		return -EOVERFLOW;
+ 
+@@ -190,6 +194,7 @@ static int __nf_conncount_add(struct net *net,
+ 	conn->jiffies32 = (u32)jiffies;
+ 	list_add_tail(&conn->node, &list->head);
+ 	list->count++;
++	list->last_gc = (u32)jiffies;
+ 	return 0;
+ }
+ 
+@@ -214,6 +219,7 @@ void nf_conncount_list_init(struct nf_conncount_list *list)
+ 	spin_lock_init(&list->list_lock);
+ 	INIT_LIST_HEAD(&list->head);
+ 	list->count = 0;
++	list->last_gc = (u32)jiffies;
+ }
+ EXPORT_SYMBOL_GPL(nf_conncount_list_init);
+ 
+@@ -227,6 +233,10 @@ bool nf_conncount_gc_list(struct net *net,
+ 	unsigned int collected = 0;
+ 	bool ret = false;
+ 
++	/* don't bother if we just did GC */
++	if (time_is_after_eq_jiffies((unsigned long)READ_ONCE(list->last_gc)))
++		return false;
++
+ 	/* don't bother if other cpu is already doing GC */
+ 	if (!spin_trylock(&list->list_lock))
+ 		return false;
+@@ -258,6 +268,7 @@ bool nf_conncount_gc_list(struct net *net,
+ 
+ 	if (!list->count)
+ 		ret = true;
++	list->last_gc = (u32)jiffies;
+ 	spin_unlock(&list->list_lock);
+ 
+ 	return ret;
+-- 
+2.51.0
+
