@@ -1,0 +1,117 @@
+From stable+bounces-204401-greg=kroah.com@vger.kernel.org Thu Jan  1 00:40:18 2026
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 31 Dec 2025 18:40:07 -0500
+Subject: block: freeze queue when updating zone resources
+To: stable@vger.kernel.org
+Cc: Damien Le Moal <dlemoal@kernel.org>, Christoph Hellwig <hch@lst.de>, Johannes Thumshirn <johannes.thumshirn@wdc.com>, Chaitanya Kulkarni <kch@nvidia.com>, Hannes Reinecke <hare@suse.de>, "Martin K. Petersen" <martin.petersen@oracle.com>, Jens Axboe <axboe@kernel.dk>, Sasha Levin <sashal@kernel.org>
+Message-ID: <20251231234008.3701023-1-sashal@kernel.org>
+
+From: Damien Le Moal <dlemoal@kernel.org>
+
+[ Upstream commit bba4322e3f303b2d656e748be758320b567f046f ]
+
+Modify disk_update_zone_resources() to freeze the device queue before
+updating the number of zones, zone capacity and other zone related
+resources. The locking order resulting from the call to
+queue_limits_commit_update_frozen() is preserved, that is, the queue
+limits lock is first taken by calling queue_limits_start_update() before
+freezing the queue, and the queue is unfrozen after executing
+queue_limits_commit_update(), which replaces the call to
+queue_limits_commit_update_frozen().
+
+This change ensures that there are no in-flights I/Os when the zone
+resources are updated due to a zone revalidation. In case of error when
+the limits are applied, directly call disk_free_zone_resources() from
+disk_update_zone_resources() while the disk queue is still frozen to
+avoid needing to freeze & unfreeze the queue again in
+blk_revalidate_disk_zones(), thus simplifying that function code a
+little.
+
+Fixes: 0b83c86b444a ("block: Prevent potential deadlock in blk_revalidate_disk_zones()")
+Cc: stable@vger.kernel.org
+Signed-off-by: Damien Le Moal <dlemoal@kernel.org>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+Reviewed-by: Chaitanya Kulkarni <kch@nvidia.com>
+Reviewed-by: Hannes Reinecke <hare@suse.de>
+Reviewed-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+[ adapted blk_mq_freeze_queue/unfreeze_queue calls to single-argument void API ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ block/blk-zoned.c |   39 +++++++++++++++++++++++----------------
+ 1 file changed, 23 insertions(+), 16 deletions(-)
+
+--- a/block/blk-zoned.c
++++ b/block/blk-zoned.c
+@@ -1514,6 +1514,11 @@ static int disk_update_zone_resources(st
+ 	unsigned int nr_seq_zones, nr_conv_zones;
+ 	unsigned int pool_size;
+ 	struct queue_limits lim;
++	int ret = 0;
++
++	lim = queue_limits_start_update(q);
++
++	blk_mq_freeze_queue(q);
+ 
+ 	disk->nr_zones = args->nr_zones;
+ 	disk->zone_capacity = args->zone_capacity;
+@@ -1523,11 +1528,10 @@ static int disk_update_zone_resources(st
+ 	if (nr_conv_zones >= disk->nr_zones) {
+ 		pr_warn("%s: Invalid number of conventional zones %u / %u\n",
+ 			disk->disk_name, nr_conv_zones, disk->nr_zones);
+-		return -ENODEV;
++		ret = -ENODEV;
++		goto unfreeze;
+ 	}
+ 
+-	lim = queue_limits_start_update(q);
+-
+ 	/*
+ 	 * Some devices can advertize zone resource limits that are larger than
+ 	 * the number of sequential zones of the zoned block device, e.g. a
+@@ -1564,7 +1568,15 @@ static int disk_update_zone_resources(st
+ 	}
+ 
+ commit:
+-	return queue_limits_commit_update_frozen(q, &lim);
++	ret = queue_limits_commit_update(q, &lim);
++
++unfreeze:
++	if (ret)
++		disk_free_zone_resources(disk);
++
++	blk_mq_unfreeze_queue(q);
++
++	return ret;
+ }
+ 
+ static int blk_revalidate_conv_zone(struct blk_zone *zone, unsigned int idx,
+@@ -1785,19 +1797,14 @@ int blk_revalidate_disk_zones(struct gen
+ 		ret = -ENODEV;
+ 	}
+ 
+-	/*
+-	 * Set the new disk zone parameters only once the queue is frozen and
+-	 * all I/Os are completed.
+-	 */
+ 	if (ret > 0)
+-		ret = disk_update_zone_resources(disk, &args);
+-	else
+-		pr_warn("%s: failed to revalidate zones\n", disk->disk_name);
+-	if (ret) {
+-		blk_mq_freeze_queue(q);
+-		disk_free_zone_resources(disk);
+-		blk_mq_unfreeze_queue(q);
+-	}
++		return disk_update_zone_resources(disk, &args);
++
++	pr_warn("%s: failed to revalidate zones\n", disk->disk_name);
++
++	blk_mq_freeze_queue(q);
++	disk_free_zone_resources(disk);
++	blk_mq_unfreeze_queue(q);
+ 
+ 	return ret;
+ }
