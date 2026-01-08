@@ -1,0 +1,230 @@
+From stable+bounces-200322-greg=kroah.com@vger.kernel.org Mon Dec  8 07:17:38 2025
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon,  8 Dec 2025 01:17:26 -0500
+Subject: KVM: x86/mmu: Use EMULTYPE flag to track write #PFs to shadow pages
+To: stable@vger.kernel.org
+Cc: Sean Christopherson <seanjc@google.com>, Paolo Bonzini <pbonzini@redhat.com>, Sasha Levin <sashal@kernel.org>
+Message-ID: <20251208061727.249698-1-sashal@kernel.org>
+
+From: Sean Christopherson <seanjc@google.com>
+
+[ Upstream commit 258d985f6eb360c9c7aacd025d0dbc080a59423f ]
+
+Use a new EMULTYPE flag, EMULTYPE_WRITE_PF_TO_SP, to track page faults
+on self-changing writes to shadowed page tables instead of propagating
+that information to the emulator via a semi-persistent vCPU flag.  Using
+a flag in "struct kvm_vcpu_arch" is confusing, especially as implemented,
+as it's not at all obvious that clearing the flag only when emulation
+actually occurs is correct.
+
+E.g. if KVM sets the flag and then retries the fault without ever getting
+to the emulator, the flag will be left set for future calls into the
+emulator.  But because the flag is consumed if and only if both
+EMULTYPE_PF and EMULTYPE_ALLOW_RETRY_PF are set, and because
+EMULTYPE_ALLOW_RETRY_PF is deliberately not set for direct MMUs, emulated
+MMIO, or while L2 is active, KVM avoids false positives on a stale flag
+since FNAME(page_fault) is guaranteed to be run and refresh the flag
+before it's ultimately consumed by the tail end of reexecute_instruction().
+
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <20230202182817.407394-2-seanjc@google.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Stable-dep-of: 4da3768e1820 ("KVM: SVM: Don't skip unrelated instruction if INT3/INTO is replaced")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/x86/include/asm/kvm_host.h |   37 ++++++++++++++++++++-----------------
+ arch/x86/kvm/mmu/mmu.c          |    5 +++--
+ arch/x86/kvm/mmu/mmu_internal.h |   12 +++++++++++-
+ arch/x86/kvm/mmu/paging_tmpl.h  |    4 +---
+ arch/x86/kvm/x86.c              |   15 ++-------------
+ 5 files changed, 37 insertions(+), 36 deletions(-)
+
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -890,23 +890,6 @@ struct kvm_vcpu_arch {
+ 
+ 	u64 msr_kvm_poll_control;
+ 
+-	/*
+-	 * Indicates the guest is trying to write a gfn that contains one or
+-	 * more of the PTEs used to translate the write itself, i.e. the access
+-	 * is changing its own translation in the guest page tables.  KVM exits
+-	 * to userspace if emulation of the faulting instruction fails and this
+-	 * flag is set, as KVM cannot make forward progress.
+-	 *
+-	 * If emulation fails for a write to guest page tables, KVM unprotects
+-	 * (zaps) the shadow page for the target gfn and resumes the guest to
+-	 * retry the non-emulatable instruction (on hardware).  Unprotecting the
+-	 * gfn doesn't allow forward progress for a self-changing access because
+-	 * doing so also zaps the translation for the gfn, i.e. retrying the
+-	 * instruction will hit a !PRESENT fault, which results in a new shadow
+-	 * page and sends KVM back to square one.
+-	 */
+-	bool write_fault_to_shadow_pgtable;
+-
+ 	/* set at EPT violation at this point */
+ 	unsigned long exit_qualification;
+ 
+@@ -1825,6 +1808,25 @@ u64 vcpu_tsc_khz(struct kvm_vcpu *vcpu);
+  * EMULTYPE_COMPLETE_USER_EXIT - Set when the emulator should update interruptibility
+  *				 state and inject single-step #DBs after skipping
+  *				 an instruction (after completing userspace I/O).
++ *
++ * EMULTYPE_WRITE_PF_TO_SP - Set when emulating an intercepted page fault that
++ *			     is attempting to write a gfn that contains one or
++ *			     more of the PTEs used to translate the write itself,
++ *			     and the owning page table is being shadowed by KVM.
++ *			     If emulation of the faulting instruction fails and
++ *			     this flag is set, KVM will exit to userspace instead
++ *			     of retrying emulation as KVM cannot make forward
++ *			     progress.
++ *
++ *			     If emulation fails for a write to guest page tables,
++ *			     KVM unprotects (zaps) the shadow page for the target
++ *			     gfn and resumes the guest to retry the non-emulatable
++ *			     instruction (on hardware).  Unprotecting the gfn
++ *			     doesn't allow forward progress for a self-changing
++ *			     access because doing so also zaps the translation for
++ *			     the gfn, i.e. retrying the instruction will hit a
++ *			     !PRESENT fault, which results in a new shadow page
++ *			     and sends KVM back to square one.
+  */
+ #define EMULTYPE_NO_DECODE	    (1 << 0)
+ #define EMULTYPE_TRAP_UD	    (1 << 1)
+@@ -1834,6 +1836,7 @@ u64 vcpu_tsc_khz(struct kvm_vcpu *vcpu);
+ #define EMULTYPE_VMWARE_GP	    (1 << 5)
+ #define EMULTYPE_PF		    (1 << 6)
+ #define EMULTYPE_COMPLETE_USER_EXIT (1 << 7)
++#define EMULTYPE_WRITE_PF_TO_SP	    (1 << 8)
+ 
+ int kvm_emulate_instruction(struct kvm_vcpu *vcpu, int emulation_type);
+ int kvm_emulate_instruction_from_buffer(struct kvm_vcpu *vcpu,
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -4152,7 +4152,7 @@ void kvm_arch_async_page_ready(struct kv
+ 	      work->arch.cr3 != kvm_mmu_get_guest_pgd(vcpu, vcpu->arch.mmu))
+ 		return;
+ 
+-	kvm_mmu_do_page_fault(vcpu, work->cr2_or_gpa, 0, true);
++	kvm_mmu_do_page_fault(vcpu, work->cr2_or_gpa, 0, true, NULL);
+ }
+ 
+ static int kvm_faultin_pfn(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault)
+@@ -5580,7 +5580,8 @@ int noinline kvm_mmu_page_fault(struct k
+ 
+ 	if (r == RET_PF_INVALID) {
+ 		r = kvm_mmu_do_page_fault(vcpu, cr2_or_gpa,
+-					  lower_32_bits(error_code), false);
++					  lower_32_bits(error_code), false,
++					  &emulation_type);
+ 		if (KVM_BUG_ON(r == RET_PF_INVALID, vcpu->kvm))
+ 			return -EIO;
+ 	}
+--- a/arch/x86/kvm/mmu/mmu_internal.h
++++ b/arch/x86/kvm/mmu/mmu_internal.h
+@@ -223,6 +223,13 @@ struct kvm_page_fault {
+ 	kvm_pfn_t pfn;
+ 	hva_t hva;
+ 	bool map_writable;
++
++	/*
++	 * Indicates the guest is trying to write a gfn that contains one or
++	 * more of the PTEs used to translate the write itself, i.e. the access
++	 * is changing its own translation in the guest page tables.
++	 */
++	bool write_fault_to_shadow_pgtable;
+ };
+ 
+ int kvm_tdp_page_fault(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault);
+@@ -256,7 +263,7 @@ enum {
+ };
+ 
+ static inline int kvm_mmu_do_page_fault(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
+-					u32 err, bool prefetch)
++					u32 err, bool prefetch, int *emulation_type)
+ {
+ 	struct kvm_page_fault fault = {
+ 		.addr = cr2_or_gpa,
+@@ -290,6 +297,9 @@ static inline int kvm_mmu_do_page_fault(
+ 	else
+ 		r = vcpu->arch.mmu->page_fault(vcpu, &fault);
+ 
++	if (fault.write_fault_to_shadow_pgtable && emulation_type)
++		*emulation_type |= EMULTYPE_WRITE_PF_TO_SP;
++
+ 	/*
+ 	 * Similar to above, prefetch faults aren't truly spurious, and the
+ 	 * async #PF path doesn't do emulation.  Do count faults that are fixed
+--- a/arch/x86/kvm/mmu/paging_tmpl.h
++++ b/arch/x86/kvm/mmu/paging_tmpl.h
+@@ -829,10 +829,8 @@ static int FNAME(page_fault)(struct kvm_
+ 	if (r)
+ 		return r;
+ 
+-	vcpu->arch.write_fault_to_shadow_pgtable = false;
+-
+ 	is_self_change_mapping = FNAME(is_self_change_mapping)(vcpu,
+-	      &walker, fault->user, &vcpu->arch.write_fault_to_shadow_pgtable);
++	      &walker, fault->user, &fault->write_fault_to_shadow_pgtable);
+ 
+ 	if (is_self_change_mapping)
+ 		fault->max_level = PG_LEVEL_4K;
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -8532,7 +8532,6 @@ static int handle_emulation_failure(stru
+ }
+ 
+ static bool reexecute_instruction(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
+-				  bool write_fault_to_shadow_pgtable,
+ 				  int emulation_type)
+ {
+ 	gpa_t gpa = cr2_or_gpa;
+@@ -8603,7 +8602,7 @@ static bool reexecute_instruction(struct
+ 	 * be fixed by unprotecting shadow page and it should
+ 	 * be reported to userspace.
+ 	 */
+-	return !write_fault_to_shadow_pgtable;
++	return !(emulation_type & EMULTYPE_WRITE_PF_TO_SP);
+ }
+ 
+ static bool retry_instruction(struct x86_emulate_ctxt *ctxt,
+@@ -8874,20 +8873,12 @@ int x86_emulate_instruction(struct kvm_v
+ 	int r;
+ 	struct x86_emulate_ctxt *ctxt = vcpu->arch.emulate_ctxt;
+ 	bool writeback = true;
+-	bool write_fault_to_spt;
+ 
+ 	if (unlikely(!kvm_can_emulate_insn(vcpu, emulation_type, insn, insn_len)))
+ 		return 1;
+ 
+ 	vcpu->arch.l1tf_flush_l1d = true;
+ 
+-	/*
+-	 * Clear write_fault_to_shadow_pgtable here to ensure it is
+-	 * never reused.
+-	 */
+-	write_fault_to_spt = vcpu->arch.write_fault_to_shadow_pgtable;
+-	vcpu->arch.write_fault_to_shadow_pgtable = false;
+-
+ 	if (!(emulation_type & EMULTYPE_NO_DECODE)) {
+ 		kvm_clear_exception_queue(vcpu);
+ 
+@@ -8908,7 +8899,6 @@ int x86_emulate_instruction(struct kvm_v
+ 				return 1;
+ 			}
+ 			if (reexecute_instruction(vcpu, cr2_or_gpa,
+-						  write_fault_to_spt,
+ 						  emulation_type))
+ 				return 1;
+ 
+@@ -8994,8 +8984,7 @@ restart:
+ 		return 1;
+ 
+ 	if (r == EMULATION_FAILED) {
+-		if (reexecute_instruction(vcpu, cr2_or_gpa, write_fault_to_spt,
+-					emulation_type))
++		if (reexecute_instruction(vcpu, cr2_or_gpa, emulation_type))
+ 			return 1;
+ 
+ 		return handle_emulation_failure(vcpu, emulation_type);
