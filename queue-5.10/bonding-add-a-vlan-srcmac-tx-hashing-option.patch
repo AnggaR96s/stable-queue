@@ -1,0 +1,199 @@
+From 99e16e20e3cd649a343cd64b81afa8a2cdcbb2d6 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 18 Jan 2021 20:09:27 -0500
+Subject: bonding: add a vlan+srcmac tx hashing option
+
+From: Jarod Wilson <jarod@redhat.com>
+
+[ Upstream commit 7b8fc0103bb51d1d3e1fb5fd67958612e709f883 ]
+
+This comes from an end-user request, where they're running multiple VMs on
+hosts with bonded interfaces connected to some interest switch topologies,
+where 802.3ad isn't an option. They're currently running a proprietary
+solution that effectively achieves load-balancing of VMs and bandwidth
+utilization improvements with a similar form of transmission algorithm.
+
+Basically, each VM has it's own vlan, so it always sends its traffic out
+the same interface, unless that interface fails. Traffic gets split
+between the interfaces, maintaining a consistent path, with failover still
+available if an interface goes down.
+
+Unlike bond_eth_hash(), this hash function is using the full source MAC
+address instead of just the last byte, as there are so few components to
+the hash, and in the no-vlan case, we would be returning just the last
+byte of the source MAC as the hash value. It's entirely possible to have
+two NICs in a bond with the same last byte of their MAC, but not the same
+MAC, so this adjustment should guarantee distinct hashes in all cases.
+
+This has been rudimetarily tested to provide similar results to the
+proprietary solution it is aiming to replace. A patch for iproute2 is also
+posted, to properly support the new mode there as well.
+
+Cc: Jay Vosburgh <j.vosburgh@gmail.com>
+Cc: Veaceslav Falico <vfalico@gmail.com>
+Cc: Andy Gospodarek <andy@greyhouse.net>
+Cc: Thomas Davis <tadavis@lbl.gov>
+Signed-off-by: Jarod Wilson <jarod@redhat.com>
+Link: https://lore.kernel.org/r/20210119010927.1191922-1-jarod@redhat.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Stable-dep-of: 5f9b32909659 ("bonding: provide a net pointer to __skb_flow_dissect()")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ Documentation/networking/bonding.rst | 13 +++++++++++
+ drivers/net/bonding/bond_main.c      | 34 ++++++++++++++++++++++++++--
+ drivers/net/bonding/bond_options.c   | 13 ++++++-----
+ include/linux/netdevice.h            |  1 +
+ include/uapi/linux/if_bonding.h      |  1 +
+ 5 files changed, 54 insertions(+), 8 deletions(-)
+
+diff --git a/Documentation/networking/bonding.rst b/Documentation/networking/bonding.rst
+index 413dca513e1db..5390e79de5bb8 100644
+--- a/Documentation/networking/bonding.rst
++++ b/Documentation/networking/bonding.rst
+@@ -952,6 +952,19 @@ xmit_hash_policy
+ 		packets will be distributed according to the encapsulated
+ 		flows.
+ 
++	vlan+srcmac
++
++		This policy uses a very rudimentary vlan ID and source mac
++		hash to load-balance traffic per-vlan, with failover
++		should one leg fail. The intended use case is for a bond
++		shared by multiple virtual machines, all configured to
++		use their own vlan, to give lacp-like functionality
++		without requiring lacp-capable switching hardware.
++
++		The formula for the hash is simply
++
++		hash = (vlan ID) XOR (source MAC vendor) XOR (source MAC dev)
++
+ 	The default value is layer2.  This option was added in bonding
+ 	version 2.6.3.  In earlier versions of bonding, this parameter
+ 	does not exist, and the layer2 policy is the only policy.  The
+diff --git a/drivers/net/bonding/bond_main.c b/drivers/net/bonding/bond_main.c
+index b4b2e6a7fdd40..2a6870a3b56dc 100644
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@ -164,7 +164,7 @@ module_param(xmit_hash_policy, charp, 0);
+ MODULE_PARM_DESC(xmit_hash_policy, "balance-alb, balance-tlb, balance-xor, 802.3ad hashing method; "
+ 				   "0 for layer 2 (default), 1 for layer 3+4, "
+ 				   "2 for layer 2+3, 3 for encap layer 2+3, "
+-				   "4 for encap layer 3+4");
++				   "4 for encap layer 3+4, 5 for vlan+srcmac");
+ module_param(arp_interval, int, 0);
+ MODULE_PARM_DESC(arp_interval, "arp interval in milliseconds");
+ module_param_array(arp_ip_target, charp, NULL, 0);
+@@ -1560,6 +1560,8 @@ static enum netdev_lag_hash bond_lag_hash_type(struct bonding *bond,
+ 		return NETDEV_LAG_HASH_E23;
+ 	case BOND_XMIT_POLICY_ENCAP34:
+ 		return NETDEV_LAG_HASH_E34;
++	case BOND_XMIT_POLICY_VLAN_SRCMAC:
++		return NETDEV_LAG_HASH_VLAN_SRCMAC;
+ 	default:
+ 		return NETDEV_LAG_HASH_UNKNOWN;
+ 	}
+@@ -3633,6 +3635,27 @@ static bool bond_flow_ip(struct sk_buff *skb, struct flow_keys *fk,
+ 	return true;
+ }
+ 
++static u32 bond_vlan_srcmac_hash(struct sk_buff *skb)
++{
++	struct ethhdr *mac_hdr = (struct ethhdr *)skb_mac_header(skb);
++	u32 srcmac_vendor = 0, srcmac_dev = 0;
++	u16 vlan;
++	int i;
++
++	for (i = 0; i < 3; i++)
++		srcmac_vendor = (srcmac_vendor << 8) | mac_hdr->h_source[i];
++
++	for (i = 3; i < ETH_ALEN; i++)
++		srcmac_dev = (srcmac_dev << 8) | mac_hdr->h_source[i];
++
++	if (!skb_vlan_tag_present(skb))
++		return srcmac_vendor ^ srcmac_dev;
++
++	vlan = skb_vlan_tag_get(skb);
++
++	return vlan ^ srcmac_vendor ^ srcmac_dev;
++}
++
+ /* Extract the appropriate headers based on bond's xmit policy */
+ static bool bond_flow_dissect(struct bonding *bond, struct sk_buff *skb,
+ 			      struct flow_keys *fk)
+@@ -3640,10 +3663,14 @@ static bool bond_flow_dissect(struct bonding *bond, struct sk_buff *skb,
+ 	bool l34 = bond->params.xmit_policy == BOND_XMIT_POLICY_LAYER34;
+ 	int noff, proto = -1;
+ 
+-	if (bond->params.xmit_policy > BOND_XMIT_POLICY_LAYER23) {
++	switch (bond->params.xmit_policy) {
++	case BOND_XMIT_POLICY_ENCAP23:
++	case BOND_XMIT_POLICY_ENCAP34:
+ 		memset(fk, 0, sizeof(*fk));
+ 		return __skb_flow_dissect(NULL, skb, &flow_keys_bonding,
+ 					  fk, NULL, 0, 0, 0, 0);
++	default:
++		break;
+ 	}
+ 
+ 	fk->ports.ports = 0;
+@@ -3705,6 +3732,9 @@ u32 bond_xmit_hash(struct bonding *bond, struct sk_buff *skb)
+ 	    skb->l4_hash)
+ 		return skb->hash;
+ 
++	if (bond->params.xmit_policy == BOND_XMIT_POLICY_VLAN_SRCMAC)
++		return bond_vlan_srcmac_hash(skb);
++
+ 	if (bond->params.xmit_policy == BOND_XMIT_POLICY_LAYER2 ||
+ 	    !bond_flow_dissect(bond, skb, &flow))
+ 		return bond_eth_hash(skb);
+diff --git a/drivers/net/bonding/bond_options.c b/drivers/net/bonding/bond_options.c
+index acc6185749945..2f2e4c4a84581 100644
+--- a/drivers/net/bonding/bond_options.c
++++ b/drivers/net/bonding/bond_options.c
+@@ -96,12 +96,13 @@ static const struct bond_opt_value bond_pps_tbl[] = {
+ };
+ 
+ static const struct bond_opt_value bond_xmit_hashtype_tbl[] = {
+-	{ "layer2",   BOND_XMIT_POLICY_LAYER2, BOND_VALFLAG_DEFAULT},
+-	{ "layer3+4", BOND_XMIT_POLICY_LAYER34, 0},
+-	{ "layer2+3", BOND_XMIT_POLICY_LAYER23, 0},
+-	{ "encap2+3", BOND_XMIT_POLICY_ENCAP23, 0},
+-	{ "encap3+4", BOND_XMIT_POLICY_ENCAP34, 0},
+-	{ NULL,       -1,                       0},
++	{ "layer2",      BOND_XMIT_POLICY_LAYER2,      BOND_VALFLAG_DEFAULT},
++	{ "layer3+4",    BOND_XMIT_POLICY_LAYER34,     0},
++	{ "layer2+3",    BOND_XMIT_POLICY_LAYER23,     0},
++	{ "encap2+3",    BOND_XMIT_POLICY_ENCAP23,     0},
++	{ "encap3+4",    BOND_XMIT_POLICY_ENCAP34,     0},
++	{ "vlan+srcmac", BOND_XMIT_POLICY_VLAN_SRCMAC, 0},
++	{ NULL,          -1,                           0},
+ };
+ 
+ static const struct bond_opt_value bond_arp_validate_tbl[] = {
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index dcf1b603cb516..3e0da2c9ff51d 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -2670,6 +2670,7 @@ enum netdev_lag_hash {
+ 	NETDEV_LAG_HASH_L23,
+ 	NETDEV_LAG_HASH_E23,
+ 	NETDEV_LAG_HASH_E34,
++	NETDEV_LAG_HASH_VLAN_SRCMAC,
+ 	NETDEV_LAG_HASH_UNKNOWN,
+ };
+ 
+diff --git a/include/uapi/linux/if_bonding.h b/include/uapi/linux/if_bonding.h
+index 45f3750aa861b..e8eb4ad03cf18 100644
+--- a/include/uapi/linux/if_bonding.h
++++ b/include/uapi/linux/if_bonding.h
+@@ -94,6 +94,7 @@
+ #define BOND_XMIT_POLICY_LAYER23	2 /* layer 2+3 (IP ^ MAC) */
+ #define BOND_XMIT_POLICY_ENCAP23	3 /* encapsulated layer 2+3 */
+ #define BOND_XMIT_POLICY_ENCAP34	4 /* encapsulated layer 3+4 */
++#define BOND_XMIT_POLICY_VLAN_SRCMAC	5 /* vlan + source MAC */
+ 
+ /* 802.3ad port state definitions (43.4.2.2 in the 802.3ad standard) */
+ #define LACP_STATE_LACP_ACTIVITY   0x1
+-- 
+2.51.0
+
