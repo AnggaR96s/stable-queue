@@ -1,0 +1,88 @@
+From inwardvessel@gmail.com  Tue Feb  3 17:30:36 2026
+From: JP Kobryn <inwardvessel@gmail.com>
+Date: Sat, 31 Jan 2026 23:09:53 -0800
+Subject: btrfs: prevent use-after-free on page private data in btrfs_subpage_clear_uptodate()
+To: wqu@suse.com, boris@bur.io, clm@fb.com, dsterba@suse.com
+Cc: linux-btrfs@vger.kernel.org, stable@vger.kernel.org, linux-kernel@vger.kernel.org, kernel-team@meta.com
+Message-ID: <20260201070953.129723-1-inwardvessel@gmail.com>
+
+From: JP Kobryn <inwardvessel@gmail.com>
+
+This is a stable-only patch. The issue was inadvertently fixed in 6.17 [0]
+as part of a refactoring, but this patch serves as a minimal targeted fix
+for prior kernels.
+
+Users of find_lock_page() need to guard against the situation where
+releasepage() has been invoked during reclaim but the page was ultimately
+not removed from the page cache. This patch covers one location that was
+overlooked.
+
+After acquiring the page, use set_page_extent_mapped() to ensure the page
+private state is valid. This is especially important in the subpage case,
+where the private field is an allocated struct containing bitmap and lock
+data.
+
+Without this protection, the race below is possible:
+
+[mm] page cache reclaim path        [fs] relocation in subpage mode
+shrink_page_list()
+  trylock_page() /* lock acquired */
+  try_to_release_page()
+    mapping->a_ops->releasepage()
+      btrfs_releasepage()
+        __btrfs_releasepage()
+          clear_page_extent_mapped()
+            btrfs_detach_subpage()
+              subpage = detach_page_private(page)
+              btrfs_free_subpage(subpage)
+                kfree(subpage) /* point A */
+                                        prealloc_file_extent_cluster()
+                                          find_lock_page()
+                                            page_cache_get_speculative()
+                                            lock_page() /* wait for lock */
+  if (...)
+    ...
+  else if (!mapping || !__remove_mapping(..))
+    /*
+     * __remove_mapping() returns zero when
+     * page_ref_freeze(page, refcount) fails /* point B */
+     */
+    goto keep_locked /* page remains in cache */
+keep_locked:
+  unlock_page(page) /* lock released */
+                                        /* lock acquired */
+                                        btrfs_subpage_clear_uptodate()
+                                          /* use-after-free */
+                                          subpage = page->private
+[0] 4e346baee95f ("btrfs: reloc: unconditionally invalidate the page cache for each cluster")
+
+Fixes: 9d9ea1e68a05 ("btrfs: subpage: fix relocation potentially overwriting last page data")
+Cc: stable@vger.kernel.org # 5.15 - 6.9
+Signed-off-by: JP Kobryn <inwardvessel@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/btrfs/relocation.c |   13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+--- a/fs/btrfs/relocation.c
++++ b/fs/btrfs/relocation.c
+@@ -2847,6 +2847,19 @@ static noinline_for_stack int prealloc_f
+ 		 * will re-read the whole page anyway.
+ 		 */
+ 		if (page) {
++			/*
++			 * releasepage() could have cleared the page private data while
++			 * we were not holding the lock. Reset the mapping if needed so
++			 * subpage operations can access a valid private page state.
++			 */
++			ret = set_page_extent_mapped(page);
++			if (ret) {
++				unlock_page(page);
++				put_page(page);
++
++				return ret;
++			}
++
+ 			btrfs_subpage_clear_uptodate(fs_info, page, i_size,
+ 					round_up(i_size, PAGE_SIZE) - i_size);
+ 			unlock_page(page);
