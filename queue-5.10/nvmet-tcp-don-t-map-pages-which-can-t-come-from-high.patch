@@ -1,0 +1,192 @@
+From c03ec5eaa7ed78a08a748bb10dc503fe32c3808b Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 31 Aug 2022 00:05:33 +0200
+Subject: nvmet-tcp: don't map pages which can't come from HIGHMEM
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+From: Fabio M. De Francesco <fmdefrancesco@gmail.com>
+
+[ Upstream commit 5bfaba275ae6486700194cad962574e3eb7ae60d ]
+
+kmap() is being deprecated in favor of kmap_local_page().[1]
+
+There are two main problems with kmap(): (1) It comes with an overhead as
+mapping space is restricted and protected by a global lock for
+synchronization and (2) it also requires global TLB invalidation when the
+kmap’s pool wraps and it might block when the mapping space is fully
+utilized until a slot becomes available.
+
+The pages which will be mapped are allocated in nvmet_tcp_map_data(),
+using the GFP_KERNEL flag. This assures that they cannot come from
+HIGHMEM. This imply that a straight page_address() can replace the kmap()
+of sg_page(sg) in nvmet_tcp_map_pdu_iovec(). As a side effect, we might
+also delete the field "nr_mapped" from struct "nvmet_tcp_cmd" because,
+after removing the kmap() calls, there would be no longer any need of it.
+
+In addition, there is no reason to use a kvec for the command receive
+data buffers iovec, use a bio_vec instead and let iov_iter handle the
+buffer mapping and data copy.
+
+Test with blktests on a QEMU/KVM x86_32 VM, 6GB RAM, booting a kernel with
+HIGHMEM64GB enabled.
+
+[1] "[PATCH] checkpatch: Add kmap and kmap_atomic to the deprecated
+list" https://lore.kernel.org/all/20220813220034.806698-1-ira.weiny@intel.com/
+
+Cc: Chaitanya Kulkarni <chaitanyak@nvidia.com>
+Cc: Keith Busch <kbusch@kernel.org>
+Suggested-by: Ira Weiny <ira.weiny@intel.com>
+Signed-off-by: Fabio M. De Francesco <fmdefrancesco@gmail.com>
+Suggested-by: Christoph Hellwig <hch@lst.de>
+Suggested-by: Al Viro <viro@zeniv.linux.org.uk>
+[sagi: added bio_vec plus minor naming changes]
+Signed-off-by: Sagi Grimberg <sagi@grimberg.me>
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Stable-dep-of: 52a0a9854934 ("nvmet-tcp: add bounds checks in nvmet_tcp_build_pdu_iovec")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/nvme/target/tcp.c | 44 ++++++++++++---------------------------
+ 1 file changed, 13 insertions(+), 31 deletions(-)
+
+diff --git a/drivers/nvme/target/tcp.c b/drivers/nvme/target/tcp.c
+index bc0e860a2887f..6fd4f74315f6c 100644
+--- a/drivers/nvme/target/tcp.c
++++ b/drivers/nvme/target/tcp.c
+@@ -68,9 +68,8 @@ struct nvmet_tcp_cmd {
+ 	u32				pdu_len;
+ 	u32				pdu_recv;
+ 	int				sg_idx;
+-	int				nr_mapped;
+ 	struct msghdr			recv_msg;
+-	struct kvec			*iov;
++	struct bio_vec			*iov;
+ 	u32				flags;
+ 
+ 	struct list_head		entry;
+@@ -156,7 +155,6 @@ static const struct nvmet_fabrics_ops nvmet_tcp_ops;
+ static void nvmet_tcp_free_cmd(struct nvmet_tcp_cmd *c);
+ static void nvmet_tcp_finish_cmd(struct nvmet_tcp_cmd *cmd);
+ static void nvmet_tcp_free_cmd_buffers(struct nvmet_tcp_cmd *cmd);
+-static void nvmet_tcp_unmap_pdu_iovec(struct nvmet_tcp_cmd *cmd);
+ 
+ static inline u16 nvmet_tcp_cmd_tag(struct nvmet_tcp_queue *queue,
+ 		struct nvmet_tcp_cmd *cmd)
+@@ -290,35 +288,21 @@ static int nvmet_tcp_check_ddgst(struct nvmet_tcp_queue *queue, void *pdu)
+ 
+ static void nvmet_tcp_free_cmd_buffers(struct nvmet_tcp_cmd *cmd)
+ {
+-	WARN_ON(unlikely(cmd->nr_mapped > 0));
+-
+ 	kfree(cmd->iov);
+ 	sgl_free(cmd->req.sg);
+ 	cmd->iov = NULL;
+ 	cmd->req.sg = NULL;
+ }
+ 
+-static void nvmet_tcp_unmap_pdu_iovec(struct nvmet_tcp_cmd *cmd)
+-{
+-	struct scatterlist *sg;
+-	int i;
+-
+-	sg = &cmd->req.sg[cmd->sg_idx];
+-
+-	for (i = 0; i < cmd->nr_mapped; i++)
+-		kunmap(sg_page(&sg[i]));
+-
+-	cmd->nr_mapped = 0;
+-}
+-
+-static void nvmet_tcp_map_pdu_iovec(struct nvmet_tcp_cmd *cmd)
++static void nvmet_tcp_build_pdu_iovec(struct nvmet_tcp_cmd *cmd)
+ {
+-	struct kvec *iov = cmd->iov;
++	struct bio_vec *iov = cmd->iov;
+ 	struct scatterlist *sg;
+ 	u32 length, offset, sg_offset;
++	int nr_pages;
+ 
+ 	length = cmd->pdu_len;
+-	cmd->nr_mapped = DIV_ROUND_UP(length, PAGE_SIZE);
++	nr_pages = DIV_ROUND_UP(length, PAGE_SIZE);
+ 	offset = cmd->rbytes_done;
+ 	cmd->sg_idx = offset / PAGE_SIZE;
+ 	sg_offset = offset % PAGE_SIZE;
+@@ -327,8 +311,9 @@ static void nvmet_tcp_map_pdu_iovec(struct nvmet_tcp_cmd *cmd)
+ 	while (length) {
+ 		u32 iov_len = min_t(u32, length, sg->length - sg_offset);
+ 
+-		iov->iov_base = kmap(sg_page(sg)) + sg->offset + sg_offset;
+-		iov->iov_len = iov_len;
++		iov->bv_page = sg_page(sg);
++		iov->bv_len = sg->length;
++		iov->bv_offset = sg->offset + sg_offset;
+ 
+ 		length -= iov_len;
+ 		sg = sg_next(sg);
+@@ -336,8 +321,8 @@ static void nvmet_tcp_map_pdu_iovec(struct nvmet_tcp_cmd *cmd)
+ 		sg_offset = 0;
+ 	}
+ 
+-	iov_iter_kvec(&cmd->recv_msg.msg_iter, READ, cmd->iov,
+-		cmd->nr_mapped, cmd->pdu_len);
++	iov_iter_bvec(&cmd->recv_msg.msg_iter, READ, cmd->iov,
++		      nr_pages, cmd->pdu_len);
+ }
+ 
+ static void nvmet_tcp_fatal_error(struct nvmet_tcp_queue *queue)
+@@ -913,7 +898,7 @@ static void nvmet_tcp_handle_req_failure(struct nvmet_tcp_queue *queue,
+ 	}
+ 
+ 	queue->rcv_state = NVMET_TCP_RECV_DATA;
+-	nvmet_tcp_map_pdu_iovec(cmd);
++	nvmet_tcp_build_pdu_iovec(cmd);
+ 	cmd->flags |= NVMET_TCP_F_INIT_FAILED;
+ }
+ 
+@@ -966,7 +951,7 @@ static int nvmet_tcp_handle_h2c_data_pdu(struct nvmet_tcp_queue *queue)
+ 		goto err_proto;
+ 	}
+ 	cmd->pdu_recv = 0;
+-	nvmet_tcp_map_pdu_iovec(cmd);
++	nvmet_tcp_build_pdu_iovec(cmd);
+ 	queue->cmd = cmd;
+ 	queue->rcv_state = NVMET_TCP_RECV_DATA;
+ 
+@@ -1040,7 +1025,7 @@ static int nvmet_tcp_done_recv_pdu(struct nvmet_tcp_queue *queue)
+ 	if (nvmet_tcp_need_data_in(queue->cmd)) {
+ 		if (nvmet_tcp_has_inline_data(queue->cmd)) {
+ 			queue->rcv_state = NVMET_TCP_RECV_DATA;
+-			nvmet_tcp_map_pdu_iovec(queue->cmd);
++			nvmet_tcp_build_pdu_iovec(queue->cmd);
+ 			return 0;
+ 		}
+ 		/* send back R2T */
+@@ -1160,7 +1145,6 @@ static int nvmet_tcp_try_recv_data(struct nvmet_tcp_queue *queue)
+ 		cmd->rbytes_done += ret;
+ 	}
+ 
+-	nvmet_tcp_unmap_pdu_iovec(cmd);
+ 	if (queue->data_digest) {
+ 		nvmet_tcp_prep_recv_ddgst(cmd);
+ 		return 0;
+@@ -1415,7 +1399,6 @@ static void nvmet_tcp_restore_socket_callbacks(struct nvmet_tcp_queue *queue)
+ static void nvmet_tcp_finish_cmd(struct nvmet_tcp_cmd *cmd)
+ {
+ 	nvmet_req_uninit(&cmd->req);
+-	nvmet_tcp_unmap_pdu_iovec(cmd);
+ 	nvmet_tcp_free_cmd_buffers(cmd);
+ }
+ 
+@@ -1428,7 +1411,6 @@ static void nvmet_tcp_uninit_data_in_cmds(struct nvmet_tcp_queue *queue)
+ 		if (nvmet_tcp_need_data_in(cmd))
+ 			nvmet_req_uninit(&cmd->req);
+ 
+-		nvmet_tcp_unmap_pdu_iovec(cmd);
+ 		nvmet_tcp_free_cmd_buffers(cmd);
+ 	}
+ 
+-- 
+2.51.0
+
