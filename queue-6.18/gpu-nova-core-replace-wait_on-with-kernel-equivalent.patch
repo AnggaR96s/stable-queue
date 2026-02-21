@@ -1,0 +1,312 @@
+From 6a682bb901f7f96c25552107df05683a7560629c Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 20 Oct 2025 15:09:25 +0900
+Subject: gpu: nova-core: replace wait_on with kernel equivalents
+
+From: Alexandre Courbot <acourbot@nvidia.com>
+
+[ Upstream commit 76544ef6a01b2d8fa86f92ff17940b6ff534696e ]
+
+wait_on was a temporary helper function waiting for a kernel crate
+equivalent.
+
+Now that read_poll_timeout and fsleep are available, use them and remove
+wait_on.
+
+Acked-by: Danilo Krummrich <dakr@kernel.org>
+Signed-off-by: Alexandre Courbot <acourbot@nvidia.com>
+Message-ID: <20251020-nova_wait_on-v1-1-2eb87fb38d14@nvidia.com>
+Stable-dep-of: 5cf76277cdec ("gpu: nova-core: check for overflow to DMATRFBASE1")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ Documentation/gpu/nova/core/todo.rst      | 11 ----
+ drivers/gpu/nova-core/falcon.rs           | 62 ++++++++++-------------
+ drivers/gpu/nova-core/falcon/hal/ga102.rs | 16 +++---
+ drivers/gpu/nova-core/gfw.rs              | 36 ++++++-------
+ drivers/gpu/nova-core/nova_core.rs        |  1 -
+ drivers/gpu/nova-core/util.rs             | 27 ----------
+ 6 files changed, 51 insertions(+), 102 deletions(-)
+ delete mode 100644 drivers/gpu/nova-core/util.rs
+
+diff --git a/Documentation/gpu/nova/core/todo.rst b/Documentation/gpu/nova/core/todo.rst
+index 0972cb905f7ae..c55c7bedbfdfa 100644
+--- a/Documentation/gpu/nova/core/todo.rst
++++ b/Documentation/gpu/nova/core/todo.rst
+@@ -153,17 +153,6 @@ A `num` core kernel module is being designed to provide these operations.
+ | Complexity: Intermediate
+ | Contact: Alexandre Courbot
+ 
+-Delay / Sleep abstractions [DLAY]
+----------------------------------
+-
+-Rust abstractions for the kernel's delay() and sleep() functions.
+-
+-FUJITA Tomonori plans to work on abstractions for read_poll_timeout_atomic()
+-(and friends) [1].
+-
+-| Complexity: Beginner
+-| Link: https://lore.kernel.org/netdev/20250228.080550.354359820929821928.fujita.tomonori@gmail.com/ [1]
+-
+ IRQ abstractions
+ ----------------
+ 
+diff --git a/drivers/gpu/nova-core/falcon.rs b/drivers/gpu/nova-core/falcon.rs
+index 37e6298195e49..05856b43b51c3 100644
+--- a/drivers/gpu/nova-core/falcon.rs
++++ b/drivers/gpu/nova-core/falcon.rs
+@@ -6,8 +6,10 @@
+ use hal::FalconHal;
+ use kernel::device;
+ use kernel::dma::DmaAddress;
++use kernel::io::poll::read_poll_timeout;
+ use kernel::prelude::*;
+ use kernel::sync::aref::ARef;
++use kernel::time::delay::fsleep;
+ use kernel::time::Delta;
+ 
+ use crate::dma::DmaObject;
+@@ -15,7 +17,6 @@
+ use crate::gpu::Chipset;
+ use crate::regs;
+ use crate::regs::macros::RegisterBase;
+-use crate::util;
+ 
+ pub(crate) mod gsp;
+ mod hal;
+@@ -380,13 +381,13 @@ pub(crate) fn new(
+     /// Wait for memory scrubbing to complete.
+     fn reset_wait_mem_scrubbing(&self, bar: &Bar0) -> Result {
+         // TIMEOUT: memory scrubbing should complete in less than 20ms.
+-        util::wait_on(Delta::from_millis(20), || {
+-            if regs::NV_PFALCON_FALCON_HWCFG2::read(bar, &E::ID).mem_scrubbing_done() {
+-                Some(())
+-            } else {
+-                None
+-            }
+-        })
++        read_poll_timeout(
++            || Ok(regs::NV_PFALCON_FALCON_HWCFG2::read(bar, &E::ID)),
++            |r| r.mem_scrubbing_done(),
++            Delta::ZERO,
++            Delta::from_millis(20),
++        )
++        .map(|_| ())
+     }
+ 
+     /// Reset the falcon engine.
+@@ -395,20 +396,17 @@ fn reset_eng(&self, bar: &Bar0) -> Result {
+ 
+         // According to OpenRM's `kflcnPreResetWait_GA102` documentation, HW sometimes does not set
+         // RESET_READY so a non-failing timeout is used.
+-        let _ = util::wait_on(Delta::from_micros(150), || {
+-            let r = regs::NV_PFALCON_FALCON_HWCFG2::read(bar, &E::ID);
+-            if r.reset_ready() {
+-                Some(())
+-            } else {
+-                None
+-            }
+-        });
++        let _ = read_poll_timeout(
++            || Ok(regs::NV_PFALCON_FALCON_HWCFG2::read(bar, &E::ID)),
++            |r| r.reset_ready(),
++            Delta::ZERO,
++            Delta::from_micros(150),
++        );
+ 
+         regs::NV_PFALCON_FALCON_ENGINE::alter(bar, &E::ID, |v| v.set_reset(true));
+ 
+-        // TODO[DLAY]: replace with udelay() or equivalent once available.
+         // TIMEOUT: falcon engine should not take more than 10us to reset.
+-        let _: Result = util::wait_on(Delta::from_micros(10), || None);
++        fsleep(Delta::from_micros(10));
+ 
+         regs::NV_PFALCON_FALCON_ENGINE::alter(bar, &E::ID, |v| v.set_reset(false));
+ 
+@@ -512,14 +510,12 @@ fn dma_wr<F: FalconFirmware<Target = E>>(
+             // Wait for the transfer to complete.
+             // TIMEOUT: arbitrarily large value, no DMA transfer to the falcon's small memories
+             // should ever take that long.
+-            util::wait_on(Delta::from_secs(2), || {
+-                let r = regs::NV_PFALCON_FALCON_DMATRFCMD::read(bar, &E::ID);
+-                if r.idle() {
+-                    Some(())
+-                } else {
+-                    None
+-                }
+-            })?;
++            read_poll_timeout(
++                || Ok(regs::NV_PFALCON_FALCON_DMATRFCMD::read(bar, &E::ID)),
++                |r| r.idle(),
++                Delta::ZERO,
++                Delta::from_secs(2),
++            )?;
+         }
+ 
+         Ok(())
+@@ -582,14 +578,12 @@ pub(crate) fn boot(
+         }
+ 
+         // TIMEOUT: arbitrarily large value, firmwares should complete in less than 2 seconds.
+-        util::wait_on(Delta::from_secs(2), || {
+-            let r = regs::NV_PFALCON_FALCON_CPUCTL::read(bar, &E::ID);
+-            if r.halted() {
+-                Some(())
+-            } else {
+-                None
+-            }
+-        })?;
++        read_poll_timeout(
++            || Ok(regs::NV_PFALCON_FALCON_CPUCTL::read(bar, &E::ID)),
++            |r| r.halted(),
++            Delta::ZERO,
++            Delta::from_secs(2),
++        )?;
+ 
+         let (mbox0, mbox1) = (
+             regs::NV_PFALCON_FALCON_MAILBOX0::read(bar, &E::ID).value(),
+diff --git a/drivers/gpu/nova-core/falcon/hal/ga102.rs b/drivers/gpu/nova-core/falcon/hal/ga102.rs
+index 0b1cbe7853b3e..f2ae9537321d0 100644
+--- a/drivers/gpu/nova-core/falcon/hal/ga102.rs
++++ b/drivers/gpu/nova-core/falcon/hal/ga102.rs
+@@ -3,6 +3,7 @@
+ use core::marker::PhantomData;
+ 
+ use kernel::device;
++use kernel::io::poll::read_poll_timeout;
+ use kernel::prelude::*;
+ use kernel::time::Delta;
+ 
+@@ -11,7 +12,6 @@
+     Falcon, FalconBromParams, FalconEngine, FalconModSelAlgo, PeregrineCoreSelect,
+ };
+ use crate::regs;
+-use crate::util;
+ 
+ use super::FalconHal;
+ 
+@@ -23,14 +23,12 @@ fn select_core_ga102<E: FalconEngine>(bar: &Bar0) -> Result {
+             .write(bar, &E::ID);
+ 
+         // TIMEOUT: falcon core should take less than 10ms to report being enabled.
+-        util::wait_on(Delta::from_millis(10), || {
+-            let r = regs::NV_PRISCV_RISCV_BCR_CTRL::read(bar, &E::ID);
+-            if r.valid() {
+-                Some(())
+-            } else {
+-                None
+-            }
+-        })?;
++        read_poll_timeout(
++            || Ok(regs::NV_PRISCV_RISCV_BCR_CTRL::read(bar, &E::ID)),
++            |r| r.valid(),
++            Delta::ZERO,
++            Delta::from_millis(10),
++        )?;
+     }
+ 
+     Ok(())
+diff --git a/drivers/gpu/nova-core/gfw.rs b/drivers/gpu/nova-core/gfw.rs
+index 8ac1ed1871992..23c28c2a3793a 100644
+--- a/drivers/gpu/nova-core/gfw.rs
++++ b/drivers/gpu/nova-core/gfw.rs
+@@ -18,13 +18,12 @@
+ //!
+ //! Note that the devinit sequence also needs to run during suspend/resume.
+ 
+-use kernel::bindings;
++use kernel::io::poll::read_poll_timeout;
+ use kernel::prelude::*;
+ use kernel::time::Delta;
+ 
+ use crate::driver::Bar0;
+ use crate::regs;
+-use crate::util;
+ 
+ /// Wait for the `GFW` (GPU firmware) boot completion signal (`GFW_BOOT`), or a 4 seconds timeout.
+ ///
+@@ -50,22 +49,19 @@ pub(crate) fn wait_gfw_boot_completion(bar: &Bar0) -> Result {
+     //
+     // TIMEOUT: arbitrarily large value. GFW starts running immediately after the GPU is put out of
+     // reset, and should complete in less time than that.
+-    util::wait_on(Delta::from_secs(4), || {
+-        // Check that FWSEC has lowered its protection level before reading the GFW_BOOT status.
+-        let gfw_booted = regs::NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_PRIV_LEVEL_MASK::read(bar)
+-            .read_protection_level0()
+-            && regs::NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_0_GFW_BOOT::read(bar).completed();
+-
+-        if gfw_booted {
+-            Some(())
+-        } else {
+-            // TODO[DLAY]: replace with [1] once it merges.
+-            // [1] https://lore.kernel.org/rust-for-linux/20250423192857.199712-6-fujita.tomonori@gmail.com/
+-            //
+-            // SAFETY: `msleep()` is safe to call with any parameter.
+-            unsafe { bindings::msleep(1) };
+-
+-            None
+-        }
+-    })
++    read_poll_timeout(
++        || {
++            Ok(
++                // Check that FWSEC has lowered its protection level before reading the GFW_BOOT
++                // status.
++                regs::NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_PRIV_LEVEL_MASK::read(bar)
++                    .read_protection_level0()
++                    && regs::NV_PGC6_AON_SECURE_SCRATCH_GROUP_05_0_GFW_BOOT::read(bar).completed(),
++            )
++        },
++        |&gfw_booted| gfw_booted,
++        Delta::from_millis(1),
++        Delta::from_secs(4),
++    )
++    .map(|_| ())
+ }
+diff --git a/drivers/gpu/nova-core/nova_core.rs b/drivers/gpu/nova-core/nova_core.rs
+index fffcaee2249fe..db062e31a5e23 100644
+--- a/drivers/gpu/nova-core/nova_core.rs
++++ b/drivers/gpu/nova-core/nova_core.rs
+@@ -11,7 +11,6 @@
+ mod gpu;
+ mod gsp;
+ mod regs;
+-mod util;
+ mod vbios;
+ 
+ pub(crate) const MODULE_NAME: &kernel::str::CStr = <LocalModule as kernel::ModuleMetadata>::NAME;
+diff --git a/drivers/gpu/nova-core/util.rs b/drivers/gpu/nova-core/util.rs
+deleted file mode 100644
+index bf35f00cb732e..0000000000000
+--- a/drivers/gpu/nova-core/util.rs
++++ /dev/null
+@@ -1,27 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0
+-
+-use kernel::prelude::*;
+-use kernel::time::{Delta, Instant, Monotonic};
+-
+-/// Wait until `cond` is true or `timeout` elapsed.
+-///
+-/// When `cond` evaluates to `Some`, its return value is returned.
+-///
+-/// `Err(ETIMEDOUT)` is returned if `timeout` has been reached without `cond` evaluating to
+-/// `Some`.
+-///
+-/// TODO[DLAY]: replace with `read_poll_timeout` once it is available.
+-/// (https://lore.kernel.org/lkml/20250220070611.214262-8-fujita.tomonori@gmail.com/)
+-pub(crate) fn wait_on<R, F: Fn() -> Option<R>>(timeout: Delta, cond: F) -> Result<R> {
+-    let start_time = Instant::<Monotonic>::now();
+-
+-    loop {
+-        if let Some(ret) = cond() {
+-            return Ok(ret);
+-        }
+-
+-        if start_time.elapsed().as_nanos() > timeout.as_nanos() {
+-            return Err(ETIMEDOUT);
+-        }
+-    }
+-}
+-- 
+2.51.0
+

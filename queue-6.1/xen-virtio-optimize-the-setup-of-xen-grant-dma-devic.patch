@@ -1,0 +1,232 @@
+From c56bfedfd47dca75367454d6308d7d902a286dc0 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 25 Oct 2022 19:20:03 +0300
+Subject: xen/virtio: Optimize the setup of "xen-grant-dma" devices
+
+From: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+
+[ Upstream commit 035e3a4321f73c352b6408ec2153fa5bc3feb459 ]
+
+This is needed to avoid having to parse the same device-tree
+several times for a given device.
+
+For this to work we need to install the xen_virtio_restricted_mem_acc
+callback in Arm's xen_guest_init() which is same callback as x86's
+PV and HVM modes already use and remove the manual assignment in
+xen_setup_dma_ops(). Also we need to split the code to initialize
+backend_domid into a separate function.
+
+Prior to current patch we parsed the device-tree three times:
+1. xen_setup_dma_ops()->...->xen_is_dt_grant_dma_device()
+2. xen_setup_dma_ops()->...->xen_dt_grant_init_backend_domid()
+3. xen_virtio_mem_acc()->...->xen_is_dt_grant_dma_device()
+
+With current patch we parse the device-tree only once in
+xen_virtio_restricted_mem_acc()->...->xen_dt_grant_init_backend_domid()
+
+Other benefits are:
+- Not diverge from x86 when setting up Xen grant DMA ops
+- Drop several global functions
+
+Signed-off-by: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Reviewed-by: Xenia Ragiadakou <burzalodowa@gmail.com>
+Reviewed-by: Stefano Stabellini <sstabellini@kernel.org>
+Link: https://lore.kernel.org/r/20221025162004.8501-2-olekstysh@gmail.com
+Signed-off-by: Juergen Gross <jgross@suse.com>
+Stable-dep-of: dc8ea8714311 ("xen/virtio: Don't use grant-dma-ops when running as Dom0")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ arch/arm/xen/enlighten.c    |  2 +-
+ drivers/xen/grant-dma-ops.c | 77 ++++++++++++++-----------------------
+ include/xen/arm/xen-ops.h   |  4 +-
+ include/xen/xen-ops.h       | 16 --------
+ 4 files changed, 30 insertions(+), 69 deletions(-)
+
+diff --git a/arch/arm/xen/enlighten.c b/arch/arm/xen/enlighten.c
+index eace3607fef41..a395b6c0aae2a 100644
+--- a/arch/arm/xen/enlighten.c
++++ b/arch/arm/xen/enlighten.c
+@@ -442,7 +442,7 @@ static int __init xen_guest_init(void)
+ 		return 0;
+ 
+ 	if (IS_ENABLED(CONFIG_XEN_VIRTIO))
+-		virtio_set_mem_acc_cb(xen_virtio_mem_acc);
++		virtio_set_mem_acc_cb(xen_virtio_restricted_mem_acc);
+ 
+ 	if (!acpi_disabled)
+ 		xen_acpi_guest_init();
+diff --git a/drivers/xen/grant-dma-ops.c b/drivers/xen/grant-dma-ops.c
+index daa525df7bdc5..1e797a043980a 100644
+--- a/drivers/xen/grant-dma-ops.c
++++ b/drivers/xen/grant-dma-ops.c
+@@ -292,50 +292,20 @@ static const struct dma_map_ops xen_grant_dma_ops = {
+ 	.dma_supported = xen_grant_dma_supported,
+ };
+ 
+-static bool xen_is_dt_grant_dma_device(struct device *dev)
+-{
+-	struct device_node *iommu_np;
+-	bool has_iommu;
+-
+-	iommu_np = of_parse_phandle(dev->of_node, "iommus", 0);
+-	has_iommu = iommu_np &&
+-		    of_device_is_compatible(iommu_np, "xen,grant-dma");
+-	of_node_put(iommu_np);
+-
+-	return has_iommu;
+-}
+-
+-bool xen_is_grant_dma_device(struct device *dev)
+-{
+-	/* XXX Handle only DT devices for now */
+-	if (dev->of_node)
+-		return xen_is_dt_grant_dma_device(dev);
+-
+-	return false;
+-}
+-
+-bool xen_virtio_mem_acc(struct virtio_device *dev)
+-{
+-	if (IS_ENABLED(CONFIG_XEN_VIRTIO_FORCE_GRANT) || xen_pv_domain())
+-		return true;
+-
+-	return xen_is_grant_dma_device(dev->dev.parent);
+-}
+-
+ static int xen_dt_grant_init_backend_domid(struct device *dev,
+-					   struct xen_grant_dma_data *data)
++					   domid_t *backend_domid)
+ {
+ 	struct of_phandle_args iommu_spec;
+ 
+ 	if (of_parse_phandle_with_args(dev->of_node, "iommus", "#iommu-cells",
+ 			0, &iommu_spec)) {
+-		dev_err(dev, "Cannot parse iommus property\n");
++		dev_dbg(dev, "Cannot parse iommus property\n");
+ 		return -ESRCH;
+ 	}
+ 
+ 	if (!of_device_is_compatible(iommu_spec.np, "xen,grant-dma") ||
+ 			iommu_spec.args_count != 1) {
+-		dev_err(dev, "Incompatible IOMMU node\n");
++		dev_dbg(dev, "Incompatible IOMMU node\n");
+ 		of_node_put(iommu_spec.np);
+ 		return -ESRCH;
+ 	}
+@@ -346,12 +316,28 @@ static int xen_dt_grant_init_backend_domid(struct device *dev,
+ 	 * The endpoint ID here means the ID of the domain where the
+ 	 * corresponding backend is running
+ 	 */
+-	data->backend_domid = iommu_spec.args[0];
++	*backend_domid = iommu_spec.args[0];
+ 
+ 	return 0;
+ }
+ 
+-void xen_grant_setup_dma_ops(struct device *dev)
++static int xen_grant_init_backend_domid(struct device *dev,
++					domid_t *backend_domid)
++{
++	int ret = -ENODEV;
++
++	if (dev->of_node) {
++		ret = xen_dt_grant_init_backend_domid(dev, backend_domid);
++	} else if (IS_ENABLED(CONFIG_XEN_VIRTIO_FORCE_GRANT) || xen_pv_domain()) {
++		dev_info(dev, "Using dom0 as backend\n");
++		*backend_domid = 0;
++		ret = 0;
++	}
++
++	return ret;
++}
++
++static void xen_grant_setup_dma_ops(struct device *dev, domid_t backend_domid)
+ {
+ 	struct xen_grant_dma_data *data;
+ 
+@@ -365,16 +351,7 @@ void xen_grant_setup_dma_ops(struct device *dev)
+ 	if (!data)
+ 		goto err;
+ 
+-	if (dev->of_node) {
+-		if (xen_dt_grant_init_backend_domid(dev, data))
+-			goto err;
+-	} else if (IS_ENABLED(CONFIG_XEN_VIRTIO_FORCE_GRANT)) {
+-		dev_info(dev, "Using dom0 as backend\n");
+-		data->backend_domid = 0;
+-	} else {
+-		/* XXX ACPI device unsupported for now */
+-		goto err;
+-	}
++	data->backend_domid = backend_domid;
+ 
+ 	if (store_xen_grant_dma_data(dev, data)) {
+ 		dev_err(dev, "Cannot store Xen grant DMA data\n");
+@@ -392,12 +369,14 @@ void xen_grant_setup_dma_ops(struct device *dev)
+ 
+ bool xen_virtio_restricted_mem_acc(struct virtio_device *dev)
+ {
+-	bool ret = xen_virtio_mem_acc(dev);
++	domid_t backend_domid;
+ 
+-	if (ret)
+-		xen_grant_setup_dma_ops(dev->dev.parent);
++	if (!xen_grant_init_backend_domid(dev->dev.parent, &backend_domid)) {
++		xen_grant_setup_dma_ops(dev->dev.parent, backend_domid);
++		return true;
++	}
+ 
+-	return ret;
++	return false;
+ }
+ 
+ MODULE_DESCRIPTION("Xen grant DMA-mapping layer");
+diff --git a/include/xen/arm/xen-ops.h b/include/xen/arm/xen-ops.h
+index b0766a660338f..70073f5a2b545 100644
+--- a/include/xen/arm/xen-ops.h
++++ b/include/xen/arm/xen-ops.h
+@@ -8,9 +8,7 @@
+ static inline void xen_setup_dma_ops(struct device *dev)
+ {
+ #ifdef CONFIG_XEN
+-	if (xen_is_grant_dma_device(dev))
+-		xen_grant_setup_dma_ops(dev);
+-	else if (xen_swiotlb_detect())
++	if (xen_swiotlb_detect())
+ 		dev->dma_ops = &xen_swiotlb_dma_ops;
+ #endif
+ }
+diff --git a/include/xen/xen-ops.h b/include/xen/xen-ops.h
+index a34f4271a2e9f..47f11bec5e90c 100644
+--- a/include/xen/xen-ops.h
++++ b/include/xen/xen-ops.h
+@@ -216,26 +216,10 @@ static inline void xen_preemptible_hcall_end(void) { }
+ #endif /* CONFIG_XEN_PV && !CONFIG_PREEMPTION */
+ 
+ #ifdef CONFIG_XEN_GRANT_DMA_OPS
+-void xen_grant_setup_dma_ops(struct device *dev);
+-bool xen_is_grant_dma_device(struct device *dev);
+-bool xen_virtio_mem_acc(struct virtio_device *dev);
+ bool xen_virtio_restricted_mem_acc(struct virtio_device *dev);
+ #else
+-static inline void xen_grant_setup_dma_ops(struct device *dev)
+-{
+-}
+-static inline bool xen_is_grant_dma_device(struct device *dev)
+-{
+-	return false;
+-}
+-
+ struct virtio_device;
+ 
+-static inline bool xen_virtio_mem_acc(struct virtio_device *dev)
+-{
+-	return false;
+-}
+-
+ static inline bool xen_virtio_restricted_mem_acc(struct virtio_device *dev)
+ {
+ 	return false;
+-- 
+2.51.0
+

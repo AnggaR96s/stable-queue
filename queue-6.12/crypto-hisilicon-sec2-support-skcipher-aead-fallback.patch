@@ -1,0 +1,220 @@
+From 3052792f1400ffd5f5d721e26b55e27c0cf6f37c Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 18 Dec 2025 21:44:52 +0800
+Subject: crypto: hisilicon/sec2 - support skcipher/aead fallback for hardware
+ queue unavailable
+
+From: Qi Tao <taoqi10@huawei.com>
+
+[ Upstream commit e7507439628052363500d717caffb5c2241854dc ]
+
+When all hardware queues are busy and no shareable queue,
+new processes fail to apply for queues. To avoid affecting
+tasks, support fallback mechanism when hardware queues are
+unavailable.
+
+Fixes: c16a70c1f253 ("crypto: hisilicon/sec - add new algorithm mode for AEAD")
+Signed-off-by: Qi Tao <taoqi10@huawei.com>
+Signed-off-by: Chenghai Huang <huangchenghai2@huawei.com>
+Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/crypto/hisilicon/sec2/sec_crypto.c | 62 ++++++++++++++++------
+ 1 file changed, 47 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/crypto/hisilicon/sec2/sec_crypto.c b/drivers/crypto/hisilicon/sec2/sec_crypto.c
+index 8605cb3cae92c..cdd485fcbc5bb 100644
+--- a/drivers/crypto/hisilicon/sec2/sec_crypto.c
++++ b/drivers/crypto/hisilicon/sec2/sec_crypto.c
+@@ -591,10 +591,8 @@ static int sec_ctx_base_init(struct sec_ctx *ctx)
+ 	int i, ret;
+ 
+ 	ctx->qps = sec_create_qps();
+-	if (!ctx->qps) {
+-		pr_err("Can not create sec qps!\n");
++	if (!ctx->qps)
+ 		return -ENODEV;
+-	}
+ 
+ 	sec = container_of(ctx->qps[0]->qm, struct sec_dev, qm);
+ 	ctx->sec = sec;
+@@ -633,6 +631,9 @@ static void sec_ctx_base_uninit(struct sec_ctx *ctx)
+ {
+ 	int i;
+ 
++	if (!ctx->qps)
++		return;
++
+ 	for (i = 0; i < ctx->sec->ctx_q_num; i++)
+ 		sec_release_qp_ctx(ctx, &ctx->qp_ctx[i]);
+ 
+@@ -644,6 +645,9 @@ static int sec_cipher_init(struct sec_ctx *ctx)
+ {
+ 	struct sec_cipher_ctx *c_ctx = &ctx->c_ctx;
+ 
++	if (!ctx->qps)
++		return 0;
++
+ 	c_ctx->c_key = dma_alloc_coherent(ctx->dev, SEC_MAX_KEY_SIZE,
+ 					  &c_ctx->c_key_dma, GFP_KERNEL);
+ 	if (!c_ctx->c_key)
+@@ -656,6 +660,9 @@ static void sec_cipher_uninit(struct sec_ctx *ctx)
+ {
+ 	struct sec_cipher_ctx *c_ctx = &ctx->c_ctx;
+ 
++	if (!ctx->qps)
++		return;
++
+ 	memzero_explicit(c_ctx->c_key, SEC_MAX_KEY_SIZE);
+ 	dma_free_coherent(ctx->dev, SEC_MAX_KEY_SIZE,
+ 			  c_ctx->c_key, c_ctx->c_key_dma);
+@@ -677,6 +684,9 @@ static void sec_auth_uninit(struct sec_ctx *ctx)
+ {
+ 	struct sec_auth_ctx *a_ctx = &ctx->a_ctx;
+ 
++	if (!ctx->qps)
++		return;
++
+ 	memzero_explicit(a_ctx->a_key, SEC_MAX_AKEY_SIZE);
+ 	dma_free_coherent(ctx->dev, SEC_MAX_AKEY_SIZE,
+ 			  a_ctx->a_key, a_ctx->a_key_dma);
+@@ -714,7 +724,7 @@ static int sec_skcipher_init(struct crypto_skcipher *tfm)
+ 	}
+ 
+ 	ret = sec_ctx_base_init(ctx);
+-	if (ret)
++	if (ret && ret != -ENODEV)
+ 		return ret;
+ 
+ 	ret = sec_cipher_init(ctx);
+@@ -823,6 +833,9 @@ static int sec_skcipher_setkey(struct crypto_skcipher *tfm, const u8 *key,
+ 	struct device *dev = ctx->dev;
+ 	int ret;
+ 
++	if (!ctx->qps)
++		goto set_soft_key;
++
+ 	if (c_mode == SEC_CMODE_XTS) {
+ 		ret = xts_verify_key(tfm, key, keylen);
+ 		if (ret) {
+@@ -853,13 +866,14 @@ static int sec_skcipher_setkey(struct crypto_skcipher *tfm, const u8 *key,
+ 	}
+ 
+ 	memcpy(c_ctx->c_key, key, keylen);
+-	if (c_ctx->fbtfm) {
+-		ret = crypto_sync_skcipher_setkey(c_ctx->fbtfm, key, keylen);
+-		if (ret) {
+-			dev_err(dev, "failed to set fallback skcipher key!\n");
+-			return ret;
+-		}
++
++set_soft_key:
++	ret = crypto_sync_skcipher_setkey(c_ctx->fbtfm, key, keylen);
++	if (ret) {
++		dev_err(dev, "failed to set fallback skcipher key!\n");
++		return ret;
+ 	}
++
+ 	return 0;
+ }
+ 
+@@ -1135,6 +1149,9 @@ static int sec_aead_setkey(struct crypto_aead *tfm, const u8 *key,
+ 	struct crypto_authenc_keys keys;
+ 	int ret;
+ 
++	if (!ctx->qps)
++		return sec_aead_fallback_setkey(a_ctx, tfm, key, keylen);
++
+ 	ctx->a_ctx.a_alg = a_alg;
+ 	ctx->c_ctx.c_alg = c_alg;
+ 	c_ctx->c_mode = c_mode;
+@@ -1829,6 +1846,9 @@ static int sec_skcipher_ctx_init(struct crypto_skcipher *tfm)
+ 	if (ret)
+ 		return ret;
+ 
++	if (!ctx->qps)
++		return 0;
++
+ 	if (ctx->sec->qm.ver < QM_HW_V3) {
+ 		ctx->type_supported = SEC_BD_TYPE2;
+ 		ctx->req_op = &sec_skcipher_req_ops;
+@@ -1837,7 +1857,7 @@ static int sec_skcipher_ctx_init(struct crypto_skcipher *tfm)
+ 		ctx->req_op = &sec_skcipher_req_ops_v3;
+ 	}
+ 
+-	return ret;
++	return 0;
+ }
+ 
+ static void sec_skcipher_ctx_exit(struct crypto_skcipher *tfm)
+@@ -1905,7 +1925,7 @@ static int sec_aead_ctx_init(struct crypto_aead *tfm, const char *hash_name)
+ 	int ret;
+ 
+ 	ret = sec_aead_init(tfm);
+-	if (ret) {
++	if (ret && ret != -ENODEV) {
+ 		pr_err("hisi_sec2: aead init error!\n");
+ 		return ret;
+ 	}
+@@ -1947,7 +1967,7 @@ static int sec_aead_xcm_ctx_init(struct crypto_aead *tfm)
+ 	int ret;
+ 
+ 	ret = sec_aead_init(tfm);
+-	if (ret) {
++	if (ret && ret != -ENODEV) {
+ 		dev_err(ctx->dev, "hisi_sec2: aead xcm init error!\n");
+ 		return ret;
+ 	}
+@@ -2092,6 +2112,9 @@ static int sec_skcipher_crypto(struct skcipher_request *sk_req, bool encrypt)
+ 	bool need_fallback = false;
+ 	int ret;
+ 
++	if (!ctx->qps)
++		goto soft_crypto;
++
+ 	if (!sk_req->cryptlen) {
+ 		if (ctx->c_ctx.c_mode == SEC_CMODE_XTS)
+ 			return -EINVAL;
+@@ -2108,9 +2131,12 @@ static int sec_skcipher_crypto(struct skcipher_request *sk_req, bool encrypt)
+ 		return -EINVAL;
+ 
+ 	if (unlikely(ctx->c_ctx.fallback || need_fallback))
+-		return sec_skcipher_soft_crypto(ctx, sk_req, encrypt);
++		goto soft_crypto;
+ 
+ 	return ctx->req_op->process(ctx, req);
++
++soft_crypto:
++	return sec_skcipher_soft_crypto(ctx, sk_req, encrypt);
+ }
+ 
+ static int sec_skcipher_encrypt(struct skcipher_request *sk_req)
+@@ -2315,6 +2341,9 @@ static int sec_aead_crypto(struct aead_request *a_req, bool encrypt)
+ 	bool need_fallback = false;
+ 	int ret;
+ 
++	if (!ctx->qps)
++		goto soft_crypto;
++
+ 	req->flag = a_req->base.flags;
+ 	req->aead_req.aead_req = a_req;
+ 	req->c_req.encrypt = encrypt;
+@@ -2324,11 +2353,14 @@ static int sec_aead_crypto(struct aead_request *a_req, bool encrypt)
+ 	ret = sec_aead_param_check(ctx, req, &need_fallback);
+ 	if (unlikely(ret)) {
+ 		if (need_fallback)
+-			return sec_aead_soft_crypto(ctx, a_req, encrypt);
++			goto soft_crypto;
+ 		return -EINVAL;
+ 	}
+ 
+ 	return ctx->req_op->process(ctx, req);
++
++soft_crypto:
++	return sec_aead_soft_crypto(ctx, a_req, encrypt);
+ }
+ 
+ static int sec_aead_encrypt(struct aead_request *a_req)
+-- 
+2.51.0
+

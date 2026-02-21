@@ -1,0 +1,143 @@
+From 6757fd33f172fd9aa2b8706020d0f86fde88d306 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 23 Jun 2023 10:36:43 -0600
+Subject: io_uring/cancel: support opcode based lookup and cancelation
+
+From: Jens Axboe <axboe@kernel.dk>
+
+[ Upstream commit d7b8b079a8f6bc007d06d9ee468659dae6053e13 ]
+
+Add IORING_ASYNC_CANCEL_OP flag for cancelation, which allows the
+application to target cancelation based on the opcode of the original
+request.
+
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Stable-dep-of: 22dbb0987bd1 ("io_uring/cancel: de-unionize file and user_data in struct io_cancel_data")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/uapi/linux/io_uring.h |  2 ++
+ io_uring/cancel.c             | 17 ++++++++++++++---
+ io_uring/cancel.h             |  2 +-
+ io_uring/poll.c               |  3 ++-
+ 4 files changed, 19 insertions(+), 5 deletions(-)
+
+diff --git a/include/uapi/linux/io_uring.h b/include/uapi/linux/io_uring.h
+index 7adc7c4e9894b..aeed98cb5c1c8 100644
+--- a/include/uapi/linux/io_uring.h
++++ b/include/uapi/linux/io_uring.h
+@@ -277,12 +277,14 @@ enum io_uring_op {
+  * IORING_ASYNC_CANCEL_ANY	Match any request
+  * IORING_ASYNC_CANCEL_FD_FIXED	'fd' passed in is a fixed descriptor
+  * IORING_ASYNC_CANCEL_USERDATA	Match on user_data, default for no other key
++ * IORING_ASYNC_CANCEL_OP	Match request based on opcode
+  */
+ #define IORING_ASYNC_CANCEL_ALL	(1U << 0)
+ #define IORING_ASYNC_CANCEL_FD	(1U << 1)
+ #define IORING_ASYNC_CANCEL_ANY	(1U << 2)
+ #define IORING_ASYNC_CANCEL_FD_FIXED	(1U << 3)
+ #define IORING_ASYNC_CANCEL_USERDATA	(1U << 4)
++#define IORING_ASYNC_CANCEL_OP	(1U << 5)
+ 
+ /*
+  * send/sendmsg and recv/recvmsg flags (sqe->ioprio)
+diff --git a/io_uring/cancel.c b/io_uring/cancel.c
+index 577d2f85b3e5b..bfaf8f9f1defc 100644
+--- a/io_uring/cancel.c
++++ b/io_uring/cancel.c
+@@ -22,11 +22,12 @@ struct io_cancel {
+ 	u64				addr;
+ 	u32				flags;
+ 	s32				fd;
++	u8				opcode;
+ };
+ 
+ #define CANCEL_FLAGS	(IORING_ASYNC_CANCEL_ALL | IORING_ASYNC_CANCEL_FD | \
+ 			 IORING_ASYNC_CANCEL_ANY | IORING_ASYNC_CANCEL_FD_FIXED | \
+-			 IORING_ASYNC_CANCEL_USERDATA)
++			 IORING_ASYNC_CANCEL_USERDATA | IORING_ASYNC_CANCEL_OP)
+ 
+ /*
+  * Returns true if the request matches the criteria outlined by 'cd'.
+@@ -38,7 +39,7 @@ bool io_cancel_req_match(struct io_kiocb *req, struct io_cancel_data *cd)
+ 	if (req->ctx != cd->ctx)
+ 		return false;
+ 
+-	if (!(cd->flags & (IORING_ASYNC_CANCEL_FD)))
++	if (!(cd->flags & (IORING_ASYNC_CANCEL_FD | IORING_ASYNC_CANCEL_OP)))
+ 		match_user_data = true;
+ 
+ 	if (cd->flags & IORING_ASYNC_CANCEL_ANY)
+@@ -47,6 +48,10 @@ bool io_cancel_req_match(struct io_kiocb *req, struct io_cancel_data *cd)
+ 		if (req->file != cd->file)
+ 			return false;
+ 	}
++	if (cd->flags & IORING_ASYNC_CANCEL_OP) {
++		if (req->opcode != cd->opcode)
++			return false;
++	}
+ 	if (match_user_data && req->cqe.user_data != cd->data)
+ 		return false;
+ 	if (cd->flags & IORING_ASYNC_CANCEL_ALL) {
+@@ -127,7 +132,7 @@ int io_async_cancel_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
+ 
+ 	if (unlikely(req->flags & REQ_F_BUFFER_SELECT))
+ 		return -EINVAL;
+-	if (sqe->off || sqe->len || sqe->splice_fd_in)
++	if (sqe->off || sqe->splice_fd_in)
+ 		return -EINVAL;
+ 
+ 	cancel->addr = READ_ONCE(sqe->addr);
+@@ -139,6 +144,11 @@ int io_async_cancel_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
+ 			return -EINVAL;
+ 		cancel->fd = READ_ONCE(sqe->fd);
+ 	}
++	if (cancel->flags & IORING_ASYNC_CANCEL_OP) {
++		if (cancel->flags & IORING_ASYNC_CANCEL_ANY)
++			return -EINVAL;
++		cancel->opcode = READ_ONCE(sqe->len);
++	}
+ 
+ 	return 0;
+ }
+@@ -185,6 +195,7 @@ int io_async_cancel(struct io_kiocb *req, unsigned int issue_flags)
+ 		.ctx	= req->ctx,
+ 		.data	= cancel->addr,
+ 		.flags	= cancel->flags,
++		.opcode	= cancel->opcode,
+ 		.seq	= atomic_inc_return(&req->ctx->cancel_seq),
+ 	};
+ 	struct io_uring_task *tctx = req->task->io_uring;
+diff --git a/io_uring/cancel.h b/io_uring/cancel.h
+index 496ce4dac78ed..fc98622e6166e 100644
+--- a/io_uring/cancel.h
++++ b/io_uring/cancel.h
+@@ -8,11 +8,11 @@ struct io_cancel_data {
+ 		u64 data;
+ 		struct file *file;
+ 	};
++	u8 opcode;
+ 	u32 flags;
+ 	int seq;
+ };
+ 
+-
+ int io_async_cancel_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe);
+ int io_async_cancel(struct io_kiocb *req, unsigned int issue_flags);
+ 
+diff --git a/io_uring/poll.c b/io_uring/poll.c
+index d4d107931f629..bac9e77d44b09 100644
+--- a/io_uring/poll.c
++++ b/io_uring/poll.c
+@@ -873,7 +873,8 @@ static int __io_poll_cancel(struct io_ring_ctx *ctx, struct io_cancel_data *cd,
+ 	struct io_hash_bucket *bucket;
+ 	struct io_kiocb *req;
+ 
+-	if (cd->flags & (IORING_ASYNC_CANCEL_FD|IORING_ASYNC_CANCEL_ANY))
++	if (cd->flags & (IORING_ASYNC_CANCEL_FD | IORING_ASYNC_CANCEL_OP |
++			 IORING_ASYNC_CANCEL_ANY))
+ 		req = io_poll_file_find(ctx, cd, table, &bucket);
+ 	else
+ 		req = io_poll_find(ctx, false, cd, table, &bucket);
+-- 
+2.51.0
+

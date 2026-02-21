@@ -1,0 +1,117 @@
+From 63de813e33ea56822ebd23a241f7e11701c5c169 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 4 Nov 2024 09:40:39 +0800
+Subject: iommu/vt-d: Drain PRQs when domain removed from RID
+
+From: Lu Baolu <baolu.lu@linux.intel.com>
+
+[ Upstream commit c43e1ccdebf2c950545fdf12c5796ad6f7bad7ee ]
+
+As this iommu driver now supports page faults for requests without
+PASID, page requests should be drained when a domain is removed from
+the RID2PASID entry.
+
+This results in the intel_iommu_drain_pasid_prq() call being moved to
+intel_pasid_tear_down_entry(). This indicates that when a translation
+is removed from any PASID entry and the PRI has been enabled on the
+device, page requests are drained in the domain detachment path.
+
+The intel_iommu_drain_pasid_prq() helper has been modified to support
+sending device TLB invalidation requests for both PASID and non-PASID
+cases.
+
+Signed-off-by: Lu Baolu <baolu.lu@linux.intel.com>
+Reviewed-by: Yi Liu <yi.l.liu@intel.com>
+Link: https://lore.kernel.org/r/20241101045543.70086-1-baolu.lu@linux.intel.com
+Signed-off-by: Joerg Roedel <jroedel@suse.de>
+Stable-dep-of: 75ed00055c05 ("iommu/vt-d: Clear Present bit before tearing down PASID entry")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/iommu/intel/iommu.c |  1 -
+ drivers/iommu/intel/pasid.c |  1 +
+ drivers/iommu/intel/prq.c   | 26 +++++++++-----------------
+ 3 files changed, 10 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/iommu/intel/iommu.c b/drivers/iommu/intel/iommu.c
+index 936db952f4385..d4f852f712aa8 100644
+--- a/drivers/iommu/intel/iommu.c
++++ b/drivers/iommu/intel/iommu.c
+@@ -4333,7 +4333,6 @@ static void intel_iommu_remove_dev_pasid(struct device *dev, ioasid_t pasid,
+ 		kfree(dev_pasid);
+ 	}
+ 	intel_pasid_tear_down_entry(iommu, dev, pasid, false);
+-	intel_iommu_drain_pasid_prq(dev, pasid);
+ }
+ 
+ static int intel_iommu_set_dev_pasid(struct iommu_domain *domain,
+diff --git a/drivers/iommu/intel/pasid.c b/drivers/iommu/intel/pasid.c
+index 2ec76333b6973..4e4d167720ba8 100644
+--- a/drivers/iommu/intel/pasid.c
++++ b/drivers/iommu/intel/pasid.c
+@@ -266,6 +266,7 @@ void intel_pasid_tear_down_entry(struct intel_iommu *iommu, struct device *dev,
+ 		iommu->flush.flush_iotlb(iommu, did, 0, 0, DMA_TLB_DSI_FLUSH);
+ 
+ 	devtlb_invalidation_with_pasid(iommu, dev, pasid);
++	intel_iommu_drain_pasid_prq(dev, pasid);
+ }
+ 
+ /*
+diff --git a/drivers/iommu/intel/prq.c b/drivers/iommu/intel/prq.c
+index edda5da8ba159..853d1cbb635fd 100644
+--- a/drivers/iommu/intel/prq.c
++++ b/drivers/iommu/intel/prq.c
+@@ -63,26 +63,18 @@ void intel_iommu_drain_pasid_prq(struct device *dev, u32 pasid)
+ 	struct dmar_domain *domain;
+ 	struct intel_iommu *iommu;
+ 	struct qi_desc desc[3];
+-	struct pci_dev *pdev;
+ 	int head, tail;
+ 	u16 sid, did;
+-	int qdep;
+ 
+ 	info = dev_iommu_priv_get(dev);
+-	if (WARN_ON(!info || !dev_is_pci(dev)))
+-		return;
+-
+ 	if (!info->pri_enabled)
+ 		return;
+ 
+ 	iommu = info->iommu;
+ 	domain = info->domain;
+-	pdev = to_pci_dev(dev);
+ 	sid = PCI_DEVID(info->bus, info->devfn);
+ 	did = domain ? domain_id_iommu(domain, iommu) : FLPT_DEFAULT_DID;
+ 
+-	qdep = pci_ats_queue_depth(pdev);
+-
+ 	/*
+ 	 * Check and wait until all pending page requests in the queue are
+ 	 * handled by the prq handling thread.
+@@ -114,15 +106,15 @@ void intel_iommu_drain_pasid_prq(struct device *dev, u32 pasid)
+ 	desc[0].qw0 = QI_IWD_STATUS_DATA(QI_DONE) |
+ 			QI_IWD_FENCE |
+ 			QI_IWD_TYPE;
+-	desc[1].qw0 = QI_EIOTLB_PASID(pasid) |
+-			QI_EIOTLB_DID(did) |
+-			QI_EIOTLB_GRAN(QI_GRAN_NONG_PASID) |
+-			QI_EIOTLB_TYPE;
+-	desc[2].qw0 = QI_DEV_EIOTLB_PASID(pasid) |
+-			QI_DEV_EIOTLB_SID(sid) |
+-			QI_DEV_EIOTLB_QDEP(qdep) |
+-			QI_DEIOTLB_TYPE |
+-			QI_DEV_IOTLB_PFSID(info->pfsid);
++	if (pasid == IOMMU_NO_PASID) {
++		qi_desc_iotlb(iommu, did, 0, 0, DMA_TLB_DSI_FLUSH, &desc[1]);
++		qi_desc_dev_iotlb(sid, info->pfsid, info->ats_qdep, 0,
++				  MAX_AGAW_PFN_WIDTH, &desc[2]);
++	} else {
++		qi_desc_piotlb(did, pasid, 0, -1, 0, &desc[1]);
++		qi_desc_dev_iotlb_pasid(sid, info->pfsid, pasid, info->ats_qdep,
++					0, MAX_AGAW_PFN_WIDTH, &desc[2]);
++	}
+ qi_retry:
+ 	reinit_completion(&iommu->prq_complete);
+ 	qi_submit_sync(iommu, desc, 3, QI_OPT_WAIT_DRAIN);
+-- 
+2.51.0
+

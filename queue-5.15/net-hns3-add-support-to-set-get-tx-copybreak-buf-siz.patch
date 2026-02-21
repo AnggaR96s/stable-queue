@@ -1,0 +1,154 @@
+From 0a3520ec3f4aa82f4d6050d9aa3671dd60f62a76 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 18 Nov 2021 20:12:41 +0800
+Subject: net: hns3: add support to set/get tx copybreak buf size via ethtool
+ for hns3 driver
+
+From: Hao Chen <chenhao288@hisilicon.com>
+
+[ Upstream commit e445f08af2b15035474439fbbb8649f466ad2501 ]
+
+Tx copybreak buf size is used for tx copybreak feature, the feature is
+used for small size packet or frag. It adds a queue based tx shared
+bounce buffer to memcpy the small packet when the len of xmitted skb is
+below tx_copybreak(value to distinguish small size and normal size),
+and reduce the overhead of dma map and unmap when IOMMU is on.
+
+Support setting it via ethtool --set-tunable parameter and getting
+it via ethtool --get-tunable parameter.
+
+Signed-off-by: Hao Chen <chenhao288@hisilicon.com>
+Signed-off-by: Guangbin Huang <huangguangbin2@huawei.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Stable-dep-of: 6d2f142b1e4b ("net: hns3: fix double free issue for tx spare buffer")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ .../net/ethernet/hisilicon/hns3/hns3_enet.c   |  4 +-
+ .../net/ethernet/hisilicon/hns3/hns3_enet.h   |  2 +
+ .../ethernet/hisilicon/hns3/hns3_ethtool.c    | 56 +++++++++++++++++++
+ 3 files changed, 60 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/ethernet/hisilicon/hns3/hns3_enet.c b/drivers/net/ethernet/hisilicon/hns3/hns3_enet.c
+index adc2f1e34e32a..84c724df2e405 100644
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3_enet.c
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3_enet.c
+@@ -5535,8 +5535,8 @@ static int hns3_reset_notify_uninit_enet(struct hnae3_handle *handle)
+ 	return 0;
+ }
+ 
+-static int hns3_reset_notify(struct hnae3_handle *handle,
+-			     enum hnae3_reset_notify_type type)
++int hns3_reset_notify(struct hnae3_handle *handle,
++		      enum hnae3_reset_notify_type type)
+ {
+ 	int ret = 0;
+ 
+diff --git a/drivers/net/ethernet/hisilicon/hns3/hns3_enet.h b/drivers/net/ethernet/hisilicon/hns3/hns3_enet.h
+index f3f7f370807f0..83c4b9856e171 100644
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3_enet.h
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3_enet.h
+@@ -713,6 +713,8 @@ void hns3_set_vector_coalesce_tx_ql(struct hns3_enet_tqp_vector *tqp_vector,
+ 				    u32 ql_value);
+ 
+ void hns3_request_update_promisc_mode(struct hnae3_handle *handle);
++int hns3_reset_notify(struct hnae3_handle *handle,
++		      enum hnae3_reset_notify_type type);
+ 
+ #ifdef CONFIG_HNS3_DCB
+ void hns3_dcbnl_setup(struct hnae3_handle *handle);
+diff --git a/drivers/net/ethernet/hisilicon/hns3/hns3_ethtool.c b/drivers/net/ethernet/hisilicon/hns3/hns3_ethtool.c
+index b01ce4fd6bc43..53f6cb3b43664 100644
+--- a/drivers/net/ethernet/hisilicon/hns3/hns3_ethtool.c
++++ b/drivers/net/ethernet/hisilicon/hns3/hns3_ethtool.c
+@@ -1726,6 +1726,7 @@ static int hns3_get_tunable(struct net_device *netdev,
+ 			    void *data)
+ {
+ 	struct hns3_nic_priv *priv = netdev_priv(netdev);
++	struct hnae3_handle *h = priv->ae_handle;
+ 	int ret = 0;
+ 
+ 	switch (tuna->id) {
+@@ -1736,6 +1737,9 @@ static int hns3_get_tunable(struct net_device *netdev,
+ 	case ETHTOOL_RX_COPYBREAK:
+ 		*(u32 *)data = priv->rx_copybreak;
+ 		break;
++	case ETHTOOL_TX_COPYBREAK_BUF_SIZE:
++		*(u32 *)data = h->kinfo.tx_spare_buf_size;
++		break;
+ 	default:
+ 		ret = -EOPNOTSUPP;
+ 		break;
+@@ -1744,11 +1748,43 @@ static int hns3_get_tunable(struct net_device *netdev,
+ 	return ret;
+ }
+ 
++static int hns3_set_tx_spare_buf_size(struct net_device *netdev,
++				      u32 data)
++{
++	struct hns3_nic_priv *priv = netdev_priv(netdev);
++	struct hnae3_handle *h = priv->ae_handle;
++	int ret;
++
++	if (hns3_nic_resetting(netdev))
++		return -EBUSY;
++
++	h->kinfo.tx_spare_buf_size = data;
++
++	ret = hns3_reset_notify(h, HNAE3_DOWN_CLIENT);
++	if (ret)
++		return ret;
++
++	ret = hns3_reset_notify(h, HNAE3_UNINIT_CLIENT);
++	if (ret)
++		return ret;
++
++	ret = hns3_reset_notify(h, HNAE3_INIT_CLIENT);
++	if (ret)
++		return ret;
++
++	ret = hns3_reset_notify(h, HNAE3_UP_CLIENT);
++	if (ret)
++		hns3_reset_notify(h, HNAE3_UNINIT_CLIENT);
++
++	return ret;
++}
++
+ static int hns3_set_tunable(struct net_device *netdev,
+ 			    const struct ethtool_tunable *tuna,
+ 			    const void *data)
+ {
+ 	struct hns3_nic_priv *priv = netdev_priv(netdev);
++	u32 old_tx_spare_buf_size, new_tx_spare_buf_size;
+ 	struct hnae3_handle *h = priv->ae_handle;
+ 	int i, ret = 0;
+ 
+@@ -1766,6 +1802,26 @@ static int hns3_set_tunable(struct net_device *netdev,
+ 		for (i = h->kinfo.num_tqps; i < h->kinfo.num_tqps * 2; i++)
+ 			priv->ring[i].rx_copybreak = priv->rx_copybreak;
+ 
++		break;
++	case ETHTOOL_TX_COPYBREAK_BUF_SIZE:
++		old_tx_spare_buf_size = h->kinfo.tx_spare_buf_size;
++		new_tx_spare_buf_size = *(u32 *)data;
++		ret = hns3_set_tx_spare_buf_size(netdev, new_tx_spare_buf_size);
++		if (ret) {
++			int ret1;
++
++			netdev_warn(netdev,
++				    "change tx spare buf size fail, revert to old value\n");
++			ret1 = hns3_set_tx_spare_buf_size(netdev,
++							  old_tx_spare_buf_size);
++			if (ret1) {
++				netdev_err(netdev,
++					   "revert to old tx spare buf size fail\n");
++				return ret1;
++			}
++
++			return ret;
++		}
+ 		break;
+ 	default:
+ 		ret = -EOPNOTSUPP;
+-- 
+2.51.0
+
