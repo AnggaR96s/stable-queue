@@ -1,0 +1,168 @@
+From 34091d5eff8468b4dac191ea7af281a65d6f921c Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 29 Aug 2024 14:46:40 +0000
+Subject: icmp: move icmp_global.credit and icmp_global.stamp to per netns
+ storage
+
+From: Eric Dumazet <edumazet@google.com>
+
+[ Upstream commit b056b4cd9178f7a1d5d57f7b48b073c29729ddaa ]
+
+Host wide ICMP ratelimiter should be per netns, to provide better isolation.
+
+Following patch in this series makes the sysctl per netns.
+
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Reviewed-by: David Ahern <dsahern@kernel.org>
+Link: https://patch.msgid.link/20240829144641.3880376-3-edumazet@google.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Stable-dep-of: 034bbd806298 ("icmp: prevent possible overflow in icmp_global_allow()")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/net/ip.h         |  4 ++--
+ include/net/netns/ipv4.h |  3 ++-
+ net/ipv4/icmp.c          | 26 +++++++++++---------------
+ net/ipv6/icmp.c          |  4 ++--
+ 4 files changed, 17 insertions(+), 20 deletions(-)
+
+diff --git a/include/net/ip.h b/include/net/ip.h
+index d8bf1f0a6919c..a8e70ba54da45 100644
+--- a/include/net/ip.h
++++ b/include/net/ip.h
+@@ -790,8 +790,8 @@ static inline void ip_cmsg_recv(struct msghdr *msg, struct sk_buff *skb)
+ 	ip_cmsg_recv_offset(msg, skb->sk, skb, 0, 0);
+ }
+ 
+-bool icmp_global_allow(void);
+-void icmp_global_consume(void);
++bool icmp_global_allow(struct net *net);
++void icmp_global_consume(struct net *net);
+ 
+ extern int sysctl_icmp_msgs_per_sec;
+ extern int sysctl_icmp_msgs_burst;
+diff --git a/include/net/netns/ipv4.h b/include/net/netns/ipv4.h
+index 7a41c47915367..8d32df274910c 100644
+--- a/include/net/netns/ipv4.h
++++ b/include/net/netns/ipv4.h
+@@ -84,7 +84,8 @@ struct netns_ipv4 {
+ 	u8 sysctl_icmp_errors_use_inbound_ifaddr;
+ 	int sysctl_icmp_ratelimit;
+ 	int sysctl_icmp_ratemask;
+-
++	atomic_t icmp_global_credit;
++	u32 icmp_global_stamp;
+ 	u32 ip_rt_min_pmtu;
+ 	int ip_rt_mtu_expires;
+ 	int ip_rt_min_advmss;
+diff --git a/net/ipv4/icmp.c b/net/ipv4/icmp.c
+index 9653ef1281a46..0a67e1f0c3ba6 100644
+--- a/net/ipv4/icmp.c
++++ b/net/ipv4/icmp.c
+@@ -224,19 +224,15 @@ static inline void icmp_xmit_unlock(struct sock *sk)
+ int sysctl_icmp_msgs_per_sec __read_mostly = 1000;
+ int sysctl_icmp_msgs_burst __read_mostly = 50;
+ 
+-static struct {
+-	atomic_t	credit;
+-	u32		stamp;
+-} icmp_global;
+-
+ /**
+  * icmp_global_allow - Are we allowed to send one more ICMP message ?
++ * @net: network namespace
+  *
+  * Uses a token bucket to limit our ICMP messages to ~sysctl_icmp_msgs_per_sec.
+  * Returns false if we reached the limit and can not send another packet.
+  * Works in tandem with icmp_global_consume().
+  */
+-bool icmp_global_allow(void)
++bool icmp_global_allow(struct net *net)
+ {
+ 	u32 delta, now, oldstamp;
+ 	int incr, new, old;
+@@ -245,11 +241,11 @@ bool icmp_global_allow(void)
+ 	 * Then later icmp_global_consume() could consume more credits,
+ 	 * this is an acceptable race.
+ 	 */
+-	if (atomic_read(&icmp_global.credit) > 0)
++	if (atomic_read(&net->ipv4.icmp_global_credit) > 0)
+ 		return true;
+ 
+ 	now = jiffies;
+-	oldstamp = READ_ONCE(icmp_global.stamp);
++	oldstamp = READ_ONCE(net->ipv4.icmp_global_stamp);
+ 	delta = min_t(u32, now - oldstamp, HZ);
+ 	if (delta < HZ / 50)
+ 		return false;
+@@ -258,23 +254,23 @@ bool icmp_global_allow(void)
+ 	if (!incr)
+ 		return false;
+ 
+-	if (cmpxchg(&icmp_global.stamp, oldstamp, now) == oldstamp) {
+-		old = atomic_read(&icmp_global.credit);
++	if (cmpxchg(&net->ipv4.icmp_global_stamp, oldstamp, now) == oldstamp) {
++		old = atomic_read(&net->ipv4.icmp_global_credit);
+ 		do {
+ 			new = min(old + incr, READ_ONCE(sysctl_icmp_msgs_burst));
+-		} while (!atomic_try_cmpxchg(&icmp_global.credit, &old, new));
++		} while (!atomic_try_cmpxchg(&net->ipv4.icmp_global_credit, &old, new));
+ 	}
+ 	return true;
+ }
+ EXPORT_SYMBOL(icmp_global_allow);
+ 
+-void icmp_global_consume(void)
++void icmp_global_consume(struct net *net)
+ {
+ 	int credits = get_random_u32_below(3);
+ 
+ 	/* Note: this might make icmp_global.credit negative. */
+ 	if (credits)
+-		atomic_sub(credits, &icmp_global.credit);
++		atomic_sub(credits, &net->ipv4.icmp_global_credit);
+ }
+ EXPORT_SYMBOL(icmp_global_consume);
+ 
+@@ -300,7 +296,7 @@ static bool icmpv4_global_allow(struct net *net, int type, int code,
+ 	if (icmpv4_mask_allow(net, type, code))
+ 		return true;
+ 
+-	if (icmp_global_allow()) {
++	if (icmp_global_allow(net)) {
+ 		*apply_ratelimit = true;
+ 		return true;
+ 	}
+@@ -337,7 +333,7 @@ static bool icmpv4_xrlim_allow(struct net *net, struct rtable *rt,
+ 	if (!rc)
+ 		__ICMP_INC_STATS(net, ICMP_MIB_RATELIMITHOST);
+ 	else
+-		icmp_global_consume();
++		icmp_global_consume(net);
+ 	return rc;
+ }
+ 
+diff --git a/net/ipv6/icmp.c b/net/ipv6/icmp.c
+index e9e457b7d4eac..1d1c56e0e2460 100644
+--- a/net/ipv6/icmp.c
++++ b/net/ipv6/icmp.c
+@@ -181,7 +181,7 @@ static bool icmpv6_global_allow(struct net *net, int type,
+ 	if (icmpv6_mask_allow(net, type))
+ 		return true;
+ 
+-	if (icmp_global_allow()) {
++	if (icmp_global_allow(net)) {
+ 		*apply_ratelimit = true;
+ 		return true;
+ 	}
+@@ -231,7 +231,7 @@ static bool icmpv6_xrlim_allow(struct sock *sk, u8 type,
+ 		__ICMP6_INC_STATS(net, ip6_dst_idev(dst),
+ 				  ICMP6_MIB_RATELIMITHOST);
+ 	else
+-		icmp_global_consume();
++		icmp_global_consume(net);
+ 	dst_release(dst);
+ 	return res;
+ }
+-- 
+2.51.0
+
