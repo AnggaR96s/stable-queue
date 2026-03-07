@@ -1,0 +1,127 @@
+From 856473fd16a0d6dffdfb1dc6169ddea52d460c8f Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 12 Feb 2026 11:23:27 -0800
+Subject: scsi: lpfc: Properly set WC for DPP mapping
+
+From: Mathias Krause <minipli@grsecurity.net>
+
+[ Upstream commit bffda93a51b40afd67c11bf558dc5aae83ca0943 ]
+
+Using set_memory_wc() to enable write-combining for the DPP portion of
+the MMIO mapping is wrong as set_memory_*() is meant to operate on RAM
+only, not MMIO mappings. In fact, as used currently triggers a BUG_ON()
+with enabled CONFIG_DEBUG_VIRTUAL.
+
+Simply map the DPP region separately and in addition to the already
+existing mappings, avoiding any possible negative side effects for
+these.
+
+Fixes: 1351e69fc6db ("scsi: lpfc: Add push-to-adapter support to sli4")
+Signed-off-by: Mathias Krause <minipli@grsecurity.net>
+Signed-off-by: Justin Tee <justin.tee@broadcom.com>
+Reviewed-by: Mathias Krause <minipli@grsecurity.net>
+Link: https://patch.msgid.link/20260212192327.141104-1-justintee8345@gmail.com
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/scsi/lpfc/lpfc_init.c |  2 ++
+ drivers/scsi/lpfc/lpfc_sli.c  | 36 +++++++++++++++++++++++++++++------
+ drivers/scsi/lpfc/lpfc_sli4.h |  3 +++
+ 3 files changed, 35 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/scsi/lpfc/lpfc_init.c b/drivers/scsi/lpfc/lpfc_init.c
+index e2f9b23a3fbb2..d7a3304de305c 100644
+--- a/drivers/scsi/lpfc/lpfc_init.c
++++ b/drivers/scsi/lpfc/lpfc_init.c
+@@ -11812,6 +11812,8 @@ lpfc_sli4_pci_mem_unset(struct lpfc_hba *phba)
+ 		iounmap(phba->sli4_hba.conf_regs_memmap_p);
+ 		if (phba->sli4_hba.dpp_regs_memmap_p)
+ 			iounmap(phba->sli4_hba.dpp_regs_memmap_p);
++		if (phba->sli4_hba.dpp_regs_memmap_wc_p)
++			iounmap(phba->sli4_hba.dpp_regs_memmap_wc_p);
+ 		break;
+ 	case LPFC_SLI_INTF_IF_TYPE_1:
+ 	default:
+diff --git a/drivers/scsi/lpfc/lpfc_sli.c b/drivers/scsi/lpfc/lpfc_sli.c
+index fb139e1e35ca3..38c8e4c410232 100644
+--- a/drivers/scsi/lpfc/lpfc_sli.c
++++ b/drivers/scsi/lpfc/lpfc_sli.c
+@@ -16161,6 +16161,32 @@ lpfc_dual_chute_pci_bar_map(struct lpfc_hba *phba, uint16_t pci_barset)
+ 	return NULL;
+ }
+ 
++static __maybe_unused void __iomem *
++lpfc_dpp_wc_map(struct lpfc_hba *phba, uint8_t dpp_barset)
++{
++
++	/* DPP region is supposed to cover 64-bit BAR2 */
++	if (dpp_barset != WQ_PCI_BAR_4_AND_5) {
++		lpfc_log_msg(phba, KERN_WARNING, LOG_INIT,
++			     "3273 dpp_barset x%x != WQ_PCI_BAR_4_AND_5\n",
++			     dpp_barset);
++		return NULL;
++	}
++
++	if (!phba->sli4_hba.dpp_regs_memmap_wc_p) {
++		void __iomem *dpp_map;
++
++		dpp_map = ioremap_wc(phba->pci_bar2_map,
++				     pci_resource_len(phba->pcidev,
++						      PCI_64BIT_BAR4));
++
++		if (dpp_map)
++			phba->sli4_hba.dpp_regs_memmap_wc_p = dpp_map;
++	}
++
++	return phba->sli4_hba.dpp_regs_memmap_wc_p;
++}
++
+ /**
+  * lpfc_modify_hba_eq_delay - Modify Delay Multiplier on EQs
+  * @phba: HBA structure that EQs are on.
+@@ -17071,9 +17097,6 @@ lpfc_wq_create(struct lpfc_hba *phba, struct lpfc_queue *wq,
+ 	uint8_t dpp_barset;
+ 	uint32_t dpp_offset;
+ 	uint8_t wq_create_version;
+-#ifdef CONFIG_X86
+-	unsigned long pg_addr;
+-#endif
+ 
+ 	/* sanity check on queue memory */
+ 	if (!wq || !cq)
+@@ -17259,14 +17282,15 @@ lpfc_wq_create(struct lpfc_hba *phba, struct lpfc_queue *wq,
+ 
+ #ifdef CONFIG_X86
+ 			/* Enable combined writes for DPP aperture */
+-			pg_addr = (unsigned long)(wq->dpp_regaddr) & PAGE_MASK;
+-			rc = set_memory_wc(pg_addr, 1);
+-			if (rc) {
++			bar_memmap_p = lpfc_dpp_wc_map(phba, dpp_barset);
++			if (!bar_memmap_p) {
+ 				lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+ 					"3272 Cannot setup Combined "
+ 					"Write on WQ[%d] - disable DPP\n",
+ 					wq->queue_id);
+ 				phba->cfg_enable_dpp = 0;
++			} else {
++				wq->dpp_regaddr = bar_memmap_p + dpp_offset;
+ 			}
+ #else
+ 			phba->cfg_enable_dpp = 0;
+diff --git a/drivers/scsi/lpfc/lpfc_sli4.h b/drivers/scsi/lpfc/lpfc_sli4.h
+index 5962cf508842f..762c4178a878d 100644
+--- a/drivers/scsi/lpfc/lpfc_sli4.h
++++ b/drivers/scsi/lpfc/lpfc_sli4.h
+@@ -781,6 +781,9 @@ struct lpfc_sli4_hba {
+ 	void __iomem *dpp_regs_memmap_p;  /* Kernel memory mapped address for
+ 					   * dpp registers
+ 					   */
++	void __iomem *dpp_regs_memmap_wc_p;/* Kernel memory mapped address for
++					    * dpp registers with write combining
++					    */
+ 	union {
+ 		struct {
+ 			/* IF Type 0, BAR 0 PCI cfg space reg mem map */
+-- 
+2.51.0
+
