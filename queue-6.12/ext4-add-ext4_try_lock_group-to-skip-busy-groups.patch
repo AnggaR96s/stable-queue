@@ -1,0 +1,163 @@
+From f82a3ece8f71192fab27975e00d5653fc4d1422e Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 14 Jul 2025 21:03:11 +0800
+Subject: ext4: add ext4_try_lock_group() to skip busy groups
+
+From: Baokun Li <libaokun1@huawei.com>
+
+[ Upstream commit e9eec6f33971fbfcdd32fd1c7dd515ff4d2954c0 ]
+
+When ext4 allocates blocks, we used to just go through the block groups
+one by one to find a good one. But when there are tons of block groups
+(like hundreds of thousands or even millions) and not many have free space
+(meaning they're mostly full), it takes a really long time to check them
+all, and performance gets bad. So, we added the "mb_optimize_scan" mount
+option (which is on by default now). It keeps track of some group lists,
+so when we need a free block, we can just grab a likely group from the
+right list. This saves time and makes block allocation much faster.
+
+But when multiple processes or containers are doing similar things, like
+constantly allocating 8k blocks, they all try to use the same block group
+in the same list. Even just two processes doing this can cut the IOPS in
+half. For example, one container might do 300,000 IOPS, but if you run two
+at the same time, the total is only 150,000.
+
+Since we can already look at block groups in a non-linear way, the first
+and last groups in the same list are basically the same for finding a block
+right now. Therefore, add an ext4_try_lock_group() helper function to skip
+the current group when it is locked by another process, thereby avoiding
+contention with other processes. This helps ext4 make better use of having
+multiple block groups.
+
+Also, to make sure we don't skip all the groups that have free space
+when allocating blocks, we won't try to skip busy groups anymore when
+ac_criteria is CR_ANY_FREE.
+
+Performance test data follows:
+
+Test: Running will-it-scale/fallocate2 on CPU-bound containers.
+Observation: Average fallocate operations per container per second.
+
+|CPU: Kunpeng 920   |          P80            |
+|Memory: 512GB      |-------------------------|
+|960GB SSD (0.5GB/s)| base  |    patched      |
+|-------------------|-------|-----------------|
+|mb_optimize_scan=0 | 2667  | 4821  (+80.7%)  |
+|mb_optimize_scan=1 | 2643  | 4784  (+81.0%)  |
+
+|CPU: AMD 9654 * 2  |          P96            |
+|Memory: 1536GB     |-------------------------|
+|960GB SSD (1GB/s)  | base  |    patched      |
+|-------------------|-------|-----------------|
+|mb_optimize_scan=0 | 3450  | 15371 (+345%)   |
+|mb_optimize_scan=1 | 3209  | 6101  (+90.0%)  |
+
+Signed-off-by: Baokun Li <libaokun1@huawei.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Reviewed-by: Ojaswin Mujoo <ojaswin@linux.ibm.com>
+Reviewed-by: Zhang Yi <yi.zhang@huawei.com>
+Link: https://patch.msgid.link/20250714130327.1830534-2-libaokun1@huawei.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Stable-dep-of: 4865c768b563 ("ext4: always allocate blocks only from groups inode can use")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/ext4/ext4.h    | 23 ++++++++++++++---------
+ fs/ext4/mballoc.c | 19 ++++++++++++++++---
+ 2 files changed, 30 insertions(+), 12 deletions(-)
+
+diff --git a/fs/ext4/ext4.h b/fs/ext4/ext4.h
+index d8a059ec1ad62..822b18996a434 100644
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@ -3507,23 +3507,28 @@ static inline int ext4_fs_is_busy(struct ext4_sb_info *sbi)
+ 	return (atomic_read(&sbi->s_lock_busy) > EXT4_CONTENTION_THRESHOLD);
+ }
+ 
++static inline bool ext4_try_lock_group(struct super_block *sb, ext4_group_t group)
++{
++	if (!spin_trylock(ext4_group_lock_ptr(sb, group)))
++		return false;
++	/*
++	 * We're able to grab the lock right away, so drop the lock
++	 * contention counter.
++	 */
++	atomic_add_unless(&EXT4_SB(sb)->s_lock_busy, -1, 0);
++	return true;
++}
++
+ static inline void ext4_lock_group(struct super_block *sb, ext4_group_t group)
+ {
+-	spinlock_t *lock = ext4_group_lock_ptr(sb, group);
+-	if (spin_trylock(lock))
+-		/*
+-		 * We're able to grab the lock right away, so drop the
+-		 * lock contention counter.
+-		 */
+-		atomic_add_unless(&EXT4_SB(sb)->s_lock_busy, -1, 0);
+-	else {
++	if (!ext4_try_lock_group(sb, group)) {
+ 		/*
+ 		 * The lock is busy, so bump the contention counter,
+ 		 * and then wait on the spin lock.
+ 		 */
+ 		atomic_add_unless(&EXT4_SB(sb)->s_lock_busy, 1,
+ 				  EXT4_MAX_CONTENTION);
+-		spin_lock(lock);
++		spin_lock(ext4_group_lock_ptr(sb, group));
+ 	}
+ }
+ 
+diff --git a/fs/ext4/mballoc.c b/fs/ext4/mballoc.c
+index edfffd15b2952..329fe83cbe814 100644
+--- a/fs/ext4/mballoc.c
++++ b/fs/ext4/mballoc.c
+@@ -913,7 +913,8 @@ static void ext4_mb_choose_next_group_p2_aligned(struct ext4_allocation_context
+ 				    bb_largest_free_order_node) {
+ 			if (sbi->s_mb_stats)
+ 				atomic64_inc(&sbi->s_bal_cX_groups_considered[CR_POWER2_ALIGNED]);
+-			if (likely(ext4_mb_good_group(ac, iter->bb_group, CR_POWER2_ALIGNED))) {
++			if (!spin_is_locked(ext4_group_lock_ptr(ac->ac_sb, iter->bb_group)) &&
++			    likely(ext4_mb_good_group(ac, iter->bb_group, CR_POWER2_ALIGNED))) {
+ 				*group = iter->bb_group;
+ 				ac->ac_flags |= EXT4_MB_CR_POWER2_ALIGNED_OPTIMIZED;
+ 				read_unlock(&sbi->s_mb_largest_free_orders_locks[i]);
+@@ -949,7 +950,8 @@ ext4_mb_find_good_group_avg_frag_lists(struct ext4_allocation_context *ac, int o
+ 	list_for_each_entry(iter, frag_list, bb_avg_fragment_size_node) {
+ 		if (sbi->s_mb_stats)
+ 			atomic64_inc(&sbi->s_bal_cX_groups_considered[cr]);
+-		if (likely(ext4_mb_good_group(ac, iter->bb_group, cr))) {
++		if (!spin_is_locked(ext4_group_lock_ptr(ac->ac_sb, iter->bb_group)) &&
++		    likely(ext4_mb_good_group(ac, iter->bb_group, cr))) {
+ 			grp = iter;
+ 			break;
+ 		}
+@@ -2910,6 +2912,11 @@ ext4_mb_regular_allocator(struct ext4_allocation_context *ac)
+ 							nr, &prefetch_ios);
+ 			}
+ 
++			/* prevent unnecessary buddy loading. */
++			if (cr < CR_ANY_FREE &&
++			    spin_is_locked(ext4_group_lock_ptr(sb, group)))
++				continue;
++
+ 			/* This now checks without needing the buddy page */
+ 			ret = ext4_mb_good_group_nolock(ac, group, cr);
+ 			if (ret <= 0) {
+@@ -2922,7 +2929,13 @@ ext4_mb_regular_allocator(struct ext4_allocation_context *ac)
+ 			if (err)
+ 				goto out;
+ 
+-			ext4_lock_group(sb, group);
++			/* skip busy group */
++			if (cr >= CR_ANY_FREE) {
++				ext4_lock_group(sb, group);
++			} else if (!ext4_try_lock_group(sb, group)) {
++				ext4_mb_unload_buddy(&e4b);
++				continue;
++			}
+ 
+ 			/*
+ 			 * We need to check again after locking the
+-- 
+2.51.0
+

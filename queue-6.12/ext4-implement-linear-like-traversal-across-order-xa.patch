@@ -1,0 +1,252 @@
+From a00dbf6c5716f7a1356e017dfeecd1a48e06f54d Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 14 Jul 2025 21:03:27 +0800
+Subject: ext4: implement linear-like traversal across order xarrays
+
+From: Baokun Li <libaokun1@huawei.com>
+
+[ Upstream commit a3ce570a5d6a70df616ae9a78635a188e6b5fd2f ]
+
+Although we now perform ordered traversal within an xarray, this is
+currently limited to a single xarray. However, we have multiple such
+xarrays, which prevents us from guaranteeing a linear-like traversal
+where all groups on the right are visited before all groups on the left.
+
+For example, suppose we have 128 block groups, with a target group of 64,
+a target length corresponding to an order of 1, and available free groups
+of 16 (order 1) and group 65 (order 8):
+
+For linear traversal, when no suitable free block is found in group 64, it
+will search in the next block group until group 127, then start searching
+from 0 up to block group 63. It ensures continuous forward traversal, which
+is consistent with the unidirectional rotation behavior of HDD platters.
+
+Additionally, the block group lock contention during freeing block is
+unavoidable. The goal increasing from 0 to 64 indicates that previously
+scanned groups (which had no suitable free space and are likely to free
+blocks later) and skipped groups (which are currently in use) have newly
+freed some used blocks. If we allocate blocks in these groups, the
+probability of competing with other processes increases.
+
+For non-linear traversal, we first traverse all groups in order_1. If only
+group 16 has free space in this list, we first traverse [63, 128), then
+traverse [0, 64) to find the available group 16, and then allocate blocks
+in group 16. Therefore, it cannot guarantee continuous traversal in one
+direction, thus increasing the probability of contention.
+
+So refactor ext4_mb_scan_groups_xarray() to ext4_mb_scan_groups_xa_range()
+to only traverse a fixed range of groups, and move the logic for handling
+wrap around to the caller. The caller first iterates through all xarrays
+in the range [start, ngroups) and then through the range [0, start). This
+approach simulates a linear scan, which reduces contention between freeing
+blocks and allocating blocks.
+
+Assume we have the following groups, where "|" denotes the xarray traversal
+start position:
+
+order_1_groups: AB | CD
+order_2_groups: EF | GH
+
+Traversal order:
+Before: C > D > A > B > G > H > E > F
+After:  C > D > G > H > A > B > E > F
+
+Performance test data follows:
+
+|CPU: Kunpeng 920   |          P80           |            P1           |
+|Memory: 512GB      |------------------------|-------------------------|
+|960GB SSD (0.5GB/s)| base  |    patched     | base   |    patched     |
+|-------------------|-------|----------------|--------|----------------|
+|mb_optimize_scan=0 | 19555 | 20049 (+2.5%)  | 315636 | 316724 (-0.3%) |
+|mb_optimize_scan=1 | 15496 | 19342 (+24.8%) | 323569 | 328324 (+1.4%) |
+
+|CPU: AMD 9654 * 2  |          P96           |             P1          |
+|Memory: 1536GB     |------------------------|-------------------------|
+|960GB SSD (1GB/s)  | base  |    patched     | base   |    patched     |
+|-------------------|-------|----------------|--------|----------------|
+|mb_optimize_scan=0 | 53192 | 52125 (-2.0%)  | 212678 | 215136 (+1.1%) |
+|mb_optimize_scan=1 | 37636 | 50331 (+33.7%) | 214189 | 209431 (-2.2%) |
+
+Signed-off-by: Baokun Li <libaokun1@huawei.com>
+Reviewed-by: Zhang Yi <yi.zhang@huawei.com>
+Link: https://patch.msgid.link/20250714130327.1830534-18-libaokun1@huawei.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Stable-dep-of: 4865c768b563 ("ext4: always allocate blocks only from groups inode can use")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/ext4/mballoc.c | 68 ++++++++++++++++++++++++++++++++---------------
+ 1 file changed, 47 insertions(+), 21 deletions(-)
+
+diff --git a/fs/ext4/mballoc.c b/fs/ext4/mballoc.c
+index 6c72eddcd6c1f..1e180c55ebd4f 100644
+--- a/fs/ext4/mballoc.c
++++ b/fs/ext4/mballoc.c
+@@ -892,21 +892,20 @@ mb_update_avg_fragment_size(struct super_block *sb, struct ext4_group_info *grp)
+ 	}
+ }
+ 
+-static int ext4_mb_scan_groups_xarray(struct ext4_allocation_context *ac,
+-				      struct xarray *xa, ext4_group_t start)
++static int ext4_mb_scan_groups_xa_range(struct ext4_allocation_context *ac,
++					struct xarray *xa,
++					ext4_group_t start, ext4_group_t end)
+ {
+ 	struct super_block *sb = ac->ac_sb;
+ 	struct ext4_sb_info *sbi = EXT4_SB(sb);
+ 	enum criteria cr = ac->ac_criteria;
+ 	ext4_group_t ngroups = ext4_get_groups_count(sb);
+ 	unsigned long group = start;
+-	ext4_group_t end = ngroups;
+ 	struct ext4_group_info *grp;
+ 
+-	if (WARN_ON_ONCE(start >= end))
++	if (WARN_ON_ONCE(end > ngroups || start >= end))
+ 		return 0;
+ 
+-wrap_around:
+ 	xa_for_each_range(xa, group, grp, start, end - 1) {
+ 		int err;
+ 
+@@ -920,28 +919,23 @@ static int ext4_mb_scan_groups_xarray(struct ext4_allocation_context *ac,
+ 		cond_resched();
+ 	}
+ 
+-	if (start) {
+-		end = start;
+-		start = 0;
+-		goto wrap_around;
+-	}
+-
+ 	return 0;
+ }
+ 
+ /*
+  * Find a suitable group of given order from the largest free orders xarray.
+  */
+-static int
+-ext4_mb_scan_groups_largest_free_order(struct ext4_allocation_context *ac,
+-				       int order, ext4_group_t start)
++static inline int
++ext4_mb_scan_groups_largest_free_order_range(struct ext4_allocation_context *ac,
++					     int order, ext4_group_t start,
++					     ext4_group_t end)
+ {
+ 	struct xarray *xa = &EXT4_SB(ac->ac_sb)->s_mb_largest_free_orders[order];
+ 
+ 	if (xa_empty(xa))
+ 		return 0;
+ 
+-	return ext4_mb_scan_groups_xarray(ac, xa, start);
++	return ext4_mb_scan_groups_xa_range(ac, xa, start, end);
+ }
+ 
+ /*
+@@ -954,12 +948,22 @@ static int ext4_mb_scan_groups_p2_aligned(struct ext4_allocation_context *ac,
+ 	struct ext4_sb_info *sbi = EXT4_SB(ac->ac_sb);
+ 	int i;
+ 	int ret = 0;
++	ext4_group_t start, end;
+ 
++	start = group;
++	end = ext4_get_groups_count(ac->ac_sb);
++wrap_around:
+ 	for (i = ac->ac_2order; i < MB_NUM_ORDERS(ac->ac_sb); i++) {
+-		ret = ext4_mb_scan_groups_largest_free_order(ac, i, group);
++		ret = ext4_mb_scan_groups_largest_free_order_range(ac, i,
++								   start, end);
+ 		if (ret || ac->ac_status != AC_STATUS_CONTINUE)
+ 			return ret;
+ 	}
++	if (start) {
++		end = start;
++		start = 0;
++		goto wrap_around;
++	}
+ 
+ 	if (sbi->s_mb_stats)
+ 		atomic64_inc(&sbi->s_bal_cX_failed[ac->ac_criteria]);
+@@ -972,15 +976,17 @@ static int ext4_mb_scan_groups_p2_aligned(struct ext4_allocation_context *ac,
+ /*
+  * Find a suitable group of given order from the average fragments xarray.
+  */
+-static int ext4_mb_scan_groups_avg_frag_order(struct ext4_allocation_context *ac,
+-					      int order, ext4_group_t start)
++static int
++ext4_mb_scan_groups_avg_frag_order_range(struct ext4_allocation_context *ac,
++					 int order, ext4_group_t start,
++					 ext4_group_t end)
+ {
+ 	struct xarray *xa = &EXT4_SB(ac->ac_sb)->s_mb_avg_fragment_size[order];
+ 
+ 	if (xa_empty(xa))
+ 		return 0;
+ 
+-	return ext4_mb_scan_groups_xarray(ac, xa, start);
++	return ext4_mb_scan_groups_xa_range(ac, xa, start, end);
+ }
+ 
+ /*
+@@ -992,13 +998,23 @@ static int ext4_mb_scan_groups_goal_fast(struct ext4_allocation_context *ac,
+ {
+ 	struct ext4_sb_info *sbi = EXT4_SB(ac->ac_sb);
+ 	int i, ret = 0;
++	ext4_group_t start, end;
+ 
++	start = group;
++	end = ext4_get_groups_count(ac->ac_sb);
++wrap_around:
+ 	i = mb_avg_fragment_size_order(ac->ac_sb, ac->ac_g_ex.fe_len);
+ 	for (; i < MB_NUM_ORDERS(ac->ac_sb); i++) {
+-		ret = ext4_mb_scan_groups_avg_frag_order(ac, i, group);
++		ret = ext4_mb_scan_groups_avg_frag_order_range(ac, i,
++							       start, end);
+ 		if (ret || ac->ac_status != AC_STATUS_CONTINUE)
+ 			return ret;
+ 	}
++	if (start) {
++		end = start;
++		start = 0;
++		goto wrap_around;
++	}
+ 
+ 	if (sbi->s_mb_stats)
+ 		atomic64_inc(&sbi->s_bal_cX_failed[ac->ac_criteria]);
+@@ -1034,6 +1050,7 @@ static int ext4_mb_scan_groups_best_avail(struct ext4_allocation_context *ac,
+ 	struct ext4_sb_info *sbi = EXT4_SB(ac->ac_sb);
+ 	int i, order, min_order;
+ 	unsigned long num_stripe_clusters = 0;
++	ext4_group_t start, end;
+ 
+ 	/*
+ 	 * mb_avg_fragment_size_order() returns order in a way that makes
+@@ -1065,6 +1082,9 @@ static int ext4_mb_scan_groups_best_avail(struct ext4_allocation_context *ac,
+ 	if (1 << min_order < ac->ac_o_ex.fe_len)
+ 		min_order = fls(ac->ac_o_ex.fe_len);
+ 
++	start = group;
++	end = ext4_get_groups_count(ac->ac_sb);
++wrap_around:
+ 	for (i = order; i >= min_order; i--) {
+ 		int frag_order;
+ 		/*
+@@ -1087,10 +1107,16 @@ static int ext4_mb_scan_groups_best_avail(struct ext4_allocation_context *ac,
+ 		frag_order = mb_avg_fragment_size_order(ac->ac_sb,
+ 							ac->ac_g_ex.fe_len);
+ 
+-		ret = ext4_mb_scan_groups_avg_frag_order(ac, frag_order, group);
++		ret = ext4_mb_scan_groups_avg_frag_order_range(ac, frag_order,
++							       start, end);
+ 		if (ret || ac->ac_status != AC_STATUS_CONTINUE)
+ 			return ret;
+ 	}
++	if (start) {
++		end = start;
++		start = 0;
++		goto wrap_around;
++	}
+ 
+ 	/* Reset goal length to original goal length before falling into CR_GOAL_LEN_SLOW */
+ 	ac->ac_g_ex.fe_len = ac->ac_orig_goal_len;
+-- 
+2.51.0
+
