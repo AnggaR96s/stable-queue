@@ -1,0 +1,85 @@
+From stable+bounces-226929-greg=kroah.com@vger.kernel.org Wed Mar 18 00:50:14 2026
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 17 Mar 2026 19:49:26 -0400
+Subject: sched_ext: Disable preemption between scx_claim_exit() and kicking helper work
+To: stable@vger.kernel.org
+Cc: Tejun Heo <tj@kernel.org>, Andrea Righi <arighi@nvidia.com>, Sasha Levin <sashal@kernel.org>
+Message-ID: <20260317234926.369009-1-sashal@kernel.org>
+
+From: Tejun Heo <tj@kernel.org>
+
+[ Upstream commit 83236b2e43dba00bee5b82eb5758816b1a674f6a ]
+
+scx_claim_exit() atomically sets exit_kind, which prevents scx_error() from
+triggering further error handling. After claiming exit, the caller must kick
+the helper kthread work which initiates bypass mode and teardown.
+
+If the calling task gets preempted between claiming exit and kicking the
+helper work, and the BPF scheduler fails to schedule it back (since error
+handling is now disabled), the helper work is never queued, bypass mode
+never activates, tasks stop being dispatched, and the system wedges.
+
+Disable preemption across scx_claim_exit() and the subsequent work kicking
+in all callers - scx_disable() and scx_vexit(). Add
+lockdep_assert_preemption_disabled() to scx_claim_exit() to enforce the
+requirement.
+
+Fixes: f0e1a0643a59 ("sched_ext: Implement BPF extensible scheduler class")
+Cc: stable@vger.kernel.org # v6.12+
+Reviewed-by: Andrea Righi <arighi@nvidia.com>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+[ adapted per-scheduler struct (sch->exit_kind, scx_disable, scx_vexit) to global variables (scx_exit_kind, scx_ops_disable, scx_ops_exit_kind) ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ kernel/sched/ext.c |   24 ++++++++++++++++++++----
+ 1 file changed, 20 insertions(+), 4 deletions(-)
+
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -4775,14 +4775,29 @@ static void schedule_scx_ops_disable_wor
+ 		kthread_queue_work(helper, &scx_ops_disable_work);
+ }
+ 
+-static void scx_ops_disable(enum scx_exit_kind kind)
++/*
++ * Claim the exit. The caller must ensure that the helper kthread work
++ * is kicked before the current task can be preempted. Once exit_kind is
++ * claimed, scx_error() can no longer trigger, so if the current task gets
++ * preempted and the BPF scheduler fails to schedule it back, the helper work
++ * will never be kicked and the whole system can wedge.
++ */
++static bool scx_claim_exit(enum scx_exit_kind kind)
+ {
+ 	int none = SCX_EXIT_NONE;
+ 
++	lockdep_assert_preemption_disabled();
++
++	return atomic_try_cmpxchg(&scx_exit_kind, &none, kind);
++}
++
++static void scx_ops_disable(enum scx_exit_kind kind)
++{
+ 	if (WARN_ON_ONCE(kind == SCX_EXIT_NONE || kind == SCX_EXIT_DONE))
+ 		kind = SCX_EXIT_ERROR;
+ 
+-	atomic_try_cmpxchg(&scx_exit_kind, &none, kind);
++	guard(preempt)();
++	scx_claim_exit(kind);
+ 
+ 	schedule_scx_ops_disable_work();
+ }
+@@ -5082,10 +5097,11 @@ static __printf(3, 4) void scx_ops_exit_
+ 					     const char *fmt, ...)
+ {
+ 	struct scx_exit_info *ei = scx_exit_info;
+-	int none = SCX_EXIT_NONE;
+ 	va_list args;
+ 
+-	if (!atomic_try_cmpxchg(&scx_exit_kind, &none, kind))
++	guard(preempt)();
++
++	if (!scx_claim_exit(kind))
+ 		return;
+ 
+ 	ei->exit_code = exit_code;
