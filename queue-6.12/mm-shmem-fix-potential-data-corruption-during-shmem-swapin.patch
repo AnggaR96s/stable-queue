@@ -1,0 +1,109 @@
+From stable+bounces-227930-greg=kroah.com@vger.kernel.org Mon Mar 23 10:34:29 2026
+From: Hugh Dickins <hughd@google.com>
+Date: Mon, 23 Mar 2026 02:34:19 -0700 (PDT)
+Subject: mm: shmem: fix potential data corruption during shmem swapin
+To: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: Hugh Dickins <hughd@google.com>, Andrew Morton <akpm@linux-foundation.org>,  Baolin Wang <baolin.wang@linux.alibaba.com>, Baoquan He <bhe@redhat.com>,  Barry Song <baohua@kernel.org>, Chris Li <chrisl@kernel.org>,  David Hildenbrand <david@kernel.org>, Dev Jain <dev.jain@arm.com>,  Greg Thelen <gthelen@google.com>, Guenter Roeck <groeck@google.com>,  Kairui Song <kasong@tencent.com>, Kemeng Shi <shikemeng@huaweicloud.com>,  Lance Yang <lance.yang@linux.dev>, Matthew Wilcox <willy@infradead.org>,  Nhat Pham <nphamcs@gmail.com>, linux-mm@kvack.org, stable@vger.kernel.org
+Message-ID: <0e918493-29b1-de47-9fca-b1fa93156d63@google.com>
+
+From: Baolin Wang <baolin.wang@linux.alibaba.com>
+
+commit 058313515d5aab10d0a01dd634f92ed4a4e71d4c upstream.
+
+Alex and Kairui reported some issues (system hang or data corruption) when
+swapping out or swapping in large shmem folios.  This is especially easy
+to reproduce when the tmpfs is mount with the 'huge=within_size'
+parameter.  Thanks to Kairui's reproducer, the issue can be easily
+replicated.
+
+The root cause of the problem is that swap readahead may asynchronously
+swap in order 0 folios into the swap cache, while the shmem mapping can
+still store large swap entries.  Then an order 0 folio is inserted into
+the shmem mapping without splitting the large swap entry, which overwrites
+the original large swap entry, leading to data corruption.
+
+When getting a folio from the swap cache, we should split the large swap
+entry stored in the shmem mapping if the orders do not match, to fix this
+issue.
+
+Link: https://lkml.kernel.org/r/2fe47c557e74e9df5fe2437ccdc6c9115fa1bf70.1740476943.git.baolin.wang@linux.alibaba.com
+Fixes: 809bc86517cc ("mm: shmem: support large folio swap out")
+Signed-off-by: Baolin Wang <baolin.wang@linux.alibaba.com>
+Reported-by: Alex Xu (Hello71) <alex_y_xu@yahoo.ca>
+Reported-by: Kairui Song <ryncsn@gmail.com>
+Closes: https://lore.kernel.org/all/1738717785.im3r5g2vxc.none@localhost/
+Tested-by: Kairui Song <kasong@tencent.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Lance Yang <ioworker0@gmail.com>
+Cc: Matthew Wilcow <willy@infradead.org>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+[ hughd: removed skip_swapcache dependencies ]
+Signed-off-by: Hugh Dickins <hughd@google.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ mm/shmem.c |   30 +++++++++++++++++++++++++++---
+ 1 file changed, 27 insertions(+), 3 deletions(-)
+
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@ -2132,7 +2132,7 @@ static int shmem_swapin_folio(struct ino
+ 	struct swap_info_struct *si;
+ 	struct folio *folio = NULL;
+ 	swp_entry_t swap;
+-	int error, nr_pages;
++	int error, nr_pages, order, split_order;
+ 
+ 	VM_BUG_ON(!*foliop || !xa_is_value(*foliop));
+ 	swap = radix_to_swp_entry(*foliop);
+@@ -2151,8 +2151,8 @@ static int shmem_swapin_folio(struct ino
+ 
+ 	/* Look it up and read it in.. */
+ 	folio = swap_cache_get_folio(swap, NULL, 0);
++	order = xa_get_order(&mapping->i_pages, index);
+ 	if (!folio) {
+-		int split_order;
+ 
+ 		/* Or update major stats only when swapin succeeds?? */
+ 		if (fault_type) {
+@@ -2189,13 +2189,37 @@ static int shmem_swapin_folio(struct ino
+ 			error = -ENOMEM;
+ 			goto failed;
+ 		}
++	} else if (order != folio_order(folio)) {
++		/*
++		 * Swap readahead may swap in order 0 folios into swapcache
++		 * asynchronously, while the shmem mapping can still stores
++		 * large swap entries. In such cases, we should split the
++		 * large swap entry to prevent possible data corruption.
++		 */
++		split_order = shmem_split_large_entry(inode, index, swap, gfp);
++		if (split_order < 0) {
++			error = split_order;
++			goto failed;
++		}
++
++		/*
++		 * If the large swap entry has already been split, it is
++		 * necessary to recalculate the new swap entry based on
++		 * the old order alignment.
++		 */
++		if (split_order > 0) {
++			pgoff_t offset = index - round_down(index, 1 << split_order);
++
++			swap = swp_entry(swp_type(swap), swp_offset(swap) + offset);
++		}
+ 	}
+ 
+ 	/* We have to do this with folio locked to prevent races */
+ 	folio_lock(folio);
+ 	if (!folio_test_swapcache(folio) ||
+ 	    folio->swap.val != swap.val ||
+-	    !shmem_confirm_swap(mapping, index, swap)) {
++	    !shmem_confirm_swap(mapping, index, swap) ||
++	    xa_get_order(&mapping->i_pages, index) != folio_order(folio)) {
+ 		error = -EEXIST;
+ 		goto unlock;
+ 	}

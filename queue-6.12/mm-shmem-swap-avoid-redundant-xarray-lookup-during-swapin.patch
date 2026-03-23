@@ -1,0 +1,116 @@
+From stable+bounces-227935-greg=kroah.com@vger.kernel.org Mon Mar 23 10:43:43 2026
+From: Hugh Dickins <hughd@google.com>
+Date: Mon, 23 Mar 2026 02:43:31 -0700 (PDT)
+Subject: mm/shmem, swap: avoid redundant Xarray lookup during swapin
+To: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: Hugh Dickins <hughd@google.com>, Andrew Morton <akpm@linux-foundation.org>,  Baolin Wang <baolin.wang@linux.alibaba.com>, Baoquan He <bhe@redhat.com>,  Barry Song <baohua@kernel.org>, Chris Li <chrisl@kernel.org>,  David Hildenbrand <david@kernel.org>, Dev Jain <dev.jain@arm.com>,  Greg Thelen <gthelen@google.com>, Guenter Roeck <groeck@google.com>,  Kairui Song <kasong@tencent.com>, Kemeng Shi <shikemeng@huaweicloud.com>,  Lance Yang <lance.yang@linux.dev>, Matthew Wilcox <willy@infradead.org>,  Nhat Pham <nphamcs@gmail.com>, linux-mm@kvack.org, stable@vger.kernel.org
+Message-ID: <ebffe1a4-f575-8a38-2584-70cbfeda6913@google.com>
+
+From: Kairui Song <kasong@tencent.com>
+
+commit 0cfc0e7e3d062b93e9eec6828de000981cdfb152 upstream.
+
+Currently shmem calls xa_get_order to get the swap radix entry order,
+requiring a full tree walk.  This can be easily combined with the swap
+entry value checking (shmem_confirm_swap) to avoid the duplicated lookup
+and abort early if the entry is gone already.  Which should improve the
+performance.
+
+Link: https://lkml.kernel.org/r/20250728075306.12704-1-ryncsn@gmail.com
+Link: https://lkml.kernel.org/r/20250728075306.12704-3-ryncsn@gmail.com
+Signed-off-by: Kairui Song <kasong@tencent.com>
+Reviewed-by: Kemeng Shi <shikemeng@huaweicloud.com>
+Reviewed-by: Dev Jain <dev.jain@arm.com>
+Reviewed-by: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Baoquan He <bhe@redhat.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Chris Li <chrisl@kernel.org>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Nhat Pham <nphamcs@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+Stable-dep-of: 8a1968bd997f ("mm/shmem, swap: fix race of truncate and swap entry split")
+[ hughd: removed series cover letter and skip_swapcache dependencies ]
+Signed-off-by: Hugh Dickins <hughd@google.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ mm/shmem.c |   34 +++++++++++++++++++++++++---------
+ 1 file changed, 25 insertions(+), 9 deletions(-)
+
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@ -499,15 +499,27 @@ static int shmem_replace_entry(struct ad
+ 
+ /*
+  * Sometimes, before we decide whether to proceed or to fail, we must check
+- * that an entry was not already brought back from swap by a racing thread.
++ * that an entry was not already brought back or split by a racing thread.
+  *
+  * Checking folio is not enough: by the time a swapcache folio is locked, it
+  * might be reused, and again be swapcache, using the same swap as before.
++ * Returns the swap entry's order if it still presents, else returns -1.
+  */
+-static bool shmem_confirm_swap(struct address_space *mapping,
+-			       pgoff_t index, swp_entry_t swap)
++static int shmem_confirm_swap(struct address_space *mapping, pgoff_t index,
++			      swp_entry_t swap)
+ {
+-	return xa_load(&mapping->i_pages, index) == swp_to_radix_entry(swap);
++	XA_STATE(xas, &mapping->i_pages, index);
++	int ret = -1;
++	void *entry;
++
++	rcu_read_lock();
++	do {
++		entry = xas_load(&xas);
++		if (entry == swp_to_radix_entry(swap))
++			ret = xas_get_order(&xas);
++	} while (xas_retry(&xas, entry));
++	rcu_read_unlock();
++	return ret;
+ }
+ 
+ /*
+@@ -2155,16 +2167,20 @@ static int shmem_swapin_folio(struct ino
+ 		return -EIO;
+ 
+ 	si = get_swap_device(swap);
+-	if (!si) {
+-		if (!shmem_confirm_swap(mapping, index, swap))
++	order = shmem_confirm_swap(mapping, index, swap);
++	if (unlikely(!si)) {
++		if (order < 0)
+ 			return -EEXIST;
+ 		else
+ 			return -EINVAL;
+ 	}
++	if (unlikely(order < 0)) {
++		put_swap_device(si);
++		return -EEXIST;
++	}
+ 
+ 	/* Look it up and read it in.. */
+ 	folio = swap_cache_get_folio(swap, NULL, 0);
+-	order = xa_get_order(&mapping->i_pages, index);
+ 	if (!folio) {
+ 
+ 		/* Or update major stats only when swapin succeeds?? */
+@@ -2241,7 +2257,7 @@ static int shmem_swapin_folio(struct ino
+ 	 */
+ 	folio_lock(folio);
+ 	if (!folio_test_swapcache(folio) ||
+-	    !shmem_confirm_swap(mapping, index, swap) ||
++	    shmem_confirm_swap(mapping, index, swap) < 0 ||
+ 	    folio->swap.val != swap.val) {
+ 		error = -EEXIST;
+ 		goto unlock;
+@@ -2284,7 +2300,7 @@ static int shmem_swapin_folio(struct ino
+ 	*foliop = folio;
+ 	return 0;
+ failed:
+-	if (!shmem_confirm_swap(mapping, index, swap))
++	if (shmem_confirm_swap(mapping, index, swap) < 0)
+ 		error = -EEXIST;
+ 	if (error == -EIO)
+ 		shmem_set_folio_swapin_error(inode, index, folio, swap);
