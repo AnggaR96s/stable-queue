@@ -1,0 +1,102 @@
+From stable+bounces-224796-greg=kroah.com@vger.kernel.org Thu Mar 12 04:17:00 2026
+From: Robert Garcia <rob_garcia@163.com>
+Date: Thu, 12 Mar 2026 11:14:29 +0800
+Subject: wifi: brcmfmac: fix use-after-free when rescheduling brcmf_btcoex_info work
+To: stable@vger.kernel.org, Duoming Zhou <duoming@zju.edu.cn>
+Cc: Johannes Berg <johannes.berg@intel.com>, Robert Garcia <rob_garcia@163.com>, Arend van Spriel <arend.vanspriel@broadcom.com>, Kalle Valo <kvalo@kernel.org>, Franky Lin <franky.lin@broadcom.com>, Hante Meuleman <hante.meuleman@broadcom.com>, "David S . Miller" <davem@davemloft.net>, Eric Dumazet <edumazet@google.com>, Jakub Kicinski <kuba@kernel.org>, Paolo Abeni <pabeni@redhat.com>, Pieter-Paul Giesberts <pieterpg@broadcom.com>, Piotr Haber <phaber@broadcom.com>, "John W . Linville" <linville@tuxdriver.com>, linux-wireless@vger.kernel.org, brcm80211-dev-list.pdl@broadcom.com, SHA-cyfmac-dev-list@infineon.com, netdev@vger.kernel.org, linux-kernel@vger.kernel.org
+Message-ID: <20260312031429.3432419-1-rob_garcia@163.com>
+
+From: Duoming Zhou <duoming@zju.edu.cn>
+
+[ Upstream commit 9cb83d4be0b9b697eae93d321e0da999f9cdfcfc ]
+
+The brcmf_btcoex_detach() only shuts down the btcoex timer, if the
+flag timer_on is false. However, the brcmf_btcoex_timerfunc(), which
+runs as timer handler, sets timer_on to false. This creates critical
+race conditions:
+
+1.If brcmf_btcoex_detach() is called while brcmf_btcoex_timerfunc()
+is executing, it may observe timer_on as false and skip the call to
+timer_shutdown_sync().
+
+2.The brcmf_btcoex_timerfunc() may then reschedule the brcmf_btcoex_info
+worker after the cancel_work_sync() has been executed, resulting in
+use-after-free bugs.
+
+The use-after-free bugs occur in two distinct scenarios, depending on
+the timing of when the brcmf_btcoex_info struct is freed relative to
+the execution of its worker thread.
+
+Scenario 1: Freed before the worker is scheduled
+
+The brcmf_btcoex_info is deallocated before the worker is scheduled.
+A race condition can occur when schedule_work(&bt_local->work) is
+called after the target memory has been freed. The sequence of events
+is detailed below:
+
+CPU0                           | CPU1
+brcmf_btcoex_detach            | brcmf_btcoex_timerfunc
+                               |   bt_local->timer_on = false;
+  if (cfg->btcoex->timer_on)   |
+    ...                        |
+  cancel_work_sync();          |
+  ...                          |
+  kfree(cfg->btcoex); // FREE  |
+                               |   schedule_work(&bt_local->work); // USE
+
+Scenario 2: Freed after the worker is scheduled
+
+The brcmf_btcoex_info is freed after the worker has been scheduled
+but before or during its execution. In this case, statements within
+the brcmf_btcoex_handler() — such as the container_of macro and
+subsequent dereferences of the brcmf_btcoex_info object will cause
+a use-after-free access. The following timeline illustrates this
+scenario:
+
+CPU0                            | CPU1
+brcmf_btcoex_detach             | brcmf_btcoex_timerfunc
+                                |   bt_local->timer_on = false;
+  if (cfg->btcoex->timer_on)    |
+    ...                         |
+  cancel_work_sync();           |
+  ...                           |   schedule_work(); // Reschedule
+                                |
+  kfree(cfg->btcoex); // FREE   |   brcmf_btcoex_handler() // Worker
+  /*                            |     btci = container_of(....); // USE
+   The kfree() above could      |     ...
+   also occur at any point      |     btci-> // USE
+   during the worker's execution|
+   */                           |
+
+To resolve the race conditions, drop the conditional check and call
+timer_shutdown_sync() directly. It can deactivate the timer reliably,
+regardless of its current state. Once stopped, the timer_on state is
+then set to false.
+
+Fixes: 61730d4dfffc ("brcmfmac: support critical protocol API for DHCP")
+Acked-by: Arend van Spriel <arend.vanspriel@broadcom.com>
+Signed-off-by: Duoming Zhou <duoming@zju.edu.cn>
+Link: https://patch.msgid.link/20250822050839.4413-1-duoming@zju.edu.cn
+Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+[ Keep del_timer_sync() instead of timer_shutdown_sync() here. ]
+Signed-off-by: Robert Garcia <rob_garcia@163.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/wireless/broadcom/brcm80211/brcmfmac/btcoex.c |    6 ++----
+ 1 file changed, 2 insertions(+), 4 deletions(-)
+
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/btcoex.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/btcoex.c
+@@ -392,10 +392,8 @@ void brcmf_btcoex_detach(struct brcmf_cf
+ 	if (!cfg->btcoex)
+ 		return;
+ 
+-	if (cfg->btcoex->timer_on) {
+-		cfg->btcoex->timer_on = false;
+-		del_timer_sync(&cfg->btcoex->timer);
+-	}
++	del_timer_sync(&cfg->btcoex->timer);
++	cfg->btcoex->timer_on = false;
+ 
+ 	cancel_work_sync(&cfg->btcoex->work);
+ 
