@@ -1,0 +1,498 @@
+From 69db0294e6d11bc765f5cbee2f39602fa2b36f7b Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Wed, 20 Aug 2025 20:03:39 -0600
+Subject: io_uring/kbuf: switch to storing struct io_buffer_list locally
+
+From: Jens Axboe <axboe@kernel.dk>
+
+Commit 5fda51255439addd1c9059098e30847a375a1008 upstream.
+
+Currently the buffer list is stored in struct io_kiocb. The buffer list
+can be of two types:
+
+1) Classic/legacy buffer list. These don't need to get referenced after
+   a buffer pick, and hence storing them in struct io_kiocb is perfectly
+   fine.
+
+2) Ring provided buffer lists. These DO need to be referenced after the
+   initial buffer pick, as they need to get consumed later on. This can
+   be either just incrementing the head of the ring, or it can be
+   consuming parts of a buffer if incremental buffer consumptions has
+   been configured.
+
+For case 2, io_uring needs to be careful not to access the buffer list
+after the initial pick-and-execute context. The core does recycling of
+these, but it's easy to make a mistake, because it's stored in the
+io_kiocb which does persist across multiple execution contexts. Either
+because it's a multishot request, or simply because it needed some kind
+of async trigger (eg poll) for retry purposes.
+
+Add a struct io_buffer_list to struct io_br_sel, which is always on
+stack for the various users of it. This prevents the buffer list from
+leaking outside of that execution context, and additionally it enables
+kbuf to not even pass back the struct io_buffer_list if the given
+context isn't appropriately locked already.
+
+This doesn't fix any bugs, it's simply a defensive measure to prevent
+any issues with reuse of a buffer list.
+
+Link: https://lore.kernel.org/r/20250821020750.598432-12-axboe@kernel.dk
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/linux/io_uring_types.h |    6 ----
+ io_uring/io_uring.c            |    6 ++--
+ io_uring/kbuf.c                |   27 ++++++++++++---------
+ io_uring/kbuf.h                |   16 ++++--------
+ io_uring/net.c                 |   51 +++++++++++++++++------------------------
+ io_uring/poll.c                |    6 ++--
+ io_uring/rw.c                  |   22 ++++++++---------
+ 7 files changed, 60 insertions(+), 74 deletions(-)
+
+--- a/include/linux/io_uring_types.h
++++ b/include/linux/io_uring_types.h
+@@ -624,12 +624,6 @@ struct io_kiocb {
+ 
+ 		/* stores selected buf, valid IFF REQ_F_BUFFER_SELECTED is set */
+ 		struct io_buffer	*kbuf;
+-
+-		/*
+-		 * stores buffer ID for ring provided buffers, valid IFF
+-		 * REQ_F_BUFFER_RING is set.
+-		 */
+-		struct io_buffer_list	*buf_list;
+ 	};
+ 
+ 	union {
+--- a/io_uring/io_uring.c
++++ b/io_uring/io_uring.c
+@@ -921,7 +921,7 @@ void io_req_defer_failed(struct io_kiocb
+ 	lockdep_assert_held(&req->ctx->uring_lock);
+ 
+ 	req_set_fail(req);
+-	io_req_set_res(req, res, io_put_kbuf(req, res, req->buf_list));
++	io_req_set_res(req, res, io_put_kbuf(req, res, NULL));
+ 	if (def->fail)
+ 		def->fail(req);
+ 	io_req_complete_defer(req);
+@@ -1921,11 +1921,11 @@ static void io_queue_async(struct io_kio
+ 
+ 	switch (io_arm_poll_handler(req, 0)) {
+ 	case IO_APOLL_READY:
+-		io_kbuf_recycle(req, req->buf_list, 0);
++		io_kbuf_recycle(req, NULL, 0);
+ 		io_req_task_queue(req);
+ 		break;
+ 	case IO_APOLL_ABORTED:
+-		io_kbuf_recycle(req, req->buf_list, 0);
++		io_kbuf_recycle(req, NULL, 0);
+ 		io_queue_iowq(req);
+ 		break;
+ 	case IO_APOLL_OK:
+--- a/io_uring/kbuf.c
++++ b/io_uring/kbuf.c
+@@ -172,8 +172,8 @@ static struct io_br_sel io_ring_buffer_s
+ 	if (*len == 0 || *len > buf->len)
+ 		*len = buf->len;
+ 	req->flags |= REQ_F_BUFFER_RING | REQ_F_BUFFERS_COMMIT;
+-	req->buf_list = bl;
+ 	req->buf_index = buf->bid;
++	sel.buf_list = bl;
+ 	sel.addr = u64_to_user_ptr(buf->addr);
+ 
+ 	if (issue_flags & IO_URING_F_UNLOCKED || !io_file_can_poll(req)) {
+@@ -187,9 +187,9 @@ static struct io_br_sel io_ring_buffer_s
+ 		 * the transfer completes (or if we get -EAGAIN and must poll of
+ 		 * retry).
+ 		 */
+-		if (!io_kbuf_commit(req, bl, *len, 1))
++		if (!io_kbuf_commit(req, sel.buf_list, *len, 1))
+ 			req->flags |= REQ_F_BUF_MORE;
+-		req->buf_list = NULL;
++		sel.buf_list = NULL;
+ 	}
+ 	return sel;
+ }
+@@ -307,7 +307,6 @@ static int io_ring_buffers_peek(struct i
+ 		req->flags |= REQ_F_BL_EMPTY;
+ 
+ 	req->flags |= REQ_F_BUFFER_RING;
+-	req->buf_list = bl;
+ 	return iov - arg->iovs;
+ }
+ 
+@@ -315,16 +314,15 @@ int io_buffers_select(struct io_kiocb *r
+ 		      struct io_br_sel *sel, unsigned int issue_flags)
+ {
+ 	struct io_ring_ctx *ctx = req->ctx;
+-	struct io_buffer_list *bl;
+ 	int ret = -ENOENT;
+ 
+ 	io_ring_submit_lock(ctx, issue_flags);
+-	bl = io_buffer_get_list(ctx, req->buf_index);
+-	if (unlikely(!bl))
++	sel->buf_list = io_buffer_get_list(ctx, req->buf_index);
++	if (unlikely(!sel->buf_list))
+ 		goto out_unlock;
+ 
+-	if (bl->flags & IOBL_BUF_RING) {
+-		ret = io_ring_buffers_peek(req, arg, bl);
++	if (sel->buf_list->flags & IOBL_BUF_RING) {
++		ret = io_ring_buffers_peek(req, arg, sel->buf_list);
+ 		/*
+ 		 * Don't recycle these buffers if we need to go through poll.
+ 		 * Nobody else can use them anyway, and holding on to provided
+@@ -334,14 +332,17 @@ int io_buffers_select(struct io_kiocb *r
+ 		 */
+ 		if (ret > 0) {
+ 			req->flags |= REQ_F_BUFFERS_COMMIT | REQ_F_BL_NO_RECYCLE;
+-			if (!io_kbuf_commit(req, bl, arg->out_len, ret))
++			if (!io_kbuf_commit(req, sel->buf_list, arg->out_len, ret))
+ 				req->flags |= REQ_F_BUF_MORE;
+ 		}
+ 	} else {
+-		ret = io_provided_buffers_select(req, &arg->out_len, bl, arg->iovs);
++		ret = io_provided_buffers_select(req, &arg->out_len, sel->buf_list, arg->iovs);
+ 	}
+ out_unlock:
+-	io_ring_submit_unlock(ctx, issue_flags);
++	if (issue_flags & IO_URING_F_UNLOCKED) {
++		sel->buf_list = NULL;
++		mutex_unlock(&ctx->uring_lock);
++	}
+ 	return ret;
+ }
+ 
+@@ -362,10 +363,12 @@ int io_buffers_peek(struct io_kiocb *req
+ 		ret = io_ring_buffers_peek(req, arg, bl);
+ 		if (ret > 0)
+ 			req->flags |= REQ_F_BUFFERS_COMMIT;
++		sel->buf_list = bl;
+ 		return ret;
+ 	}
+ 
+ 	/* don't support multiple buffer selections for legacy */
++	sel->buf_list = NULL;
+ 	return io_provided_buffers_select(req, &arg->max_len, bl, arg->iovs);
+ }
+ 
+--- a/io_uring/kbuf.h
++++ b/io_uring/kbuf.h
+@@ -65,11 +65,14 @@ struct buf_sel_arg {
+ };
+ 
+ /*
+- * Return value from io_buffer_list selection. Just returns the error or
+- * user address for now, will be extended to return the buffer list in the
+- * future.
++ * Return value from io_buffer_list selection, to avoid stashing it in
++ * struct io_kiocb. For legacy/classic provided buffers, keeping a reference
++ * across execution contexts are fine. But for ring provided buffers, the
++ * list may go away as soon as ->uring_lock is dropped. As the io_kiocb
++ * persists, it's better to just keep the buffer local for those cases.
+  */
+ struct io_br_sel {
++	struct io_buffer_list *buf_list;
+ 	/*
+ 	 * Some selection parts return the user address, others return an error.
+ 	 */
+@@ -113,13 +116,6 @@ int io_pbuf_mmap(struct file *file, stru
+ static inline bool io_kbuf_recycle_ring(struct io_kiocb *req,
+ 					struct io_buffer_list *bl)
+ {
+-	/*
+-	 * We don't need to recycle for REQ_F_BUFFER_RING, we can just clear
+-	 * the flag and hence ensure that bl->head doesn't get incremented.
+-	 * If the tail has already been incremented, hang on to it.
+-	 * The exception is partial io, that case we should increment bl->head
+-	 * to monopolize the buffer.
+-	 */
+ 	if (bl) {
+ 		req->buf_index = bl->bgid;
+ 		req->flags &= ~(REQ_F_BUFFER_RING|REQ_F_BUFFERS_COMMIT);
+--- a/io_uring/net.c
++++ b/io_uring/net.c
+@@ -442,7 +442,6 @@ int io_sendmsg_prep(struct io_kiocb *req
+ 			return -EINVAL;
+ 		sr->msg_flags |= MSG_WAITALL;
+ 		sr->buf_group = req->buf_index;
+-		req->buf_list = NULL;
+ 		req->flags |= REQ_F_MULTISHOT;
+ 	}
+ 
+@@ -516,11 +515,11 @@ static inline bool io_send_finish(struct
+ 	unsigned int cflags;
+ 
+ 	if (!(sr->flags & IORING_RECVSEND_BUNDLE)) {
+-		cflags = io_put_kbuf(req, sel->val, req->buf_list);
++		cflags = io_put_kbuf(req, sel->val, sel->buf_list);
+ 		goto finish;
+ 	}
+ 
+-	cflags = io_put_kbufs(req, sel->val, req->buf_list, io_bundle_nbufs(kmsg, sel->val));
++	cflags = io_put_kbufs(req, sel->val, sel->buf_list, io_bundle_nbufs(kmsg, sel->val));
+ 
+ 	/*
+ 	 * Don't start new bundles if the buffer list is empty, or if the
+@@ -617,6 +616,7 @@ int io_send(struct io_kiocb *req, unsign
+ 		flags |= MSG_DONTWAIT;
+ 
+ retry_bundle:
++	sel.buf_list = NULL;
+ 	if (io_do_buffer_select(req)) {
+ 		struct buf_sel_arg arg = {
+ 			.iovs = &kmsg->fast_iov,
+@@ -677,7 +677,7 @@ retry_bundle:
+ 			sr->len -= ret;
+ 			sr->buf += ret;
+ 			sr->done_io += ret;
+-			return io_net_kbuf_recyle(req, req->buf_list, kmsg, ret);
++			return io_net_kbuf_recyle(req, sel.buf_list, kmsg, ret);
+ 		}
+ 		if (ret == -ERESTARTSYS)
+ 			ret = -EINTR;
+@@ -816,18 +816,8 @@ int io_recvmsg_prep(struct io_kiocb *req
+ 		req->flags |= REQ_F_NOWAIT;
+ 	if (sr->msg_flags & MSG_ERRQUEUE)
+ 		req->flags |= REQ_F_CLEAR_POLLIN;
+-	if (req->flags & REQ_F_BUFFER_SELECT) {
+-		/*
+-		 * Store the buffer group for this multishot receive separately,
+-		 * as if we end up doing an io-wq based issue that selects a
+-		 * buffer, it has to be committed immediately and that will
+-		 * clear ->buf_list. This means we lose the link to the buffer
+-		 * list, and the eventual buffer put on completion then cannot
+-		 * restore it.
+-		 */
++	if (req->flags & REQ_F_BUFFER_SELECT)
+ 		sr->buf_group = req->buf_index;
+-		req->buf_list = NULL;
+-	}
+ 	if (sr->flags & IORING_RECV_MULTISHOT) {
+ 		if (!(req->flags & REQ_F_BUFFER_SELECT))
+ 			return -EINVAL;
+@@ -873,7 +863,7 @@ static inline bool io_recv_finish(struct
+ 	if (sr->flags & IORING_RECVSEND_BUNDLE) {
+ 		size_t this_ret = sel->val - sr->done_io;
+ 
+-		cflags |= io_put_kbufs(req, this_ret, req->buf_list, io_bundle_nbufs(kmsg, this_ret));
++		cflags |= io_put_kbufs(req, this_ret, sel->buf_list, io_bundle_nbufs(kmsg, this_ret));
+ 		if (sr->retry_flags & IO_SR_MSG_RETRY)
+ 			cflags = req->cqe.flags | (cflags & CQE_F_MASK);
+ 		/* bundle with no more immediate buffers, we're done */
+@@ -892,7 +882,7 @@ static inline bool io_recv_finish(struct
+ 			return false;
+ 		}
+ 	} else {
+-		cflags |= io_put_kbuf(req, sel->val, req->buf_list);
++		cflags |= io_put_kbuf(req, sel->val, sel->buf_list);
+ 	}
+ 
+ 	/*
+@@ -1039,6 +1029,7 @@ int io_recvmsg(struct io_kiocb *req, uns
+ 		flags |= MSG_DONTWAIT;
+ 
+ retry_multishot:
++	sel.buf_list = NULL;
+ 	if (io_do_buffer_select(req)) {
+ 		size_t len = sr->len;
+ 
+@@ -1049,7 +1040,7 @@ retry_multishot:
+ 		if (req->flags & REQ_F_APOLL_MULTISHOT) {
+ 			ret = io_recvmsg_prep_multishot(kmsg, sr, &sel.addr, &len);
+ 			if (ret) {
+-				io_kbuf_recycle(req, req->buf_list, issue_flags);
++				io_kbuf_recycle(req, sel.buf_list, issue_flags);
+ 				return ret;
+ 			}
+ 		}
+@@ -1073,12 +1064,15 @@ retry_multishot:
+ 
+ 	if (ret < min_ret) {
+ 		if (ret == -EAGAIN && force_nonblock) {
+-			if (issue_flags & IO_URING_F_MULTISHOT) {
+-				io_kbuf_recycle(req, req->buf_list, issue_flags);
++			io_kbuf_recycle(req, sel.buf_list, issue_flags);
++			if (issue_flags & IO_URING_F_MULTISHOT)
+ 				return IOU_ISSUE_SKIP_COMPLETE;
+-			}
+ 			return -EAGAIN;
+ 		}
++		if (ret > 0 && io_net_retry(sock, flags)) {
++			sr->done_io += ret;
++			return io_net_kbuf_recyle(req, sel.buf_list, kmsg, ret);
++		}
+ 		if (ret == -ERESTARTSYS)
+ 			ret = -EINTR;
+ 		req_set_fail(req);
+@@ -1091,7 +1085,7 @@ retry_multishot:
+ 	else if (sr->done_io)
+ 		ret = sr->done_io;
+ 	else
+-		io_kbuf_recycle(req, req->buf_list, issue_flags);
++		io_kbuf_recycle(req, sel.buf_list, issue_flags);
+ 
+ 	sel.val = ret;
+ 	if (!io_recv_finish(req, kmsg, &sel, mshot_finished, issue_flags))
+@@ -1172,7 +1166,7 @@ int io_recv(struct io_kiocb *req, unsign
+ {
+ 	struct io_sr_msg *sr = io_kiocb_to_cmd(req, struct io_sr_msg);
+ 	struct io_async_msghdr *kmsg = req->async_data;
+-	struct io_br_sel sel = { };
++	struct io_br_sel sel;
+ 	struct socket *sock;
+ 	unsigned flags;
+ 	int ret, min_ret = 0;
+@@ -1192,6 +1186,7 @@ int io_recv(struct io_kiocb *req, unsign
+ 		flags |= MSG_DONTWAIT;
+ 
+ retry_multishot:
++	sel.buf_list = NULL;
+ 	if (io_do_buffer_select(req)) {
+ 		sel.val = sr->len;
+ 		ret = io_recv_buf_select(req, kmsg, &sel, issue_flags);
+@@ -1211,18 +1206,16 @@ retry_multishot:
+ 	ret = sock_recvmsg(sock, &kmsg->msg, flags);
+ 	if (ret < min_ret) {
+ 		if (ret == -EAGAIN && force_nonblock) {
+-			if (issue_flags & IO_URING_F_MULTISHOT) {
+-				io_kbuf_recycle(req, req->buf_list, issue_flags);
++			io_kbuf_recycle(req, sel.buf_list, issue_flags);
++			if (issue_flags & IO_URING_F_MULTISHOT)
+ 				return IOU_ISSUE_SKIP_COMPLETE;
+-			}
+-
+ 			return -EAGAIN;
+ 		}
+ 		if (ret > 0 && io_net_retry(sock, flags)) {
+ 			sr->len -= ret;
+ 			sr->buf += ret;
+ 			sr->done_io += ret;
+-			return io_net_kbuf_recyle(req, req->buf_list, kmsg, ret);
++			return io_net_kbuf_recyle(req, sel.buf_list, kmsg, ret);
+ 		}
+ 		if (ret == -ERESTARTSYS)
+ 			ret = -EINTR;
+@@ -1238,7 +1231,7 @@ out_free:
+ 	else if (sr->done_io)
+ 		ret = sr->done_io;
+ 	else
+-		io_kbuf_recycle(req, req->buf_list, issue_flags);
++		io_kbuf_recycle(req, sel.buf_list, issue_flags);
+ 
+ 	sel.val = ret;
+ 	if (!io_recv_finish(req, kmsg, &sel, mshot_finished, issue_flags))
+--- a/io_uring/poll.c
++++ b/io_uring/poll.c
+@@ -356,10 +356,10 @@ void io_poll_task_func(struct io_kiocb *
+ 
+ 	ret = io_poll_check_events(req, ts);
+ 	if (ret == IOU_POLL_NO_ACTION) {
+-		io_kbuf_recycle(req, req->buf_list, 0);
++		io_kbuf_recycle(req, NULL, 0);
+ 		return;
+ 	} else if (ret == IOU_POLL_REQUEUE) {
+-		io_kbuf_recycle(req, req->buf_list, 0);
++		io_kbuf_recycle(req, NULL, 0);
+ 		__io_poll_execute(req, 0);
+ 		return;
+ 	}
+@@ -753,7 +753,7 @@ int io_arm_poll_handler(struct io_kiocb
+ 	req->flags |= REQ_F_POLLED;
+ 	ipt.pt._qproc = io_async_queue_proc;
+ 
+-	io_kbuf_recycle(req, req->buf_list, issue_flags);
++	io_kbuf_recycle(req, NULL, issue_flags);
+ 
+ 	ret = __io_arm_poll_handler(req, &apoll->poll, &ipt, mask, issue_flags);
+ 	if (ret)
+--- a/io_uring/rw.c
++++ b/io_uring/rw.c
+@@ -522,7 +522,7 @@ void io_req_rw_complete(struct io_kiocb
+ 	io_req_io_end(req);
+ 
+ 	if (req->flags & (REQ_F_BUFFER_SELECTED|REQ_F_BUFFER_RING))
+-		req->cqe.flags |= io_put_kbuf(req, req->cqe.res, req->buf_list);
++		req->cqe.flags |= io_put_kbuf(req, req->cqe.res, NULL);
+ 
+ 	io_req_rw_cleanup(req, 0);
+ 	io_req_task_complete(req, ts);
+@@ -589,7 +589,7 @@ static inline void io_rw_done(struct kio
+ }
+ 
+ static int kiocb_done(struct io_kiocb *req, ssize_t ret,
+-		       unsigned int issue_flags)
++		      struct io_br_sel *sel, unsigned int issue_flags)
+ {
+ 	struct io_rw *rw = io_kiocb_to_cmd(req, struct io_rw);
+ 	unsigned final_ret = io_fixup_rw_res(req, ret);
+@@ -604,7 +604,7 @@ static int kiocb_done(struct io_kiocb *r
+ 			 */
+ 			io_req_io_end(req);
+ 			io_req_set_res(req, final_ret,
+-				       io_put_kbuf(req, ret, req->buf_list));
++				       io_put_kbuf(req, ret, sel->buf_list));
+ 			io_req_rw_cleanup(req, issue_flags);
+ 			return IOU_OK;
+ 		}
+@@ -955,10 +955,10 @@ int io_read(struct io_kiocb *req, unsign
+ 
+ 	ret = __io_read(req, &sel, issue_flags);
+ 	if (ret >= 0)
+-		return kiocb_done(req, ret, issue_flags);
++		return kiocb_done(req, ret, &sel, issue_flags);
+ 
+ 	if (req->flags & REQ_F_BUFFERS_COMMIT)
+-		io_kbuf_recycle(req, req->buf_list, issue_flags);
++		io_kbuf_recycle(req, sel.buf_list, issue_flags);
+ 	return ret;
+ }
+ 
+@@ -986,17 +986,17 @@ int io_read_mshot(struct io_kiocb *req,
+ 		 * Reset rw->len to 0 again to avoid clamping future mshot
+ 		 * reads, in case the buffer size varies.
+ 		 */
+-		if (io_kbuf_recycle(req, req->buf_list, issue_flags))
++		if (io_kbuf_recycle(req, sel.buf_list, issue_flags))
+ 			rw->len = 0;
+ 		if (issue_flags & IO_URING_F_MULTISHOT)
+ 			return IOU_ISSUE_SKIP_COMPLETE;
+ 		return -EAGAIN;
+ 	} else if (ret <= 0) {
+-		io_kbuf_recycle(req, req->buf_list, issue_flags);
++		io_kbuf_recycle(req, sel.buf_list, issue_flags);
+ 		if (ret < 0)
+ 			req_set_fail(req);
+ 	} else if (!(req->flags & REQ_F_APOLL_MULTISHOT)) {
+-		cflags = io_put_kbuf(req, ret, req->buf_list);
++		cflags = io_put_kbuf(req, ret, sel.buf_list);
+ 	} else {
+ 		/*
+ 		 * Any successful return value will keep the multishot read
+@@ -1004,7 +1004,7 @@ int io_read_mshot(struct io_kiocb *req,
+ 		 * we fail to post a CQE, or multishot is no longer set, then
+ 		 * jump to the termination path. This request is then done.
+ 		 */
+-		cflags = io_put_kbuf(req, ret, req->buf_list);
++		cflags = io_put_kbuf(req, ret, sel.buf_list);
+ 		rw->len = 0; /* similarly to above, reset len to 0 */
+ 
+ 		if (io_req_post_cqe(req, ret, cflags | IORING_CQE_F_MORE)) {
+@@ -1135,7 +1135,7 @@ int io_write(struct io_kiocb *req, unsig
+ 			return -EAGAIN;
+ 		}
+ done:
+-		return kiocb_done(req, ret2, issue_flags);
++		return kiocb_done(req, ret2, NULL, issue_flags);
+ 	} else {
+ ret_eagain:
+ 		iov_iter_restore(&io->iter, &io->iter_state);
+@@ -1215,7 +1215,7 @@ int io_do_iopoll(struct io_ring_ctx *ctx
+ 		if (!smp_load_acquire(&req->iopoll_completed))
+ 			break;
+ 		nr_events++;
+-		req->cqe.flags = io_put_kbuf(req, req->cqe.res, req->buf_list);
++		req->cqe.flags = io_put_kbuf(req, req->cqe.res, NULL);
+ 		if (req->opcode != IORING_OP_URING_CMD)
+ 			io_req_rw_cleanup(req, 0);
+ 	}

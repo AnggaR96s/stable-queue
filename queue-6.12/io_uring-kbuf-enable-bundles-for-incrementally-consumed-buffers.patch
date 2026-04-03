@@ -1,0 +1,112 @@
+From 145c6a4a6e0d6d44b2bf75e60cb495c3d05d0461 Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Mon, 10 Mar 2025 14:01:49 -0600
+Subject: io_uring/kbuf: enable bundles for incrementally consumed buffers
+
+From: Jens Axboe <axboe@kernel.dk>
+
+Commit cf9536e550dd243a1681fdbf804221527da20a80 upstream.
+
+The original support for incrementally consumed buffers didn't allow it
+to be used with bundles, with the assumption being that incremental
+buffers are generally larger, and hence there's less of a nedd to
+support it.
+
+But that assumption may not be correct - it's perfectly viable to use
+smaller buffers with incremental consumption, and there may be valid
+reasons for an application or framework to do so.
+
+As there's really no need to explicitly disable bundles with
+incrementally consumed buffers, allow it. This actually makes the peek
+side cheaper and simpler, with the completion side basically the same,
+just needing to iterate for the consumed length.
+
+Reported-by: Norman Maurer <norman_maurer@apple.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ io_uring/kbuf.c |   56 ++++++++++++++++++++++++++------------------------------
+ 1 file changed, 26 insertions(+), 30 deletions(-)
+
+--- a/io_uring/kbuf.c
++++ b/io_uring/kbuf.c
+@@ -32,6 +32,25 @@ struct io_provide_buf {
+ 	__u16				bid;
+ };
+ 
++static bool io_kbuf_inc_commit(struct io_buffer_list *bl, int len)
++{
++	while (len) {
++		struct io_uring_buf *buf;
++		u32 this_len;
++
++		buf = io_ring_head_to_buf(bl->buf_ring, bl->head, bl->mask);
++		this_len = min_t(u32, len, buf->len);
++		buf->len -= this_len;
++		if (buf->len) {
++			buf->addr += this_len;
++			return false;
++		}
++		bl->head++;
++		len -= this_len;
++	}
++	return true;
++}
++
+ bool io_kbuf_commit(struct io_kiocb *req,
+ 		    struct io_buffer_list *bl, int len, int nr)
+ {
+@@ -42,20 +61,8 @@ bool io_kbuf_commit(struct io_kiocb *req
+ 
+ 	if (unlikely(len < 0))
+ 		return true;
+-
+-	if (bl->flags & IOBL_INC) {
+-		struct io_uring_buf *buf;
+-
+-		buf = io_ring_head_to_buf(bl->buf_ring, bl->head, bl->mask);
+-		if (WARN_ON_ONCE(len > buf->len))
+-			len = buf->len;
+-		buf->len -= len;
+-		if (buf->len) {
+-			buf->addr += len;
+-			return false;
+-		}
+-	}
+-
++	if (bl->flags & IOBL_INC)
++		return io_kbuf_inc_commit(bl, len);
+ 	bl->head += nr;
+ 	return true;
+ }
+@@ -235,25 +242,14 @@ static int io_ring_buffers_peek(struct i
+ 	buf = io_ring_head_to_buf(br, head, bl->mask);
+ 	if (arg->max_len) {
+ 		u32 len = READ_ONCE(buf->len);
++		size_t needed;
+ 
+ 		if (unlikely(!len))
+ 			return -ENOBUFS;
+-		/*
+-		 * Limit incremental buffers to 1 segment. No point trying
+-		 * to peek ahead and map more than we need, when the buffers
+-		 * themselves should be large when setup with
+-		 * IOU_PBUF_RING_INC.
+-		 */
+-		if (bl->flags & IOBL_INC) {
+-			nr_avail = 1;
+-		} else {
+-			size_t needed;
+-
+-			needed = (arg->max_len + len - 1) / len;
+-			needed = min_not_zero(needed, (size_t) PEEK_MAX_IMPORT);
+-			if (nr_avail > needed)
+-				nr_avail = needed;
+-		}
++		needed = (arg->max_len + len - 1) / len;
++		needed = min_not_zero(needed, (size_t) PEEK_MAX_IMPORT);
++		if (nr_avail > needed)
++			nr_avail = needed;
+ 	}
+ 
+ 	/*
