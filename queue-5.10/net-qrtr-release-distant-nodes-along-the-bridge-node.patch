@@ -1,0 +1,81 @@
+From 4f40afd8bd45d690421e467296bc7f30e6a19cec Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 6 Nov 2020 18:33:30 +0100
+Subject: net: qrtr: Release distant nodes along the bridge node
+
+From: Loic Poulain <loic.poulain@linaro.org>
+
+[ Upstream commit 90829f07baea7efe4ca77f79820f3849081186a8 ]
+
+Distant QRTR nodes can be accessed via an other node that acts as
+a bridge. When the a QRTR endpoint associated to a bridge node is
+released, all the linked distant nodes should also be released.
+
+This patch fixes endpoint release by:
+- Submitting QRTR BYE message locally on behalf of all the nodes
+accessible through the endpoint.
+- Removing all the routable node IDs from radix tree pointing to
+the released node endpoint.
+
+Signed-off-by: Loic Poulain <loic.poulain@linaro.org>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Stable-dep-of: 2428083101f6 ("net: qrtr: replace qrtr_tx_flow radix_tree with xarray to fix memory leak")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ net/qrtr/af_qrtr.c | 25 +++++++++++++++++++------
+ 1 file changed, 19 insertions(+), 6 deletions(-)
+
+diff --git a/net/qrtr/af_qrtr.c b/net/qrtr/af_qrtr.c
+index 01d8cb93ad756..68b6124fc8a10 100644
+--- a/net/qrtr/af_qrtr.c
++++ b/net/qrtr/af_qrtr.c
+@@ -172,8 +172,13 @@ static void __qrtr_node_release(struct kref *kref)
+ 	void __rcu **slot;
+ 
+ 	spin_lock_irqsave(&qrtr_nodes_lock, flags);
+-	if (node->nid != QRTR_EP_NID_AUTO)
+-		radix_tree_delete(&qrtr_nodes, node->nid);
++	/* If the node is a bridge for other nodes, there are possibly
++	 * multiple entries pointing to our released node, delete them all.
++	 */
++	radix_tree_for_each_slot(slot, &qrtr_nodes, &iter, 0) {
++		if (*slot == node)
++			radix_tree_iter_delete(&qrtr_nodes, &iter, slot);
++	}
+ 	spin_unlock_irqrestore(&qrtr_nodes_lock, flags);
+ 
+ 	list_del(&node->item);
+@@ -615,6 +620,7 @@ void qrtr_endpoint_unregister(struct qrtr_endpoint *ep)
+ 	struct qrtr_ctrl_pkt *pkt;
+ 	struct qrtr_tx_flow *flow;
+ 	struct sk_buff *skb;
++	unsigned long flags;
+ 	void __rcu **slot;
+ 
+ 	mutex_lock(&node->ep_lock);
+@@ -622,11 +628,18 @@ void qrtr_endpoint_unregister(struct qrtr_endpoint *ep)
+ 	mutex_unlock(&node->ep_lock);
+ 
+ 	/* Notify the local controller about the event */
+-	skb = qrtr_alloc_ctrl_packet(&pkt, GFP_KERNEL);
+-	if (skb) {
+-		pkt->cmd = cpu_to_le32(QRTR_TYPE_BYE);
+-		qrtr_local_enqueue(NULL, skb, QRTR_TYPE_BYE, &src, &dst);
++	spin_lock_irqsave(&qrtr_nodes_lock, flags);
++	radix_tree_for_each_slot(slot, &qrtr_nodes, &iter, 0) {
++		if (*slot != node)
++			continue;
++		src.sq_node = iter.index;
++		skb = qrtr_alloc_ctrl_packet(&pkt, GFP_ATOMIC);
++		if (skb) {
++			pkt->cmd = cpu_to_le32(QRTR_TYPE_BYE);
++			qrtr_local_enqueue(NULL, skb, QRTR_TYPE_BYE, &src, &dst);
++		}
+ 	}
++	spin_unlock_irqrestore(&qrtr_nodes_lock, flags);
+ 
+ 	/* Wake up any transmitters waiting for resume-tx from the node */
+ 	mutex_lock(&node->qrtr_tx_lock);
+-- 
+2.53.0
+
