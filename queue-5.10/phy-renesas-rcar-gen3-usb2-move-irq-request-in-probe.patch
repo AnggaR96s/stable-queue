@@ -1,0 +1,152 @@
+From 8f5b94bf37140234f64aa8c0db67cccbf648b0ca Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 7 Apr 2026 14:37:40 +0300
+Subject: phy: renesas: rcar-gen3-usb2: Move IRQ request in probe
+
+From: Claudiu Beznea <claudiu.beznea.uj@bp.renesas.com>
+
+commit de76809f60cc938d3580bbbd5b04b7d12af6ce3a upstream.
+
+Commit 08b0ad375ca6 ("phy: renesas: rcar-gen3-usb2: move IRQ registration
+to init") moved the IRQ request operation from probe to
+struct phy_ops::phy_init API to avoid triggering interrupts (which lead to
+register accesses) while the PHY clocks (enabled through runtime PM APIs)
+are not active. If this happens, it results in a synchronous abort.
+
+One way to reproduce this issue is by enabling CONFIG_DEBUG_SHIRQ, which
+calls free_irq() on driver removal.
+
+Move the IRQ request and free operations back to probe, and take the
+runtime PM state into account in IRQ handler. This commit is preparatory
+for the subsequent fixes in this series.
+
+[claudiu.beznea: fixed conflicts by:
+ - dropping irq and obint_enable_bits members of rcar_gen3_chan
+ - using USB2_OBINT_BITS marco in rcar_gen3_phy_usb2_irq()
+ - keeping irq local variable in rcar_gen3_phy_usb2_probe()
+ - dropping channel->irq and channel->obint_enable_bits asssignement from
+   probe
+ - keeping platform_set_drvdata() and channel->dev assignment in probe]
+
+Reviewed-by: Yoshihiro Shimoda <yoshihiro.shimoda.uh@renesas.com>
+Tested-by: Yoshihiro Shimoda <yoshihiro.shimoda.uh@renesas.com>
+Reviewed-by: Lad Prabhakar <prabhakar.mahadev-lad.rj@bp.renesas.com>
+Signed-off-by: Claudiu Beznea <claudiu.beznea.uj@bp.renesas.com>
+Link: https://lore.kernel.org/r/20250507125032.565017-3-claudiu.beznea.uj@bp.renesas.com
+Signed-off-by: Vinod Koul <vkoul@kernel.org>
+Signed-off-by: Claudiu Beznea <claudiu.beznea.uj@bp.renesas.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/phy/renesas/phy-rcar-gen3-usb2.c | 46 +++++++++++++-----------
+ 1 file changed, 26 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/phy/renesas/phy-rcar-gen3-usb2.c b/drivers/phy/renesas/phy-rcar-gen3-usb2.c
+index 646a5140b30e1..f66e0daa23648 100644
+--- a/drivers/phy/renesas/phy-rcar-gen3-usb2.c
++++ b/drivers/phy/renesas/phy-rcar-gen3-usb2.c
+@@ -110,7 +110,6 @@ struct rcar_gen3_chan {
+ 	struct work_struct work;
+ 	struct mutex lock;	/* protects rphys[...].powered */
+ 	enum usb_dr_mode dr_mode;
+-	int irq;
+ 	bool extcon_host;
+ 	bool is_otg_channel;
+ 	bool uses_otg_pins;
+@@ -396,16 +395,25 @@ static irqreturn_t rcar_gen3_phy_usb2_irq(int irq, void *_ch)
+ {
+ 	struct rcar_gen3_chan *ch = _ch;
+ 	void __iomem *usb2_base = ch->base;
+-	u32 status = readl(usb2_base + USB2_OBINTSTA);
++	struct device *dev = ch->dev;
+ 	irqreturn_t ret = IRQ_NONE;
++	u32 status;
+ 
++	pm_runtime_get_noresume(dev);
++
++	if (pm_runtime_suspended(dev))
++		goto rpm_put;
++
++	status = readl(usb2_base + USB2_OBINTSTA);
+ 	if (status & USB2_OBINT_BITS) {
+-		dev_vdbg(ch->dev, "%s: %08x\n", __func__, status);
++		dev_vdbg(dev, "%s: %08x\n", __func__, status);
+ 		writel(USB2_OBINT_BITS, usb2_base + USB2_OBINTSTA);
+ 		rcar_gen3_device_recognition(ch);
+ 		ret = IRQ_HANDLED;
+ 	}
+ 
++rpm_put:
++	pm_runtime_put_noidle(dev);
+ 	return ret;
+ }
+ 
+@@ -415,17 +423,6 @@ static int rcar_gen3_phy_usb2_init(struct phy *p)
+ 	struct rcar_gen3_chan *channel = rphy->ch;
+ 	void __iomem *usb2_base = channel->base;
+ 	u32 val;
+-	int ret;
+-
+-	if (!rcar_gen3_is_any_rphy_initialized(channel) && channel->irq >= 0) {
+-		INIT_WORK(&channel->work, rcar_gen3_phy_usb2_work);
+-		ret = request_irq(channel->irq, rcar_gen3_phy_usb2_irq,
+-				  IRQF_SHARED, dev_name(channel->dev), channel);
+-		if (ret < 0) {
+-			dev_err(channel->dev, "No irq handler (%d)\n", channel->irq);
+-			return ret;
+-		}
+-	}
+ 
+ 	/* Initialize USB2 part */
+ 	val = readl(usb2_base + USB2_INT_ENABLE);
+@@ -461,9 +458,6 @@ static int rcar_gen3_phy_usb2_exit(struct phy *p)
+ 		val &= ~USB2_INT_ENABLE_UCOM_INTEN;
+ 	writel(val, usb2_base + USB2_INT_ENABLE);
+ 
+-	if (channel->irq >= 0 && !rcar_gen3_is_any_rphy_initialized(channel))
+-		free_irq(channel->irq, channel);
+-
+ 	return 0;
+ }
+ 
+@@ -612,7 +606,7 @@ static int rcar_gen3_phy_usb2_probe(struct platform_device *pdev)
+ 	struct phy_provider *provider;
+ 	struct resource *res;
+ 	const struct phy_ops *phy_usb2_ops;
+-	int ret = 0, i;
++	int ret = 0, i, irq;
+ 
+ 	if (!dev->of_node) {
+ 		dev_err(dev, "This driver needs device tree\n");
+@@ -628,8 +622,6 @@ static int rcar_gen3_phy_usb2_probe(struct platform_device *pdev)
+ 	if (IS_ERR(channel->base))
+ 		return PTR_ERR(channel->base);
+ 
+-	/* get irq number here and request_irq for OTG in phy_init */
+-	channel->irq = platform_get_irq_optional(pdev, 0);
+ 	channel->dr_mode = rcar_gen3_get_dr_mode(dev->of_node);
+ 	if (channel->dr_mode != USB_DR_MODE_UNKNOWN) {
+ 		channel->is_otg_channel = true;
+@@ -683,6 +675,20 @@ static int rcar_gen3_phy_usb2_probe(struct platform_device *pdev)
+ 
+ 	platform_set_drvdata(pdev, channel);
+ 	channel->dev = dev;
++	
++	irq = platform_get_irq_optional(pdev, 0);
++	if (irq < 0 && irq != -ENXIO) {
++		ret = irq;
++		goto error;
++	} else if (irq > 0) {
++		INIT_WORK(&channel->work, rcar_gen3_phy_usb2_work);
++		ret = devm_request_irq(dev, irq, rcar_gen3_phy_usb2_irq,
++				       IRQF_SHARED, dev_name(dev), channel);
++		if (ret < 0) {
++			dev_err(dev, "Failed to request irq (%d)\n", irq);
++			goto error;
++		}
++	}
+ 
+ 	provider = devm_of_phy_provider_register(dev, rcar_gen3_phy_usb2_xlate);
+ 	if (IS_ERR(provider)) {
+-- 
+2.53.0
+
