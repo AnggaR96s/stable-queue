@@ -1,0 +1,85 @@
+From jetlan9@163.com Sun Mar  1 04:07:20 2026
+From: Wenshan Lan <jetlan9@163.com>
+Date: Sun,  1 Mar 2026 11:06:21 +0800
+Subject: dmaengine: mmp_pdma: Fix race condition in mmp_pdma_residue()
+To: gregkh@linuxfoundation.org, stable@vger.kernel.org
+Cc: Guodong Xu <guodong@riscstar.com>, Juan Li <lijuan@linux.spacemit.com>, Vinod Koul <vkoul@kernel.org>, Wenshan Lan <jetlan9@163.com>
+Message-ID: <20260301030621.2448938-1-jetlan9@163.com>
+
+From: Guodong Xu <guodong@riscstar.com>
+
+[ Upstream commit a143545855bc2c6e1330f6f57ae375ac44af00a7 ]
+
+Add proper locking in mmp_pdma_residue() to prevent use-after-free when
+accessing descriptor list and descriptor contents.
+
+The race occurs when multiple threads call tx_status() while the tasklet
+on another CPU is freeing completed descriptors:
+
+CPU 0                              CPU 1
+-----                              -----
+mmp_pdma_tx_status()
+mmp_pdma_residue()
+  -> NO LOCK held
+     list_for_each_entry(sw, ..)
+                                   DMA interrupt
+                                   dma_do_tasklet()
+                                     -> spin_lock(&desc_lock)
+                                        list_move(sw->node, ...)
+                                        spin_unlock(&desc_lock)
+  |                                     dma_pool_free(sw) <- FREED!
+  -> access sw->desc <- UAF!
+
+This issue can be reproduced when running dmatest on the same channel with
+multiple threads (threads_per_chan > 1).
+
+Fix by protecting the chain_running list iteration and descriptor access
+with the chan->desc_lock spinlock.
+
+Signed-off-by: Juan Li <lijuan@linux.spacemit.com>
+Signed-off-by: Guodong Xu <guodong@riscstar.com>
+Link: https://patch.msgid.link/20251216-mmp-pdma-race-v1-1-976a224bb622@riscstar.com
+Signed-off-by: Vinod Koul <vkoul@kernel.org>
+[ Minor context conflict resolved. ]
+Signed-off-by: Wenshan Lan <jetlan9@163.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/dma/mmp_pdma.c |    6 ++++++
+ 1 file changed, 6 insertions(+)
+
+--- a/drivers/dma/mmp_pdma.c
++++ b/drivers/dma/mmp_pdma.c
+@@ -764,6 +764,7 @@ static unsigned int mmp_pdma_residue(str
+ {
+ 	struct mmp_pdma_desc_sw *sw;
+ 	u32 curr, residue = 0;
++	unsigned long flags;
+ 	bool passed = false;
+ 	bool cyclic = chan->cyclic_first != NULL;
+ 
+@@ -779,6 +780,8 @@ static unsigned int mmp_pdma_residue(str
+ 	else
+ 		curr = readl(chan->phy->base + DSADR(chan->phy->idx));
+ 
++	spin_lock_irqsave(&chan->desc_lock, flags);
++
+ 	list_for_each_entry(sw, &chan->chain_running, node) {
+ 		u32 start, end, len;
+ 
+@@ -822,6 +825,7 @@ static unsigned int mmp_pdma_residue(str
+ 			continue;
+ 
+ 		if (sw->async_tx.cookie == cookie) {
++			spin_unlock_irqrestore(&chan->desc_lock, flags);
+ 			return residue;
+ 		} else {
+ 			residue = 0;
+@@ -829,6 +833,8 @@ static unsigned int mmp_pdma_residue(str
+ 		}
+ 	}
+ 
++	spin_unlock_irqrestore(&chan->desc_lock, flags);
++
+ 	/* We should only get here in case of cyclic transactions */
+ 	return residue;
+ }
