@@ -1,0 +1,124 @@
+From 639eb566eefc602173be132d72d60fc8ea05f6e9 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Sat, 25 Apr 2026 15:14:21 +0800
+Subject: regset: use kvzalloc() for regset_get_alloc()
+
+From: Douglas Anderson <dianders@chromium.org>
+
+commit 6b839b3b76cf17296ebd4a893841f32cae08229c upstream.
+
+While browsing through ChromeOS crash reports, I found one with an
+allocation failure that looked like this:
+
+  chrome: page allocation failure: order:7,
+          mode:0x40dc0(GFP_KERNEL|__GFP_COMP|__GFP_ZERO),
+	  nodemask=(null),cpuset=urgent,mems_allowed=0
+  CPU: 7 PID: 3295 Comm: chrome Not tainted
+          5.15.133-20574-g8044615ac35c #1 (HASH:1162 1)
+  Hardware name: Google Lazor (rev3 - 8) with KB Backlight (DT)
+  Call trace:
+  ...
+  warn_alloc+0x104/0x174
+  __alloc_pages+0x5f0/0x6e4
+  kmalloc_order+0x44/0x98
+  kmalloc_order_trace+0x34/0x124
+  __kmalloc+0x228/0x36c
+  __regset_get+0x68/0xcc
+  regset_get_alloc+0x1c/0x28
+  elf_core_dump+0x3d8/0xd8c
+  do_coredump+0xeb8/0x1378
+  get_signal+0x14c/0x804
+  ...
+
+An order 7 allocation is (1 << 7) contiguous pages, or 512K. It's not
+a surprise that this allocation failed on a system that's been running
+for a while.
+
+More digging showed that it was fairly easy to see the order 7
+allocation by just sending a SIGQUIT to chrome (or other processes) to
+generate a core dump. The actual amount being allocated was 279,584
+bytes and it was for "core_note_type" NT_ARM_SVE.
+
+There was quite a bit of discussion [1] on the mailing lists in
+response to my v1 patch attempting to switch to vmalloc. The overall
+conclusion was that we could likely reduce the 279,584 byte allocation
+by quite a bit and Mark Brown has sent a patch to that effect [2].
+However even with the 279,584 byte allocation gone there are still
+65,552 byte allocations. These are just barely more than the 65,536
+bytes and thus would require an order 5 allocation.
+
+An order 5 allocation is still something to avoid unless necessary and
+nothing needs the memory here to be contiguous. Change the allocation
+to kvzalloc() which should still be efficient for small allocations
+but doesn't force the memory subsystem to work hard (and maybe fail)
+at getting a large contiguous chunk.
+
+[1] https://lore.kernel.org/r/20240201171159.1.Id9ad163b60d21c9e56c2d686b0cc9083a8ba7924@changeid
+[2] https://lore.kernel.org/r/20240203-arm64-sve-ptrace-regset-size-v1-1-2c3ba1386b9e@kernel.org
+
+Link: https://lkml.kernel.org/r/20240205092626.v2.1.Id9ad163b60d21c9e56c2d686b0cc9083a8ba7924@changeid
+Signed-off-by: Douglas Anderson <dianders@chromium.org>
+Reviewed-by: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Al Viro <viro@ZenIV.linux.org.uk>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Dave Martin <Dave.Martin@arm.com>
+Cc: Eric Biederman <ebiederm@xmission.com>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Kees Cook <keescook@chromium.org>
+Cc: Mark Brown <broonie@kernel.org>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Oleg Nesterov <oleg@redhat.com>
+Cc: Will Deacon <will@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Wen Yang <wen.yang@linux.dev>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/binfmt_elf.c | 2 +-
+ kernel/regset.c | 6 +++---
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/fs/binfmt_elf.c b/fs/binfmt_elf.c
+index 3ff7d2e47c7e9..e4348dd76658e 100644
+--- a/fs/binfmt_elf.c
++++ b/fs/binfmt_elf.c
+@@ -2035,7 +2035,7 @@ static void free_note_info(struct elf_note_info *info)
+ 		threads = t->next;
+ 		WARN_ON(t->notes[0].data && t->notes[0].data != &t->prstatus);
+ 		for (i = 1; i < info->thread_notes; ++i)
+-			kfree(t->notes[i].data);
++			kvfree(t->notes[i].data);
+ 		kfree(t);
+ 	}
+ 	kfree(info->psinfo.data);
+diff --git a/kernel/regset.c b/kernel/regset.c
+index 586823786f397..b2871fa68b2a7 100644
+--- a/kernel/regset.c
++++ b/kernel/regset.c
+@@ -16,14 +16,14 @@ static int __regset_get(struct task_struct *target,
+ 	if (size > regset->n * regset->size)
+ 		size = regset->n * regset->size;
+ 	if (!p) {
+-		to_free = p = kzalloc(size, GFP_KERNEL);
++		to_free = p = kvzalloc(size, GFP_KERNEL);
+ 		if (!p)
+ 			return -ENOMEM;
+ 	}
+ 	res = regset->regset_get(target, regset,
+ 			   (struct membuf){.p = p, .left = size});
+ 	if (res < 0) {
+-		kfree(to_free);
++		kvfree(to_free);
+ 		return res;
+ 	}
+ 	*data = p;
+@@ -71,6 +71,6 @@ int copy_regset_to_user(struct task_struct *target,
+ 	ret = regset_get_alloc(target, regset, size, &buf);
+ 	if (ret > 0)
+ 		ret = copy_to_user(data, buf, ret) ? -EFAULT : 0;
+-	kfree(buf);
++	kvfree(buf);
+ 	return ret;
+ }
+-- 
+2.53.0
+
