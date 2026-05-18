@@ -1,0 +1,164 @@
+From ec8003395b447ef643a55650cdd7bddc8fbb8987 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 30 Oct 2024 06:35:52 +0000
+Subject: iommu/amd: Rearrange attach device code
+
+From: Vasant Hegde <vasant.hegde@amd.com>
+
+[ Upstream commit 4b18ef8491b06e353e8801705092cc292582cb7a ]
+
+attach_device() is just holding lock and calling do_attach(). There is
+not need to have another function. Just move do_attach() code to
+attach_device(). Similarly move do_detach() code to detach_device().
+
+Signed-off-by: Vasant Hegde <vasant.hegde@amd.com>
+Reviewed-by: Joerg Roedel <jroedel@suse.de>
+Reviewed-by: Jason Gunthorpe <jgg@nvidia.com>
+Link: https://lore.kernel.org/r/20241030063556.6104-9-vasant.hegde@amd.com
+Signed-off-by: Joerg Roedel <jroedel@suse.de>
+Stable-dep-of: faad224fe0f0 ("iommu/amd: Fix clone_alias() to use the original device's devid")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/iommu/amd/iommu.c | 91 ++++++++++++++++-----------------------
+ 1 file changed, 36 insertions(+), 55 deletions(-)
+
+diff --git a/drivers/iommu/amd/iommu.c b/drivers/iommu/amd/iommu.c
+index 3ac8f64a21475..4d59832ed6f81 100644
+--- a/drivers/iommu/amd/iommu.c
++++ b/drivers/iommu/amd/iommu.c
+@@ -2118,12 +2118,24 @@ static void pdom_detach_iommu(struct amd_iommu *iommu,
+ 	spin_unlock_irqrestore(&pdom->lock, flags);
+ }
+ 
+-static int do_attach(struct iommu_dev_data *dev_data,
+-		     struct protection_domain *domain)
++/*
++ * If a device is not yet associated with a domain, this function makes the
++ * device visible in the domain
++ */
++static int attach_device(struct device *dev,
++			 struct protection_domain *domain)
+ {
++	struct iommu_dev_data *dev_data = dev_iommu_priv_get(dev);
+ 	struct amd_iommu *iommu = get_amd_iommu_from_dev_data(dev_data);
+ 	int ret = 0;
+ 
++	spin_lock(&dev_data->lock);
++
++	if (dev_data->domain != NULL) {
++		ret = -EBUSY;
++		goto out;
++	}
++
+ 	/* Update data structures */
+ 	dev_data->domain = domain;
+ 	list_add(&dev_data->list, &domain->dev_list);
+@@ -2131,67 +2143,17 @@ static int do_attach(struct iommu_dev_data *dev_data,
+ 	/* Do reference counting */
+ 	ret = pdom_attach_iommu(iommu, domain);
+ 	if (ret)
+-		return ret;
++		goto out;
+ 
+ 	/* Setup GCR3 table */
+ 	if (pdom_is_sva_capable(domain)) {
+ 		ret = init_gcr3_table(dev_data, domain);
+ 		if (ret) {
+ 			pdom_detach_iommu(iommu, domain);
+-			return ret;
++			goto out;
+ 		}
+ 	}
+ 
+-	return ret;
+-}
+-
+-static void do_detach(struct iommu_dev_data *dev_data)
+-{
+-	struct protection_domain *domain = dev_data->domain;
+-	struct amd_iommu *iommu = get_amd_iommu_from_dev_data(dev_data);
+-	unsigned long flags;
+-
+-	/* Clear DTE and flush the entry */
+-	dev_update_dte(dev_data, false);
+-
+-	/* Flush IOTLB and wait for the flushes to finish */
+-	spin_lock_irqsave(&domain->lock, flags);
+-	amd_iommu_domain_flush_all(domain);
+-	spin_unlock_irqrestore(&domain->lock, flags);
+-
+-	/* Clear GCR3 table */
+-	if (pdom_is_sva_capable(domain))
+-		destroy_gcr3_table(dev_data, domain);
+-
+-	/* Update data structures */
+-	dev_data->domain = NULL;
+-	list_del(&dev_data->list);
+-
+-	/* decrease reference counters - needs to happen after the flushes */
+-	pdom_detach_iommu(iommu, domain);
+-}
+-
+-/*
+- * If a device is not yet associated with a domain, this function makes the
+- * device visible in the domain
+- */
+-static int attach_device(struct device *dev,
+-			 struct protection_domain *domain)
+-{
+-	struct iommu_dev_data *dev_data;
+-	int ret = 0;
+-
+-	dev_data = dev_iommu_priv_get(dev);
+-
+-	spin_lock(&dev_data->lock);
+-
+-	if (dev_data->domain != NULL) {
+-		ret = -EBUSY;
+-		goto out;
+-	}
+-
+-	ret = do_attach(dev_data, domain);
+-
+ out:
+ 	spin_unlock(&dev_data->lock);
+ 
+@@ -2205,7 +2167,9 @@ static void detach_device(struct device *dev)
+ {
+ 	struct iommu_dev_data *dev_data = dev_iommu_priv_get(dev);
+ 	struct amd_iommu *iommu = get_amd_iommu_from_dev_data(dev_data);
++	struct protection_domain *domain = dev_data->domain;
+ 	bool ppr = dev_data->ppr;
++	unsigned long flags;
+ 
+ 	spin_lock(&dev_data->lock);
+ 
+@@ -2225,7 +2189,24 @@ static void detach_device(struct device *dev)
+ 		dev_data->ppr = false;
+ 	}
+ 
+-	do_detach(dev_data);
++	/* Clear DTE and flush the entry */
++	dev_update_dte(dev_data, false);
++
++	/* Flush IOTLB and wait for the flushes to finish */
++	spin_lock_irqsave(&domain->lock, flags);
++	amd_iommu_domain_flush_all(domain);
++	spin_unlock_irqrestore(&domain->lock, flags);
++
++	/* Clear GCR3 table */
++	if (pdom_is_sva_capable(domain))
++		destroy_gcr3_table(dev_data, domain);
++
++	/* Update data structures */
++	dev_data->domain = NULL;
++	list_del(&dev_data->list);
++
++	/* decrease reference counters - needs to happen after the flushes */
++	pdom_detach_iommu(iommu, domain);
+ 
+ out:
+ 	spin_unlock(&dev_data->lock);
+-- 
+2.53.0
+

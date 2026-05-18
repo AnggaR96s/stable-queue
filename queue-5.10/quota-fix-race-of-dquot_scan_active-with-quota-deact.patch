@@ -1,0 +1,148 @@
+From 1101525c615a125d76856a41d541b4d994a80d4e Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 27 Feb 2026 14:22:16 +0100
+Subject: quota: Fix race of dquot_scan_active() with quota deactivation
+
+From: Jan Kara <jack@suse.cz>
+
+[ Upstream commit e93ab401da4b2e2c1b8ef2424de2f238d51c8b2d ]
+
+dquot_scan_active() can race with quota deactivation in
+quota_release_workfn() like:
+
+  CPU0 (quota_release_workfn)         CPU1 (dquot_scan_active)
+  ==============================      ==============================
+  spin_lock(&dq_list_lock);
+  list_replace_init(
+    &releasing_dquots, &rls_head);
+    /* dquot X on rls_head,
+       dq_count == 0,
+       DQ_ACTIVE_B still set */
+  spin_unlock(&dq_list_lock);
+  synchronize_srcu(&dquot_srcu);
+                                      spin_lock(&dq_list_lock);
+                                      list_for_each_entry(dquot,
+                                          &inuse_list, dq_inuse) {
+                                        /* finds dquot X */
+                                        dquot_active(X) -> true
+                                        atomic_inc(&X->dq_count);
+                                      }
+                                      spin_unlock(&dq_list_lock);
+  spin_lock(&dq_list_lock);
+  dquot = list_first_entry(&rls_head);
+  WARN_ON_ONCE(atomic_read(&dquot->dq_count));
+
+The problem is not only a cosmetic one as under memory pressure the
+caller of dquot_scan_active() can end up working on freed dquot.
+
+Fix the problem by making sure the dquot is removed from releasing list
+when we acquire a reference to it.
+
+Fixes: 869b6ea1609f ("quota: Fix slow quotaoff")
+Reported-by: Sam Sun <samsun1006219@gmail.com>
+Link: https://lore.kernel.org/all/CAEkJfYPTt3uP1vAYnQ5V2ZWn5O9PLhhGi5HbOcAzyP9vbXyjeg@mail.gmail.com
+Signed-off-by: Jan Kara <jack@suse.cz>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/quota/dquot.c         | 38 ++++++++++++++++++++++++++++++--------
+ include/linux/quotaops.h |  9 +--------
+ 2 files changed, 31 insertions(+), 16 deletions(-)
+
+diff --git a/fs/quota/dquot.c b/fs/quota/dquot.c
+index 525ae0f11818c..b4326fc1d90fd 100644
+--- a/fs/quota/dquot.c
++++ b/fs/quota/dquot.c
+@@ -364,6 +364,31 @@ static inline int dquot_active(struct dquot *dquot)
+ 	return test_bit(DQ_ACTIVE_B, &dquot->dq_flags);
+ }
+ 
++static struct dquot *__dqgrab(struct dquot *dquot)
++{
++	lockdep_assert_held(&dq_list_lock);
++	if (!atomic_read(&dquot->dq_count))
++		remove_free_dquot(dquot);
++	atomic_inc(&dquot->dq_count);
++	return dquot;
++}
++
++/*
++ * Get reference to dquot when we got pointer to it by some other means. The
++ * dquot has to be active and the caller has to make sure it cannot get
++ * deactivated under our hands.
++ */
++struct dquot *dqgrab(struct dquot *dquot)
++{
++	spin_lock(&dq_list_lock);
++	WARN_ON_ONCE(!dquot_active(dquot));
++	dquot = __dqgrab(dquot);
++	spin_unlock(&dq_list_lock);
++
++	return dquot;
++}
++EXPORT_SYMBOL_GPL(dqgrab);
++
+ static inline int dquot_dirty(struct dquot *dquot)
+ {
+ 	return test_bit(DQ_MOD_B, &dquot->dq_flags);
+@@ -642,15 +667,14 @@ int dquot_scan_active(struct super_block *sb,
+ 			continue;
+ 		if (dquot->dq_sb != sb)
+ 			continue;
+-		/* Now we have active dquot so we can just increase use count */
+-		atomic_inc(&dquot->dq_count);
++		__dqgrab(dquot);
+ 		spin_unlock(&dq_list_lock);
+ 		dqput(old_dquot);
+ 		old_dquot = dquot;
+ 		/*
+ 		 * ->release_dquot() can be racing with us. Our reference
+-		 * protects us from new calls to it so just wait for any
+-		 * outstanding call and recheck the DQ_ACTIVE_B after that.
++		 * protects us from dquot_release() proceeding so just wait for
++		 * any outstanding call and recheck the DQ_ACTIVE_B after that.
+ 		 */
+ 		wait_on_dquot(dquot);
+ 		if (dquot_active(dquot)) {
+@@ -718,7 +742,7 @@ int dquot_writeback_dquots(struct super_block *sb, int type)
+ 			/* Now we have active dquot from which someone is
+  			 * holding reference so we can safely just increase
+ 			 * use count */
+-			dqgrab(dquot);
++			__dqgrab(dquot);
+ 			spin_unlock(&dq_list_lock);
+ 			err = dquot_write_dquot(dquot);
+ 			if (err && !ret)
+@@ -973,9 +997,7 @@ struct dquot *dqget(struct super_block *sb, struct kqid qid)
+ 		spin_unlock(&dq_list_lock);
+ 		dqstats_inc(DQST_LOOKUPS);
+ 	} else {
+-		if (!atomic_read(&dquot->dq_count))
+-			remove_free_dquot(dquot);
+-		atomic_inc(&dquot->dq_count);
++		__dqgrab(dquot);
+ 		spin_unlock(&dq_list_lock);
+ 		dqstats_inc(DQST_CACHE_HITS);
+ 		dqstats_inc(DQST_LOOKUPS);
+diff --git a/include/linux/quotaops.h b/include/linux/quotaops.h
+index 4bc8ff2a66143..8a1ad23da3a11 100644
+--- a/include/linux/quotaops.h
++++ b/include/linux/quotaops.h
+@@ -43,14 +43,7 @@ int dquot_initialize(struct inode *inode);
+ bool dquot_initialize_needed(struct inode *inode);
+ void dquot_drop(struct inode *inode);
+ struct dquot *dqget(struct super_block *sb, struct kqid qid);
+-static inline struct dquot *dqgrab(struct dquot *dquot)
+-{
+-	/* Make sure someone else has active reference to dquot */
+-	WARN_ON_ONCE(!atomic_read(&dquot->dq_count));
+-	WARN_ON_ONCE(!test_bit(DQ_ACTIVE_B, &dquot->dq_flags));
+-	atomic_inc(&dquot->dq_count);
+-	return dquot;
+-}
++struct dquot *dqgrab(struct dquot *dquot);
+ 
+ static inline bool dquot_is_busy(struct dquot *dquot)
+ {
+-- 
+2.53.0
+

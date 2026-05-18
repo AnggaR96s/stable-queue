@@ -1,0 +1,216 @@
+From 10a79fd56ab5e340409b51200638900e8610875e Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 28 Apr 2025 18:06:44 +0800
+Subject: spi: spi-nxp-fspi: enable runtime pm for fspi
+
+From: Haibo Chen <haibo.chen@nxp.com>
+
+[ Upstream commit 97be4b919a609fc8c4bd1118502b5d26cc2f77c4 ]
+
+Enable the runtime PM in fspi driver.
+Also for system PM, On some board like i.MX8ULP-EVK board,
+after system suspend, IOMUX module will lost power, so all
+the pinctrl setting will lost when system resume back, need
+driver to save/restore the pinctrl setting.
+
+Signed-off-by: Han Xu <han.xu@nxp.com>
+Signed-off-by: Haibo Chen <haibo.chen@nxp.com>
+Link: https://patch.msgid.link/20250428-flexspipatch-v3-2-61d5e8f591bc@nxp.com
+Signed-off-by: Mark Brown <broonie@kernel.org>
+Stable-dep-of: 68c8c93fdb0d ("spi: nxp-fspi: Use reinit_completion() for repeated operations")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/spi/spi-nxp-fspi.c | 93 +++++++++++++++++++++++++++++++-------
+ 1 file changed, 76 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/spi/spi-nxp-fspi.c b/drivers/spi/spi-nxp-fspi.c
+index a43540d7995ef..67bcc6d351326 100644
+--- a/drivers/spi/spi-nxp-fspi.c
++++ b/drivers/spi/spi-nxp-fspi.c
+@@ -48,6 +48,8 @@
+ #include <linux/mutex.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
++#include <linux/pinctrl/consumer.h>
++#include <linux/pm_runtime.h>
+ #include <linux/pm_qos.h>
+ #include <linux/regmap.h>
+ #include <linux/sizes.h>
+@@ -57,6 +59,9 @@
+ #include <linux/spi/spi.h>
+ #include <linux/spi/spi-mem.h>
+ 
++/* runtime pm timeout */
++#define FSPI_RPM_TIMEOUT 50	/* 50ms */
++
+ /* Registers used by the driver */
+ #define FSPI_MCR0			0x00
+ #define FSPI_MCR0_AHB_TIMEOUT(x)	((x) << 24)
+@@ -396,6 +401,8 @@ struct nxp_fspi {
+ 	struct mutex lock;
+ 	struct pm_qos_request pm_qos_req;
+ 	int selected;
++#define FSPI_NEED_INIT		(1 << 0)
++	int flags;
+ };
+ 
+ static inline int needs_ip_only(struct nxp_fspi *f)
+@@ -935,6 +942,13 @@ static int nxp_fspi_exec_op(struct spi_mem *mem, const struct spi_mem_op *op)
+ 
+ 	mutex_lock(&f->lock);
+ 
++	err = pm_runtime_get_sync(f->dev);
++	if (err < 0) {
++		mutex_unlock(&f->lock);
++		dev_err(f->dev, "Failed to enable clock %d\n", __LINE__);
++		return err;
++	}
++
+ 	/* Wait for controller being ready. */
+ 	err = fspi_readl_poll_tout(f, f->iobase + FSPI_STS0,
+ 				   FSPI_STS0_ARB_IDLE, 1, POLL_TOUT, true);
+@@ -963,8 +977,10 @@ static int nxp_fspi_exec_op(struct spi_mem *mem, const struct spi_mem_op *op)
+ 	/* Invalidate the data in the AHB buffer. */
+ 	nxp_fspi_invalid(f);
+ 
+-	mutex_unlock(&f->lock);
++	pm_runtime_mark_last_busy(f->dev);
++	pm_runtime_put_autosuspend(f->dev);
+ 
++	mutex_unlock(&f->lock);
+ 	return err;
+ }
+ 
+@@ -1231,9 +1247,14 @@ static int nxp_fspi_probe(struct platform_device *pdev)
+ 	if (irq < 0)
+ 		return dev_err_probe(dev, irq, "Failed to get irq source");
+ 
+-	ret = nxp_fspi_clk_prep_enable(f);
+-	if (ret)
+-		return dev_err_probe(dev, ret, "Can't enable the clock\n");
++	pm_runtime_enable(dev);
++	pm_runtime_set_autosuspend_delay(dev, FSPI_RPM_TIMEOUT);
++	pm_runtime_use_autosuspend(dev);
++
++	/* enable clock */
++	ret = pm_runtime_get_sync(f->dev);
++	if (ret < 0)
++		return dev_err_probe(dev, ret, "Failed to enable clock");
+ 
+ 	/* Clear potential interrupts */
+ 	reg = fspi_readl(f, f->iobase + FSPI_INTR);
+@@ -1242,12 +1263,14 @@ static int nxp_fspi_probe(struct platform_device *pdev)
+ 
+ 	nxp_fspi_default_setup(f);
+ 
++	ret = pm_runtime_put_sync(dev);
++	if (ret < 0)
++		return dev_err_probe(dev, ret, "Failed to disable clock");
++
+ 	ret = devm_request_irq(dev, irq,
+ 			nxp_fspi_irq_handler, 0, pdev->name, f);
+-	if (ret) {
+-		nxp_fspi_clk_disable_unprep(f);
++	if (ret)
+ 		return dev_err_probe(dev, ret, "Failed to request irq\n");
+-	}
+ 
+ 	ret = devm_mutex_init(dev, &f->lock);
+ 	if (ret)
+@@ -1271,29 +1294,70 @@ static void nxp_fspi_remove(struct platform_device *pdev)
+ {
+ 	struct nxp_fspi *f = platform_get_drvdata(pdev);
+ 
++	/* enable clock first since there is reigster access */
++	pm_runtime_get_sync(f->dev);
++
+ 	/* disable the hardware */
+ 	fspi_writel(f, FSPI_MCR0_MDIS, f->iobase + FSPI_MCR0);
+ 
++	pm_runtime_disable(f->dev);
++	pm_runtime_put_noidle(f->dev);
+ 	nxp_fspi_clk_disable_unprep(f);
+ 
+ 	if (f->ahb_addr)
+ 		iounmap(f->ahb_addr);
+ }
+ 
+-static int nxp_fspi_suspend(struct device *dev)
++static int nxp_fspi_runtime_suspend(struct device *dev)
+ {
++	struct nxp_fspi *f = dev_get_drvdata(dev);
++
++	nxp_fspi_clk_disable_unprep(f);
++
+ 	return 0;
+ }
+ 
+-static int nxp_fspi_resume(struct device *dev)
++static int nxp_fspi_runtime_resume(struct device *dev)
+ {
+ 	struct nxp_fspi *f = dev_get_drvdata(dev);
++	int ret;
+ 
+-	nxp_fspi_default_setup(f);
++	ret = nxp_fspi_clk_prep_enable(f);
++	if (ret)
++		return ret;
+ 
+-	return 0;
++	if (f->flags & FSPI_NEED_INIT) {
++		nxp_fspi_default_setup(f);
++		ret = pinctrl_pm_select_default_state(dev);
++		if (ret)
++			dev_err(dev, "select flexspi default pinctrl failed!\n");
++		f->flags &= ~FSPI_NEED_INIT;
++	}
++
++	return ret;
+ }
+ 
++static int nxp_fspi_suspend(struct device *dev)
++{
++	struct nxp_fspi *f = dev_get_drvdata(dev);
++	int ret;
++
++	ret = pinctrl_pm_select_sleep_state(dev);
++	if (ret) {
++		dev_err(dev, "select flexspi sleep pinctrl failed!\n");
++		return ret;
++	}
++
++	f->flags |= FSPI_NEED_INIT;
++
++	return pm_runtime_force_suspend(dev);
++}
++
++static const struct dev_pm_ops nxp_fspi_pm_ops = {
++	RUNTIME_PM_OPS(nxp_fspi_runtime_suspend, nxp_fspi_runtime_resume, NULL)
++	SYSTEM_SLEEP_PM_OPS(nxp_fspi_suspend, pm_runtime_force_resume)
++};
++
+ static const struct of_device_id nxp_fspi_dt_ids[] = {
+ 	{ .compatible = "nxp,lx2160a-fspi", .data = (void *)&lx2160a_data, },
+ 	{ .compatible = "nxp,imx8mm-fspi", .data = (void *)&imx8mm_data, },
+@@ -1313,17 +1377,12 @@ static const struct acpi_device_id nxp_fspi_acpi_ids[] = {
+ MODULE_DEVICE_TABLE(acpi, nxp_fspi_acpi_ids);
+ #endif
+ 
+-static const struct dev_pm_ops nxp_fspi_pm_ops = {
+-	.suspend	= nxp_fspi_suspend,
+-	.resume		= nxp_fspi_resume,
+-};
+-
+ static struct platform_driver nxp_fspi_driver = {
+ 	.driver = {
+ 		.name	= "nxp-fspi",
+ 		.of_match_table = nxp_fspi_dt_ids,
+ 		.acpi_match_table = ACPI_PTR(nxp_fspi_acpi_ids),
+-		.pm =   &nxp_fspi_pm_ops,
++		.pm = pm_ptr(&nxp_fspi_pm_ops),
+ 	},
+ 	.probe          = nxp_fspi_probe,
+ 	.remove_new	= nxp_fspi_remove,
+-- 
+2.53.0
+
