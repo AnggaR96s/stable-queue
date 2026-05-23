@@ -1,0 +1,98 @@
+From 8f01dc36e889fb37217023bd6257f00239661e31 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 5 Dec 2025 11:29:14 +0530
+Subject: ext4: unmap invalidated folios from page tables in
+ mpage_release_unused_pages()
+
+From: Deepanshu Kartikey <kartikey406@gmail.com>
+
+[ Upstream commit 9b25f381de6b8942645f43735cb0a4fb0ab3a6d1 ]
+
+When delayed block allocation fails (e.g., due to filesystem corruption
+detected in ext4_map_blocks()), the writeback error handler calls
+mpage_release_unused_pages(invalidate=true) which invalidates affected
+folios by clearing their uptodate flag via folio_clear_uptodate().
+
+However, these folios may still be mapped in process page tables. If a
+subsequent operation (such as ftruncate calling ext4_block_truncate_page)
+triggers a write fault, the existing page table entry allows access to
+the now-invalidated folio. This leads to ext4_page_mkwrite() being called
+with a non-uptodate folio, which then gets marked dirty, triggering:
+
+    WARNING: CPU: 0 PID: 5 at mm/page-writeback.c:2960
+    __folio_mark_dirty+0x578/0x880
+
+    Call Trace:
+     fault_dirty_shared_page+0x16e/0x2d0
+     do_wp_page+0x38b/0xd20
+     handle_pte_fault+0x1da/0x450
+
+The sequence leading to this warning is:
+
+1. Process writes to mmap'd file, folio becomes uptodate and dirty
+2. Writeback begins, but delayed allocation fails due to corruption
+3. mpage_release_unused_pages(invalidate=true) is called:
+   - block_invalidate_folio() clears dirty flag
+   - folio_clear_uptodate() clears uptodate flag
+   - But folio remains mapped in page tables
+4. Later, ftruncate triggers ext4_block_truncate_page()
+5. This causes a write fault on the still-mapped folio
+6. ext4_page_mkwrite() is called with folio that is !uptodate
+7. block_page_mkwrite() marks buffers dirty
+8. fault_dirty_shared_page() tries to mark folio dirty
+9. block_dirty_folio() calls __folio_mark_dirty(warn=1)
+10. WARNING triggers: WARN_ON_ONCE(warn && !uptodate && !dirty)
+
+Fix this by unmapping folios from page tables before invalidating them
+using unmap_mapping_pages(). This ensures that subsequent accesses
+trigger new page faults rather than reusing invalidated folios through
+stale page table entries.
+
+Note that this results in data loss for any writes to the mmap'd region
+that couldn't be written back, but this is expected behavior when
+writeback fails due to filesystem corruption. The existing error message
+already states "This should not happen!! Data will be lost".
+
+Reported-by: syzbot+b0a0670332b6b3230a0a@syzkaller.appspotmail.com
+Tested-by: syzbot+b0a0670332b6b3230a0a@syzkaller.appspotmail.com
+Closes: https://syzkaller.appspot.com/bug?extid=b0a0670332b6b3230a0a
+Suggested-by: Matthew Wilcox <willy@infradead.org>
+Signed-off-by: Deepanshu Kartikey <kartikey406@gmail.com>
+Link: https://patch.msgid.link/20251205055914.1393799-1-kartikey406@gmail.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/ext4/inode.c | 16 +++++++++++++++-
+ 1 file changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index a0b68b9d96266..7b6cef79db5db 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -1607,8 +1607,22 @@ static void mpage_release_unused_pages(struct mpage_da_data *mpd,
+ 			BUG_ON(!folio_test_locked(folio));
+ 			BUG_ON(folio_test_writeback(folio));
+ 			if (invalidate) {
+-				if (folio_mapped(folio))
++				if (folio_mapped(folio)) {
+ 					folio_clear_dirty_for_io(folio);
++					/*
++					 * Unmap folio from page
++					 * tables to prevent
++					 * subsequent accesses through
++					 * stale PTEs. This ensures
++					 * future accesses trigger new
++					 * page faults rather than
++					 * reusing the invalidated
++					 * folio.
++					 */
++					unmap_mapping_pages(folio->mapping,
++						folio->index,
++						folio_nr_pages(folio), false);
++				}
+ 				block_invalidate_folio(folio, 0,
+ 						folio_size(folio));
+ 				folio_clear_uptodate(folio);
+-- 
+2.53.0
+

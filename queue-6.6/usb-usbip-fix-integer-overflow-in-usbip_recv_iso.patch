@@ -1,0 +1,83 @@
+From 005e3d365c141828a024fca5cf512c17f80ef72b Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 25 Mar 2026 13:36:38 +0300
+Subject: usb: usbip: fix integer overflow in usbip_recv_iso()
+
+From: Kelvin Mbogo <addcontent08@gmail.com>
+
+[ Upstream commit 1897852293faca4c2be51e0a19f739622f771623 ]
+
+usbip_recv_iso() computes the iso descriptor buffer size as:
+
+    int size = np * sizeof(*iso);
+
+where np comes straight from the wire (urb->number_of_packets, set by
+usbip_pack_ret_submit() before we get here).  With np = 0x10000001 and
+sizeof(*iso) == 16 the product is 0x100000010 which truncates to 16 on
+a 32-bit int.  kzalloc(16) succeeds but the following receive loop
+writes np * 16 bytes into it - game over.
+
+USBIP_MAX_ISO_PACKETS (1024) already exists in usbip_common.h for the
+submit path but was never enforced on the receive side.
+
+Clamp np to [1, USBIP_MAX_ISO_PACKETS] and switch to kcalloc() so
+the allocator itself can catch overflows in the future.  Fold the
+existing np == 0 early return into the new bounds check.
+
+usbip_pack_ret_submit() already copied the bogus np into
+urb->number_of_packets before we run, so just returning -EPROTO is
+not enough - processcompl() in the HCD will still iterate that many
+iso_frame_desc entries when it completes the failed URB.  Zero out
+urb->number_of_packets before bailing to prevent that secondary crash
+(confirmed on 6.12.0, processcompl+0x63 with CR2 in unmapped slab).
+
+Signed-off-by: Kelvin Mbogo <addcontent08@gmail.com>
+Link: https://patch.msgid.link/20260325103640.8090-1-addcontent08@gmail.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/usb/usbip/usbip_common.c | 20 +++++++++++++++-----
+ 1 file changed, 15 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/usb/usbip/usbip_common.c b/drivers/usb/usbip/usbip_common.c
+index f8f47a3b87871..f8d1d1167ef4b 100644
+--- a/drivers/usb/usbip/usbip_common.c
++++ b/drivers/usb/usbip/usbip_common.c
+@@ -674,7 +674,7 @@ int usbip_recv_iso(struct usbip_device *ud, struct urb *urb)
+ 	void *buff;
+ 	struct usbip_iso_packet_descriptor *iso;
+ 	int np = urb->number_of_packets;
+-	int size = np * sizeof(*iso);
++	int size;
+ 	int i;
+ 	int ret;
+ 	u32 total_length = 0;
+@@ -682,11 +682,21 @@ int usbip_recv_iso(struct usbip_device *ud, struct urb *urb)
+ 	if (!usb_pipeisoc(urb->pipe))
+ 		return 0;
+ 
+-	/* my Bluetooth dongle gets ISO URBs which are np = 0 */
+-	if (np == 0)
+-		return 0;
++	if (np <= 0 || np > USBIP_MAX_ISO_PACKETS) {
++		dev_err(&urb->dev->dev,
++			"recv iso: invalid number_of_packets %d\n", np);
++		/*
++		 * usbip_pack_ret_submit() already set urb->number_of_packets
++		 * from the wire.  Zero it so processcompl() does not iterate
++		 * OOB descriptors on the way out.
++		 */
++		urb->number_of_packets = 0;
++		return -EPROTO;
++	}
++
++	size = np * sizeof(*iso);
+ 
+-	buff = kzalloc(size, GFP_KERNEL);
++	buff = kcalloc(np, sizeof(*iso), GFP_KERNEL);
+ 	if (!buff)
+ 		return -ENOMEM;
+ 
+-- 
+2.53.0
+

@@ -1,0 +1,157 @@
+From df7782c5d9f308e30320336f81717c48481b2b0c Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 13 Apr 2026 18:24:23 -0400
+Subject: NFS: fix writeback in presence of errors
+
+From: Olga Kornievskaia <okorniev@redhat.com>
+
+[ Upstream commit 5d3869a41f3608101c00ff9c9c7c2364c555fa65 ]
+
+After running xfstest generic/751, in certain conditions, can have
+a writeback IO stuck while experiencing one of the two patterns.
+
+Pattern#1: writeback IO experiences ENOSPC on an offset smaller
+than the filesize. Example,
+write offset=0 len=4096 how=unstable OK
+write offset=8192 len=4096 how=unstable OK
+write offset=12288 len=4096 how=unstable ENOSPC
+write offset=4096 len=4096 how=unstable ENOSPC
+client sends a commit and receives a verifier which is different
+from the last successful write. It marks pages dirty and writeback
+retries. But it again send writes unstable and gets into the same
+pattern, running into the ENOSPC error and sending a commit because
+writes were sent at unstable.
+
+Pattern#2: an unstable write followed by a short write and ENOSPC.
+write offset=0 len=4096 how=unstable OK
+write offset=4096 len=4096 how=unstable returns OK but count=100
+write offset=4197 len=3996 how=stable returns ENOSPC
+client send a commit and receives a verifier different from
+the last unstable write. The same behaviour is retried in a loop.
+
+Instead, this patch proposes to identify those conditions and mark
+requests to be done synchronously instead. Previous solution tried
+to mark it in the nfs_page, however that's not persistent thus
+instead mark it in the nfs_open_context.
+
+Furthermore, the same problem occurs during localio code path so
+recognize that IO needs to be done sync in that case as well.
+
+Signed-off-by: Olga Kornievskaia <okorniev@redhat.com>
+Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/nfs/localio.c       | 15 ++++++++++++++-
+ fs/nfs/pagelist.c      |  3 +++
+ fs/nfs/write.c         |  9 +++++++++
+ include/linux/nfs_fs.h |  1 +
+ 4 files changed, 27 insertions(+), 1 deletion(-)
+
+diff --git a/fs/nfs/localio.c b/fs/nfs/localio.c
+index 4c7d16a99ed61..e55c5977fcc3a 100644
+--- a/fs/nfs/localio.c
++++ b/fs/nfs/localio.c
+@@ -865,6 +865,8 @@ static void nfs_local_call_write(struct work_struct *work)
+ 	file_start_write(filp);
+ 	n_iters = atomic_read(&iocb->n_iters);
+ 	for (int i = 0; i < n_iters ; i++) {
++		size_t icount;
++
+ 		if (iocb->iter_is_dio_aligned[i]) {
+ 			iocb->kiocb.ki_flags |= IOCB_DIRECT;
+ 			/* Only use AIO completion if DIO-aligned segment is last */
+@@ -881,8 +883,16 @@ static void nfs_local_call_write(struct work_struct *work)
+ 		if (status == -EIOCBQUEUED)
+ 			continue;
+ 		/* Break on completion, errors, or short writes */
++		icount = iov_iter_count(&iocb->iters[i]);
+ 		if (nfs_local_pgio_done(iocb, status) || status < 0 ||
+-		    (size_t)status < iov_iter_count(&iocb->iters[i])) {
++		    (size_t)status < icount) {
++			if ((size_t)status < icount) {
++				struct nfs_lock_context *ctx =
++					iocb->hdr->req->wb_lock_context;
++
++				set_bit(NFS_CONTEXT_WRITE_SYNC,
++					&ctx->open_context->flags);
++			}
+ 			nfs_local_write_iocb_done(iocb);
+ 			break;
+ 		}
+@@ -901,6 +911,9 @@ static void nfs_local_do_write(struct nfs_local_kiocb *iocb,
+ 		__func__, hdr->args.count, hdr->args.offset,
+ 		(hdr->args.stable == NFS_UNSTABLE) ?  "unstable" : "stable");
+ 
++	if (test_bit(NFS_CONTEXT_WRITE_SYNC,
++		     &hdr->req->wb_lock_context->open_context->flags))
++		hdr->args.stable = NFS_FILE_SYNC;
+ 	switch (hdr->args.stable) {
+ 	default:
+ 		break;
+diff --git a/fs/nfs/pagelist.c b/fs/nfs/pagelist.c
+index a9373de891c98..4a87b2fdb2e6e 100644
+--- a/fs/nfs/pagelist.c
++++ b/fs/nfs/pagelist.c
+@@ -1186,6 +1186,9 @@ static int __nfs_pageio_add_request(struct nfs_pageio_descriptor *desc,
+ 
+ 	nfs_page_group_lock(req);
+ 
++	if (test_bit(NFS_CONTEXT_WRITE_SYNC,
++		     &req->wb_lock_context->open_context->flags))
++		desc->pg_ioflags |= FLUSH_STABLE;
+ 	subreq = req;
+ 	subreq_size = subreq->wb_bytes;
+ 	for(;;) {
+diff --git a/fs/nfs/write.c b/fs/nfs/write.c
+index 1ed4b3590b1ac..ddae197d2d3f9 100644
+--- a/fs/nfs/write.c
++++ b/fs/nfs/write.c
+@@ -927,9 +927,13 @@ static void nfs_write_completion(struct nfs_pgio_header *hdr)
+ 			goto remove_req;
+ 		}
+ 		if (nfs_write_need_commit(hdr)) {
++			struct nfs_open_context *ctx =
++				hdr->req->wb_lock_context->open_context;
++
+ 			/* Reset wb_nio, since the write was successful. */
+ 			req->wb_nio = 0;
+ 			memcpy(&req->wb_verf, &hdr->verf.verifier, sizeof(req->wb_verf));
++			clear_bit(NFS_CONTEXT_WRITE_SYNC, &ctx->flags);
+ 			nfs_mark_request_commit(req, hdr->lseg, &cinfo,
+ 				hdr->ds_commit_idx);
+ 			goto next;
+@@ -1553,7 +1557,10 @@ static void nfs_writeback_result(struct rpc_task *task,
+ 
+ 	if (resp->count < argp->count) {
+ 		static unsigned long    complain;
++		struct nfs_open_context *ctx =
++			hdr->req->wb_lock_context->open_context;
+ 
++		set_bit(NFS_CONTEXT_WRITE_SYNC, &ctx->flags);
+ 		/* This a short write! */
+ 		nfs_inc_stats(hdr->inode, NFSIOS_SHORTWRITE);
+ 
+@@ -1837,6 +1844,8 @@ static void nfs_commit_release_pages(struct nfs_commit_data *data)
+ 		/* We have a mismatch. Write the page again */
+ 		dprintk(" mismatch\n");
+ 		nfs_mark_request_dirty(req);
++		set_bit(NFS_CONTEXT_WRITE_SYNC,
++			&req->wb_lock_context->open_context->flags);
+ 		atomic_long_inc(&NFS_I(data->inode)->redirtied_pages);
+ 	next:
+ 		nfs_unlock_and_release_request(req);
+diff --git a/include/linux/nfs_fs.h b/include/linux/nfs_fs.h
+index 8dd79a3f3d662..4623262da3c09 100644
+--- a/include/linux/nfs_fs.h
++++ b/include/linux/nfs_fs.h
+@@ -109,6 +109,7 @@ struct nfs_open_context {
+ #define NFS_CONTEXT_BAD			(2)
+ #define NFS_CONTEXT_UNLOCK	(3)
+ #define NFS_CONTEXT_FILE_OPEN		(4)
++#define NFS_CONTEXT_WRITE_SYNC		(5)
+ 
+ 	struct nfs4_threshold	*mdsthreshold;
+ 	struct list_head list;
+-- 
+2.53.0
+

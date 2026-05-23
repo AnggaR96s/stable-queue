@@ -1,0 +1,111 @@
+From 77f4a16ca22ff37b2ffbfe0b33ad800072e3c857 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Sun, 9 Nov 2025 15:58:18 +0800
+Subject: jfs: fix corrupted list in dbUpdatePMap
+
+From: Yun Zhou <yun.zhou@windriver.com>
+
+[ Upstream commit 3c778ec882084626ac915d6c6ec88aff87b82221 ]
+
+This patch resolves the "list_add corruption. next is NULL" Oops
+reported by syzkaller in dbUpdatePMap(). The root cause is uninitialized
+synclist nodes in struct metapage and struct TxBlock, plus improper list
+node removal using list_del() (which leaves nodes in an invalid state).
+
+This fixes the following Oops reported by syzkaller.
+
+list_add corruption. next is NULL.
+------------[ cut here ]------------
+kernel BUG at lib/list_debug.c:28!
+Oops: invalid opcode: 0000 [#1] SMP KASAN PTI
+CPU: 1 UID: 0 PID: 122 Comm: jfsCommit Not tainted syzkaller #0
+PREEMPT_{RT,(full)}
+Hardware name: Google Google Compute Engine/Google Compute Engine, BIOS
+Google 10/02/2025
+RIP: 0010:__list_add_valid_or_report+0xc3/0x130 lib/list_debug.c:27
+Code: 4c 89 f2 48 89 d9 e8 0c 88 a4 fc 90 0f 0b 48 c7 c7 20 de 3d 8b e8
+fd 87 a4 fc 90 0f 0b 48 c7 c7 c0 de 3d 8b e8 ee 87 a4 fc 90 <0f> 0b 48
+89 df e8 13 c3 7d fd 42 80 7c 2d 00 00 74 08 4c 89 e7 e8
+RSP: 0018:ffffc9000395fa20 EFLAGS: 00010246
+RAX: 0000000000000022 RBX: 0000000000000000 RCX: 270c5dfadb559700
+RDX: 0000000000000000 RSI: 0000000000000000 RDI: 0000000000000000
+RBP: 00000000000f0000 R08: 0000000000000000 R09: 0000000000000000
+R10: dffffc0000000000 R11: fffff5200072bee9 R12: 0000000000000000
+R13: dffffc0000000000 R14: 0000000000000004 R15: 1ffff92000632266
+FS:  0000000000000000(0000) GS:ffff888126ef9000(0000)
+knlGS:0000000000000000
+CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+CR2: 000056341fdb86c0 CR3: 0000000040a18000 CR4: 00000000003526f0
+Call Trace:
+ <TASK>
+ __list_add_valid include/linux/list.h:96 [inline]
+ __list_add include/linux/list.h:158 [inline]
+ list_add include/linux/list.h:177 [inline]
+ dbUpdatePMap+0x7e4/0xeb0 fs/jfs/jfs_dmap.c:577
+ txAllocPMap+0x57d/0x6b0 fs/jfs/jfs_txnmgr.c:2426
+ txUpdateMap+0x81e/0x9c0 fs/jfs/jfs_txnmgr.c:2364
+ txLazyCommit fs/jfs/jfs_txnmgr.c:2665 [inline]
+ jfs_lazycommit+0x3f1/0xa10 fs/jfs/jfs_txnmgr.c:2734
+ kthread+0x711/0x8a0 kernel/kthread.c:463
+ ret_from_fork+0x4bc/0x870 arch/x86/kernel/process.c:158
+ ret_from_fork_asm+0x1a/0x30 arch/x86/entry/entry_64.S:245
+ </TASK>
+Modules linked in:
+---[ end trace 0000000000000000 ]---
+
+Reported-by: syzbot+4d0a0feb49c5138cac46@syzkaller.appspotmail.com
+Closes: https://syzkaller.appspot.com/bug?extid=4d0a0feb49c5138cac46
+Tested-by: syzbot+4d0a0feb49c5138cac46@syzkaller.appspotmail.com
+Signed-off-by: Yun Zhou <yun.zhou@windriver.com>
+Signed-off-by: Dave Kleikamp <dave.kleikamp@oracle.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/jfs/jfs_metapage.c | 3 ++-
+ fs/jfs/jfs_txnmgr.c   | 3 ++-
+ 2 files changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/fs/jfs/jfs_metapage.c b/fs/jfs/jfs_metapage.c
+index df575a873ec6d..8ff496e937442 100644
+--- a/fs/jfs/jfs_metapage.c
++++ b/fs/jfs/jfs_metapage.c
+@@ -188,6 +188,7 @@ static inline struct metapage *alloc_metapage(gfp_t gfp_mask)
+ 		mp->clsn = 0;
+ 		mp->log = NULL;
+ 		init_waitqueue_head(&mp->wait);
++		INIT_LIST_HEAD(&mp->synclist);
+ 	}
+ 	return mp;
+ }
+@@ -297,7 +298,7 @@ static void remove_from_logsync(struct metapage *mp)
+ 		mp->lsn = 0;
+ 		mp->clsn = 0;
+ 		log->count--;
+-		list_del(&mp->synclist);
++		list_del_init(&mp->synclist);
+ 	}
+ 	LOGSYNC_UNLOCK(log, flags);
+ }
+diff --git a/fs/jfs/jfs_txnmgr.c b/fs/jfs/jfs_txnmgr.c
+index 7840a03e5bcb7..a5a5bc0a266d9 100644
+--- a/fs/jfs/jfs_txnmgr.c
++++ b/fs/jfs/jfs_txnmgr.c
+@@ -275,6 +275,7 @@ int txInit(void)
+ 	for (k = 0; k < nTxBlock; k++) {
+ 		init_waitqueue_head(&TxBlock[k].gcwait);
+ 		init_waitqueue_head(&TxBlock[k].waitor);
++		INIT_LIST_HEAD(&TxBlock[k].synclist);
+ 	}
+ 
+ 	for (k = 1; k < nTxBlock - 1; k++) {
+@@ -974,7 +975,7 @@ static void txUnlock(struct tblock * tblk)
+ 	if (tblk->lsn) {
+ 		LOGSYNC_LOCK(log, flags);
+ 		log->count--;
+-		list_del(&tblk->synclist);
++		list_del_init(&tblk->synclist);
+ 		LOGSYNC_UNLOCK(log, flags);
+ 	}
+ }
+-- 
+2.53.0
+

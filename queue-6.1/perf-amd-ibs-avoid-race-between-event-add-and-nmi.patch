@@ -1,0 +1,99 @@
+From 9c04142aa993107ab0efabd42dfd48e5c3adeb06 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 16 Feb 2026 04:22:16 +0000
+Subject: perf/amd/ibs: Avoid race between event add and NMI
+
+From: Ravi Bangoria <ravi.bangoria@amd.com>
+
+[ Upstream commit 1b044ff3c17e9d7fd93ffc0ba541ccdeb992d7f5 ]
+
+Consider the following race:
+
+  --------
+  o OP_CTL contains stale value: OP_CTL[Val]=1, OP_CTL[En]=0
+  o A new IBS OP event is being added
+  o [P]: Process context, [N]: NMI context
+
+  [P] perf_ibs_add(event) {
+  [P]     if (test_and_set_bit(IBS_ENABLED, pcpu->state))
+  [P]         return;
+  [P]     /* pcpu->state = IBS_ENABLED */
+  [P]
+  [P]     pcpu->event = event;
+  [P]
+  [P]     perf_ibs_start(event) {
+  [P]         set_bit(IBS_STARTED, pcpu->state);
+  [P]         /* pcpu->state = IBS_ENABLED | IBS_STARTED */
+  [P]         clear_bit(IBS_STOPPING, pcpu->state);
+  [P]         /* pcpu->state = IBS_ENABLED | IBS_STARTED */
+
+  [N] --> NMI due to genuine FETCH event. perf_ibs_handle_irq()
+  [N]     called for OP PMU as well.
+  [N]
+  [N] perf_ibs_handle_irq(perf_ibs) {
+  [N]     event = pcpu->event; /* See line 6 */
+  [N]
+  [N]     if (!test_bit(IBS_STARTED, pcpu->state)) /* false */
+  [N]         return 0;
+  [N]
+  [N]     if (WARN_ON_ONCE(!event)) /* false */
+  [N]         goto fail;
+  [N]
+  [N]     if (!(*buf++ & perf_ibs->valid_mask)) /* false due to stale
+  [N]                                            * IBS_OP_CTL value */
+  [N]         goto fail;
+  [N]
+  [N]         ...
+  [N]
+  [N]     perf_ibs_enable_event() // *Accidentally* enable the event.
+  [N] }
+  [N]
+  [N] /*
+  [N]  * Repeated NMIs may follow due to accidentally enabled IBS OP
+  [N]  * event if the sample period is very low. It could also lead
+  [N]  * to pcpu->state corruption if the event gets throttled due
+  [N]  * to too frequent NMIs.
+  [N]  */
+
+  [P]         perf_ibs_enable_event();
+  [P]     }
+  [P] }
+  --------
+
+We cannot safely clear IBS_{FETCH|OP}_CTL while disabling the event,
+because the register might be read again later. So, clear the register
+in the enable path - before we update pcpu->state and enable the event.
+This guarantees that any NMI that lands in the gap finds Val=0 and
+bails out cleanly.
+
+Signed-off-by: Ravi Bangoria <ravi.bangoria@amd.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Acked-by: Namhyung Kim <namhyung@kernel.org>
+Link: https://patch.msgid.link/20260216042216.1440-6-ravi.bangoria@amd.com
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ arch/x86/events/amd/ibs.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/arch/x86/events/amd/ibs.c b/arch/x86/events/amd/ibs.c
+index 8c385e231e070..7d69e2840569d 100644
+--- a/arch/x86/events/amd/ibs.c
++++ b/arch/x86/events/amd/ibs.c
+@@ -413,6 +413,14 @@ static void perf_ibs_start(struct perf_event *event, int flags)
+ 	}
+ 	config |= period >> 4;
+ 
++	/*
++	 * Reset the IBS_{FETCH|OP}_CTL MSR before updating pcpu->state.
++	 * Doing so prevents a race condition in which an NMI due to other
++	 * source might accidentally activate the event before we enable
++	 * it ourselves.
++	 */
++	perf_ibs_disable_event(perf_ibs, hwc, 0);
++
+ 	/*
+ 	 * Set STARTED before enabling the hardware, such that a subsequent NMI
+ 	 * must observe it.
+-- 
+2.53.0
+

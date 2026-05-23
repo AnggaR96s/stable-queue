@@ -1,0 +1,144 @@
+From 745eb6ebb51a7281c092cc403017c505d85c8140 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 8 Apr 2026 00:35:48 -0400
+Subject: md/raid5: Fix UAF on IO across the reshape position
+
+From: Benjamin Marzinski <bmarzins@redhat.com>
+
+[ Upstream commit 418b3e64e4459feb3f75979de9ec89e085745343 ]
+
+If make_stripe_request() returns STRIPE_WAIT_RESHAPE,
+raid5_make_request() will free the cloned bio. But raid5_make_request()
+can call make_stripe_request() multiple times, writing to the various
+stripes. If that bio got added to the toread or towrite lists of a
+stripe disk in an earlier call to make_stripe_request(), then it's not
+safe to just free the bio if a later part of it is found to cross the
+reshape position. Doing so can lead to a UAF error, when bio_endio()
+is called on the bio for the earlier stripes.
+
+Instead, raid5_make_request() needs to wait until all parts of the bio
+have called bio_endio(). To do this, bios that cross the reshape
+position while the reshape can't make progress are flagged as needing to
+wait for all parts to complete. When raid5_make_request() has a bio that
+failed make_stripe_request() with STRIPE_WAIT_RESHAPE, it sets
+bi->bi_private to a completion struct and waits for completion after
+ending the bio.  When the bio_endio() is called for the last time on a
+clone bio with bi->bi_private set, it wakes up the waiter. This
+guarantees that raid5_make_request() doesn't return until the cloned bio
+needing a retry for io across the reshape boundary is safely cleaned up.
+
+There is a simple reproducer available at [1]. Compile the kernel with
+KASAN for more useful reporting when the error is triggered (this is not
+necessary to see the bug).
+
+[1] https://gist.github.com/bmarzins/e48598824305cf2171289e47d7241fa5
+
+Signed-off-by: Benjamin Marzinski <bmarzins@redhat.com>
+Reviewed-by: Xiao Ni <xni@redhat.com>
+Link: https://lore.kernel.org/r/20260408043548.1695157-1-bmarzins@redhat.com
+Signed-off-by: Yu Kuai <yukuai@fnnas.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/md/md.c    | 31 ++++++++-----------------------
+ drivers/md/md.h    |  1 -
+ drivers/md/raid5.c |  7 ++++++-
+ 3 files changed, 14 insertions(+), 25 deletions(-)
+
+diff --git a/drivers/md/md.c b/drivers/md/md.c
+index 32927c24ebf7c..aa5b55f8b4e20 100644
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -9395,9 +9395,11 @@ static void md_bitmap_end(struct mddev *mddev, struct md_io_clone *md_io_clone)
+ 
+ static void md_end_clone_io(struct bio *bio)
+ {
+-	struct md_io_clone *md_io_clone = bio->bi_private;
++	struct md_io_clone *md_io_clone = container_of(bio, struct md_io_clone,
++						       bio_clone);
+ 	struct bio *orig_bio = md_io_clone->orig_bio;
+ 	struct mddev *mddev = md_io_clone->mddev;
++	struct completion *reshape_completion = bio->bi_private;
+ 
+ 	if (bio_data_dir(orig_bio) == WRITE && md_bitmap_enabled(mddev, false))
+ 		md_bitmap_end(mddev, md_io_clone);
+@@ -9409,7 +9411,10 @@ static void md_end_clone_io(struct bio *bio)
+ 		bio_end_io_acct(orig_bio, md_io_clone->start_time);
+ 
+ 	bio_put(bio);
+-	bio_endio(orig_bio);
++	if (unlikely(reshape_completion))
++		complete(reshape_completion);
++	else
++		bio_endio(orig_bio);
+ 	percpu_ref_put(&mddev->active_io);
+ }
+ 
+@@ -9434,7 +9439,7 @@ static void md_clone_bio(struct mddev *mddev, struct bio **bio)
+ 	}
+ 
+ 	clone->bi_end_io = md_end_clone_io;
+-	clone->bi_private = md_io_clone;
++	clone->bi_private = NULL;
+ 	*bio = clone;
+ }
+ 
+@@ -9445,26 +9450,6 @@ void md_account_bio(struct mddev *mddev, struct bio **bio)
+ }
+ EXPORT_SYMBOL_GPL(md_account_bio);
+ 
+-void md_free_cloned_bio(struct bio *bio)
+-{
+-	struct md_io_clone *md_io_clone = bio->bi_private;
+-	struct bio *orig_bio = md_io_clone->orig_bio;
+-	struct mddev *mddev = md_io_clone->mddev;
+-
+-	if (bio_data_dir(orig_bio) == WRITE && md_bitmap_enabled(mddev, false))
+-		md_bitmap_end(mddev, md_io_clone);
+-
+-	if (bio->bi_status && !orig_bio->bi_status)
+-		orig_bio->bi_status = bio->bi_status;
+-
+-	if (md_io_clone->start_time)
+-		bio_end_io_acct(orig_bio, md_io_clone->start_time);
+-
+-	bio_put(bio);
+-	percpu_ref_put(&mddev->active_io);
+-}
+-EXPORT_SYMBOL_GPL(md_free_cloned_bio);
+-
+ /* md_allow_write(mddev)
+  * Calling this ensures that the array is marked 'active' so that writes
+  * may proceed without blocking.  It is important to call this before
+diff --git a/drivers/md/md.h b/drivers/md/md.h
+index 409c8f61695d3..d3f0ac39a2238 100644
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@ -917,7 +917,6 @@ extern void md_finish_reshape(struct mddev *mddev);
+ void md_submit_discard_bio(struct mddev *mddev, struct md_rdev *rdev,
+ 			struct bio *bio, sector_t start, sector_t size);
+ void md_account_bio(struct mddev *mddev, struct bio **bio);
+-void md_free_cloned_bio(struct bio *bio);
+ 
+ extern bool __must_check md_flush_request(struct mddev *mddev, struct bio *bio);
+ void md_write_metadata(struct mddev *mddev, struct md_rdev *rdev,
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index 8feecd60a86c8..5e0ca832d4eb5 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -6219,7 +6219,12 @@ static bool raid5_make_request(struct mddev *mddev, struct bio * bi)
+ 
+ 	mempool_free(ctx, conf->ctx_pool);
+ 	if (res == STRIPE_WAIT_RESHAPE) {
+-		md_free_cloned_bio(bi);
++		DECLARE_COMPLETION_ONSTACK(done);
++		WRITE_ONCE(bi->bi_private, &done);
++
++		bio_endio(bi);
++
++		wait_for_completion(&done);
+ 		return false;
+ 	}
+ 
+-- 
+2.53.0
+

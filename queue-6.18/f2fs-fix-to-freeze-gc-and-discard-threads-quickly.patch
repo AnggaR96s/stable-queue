@@ -1,0 +1,115 @@
+From 5210d33e29142ff3edfd1ba3c67a1b302c4ab7c4 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 16 Mar 2026 11:59:54 -0700
+Subject: f2fs: fix to freeze GC and discard threads quickly
+
+From: Daeho Jeong <daehojeong@google.com>
+
+[ Upstream commit 02d91398a602c394d72cd61a67c84e2730c5f79b ]
+
+Suspend can fail if kernel threads do not freeze for a while.
+f2fs_gc and f2fs_discard threads can perform long-running operations
+that prevent them from reaching a freeze point in a timely manner.
+
+This patch adds explicit freezing checks in the following locations:
+1. f2fs_gc: Added a check at the 'retry' label to exit the loop quickly
+   if freezing is requested, especially during heavy GC rounds.
+2. __issue_discard_cmd: Added a 'suspended' flag to break both inner and
+   outer loops during discard command issuance if freezing is detected
+   after at least one command has been issued.
+3. __issue_discard_cmd_orderly: Added a similar check for orderly discard
+   to ensure responsiveness.
+
+These checks ensure that the threads release locks safely and enter the
+frozen state.
+
+Signed-off-by: Daeho Jeong <daehojeong@google.com>
+Reviewed-by: Chao Yu <chao@kernel.org>
+Signed-off-by: Jaegeuk Kim <jaegeuk@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/f2fs/gc.c      | 10 ++++++++++
+ fs/f2fs/segment.c | 12 +++++++++++-
+ 2 files changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/fs/f2fs/gc.c b/fs/f2fs/gc.c
+index 5d4202564f257..d107f54f4bf0d 100644
+--- a/fs/f2fs/gc.c
++++ b/fs/f2fs/gc.c
+@@ -1879,12 +1879,18 @@ static int do_garbage_collect(struct f2fs_sb_info *sbi,
+ 				sbi->next_victim_seg[gc_type] =
+ 					(cur_segno + 1 < sec_end_segno) ?
+ 					cur_segno + 1 : NULL_SEGNO;
++
++			if (unlikely(freezing(current))) {
++				folio_put_refs(sum_folio, 2);
++				goto stop;
++			}
+ 		}
+ next_block:
+ 		folio_put_refs(sum_folio, 2);
+ 		segno = block_end_segno;
+ 	}
+ 
++stop:
+ 	if (submitted)
+ 		f2fs_submit_merged_write(sbi, data_type);
+ 
+@@ -1958,6 +1964,10 @@ int f2fs_gc(struct f2fs_sb_info *sbi, struct f2fs_gc_control *gc_control)
+ 		goto stop;
+ 	}
+ retry:
++	if (unlikely(freezing(current))) {
++		ret = 0;
++		goto stop;
++	}
+ 	ret = __get_victim(sbi, &segno, gc_type, gc_control->one_time);
+ 	if (ret) {
+ 		/* allow to search victim from sections has pinned data */
+diff --git a/fs/f2fs/segment.c b/fs/f2fs/segment.c
+index a7cf8627d8881..ed3c330445195 100644
+--- a/fs/f2fs/segment.c
++++ b/fs/f2fs/segment.c
+@@ -1621,6 +1621,9 @@ static void __issue_discard_cmd_orderly(struct f2fs_sb_info *sbi,
+ 		if (dc->state != D_PREP)
+ 			goto next;
+ 
++		if (*issued > 0 && unlikely(freezing(current)))
++			break;
++
+ 		if (dpolicy->io_aware && !is_idle(sbi, DISCARD_TIME)) {
+ 			io_interrupted = true;
+ 			break;
+@@ -1660,6 +1663,7 @@ static int __issue_discard_cmd(struct f2fs_sb_info *sbi,
+ 	struct blk_plug plug;
+ 	int i, issued;
+ 	bool io_interrupted = false;
++	bool suspended = false;
+ 
+ 	if (dpolicy->timeout)
+ 		f2fs_update_time(sbi, UMOUNT_DISCARD_TIMEOUT);
+@@ -1690,6 +1694,11 @@ static int __issue_discard_cmd(struct f2fs_sb_info *sbi,
+ 		list_for_each_entry_safe(dc, tmp, pend_list, list) {
+ 			f2fs_bug_on(sbi, dc->state != D_PREP);
+ 
++			if (issued > 0 && unlikely(freezing(current))) {
++				suspended = true;
++				break;
++			}
++
+ 			if (dpolicy->timeout &&
+ 				f2fs_time_over(sbi, UMOUNT_DISCARD_TIMEOUT))
+ 				break;
+@@ -1709,7 +1718,8 @@ static int __issue_discard_cmd(struct f2fs_sb_info *sbi,
+ next:
+ 		mutex_unlock(&dcc->cmd_lock);
+ 
+-		if (issued >= dpolicy->max_requests || io_interrupted)
++		if (issued >= dpolicy->max_requests || io_interrupted ||
++					suspended)
+ 			break;
+ 	}
+ 
+-- 
+2.53.0
+

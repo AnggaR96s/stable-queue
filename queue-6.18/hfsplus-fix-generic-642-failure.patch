@@ -1,0 +1,203 @@
+From 957947bb4fe9fe1911f70ac7932d42a860cfec8c Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 3 Apr 2026 16:05:56 -0700
+Subject: hfsplus: fix generic/642 failure
+
+From: Viacheslav Dubeyko <slava@dubeyko.com>
+
+[ Upstream commit c1307d18caa819ddc28459d858eb38fdd6c3f8a0 ]
+
+The xfstests' test-case generic/642 finishes with
+corrupted HFS+ volume:
+
+sudo ./check generic/642
+[sudo] password for slavad:
+FSTYP -- hfsplus
+PLATFORM -- Linux/x86_64 hfsplus-testing-0001 7.0.0-rc1+ #26 SMP PREEMPT_DYNAMIC Mon Mar 23 17:24:32 PDT 2026
+MKFS_OPTIONS -- /dev/loop51
+MOUNT_OPTIONS -- /dev/loop51 /mnt/scratch
+
+generic/642 6s ... _check_generic_filesystem: filesystem on /dev/loop51 is inconsistent
+(see xfstests-dev/results//generic/642.full for details)
+
+Ran: generic/642
+Failures: generic/642
+Failed 1 of 1 tests
+
+sudo fsck.hfs -d /dev/loop51
+** /dev/loop51
+Using cacheBlockSize=32K cacheTotalBlock=1024 cacheSize=32768K.
+Executing fsck_hfs (version 540.1-Linux).
+** Checking non-journaled HFS Plus Volume.
+The volume name is untitled
+** Checking extents overflow file.
+** Checking catalog file.
+** Checking multi-linked files.
+** Checking catalog hierarchy.
+** Checking extended attributes file.
+invalid free nodes - calculated 1637 header 1260
+Invalid B-tree header
+Invalid map node
+(8, 0)
+** Checking volume bitmap.
+** Checking volume information.
+Verify Status: VIStat = 0x0000, ABTStat = 0xc000 EBTStat = 0x0000
+CBTStat = 0x0000 CatStat = 0x00000000
+** Repairing volume.
+** Rechecking volume.
+** Checking non-journaled HFS Plus Volume.
+The volume name is untitled
+** Checking extents overflow file.
+** Checking catalog file.
+** Checking multi-linked files.
+** Checking catalog hierarchy.
+** Checking extended attributes file.
+** Checking volume bitmap.
+** Checking volume information.
+** The volume untitled was repaired successfully.
+
+The fsck tool detected that Extended Attributes b-tree is corrupted.
+Namely, the free nodes number is incorrect and map node
+bitmap has inconsistent state. Analysis has shown that during
+b-tree closing there are still some lost b-tree's nodes in
+the hash out of b-tree structure. But this orphaned b-tree nodes
+are still accounted as used in map node bitmap:
+
+tree_cnid 8, nidx 0, node_count 1408, free_nodes 1403
+tree_cnid 8, nidx 1, node_count 1408, free_nodes 1403
+tree_cnid 8, nidx 3, node_count 1408, free_nodes 1403
+tree_cnid 8, nidx 54, node_count 1408, free_nodes 1403
+tree_cnid 8, nidx 67, node_count 1408, free_nodes 1403
+tree_cnid 8, nidx 0, prev 0, next 0, parent 0, num_recs 3, type 0x1, height 0
+tree_cnid 8, nidx 1, prev 0, next 0, parent 3, num_recs 1, type 0xff, height 1
+tree_cnid 8, nidx 3, prev 0, next 0, parent 0, num_recs 1, type 0x0, height 2
+tree_cnid 8, nidx 54, prev 29, next 46, parent 3, num_recs 0, type 0xff, height 1
+tree_cnid 8, nidx 67, prev 8, next 14, parent 3, num_recs 0, type 0xff, height 1
+
+This issue happens in hfs_bnode_split() logic during detection
+the possibility of moving half ot the records out of the node.
+The hfs_bnode_split() contains a loop that implements
+a roughly 50/50 split of the B-tree node's records by scanning
+the offset table to find where the data crosses the node's midpoint.
+If this logic detects the incapability of spliting the node, then
+it simply calls hfs_bnode_put() for newly created node. However,
+node is not set as HFS_BNODE_DELETED and real deletion of node
+doesn't happen. As a result, the empty node becomes orphaned but
+it is still accounted as used. Finally, fsck tool detects this
+inconsistency of HFS+ volume.
+
+This patch adds call of hfs_bnode_unlink() before hfs_bnode_put()
+for the case if new node cannot be used for spliting the existing
+node.
+
+sudo ./check generic/642
+FSTYP         -- hfsplus
+PLATFORM      -- Linux/x86_64 hfsplus-testing-0001 7.0.0-rc1+ #26 SMP PREEMPT_DYNAMIC Fri Apr  3 12:39:13 PDT 2026
+MKFS_OPTIONS  -- /dev/loop51
+MOUNT_OPTIONS -- /dev/loop51 /mnt/scratch
+
+generic/642 40s ...  39s
+Ran: generic/642
+Passed all 1 tests
+
+Closes: https://github.com/hfs-linux-kernel/hfs-linux-kernel/issues/242
+cc: John Paul Adrian Glaubitz <glaubitz@physik.fu-berlin.de>
+cc: Yangtao Li <frank.li@vivo.com>
+cc: linux-fsdevel@vger.kernel.org
+Signed-off-by: Viacheslav Dubeyko <slava@dubeyko.com>
+Link: https://lore.kernel.org/r/20260403230556.614171-6-slava@dubeyko.com
+Signed-off-by: Viacheslav Dubeyko <slava@dubeyko.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/hfsplus/brec.c | 32 ++++++++++++++++++++------------
+ 1 file changed, 20 insertions(+), 12 deletions(-)
+
+diff --git a/fs/hfsplus/brec.c b/fs/hfsplus/brec.c
+index b4645102feecd..12f1fd8b69ecf 100644
+--- a/fs/hfsplus/brec.c
++++ b/fs/hfsplus/brec.c
+@@ -239,6 +239,9 @@ static struct hfs_bnode *hfs_bnode_split(struct hfs_find_data *fd)
+ 	struct hfs_bnode_desc node_desc;
+ 	int num_recs, new_rec_off, new_off, old_rec_off;
+ 	int data_start, data_end, size;
++	size_t rec_off_tbl_size;
++	size_t node_desc_size = sizeof(struct hfs_bnode_desc);
++	size_t rec_size = sizeof(__be16);
+ 
+ 	tree = fd->tree;
+ 	node = fd->bnode;
+@@ -265,18 +268,22 @@ static struct hfs_bnode *hfs_bnode_split(struct hfs_find_data *fd)
+ 		return next_node;
+ 	}
+ 
+-	size = tree->node_size / 2 - node->num_recs * 2 - 14;
+-	old_rec_off = tree->node_size - 4;
++	rec_off_tbl_size = node->num_recs * rec_size;
++	size = tree->node_size / 2;
++	size -= node_desc_size;
++	size -= rec_off_tbl_size;
++	old_rec_off = tree->node_size - (2 * rec_size);
++
+ 	num_recs = 1;
+ 	for (;;) {
+ 		data_start = hfs_bnode_read_u16(node, old_rec_off);
+ 		if (data_start > size)
+ 			break;
+-		old_rec_off -= 2;
++		old_rec_off -= rec_size;
+ 		if (++num_recs < node->num_recs)
+ 			continue;
+-		/* panic? */
+ 		hfs_bnode_put(node);
++		hfs_bnode_unlink(new_node);
+ 		hfs_bnode_put(new_node);
+ 		if (next_node)
+ 			hfs_bnode_put(next_node);
+@@ -287,7 +294,7 @@ static struct hfs_bnode *hfs_bnode_split(struct hfs_find_data *fd)
+ 		/* new record is in the lower half,
+ 		 * so leave some more space there
+ 		 */
+-		old_rec_off += 2;
++		old_rec_off += rec_size;
+ 		num_recs--;
+ 		data_start = hfs_bnode_read_u16(node, old_rec_off);
+ 	} else {
+@@ -295,27 +302,28 @@ static struct hfs_bnode *hfs_bnode_split(struct hfs_find_data *fd)
+ 		hfs_bnode_get(new_node);
+ 		fd->bnode = new_node;
+ 		fd->record -= num_recs;
+-		fd->keyoffset -= data_start - 14;
+-		fd->entryoffset -= data_start - 14;
++		fd->keyoffset -= data_start - node_desc_size;
++		fd->entryoffset -= data_start - node_desc_size;
+ 	}
+ 	new_node->num_recs = node->num_recs - num_recs;
+ 	node->num_recs = num_recs;
+ 
+-	new_rec_off = tree->node_size - 2;
+-	new_off = 14;
++	new_rec_off = tree->node_size - rec_size;
++	new_off = node_desc_size;
+ 	size = data_start - new_off;
+ 	num_recs = new_node->num_recs;
+ 	data_end = data_start;
+ 	while (num_recs) {
+ 		hfs_bnode_write_u16(new_node, new_rec_off, new_off);
+-		old_rec_off -= 2;
+-		new_rec_off -= 2;
++		old_rec_off -= rec_size;
++		new_rec_off -= rec_size;
+ 		data_end = hfs_bnode_read_u16(node, old_rec_off);
+ 		new_off = data_end - size;
+ 		num_recs--;
+ 	}
+ 	hfs_bnode_write_u16(new_node, new_rec_off, new_off);
+-	hfs_bnode_copy(new_node, 14, node, data_start, data_end - data_start);
++	hfs_bnode_copy(new_node, node_desc_size,
++			node, data_start, data_end - data_start);
+ 
+ 	/* update new bnode header */
+ 	node_desc.next = cpu_to_be32(new_node->next);
+-- 
+2.53.0
+

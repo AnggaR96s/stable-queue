@@ -1,0 +1,107 @@
+From 0da301c99fcbfc5269ef96b00e0608c0b897d72d Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 9 Apr 2026 17:10:21 +0800
+Subject: drm/amdgpu: fix CPER ring header parsing
+
+From: Xiang Liu <xiang.liu@amd.com>
+
+[ Upstream commit b8939bd764c9c8bf6488dc0d71d9c718c25d8cfc ]
+
+amdgpu_cper_ring_get_ent_sz() parses CPER headers directly from the
+circular ring buffer to determine the current entry size. When the ring
+is full and the write pointer lands near the end of the buffer, the
+header can wrap across the ring boundary.
+
+The existing code treats the 4-byte CPER signature as a C string and
+uses strcmp() on in-ring binary data, then reads record_length through a
+direct struct pointer cast. Both assumptions are unsafe for wrapped
+entries and can read past the end of the ring mapping.
+
+Fix the parser by comparing the signature as raw bytes and by copying
+the header into a local buffer before reading record_length, handling
+wraparound explicitly in both cases. This avoids out-of-bounds reads in
+amdgpu_cper_ring_get_ent_sz() when the CPER ring is full or the current
+entry starts at the tail of the ring.
+
+Signed-off-by: Xiang Liu <xiang.liu@amd.com>
+Reviewed-by: Tao Zhou <tao.zhou1@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cper.c | 36 ++++++++++++++++++------
+ 1 file changed, 27 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cper.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cper.c
+index 425a3e5643608..c5fe670b847c3 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cper.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cper.c
+@@ -31,6 +31,8 @@ static const guid_t BOOT		= BOOT_TYPE;
+ static const guid_t CRASHDUMP		= AMD_CRASHDUMP;
+ static const guid_t RUNTIME		= AMD_GPU_NONSTANDARD_ERROR;
+ 
++#define CPER_SIGNATURE_SZ		(sizeof(((struct cper_hdr *)0)->signature))
++
+ static void __inc_entry_length(struct cper_hdr *hdr, uint32_t size)
+ {
+ 	hdr->record_length += size;
+@@ -424,23 +426,40 @@ int amdgpu_cper_generate_ce_records(struct amdgpu_device *adev,
+ 
+ static bool amdgpu_cper_is_hdr(struct amdgpu_ring *ring, u64 pos)
+ {
+-	struct cper_hdr *chdr;
++	char signature[CPER_SIGNATURE_SZ];
++
++	if ((pos << 2) >= ring->ring_size)
++		return false;
+ 
+-	chdr = (struct cper_hdr *)&(ring->ring[pos]);
+-	return strcmp(chdr->signature, "CPER") ? false : true;
++	if ((pos << 2) + CPER_SIGNATURE_SZ <= ring->ring_size) {
++		memcpy(signature, &ring->ring[pos], CPER_SIGNATURE_SZ);
++	} else {
++		u32 chunk = ring->ring_size - (pos << 2);
++
++		memcpy(signature, &ring->ring[pos], chunk);
++		memcpy(signature + chunk, ring->ring, CPER_SIGNATURE_SZ - chunk);
++	}
++
++	return !memcmp(signature, "CPER", CPER_SIGNATURE_SZ);
+ }
+ 
+ static u32 amdgpu_cper_ring_get_ent_sz(struct amdgpu_ring *ring, u64 pos)
+ {
+-	struct cper_hdr *chdr;
++	struct cper_hdr chdr;
+ 	u64 p;
+ 	u32 chunk, rec_len = 0;
+ 
+-	chdr = (struct cper_hdr *)&(ring->ring[pos]);
+ 	chunk = ring->ring_size - (pos << 2);
+ 
+-	if (!strcmp(chdr->signature, "CPER")) {
+-		rec_len = chdr->record_length;
++	if (amdgpu_cper_is_hdr(ring, pos)) {
++		if (chunk >= sizeof(chdr)) {
++			memcpy(&chdr, &ring->ring[pos], sizeof(chdr));
++		} else {
++			memcpy(&chdr, &ring->ring[pos], chunk);
++			memcpy((u8 *)&chdr + chunk, ring->ring, sizeof(chdr) - chunk);
++		}
++
++		rec_len = chdr.record_length;
+ 		goto calc;
+ 	}
+ 
+@@ -449,8 +468,7 @@ static u32 amdgpu_cper_ring_get_ent_sz(struct amdgpu_ring *ring, u64 pos)
+ 		goto calc;
+ 
+ 	for (p = pos + 1; p <= ring->buf_mask; p++) {
+-		chdr = (struct cper_hdr *)&(ring->ring[p]);
+-		if (!strcmp(chdr->signature, "CPER")) {
++		if (amdgpu_cper_is_hdr(ring, p)) {
+ 			rec_len = (p - pos) << 2;
+ 			goto calc;
+ 		}
+-- 
+2.53.0
+

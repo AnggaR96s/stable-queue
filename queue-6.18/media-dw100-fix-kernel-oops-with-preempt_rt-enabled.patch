@@ -1,0 +1,111 @@
+From 6ae8dca40361726d19ff3c43ffed94c0ba1f26f3 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 4 Mar 2026 16:50:24 +0100
+Subject: media: dw100: Fix kernel oops with PREEMPT_RT enabled
+
+From: Stefan Klug <stefan.klug@ideasonboard.com>
+
+[ Upstream commit 557ec8cc29ade6c72ea768e59389db08cb7742c9 ]
+
+On kernels with PREEMPT_RT enabled, a "BUG: scheduling while atomic"
+kernel oops occurs inside dw100_irq_handler -> vb2_buffer_done. This is
+because vb2_buffer_done takes a spinlock which is not allowed within
+interrupt context on PREEMPT_RT.
+
+The first attempt to fix this was to just drop the IRQF_ONESHOT so that
+the interrupt is handled threaded on PREEMPT_RT systems. This introduced
+a new issue. The dw100 has an internal timeout counter that is gated by
+the DW100_BUS_CTRL_AXI_MASTER_ENABLE bit. Depending on the time it takes
+for the threaded handler to run and the geometry of the data being
+processed it is possible to reach the timeout resulting in
+DW100_INTERRUPT_STATUS_INT_ERR_TIME_OUT being set and "dw100
+32e30000.dwe: Interrupt error: 0x1" errors in dmesg.
+
+To properly fix that, split the interrupt into two halves, reset the
+DW100_BUS_CTRL_AXI_MASTER_ENABLE bit in the hard interrupt handler and
+do the v4l2 buffer handling in the threaded half. The IRQF_ONESHOT can
+still be dropped as the interrupt gets disabled in the hard handler and
+will only be reenabled on the next dw100_device_run which will not be
+called before the current job has finished.
+
+Signed-off-by: Stefan Klug <stefan.klug@ideasonboard.com>
+Reviewed-by: Xavier Roumegue <xavier.roumegue@oss.nxp.com>
+Reviewed-by: Laurent Pinchart <laurent.pinchart@ideasonboard.com>
+Link: https://patch.msgid.link/20260304-sklug-v6-16-topic-dw100-v3-1-dev-v5-3-1a7e1f721b50@ideasonboard.com
+Signed-off-by: Laurent Pinchart <laurent.pinchart@ideasonboard.com>
+Signed-off-by: Hans Verkuil <hverkuil+cisco@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/media/platform/nxp/dw100/dw100.c | 21 ++++++++++++++++-----
+ 1 file changed, 16 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/media/platform/nxp/dw100/dw100.c b/drivers/media/platform/nxp/dw100/dw100.c
+index 97744c7b7c034..40ca7414db339 100644
+--- a/drivers/media/platform/nxp/dw100/dw100.c
++++ b/drivers/media/platform/nxp/dw100/dw100.c
+@@ -11,6 +11,7 @@
+ #include <linux/debugfs.h>
+ #include <linux/interrupt.h>
+ #include <linux/io.h>
++#include <linux/irqreturn.h>
+ #include <linux/minmax.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+@@ -74,6 +75,7 @@ struct dw100_device {
+ 	struct clk_bulk_data		*clks;
+ 	int				num_clks;
+ 	struct dentry			*debugfs_root;
++	bool				frame_failed;
+ };
+ 
+ struct dw100_q_data {
+@@ -1393,7 +1395,8 @@ static irqreturn_t dw100_irq_handler(int irq, void *dev_id)
+ {
+ 	struct dw100_device *dw_dev = dev_id;
+ 	u32 pending_irqs, err_irqs, frame_done_irq;
+-	bool with_error = true;
++
++	dw_dev->frame_failed = true;
+ 
+ 	pending_irqs = dw_hw_get_pending_irqs(dw_dev);
+ 	frame_done_irq = pending_irqs & DW100_INTERRUPT_STATUS_INT_FRAME_DONE;
+@@ -1401,7 +1404,7 @@ static irqreturn_t dw100_irq_handler(int irq, void *dev_id)
+ 
+ 	if (frame_done_irq) {
+ 		dev_dbg(&dw_dev->pdev->dev, "Frame done interrupt\n");
+-		with_error = false;
++		dw_dev->frame_failed = false;
+ 		err_irqs &= ~DW100_INTERRUPT_STATUS_INT_ERR_STATUS
+ 			(DW100_INTERRUPT_STATUS_INT_ERR_FRAME_DONE);
+ 	}
+@@ -1414,7 +1417,14 @@ static irqreturn_t dw100_irq_handler(int irq, void *dev_id)
+ 	dw100_hw_clear_irq(dw_dev, pending_irqs |
+ 			   DW100_INTERRUPT_STATUS_INT_ERR_TIME_OUT);
+ 
+-	dw100_job_finish(dw_dev, with_error);
++	return IRQ_WAKE_THREAD;
++}
++
++static irqreturn_t dw100_irq_thread_fn(int irq, void *dev_id)
++{
++	struct dw100_device *dw_dev = dev_id;
++
++	dw100_job_finish(dw_dev, dw_dev->frame_failed);
+ 
+ 	return IRQ_HANDLED;
+ }
+@@ -1562,8 +1572,9 @@ static int dw100_probe(struct platform_device *pdev)
+ 
+ 	pm_runtime_put_sync(&pdev->dev);
+ 
+-	ret = devm_request_irq(&pdev->dev, irq, dw100_irq_handler, IRQF_ONESHOT,
+-			       dev_name(&pdev->dev), dw_dev);
++	ret = devm_request_threaded_irq(&pdev->dev, irq, dw100_irq_handler,
++					dw100_irq_thread_fn, 0,
++					dev_name(&pdev->dev), dw_dev);
+ 	if (ret < 0) {
+ 		dev_err(&pdev->dev, "Failed to request irq: %d\n", ret);
+ 		goto err_pm;
+-- 
+2.53.0
+
