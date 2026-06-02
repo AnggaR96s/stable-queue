@@ -1,0 +1,127 @@
+From 41f7de14999f10ff56b1abf68e1184c1b73d243f Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 1 Jun 2026 12:25:52 +0200
+Subject: arm64: debug: split bkpt32 exception entry
+
+From: Ada Couprie Diaz <ada.coupriediaz@arm.com>
+
+[ Upstream commit fc5e5d0477c532054ce8692fd16fdaab2cb8946f ]
+
+Currently all debug exceptions share common entry code and are routed
+to `do_debug_exception()`, which calls dynamically-registered
+handlers for each specific debug exception. This is unfortunate as
+different debug exceptions have different entry handling requirements,
+and it would be better to handle these distinct requirements earlier.
+
+The BKPT32 exception can only be triggered by a BKPT instruction. Thus,
+we know that the PC is a legitimate address and isn't being used to train
+a branch predictor with a bogus address : we don't need to call
+`arm64_apply_bp_hardening()`.
+
+The handler for this exception only pends a signal and doesn't depend
+on any per-CPU state : we don't need to inhibit preemption, nor do we
+need to keep the DAIF exceptions masked, so we can unmask them earlier.
+
+Split the BKPT32 exception entry and adjust function signatures and its
+behaviour to match its relaxed constraints compared to other
+debug exceptions.
+We can also remove `NOKRPOBE_SYMBOL`, as this cannot lead to a kprobe
+recursion.
+
+This replaces the last usage of `el0_dbg()`, so remove it.
+
+Signed-off-by: Ada Couprie Diaz <ada.coupriediaz@arm.com>
+Tested-by: Luis Claudio R. Goncalves <lgoncalv@redhat.com>
+Reviewed-by: Will Deacon <will@kernel.org>
+Acked-by: Mark Rutland <mark.rutland@arm.com>
+Link: https://lore.kernel.org/r/20250707114109.35672-13-ada.coupriediaz@arm.com
+Signed-off-by: Will Deacon <will@kernel.org>
+Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Reviewed-by: Ada Couprie Diaz <ada.coupriediaz@arm.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ arch/arm64/include/asm/exception.h |  1 +
+ arch/arm64/kernel/debug-monitors.c |  7 +++++++
+ arch/arm64/kernel/entry-common.c   | 22 +++++++++-------------
+ 3 files changed, 17 insertions(+), 13 deletions(-)
+
+diff --git a/arch/arm64/include/asm/exception.h b/arch/arm64/include/asm/exception.h
+index 7bc79602840fd0..9b05c6f487ccf1 100644
+--- a/arch/arm64/include/asm/exception.h
++++ b/arch/arm64/include/asm/exception.h
+@@ -72,6 +72,7 @@ void do_el0_softstep(unsigned long esr, struct pt_regs *regs);
+ void do_el1_softstep(unsigned long esr, struct pt_regs *regs);
+ void do_el0_brk64(unsigned long esr, struct pt_regs *regs);
+ void do_el1_brk64(unsigned long esr, struct pt_regs *regs);
++void do_bkpt32(unsigned long esr, struct pt_regs *regs);
+ void do_fpsimd_acc(unsigned long esr, struct pt_regs *regs);
+ void do_sve_acc(unsigned long esr, struct pt_regs *regs);
+ void do_sme_acc(unsigned long esr, struct pt_regs *regs);
+diff --git a/arch/arm64/kernel/debug-monitors.c b/arch/arm64/kernel/debug-monitors.c
+index 45e0dbe17c82fd..ed03270fa34375 100644
+--- a/arch/arm64/kernel/debug-monitors.c
++++ b/arch/arm64/kernel/debug-monitors.c
+@@ -270,6 +270,13 @@ void do_el1_brk64(unsigned long esr, struct pt_regs *regs)
+ }
+ NOKPROBE_SYMBOL(do_el1_brk64);
+ 
++#ifdef CONFIG_COMPAT
++void do_bkpt32(unsigned long esr, struct pt_regs *regs)
++{
++	arm64_notify_die("aarch32 BKPT", regs, SIGTRAP, TRAP_BRKPT, regs->pc, esr);
++}
++#endif /* CONFIG_COMPAT */
++
+ bool try_handle_aarch32_break(struct pt_regs *regs)
+ {
+ 	u32 arm_instr;
+diff --git a/arch/arm64/kernel/entry-common.c b/arch/arm64/kernel/entry-common.c
+index ba114bfdb32b5a..9a1ea5a6e6b72a 100644
+--- a/arch/arm64/kernel/entry-common.c
++++ b/arch/arm64/kernel/entry-common.c
+@@ -834,18 +834,6 @@ static void noinstr el0_brk64(struct pt_regs *regs, unsigned long esr)
+ 	exit_to_user_mode(regs);
+ }
+ 
+-static void noinstr __maybe_unused
+-el0_dbg(struct pt_regs *regs, unsigned long esr)
+-{
+-	/* Only watchpoints write FAR_EL1, otherwise its UNKNOWN */
+-	unsigned long far = read_sysreg(far_el1);
+-
+-	enter_from_user_mode(regs);
+-	do_debug_exception(far, esr, regs);
+-	local_daif_restore(DAIF_PROCCTX);
+-	exit_to_user_mode(regs);
+-}
+-
+ static void noinstr el0_svc(struct pt_regs *regs)
+ {
+ 	enter_from_user_mode(regs);
+@@ -1003,6 +991,14 @@ static void noinstr el0_svc_compat(struct pt_regs *regs)
+ 	exit_to_user_mode(regs);
+ }
+ 
++static void noinstr el0_bkpt32(struct pt_regs *regs, unsigned long esr)
++{
++	enter_from_user_mode(regs);
++	local_daif_restore(DAIF_PROCCTX);
++	do_bkpt32(esr, regs);
++	exit_to_user_mode(regs);
++}
++
+ asmlinkage void noinstr el0t_32_sync_handler(struct pt_regs *regs)
+ {
+ 	unsigned long esr = read_sysreg(esr_el1);
+@@ -1046,7 +1042,7 @@ asmlinkage void noinstr el0t_32_sync_handler(struct pt_regs *regs)
+ 		el0_watchpt(regs, esr);
+ 		break;
+ 	case ESR_ELx_EC_BKPT32:
+-		el0_dbg(regs, esr);
++		el0_bkpt32(regs, esr);
+ 		break;
+ 	default:
+ 		el0_inv(regs, esr);
+-- 
+2.53.0
+

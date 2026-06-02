@@ -1,0 +1,197 @@
+From 6c640c1850f7bb22d42145f3660fde62fd0eb849 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 1 Jun 2026 12:25:50 +0200
+Subject: arm64: debug: split hardware watchpoint exception entry
+
+From: Ada Couprie Diaz <ada.coupriediaz@arm.com>
+
+[ Upstream commit 413f0bba005dacf2484bb8ecce212fab9be79d81 ]
+
+Currently all debug exceptions share common entry code and are routed
+to `do_debug_exception()`, which calls dynamically-registered
+handlers for each specific debug exception. This is unfortunate as
+different debug exceptions have different entry handling requirements,
+and it would be better to handle these distinct requirements earlier.
+
+Hardware watchpoints are the only debug exceptions that will write
+FAR_EL1, so we need to preserve it and pass it down.
+However, they cannot be used to maliciously train branch predictors, so
+we can omit calling `arm64_bp_hardening()`, nor do they need to handle
+the Cortex-A76 erratum #1463225, as it only applies to single stepping
+exceptions.
+
+As the hardware watchpoint handler only returns 0 and never triggers
+the call to `arm64_notify_die()`, we can call it directly from
+`entry-common.c`.
+Split the hardware watchpoint exception entry and adjust the behaviour
+to match the lack of needed mitigations.
+
+Signed-off-by: Ada Couprie Diaz <ada.coupriediaz@arm.com>
+Tested-by: Luis Claudio R. Goncalves <lgoncalv@redhat.com>
+Reviewed-by: Will Deacon <will@kernel.org>
+Acked-by: Mark Rutland <mark.rutland@arm.com>
+Link: https://lore.kernel.org/r/20250707114109.35672-11-ada.coupriediaz@arm.com
+Signed-off-by: Will Deacon <will@kernel.org>
+Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Reviewed-by: Ada Couprie Diaz <ada.coupriediaz@arm.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ arch/arm64/include/asm/exception.h |  4 ++++
+ arch/arm64/kernel/entry-common.c   | 31 ++++++++++++++++++++++++++++++
+ arch/arm64/kernel/hw_breakpoint.c  | 17 +++++-----------
+ 3 files changed, 40 insertions(+), 12 deletions(-)
+
+diff --git a/arch/arm64/include/asm/exception.h b/arch/arm64/include/asm/exception.h
+index 6d40efc28be401..594350e552e112 100644
+--- a/arch/arm64/include/asm/exception.h
++++ b/arch/arm64/include/asm/exception.h
+@@ -61,8 +61,12 @@ void do_debug_exception(unsigned long addr_if_watchpoint, unsigned long esr,
+ 			struct pt_regs *regs);
+ #ifdef CONFIG_HAVE_HW_BREAKPOINT
+ void do_breakpoint(unsigned long esr, struct pt_regs *regs);
++void do_watchpoint(unsigned long addr, unsigned long esr,
++			struct pt_regs *regs);
+ #else
+ static inline void do_breakpoint(unsigned long esr, struct pt_regs *regs) {}
++static inline void do_watchpoint(unsigned long addr, unsigned long esr,
++			struct pt_regs *regs) {}
+ #endif /* CONFIG_HAVE_HW_BREAKPOINT */
+ void do_el0_softstep(unsigned long esr, struct pt_regs *regs);
+ void do_el1_softstep(unsigned long esr, struct pt_regs *regs);
+diff --git a/arch/arm64/kernel/entry-common.c b/arch/arm64/kernel/entry-common.c
+index c22cc4d0052d54..b90babcf2e2b10 100644
+--- a/arch/arm64/kernel/entry-common.c
++++ b/arch/arm64/kernel/entry-common.c
+@@ -535,6 +535,18 @@ static void noinstr el1_softstp(struct pt_regs *regs, unsigned long esr)
+ 	arm64_exit_el1_dbg(regs);
+ }
+ 
++static void noinstr el1_watchpt(struct pt_regs *regs, unsigned long esr)
++{
++	/* Watchpoints are the only debug exception to write FAR_EL1 */
++	unsigned long far = read_sysreg(far_el1);
++
++	arm64_enter_el1_dbg(regs);
++	debug_exception_enter(regs);
++	do_watchpoint(far, esr, regs);
++	debug_exception_exit(regs);
++	arm64_exit_el1_dbg(regs);
++}
++
+ static void noinstr el1_dbg(struct pt_regs *regs, unsigned long esr)
+ {
+ 	unsigned long far = read_sysreg(far_el1);
+@@ -584,6 +596,8 @@ asmlinkage void noinstr el1h_64_sync_handler(struct pt_regs *regs)
+ 		el1_softstp(regs, esr);
+ 		break;
+ 	case ESR_ELx_EC_WATCHPT_CUR:
++		el1_watchpt(regs, esr);
++		break;
+ 	case ESR_ELx_EC_BRK64:
+ 		el1_dbg(regs, esr);
+ 		break;
+@@ -800,6 +814,19 @@ static void noinstr el0_softstp(struct pt_regs *regs, unsigned long esr)
+ 	exit_to_user_mode(regs);
+ }
+ 
++static void noinstr el0_watchpt(struct pt_regs *regs, unsigned long esr)
++{
++	/* Watchpoints are the only debug exception to write FAR_EL1 */
++	unsigned long far = read_sysreg(far_el1);
++
++	enter_from_user_mode(regs);
++	debug_exception_enter(regs);
++	do_watchpoint(far, esr, regs);
++	debug_exception_exit(regs);
++	local_daif_restore(DAIF_PROCCTX);
++	exit_to_user_mode(regs);
++}
++
+ static void noinstr el0_dbg(struct pt_regs *regs, unsigned long esr)
+ {
+ 	/* Only watchpoints write FAR_EL1, otherwise its UNKNOWN */
+@@ -882,6 +909,8 @@ asmlinkage void noinstr el0t_64_sync_handler(struct pt_regs *regs)
+ 		el0_softstp(regs, esr);
+ 		break;
+ 	case ESR_ELx_EC_WATCHPT_LOW:
++		el0_watchpt(regs, esr);
++		break;
+ 	case ESR_ELx_EC_BRK64:
+ 		el0_dbg(regs, esr);
+ 		break;
+@@ -1006,6 +1035,8 @@ asmlinkage void noinstr el0t_32_sync_handler(struct pt_regs *regs)
+ 		el0_softstp(regs, esr);
+ 		break;
+ 	case ESR_ELx_EC_WATCHPT_LOW:
++		el0_watchpt(regs, esr);
++		break;
+ 	case ESR_ELx_EC_BKPT32:
+ 		el0_dbg(regs, esr);
+ 		break;
+diff --git a/arch/arm64/kernel/hw_breakpoint.c b/arch/arm64/kernel/hw_breakpoint.c
+index 8a80e13347c88f..ab76b36dce820b 100644
+--- a/arch/arm64/kernel/hw_breakpoint.c
++++ b/arch/arm64/kernel/hw_breakpoint.c
+@@ -750,8 +750,7 @@ static int watchpoint_report(struct perf_event *wp, unsigned long addr,
+ 	return step;
+ }
+ 
+-static int watchpoint_handler(unsigned long addr, unsigned long esr,
+-			      struct pt_regs *regs)
++void do_watchpoint(unsigned long addr, unsigned long esr, struct pt_regs *regs)
+ {
+ 	int i, step = 0, *kernel_step, access, closest_match = 0;
+ 	u64 min_dist = -1, dist;
+@@ -806,7 +805,7 @@ static int watchpoint_handler(unsigned long addr, unsigned long esr,
+ 	rcu_read_unlock();
+ 
+ 	if (!step)
+-		return 0;
++		return;
+ 
+ 	/*
+ 	 * We always disable EL0 watchpoints because the kernel can
+@@ -819,7 +818,7 @@ static int watchpoint_handler(unsigned long addr, unsigned long esr,
+ 
+ 		/* If we're already stepping a breakpoint, just return. */
+ 		if (debug_info->bps_disabled)
+-			return 0;
++			return;
+ 
+ 		if (test_thread_flag(TIF_SINGLESTEP))
+ 			debug_info->suspended_step = 1;
+@@ -830,7 +829,7 @@ static int watchpoint_handler(unsigned long addr, unsigned long esr,
+ 		kernel_step = this_cpu_ptr(&stepping_kernel_bp);
+ 
+ 		if (*kernel_step != ARM_KERNEL_STEP_NONE)
+-			return 0;
++			return;
+ 
+ 		if (kernel_active_single_step()) {
+ 			*kernel_step = ARM_KERNEL_STEP_SUSPEND;
+@@ -839,10 +838,8 @@ static int watchpoint_handler(unsigned long addr, unsigned long esr,
+ 			kernel_enable_single_step(regs);
+ 		}
+ 	}
+-
+-	return 0;
+ }
+-NOKPROBE_SYMBOL(watchpoint_handler);
++NOKPROBE_SYMBOL(do_watchpoint);
+ 
+ /*
+  * Handle single-step exception.
+@@ -984,10 +981,6 @@ static int __init arch_hw_breakpoint_init(void)
+ 	pr_info("found %d breakpoint and %d watchpoint registers.\n",
+ 		core_num_brps, core_num_wrps);
+ 
+-	/* Register debug fault handlers. */
+-	hook_debug_fault_code(DBG_ESR_EVT_HWWP, watchpoint_handler, SIGTRAP,
+-			      TRAP_HWBKPT, "hw-watchpoint handler");
+-
+ 	/*
+ 	 * Reset the breakpoint resources. We assume that a halting
+ 	 * debugger will leave the world in a nice state for us.
+-- 
+2.53.0
+
