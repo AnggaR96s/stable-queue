@@ -1,0 +1,111 @@
+From bd3bf302b345b6a160221064792f0d0c6bfa6684 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 11 Jun 2026 12:11:27 +0000
+Subject: xfrm: hold dev ref until after transport_finish NF_HOOK
+
+From: Qi Tang <tpluszz77@gmail.com>
+
+[ Upstream commit 1c428b03840094410c5fb6a5db30640486bbbfcb ]
+
+After async crypto completes, xfrm_input_resume() calls dev_put()
+immediately on re-entry before the skb reaches transport_finish.
+The skb->dev pointer is then used inside NF_HOOK and its okfn,
+which can race with device teardown.
+
+Remove the dev_put from the async resumption entry and instead
+drop the reference after the NF_HOOK call in transport_finish,
+using a saved device pointer since NF_HOOK may consume the skb.
+This covers NF_DROP, NF_QUEUE and NF_STOLEN paths that skip
+the okfn.
+
+For non-transport exits (decaps, gro, drop) and secondary
+async return points, release the reference inline when
+async is set.
+
+Suggested-by: Florian Westphal <fw@strlen.de>
+Fixes: acf568ee859f ("xfrm: Reinject transport-mode packets through tasklet")
+Cc: stable@vger.kernel.org
+Signed-off-by: Qi Tang <tpluszz77@gmail.com>
+Signed-off-by: Steffen Klassert <steffen.klassert@secunet.com>
+[ net/xfrm/xfrm_input.c: dev_hold/dev_put are unconditional here rather
+than inside !crypto_done as in mainline, and the dev_put in the
+encap_type == -1 async-resumption block does not exist. Adapted by
+taking a fresh dev_hold (when async && !xfrm_gro) immediately before
+transport_finish, which releases it after NF_HOOK. The per-iteration
+dev_hold/dev_put pair at loop-top/resume: is left unchanged.]
+Signed-off-by: Simon Liebold <simonlie@amazon.de>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ net/ipv4/xfrm4_input.c | 5 ++++-
+ net/ipv6/xfrm6_input.c | 5 ++++-
+ net/xfrm/xfrm_input.c  | 5 ++++-
+ 3 files changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/net/ipv4/xfrm4_input.c b/net/ipv4/xfrm4_input.c
+index 12a1a0f421956c..adf21d6b6076c1 100644
+--- a/net/ipv4/xfrm4_input.c
++++ b/net/ipv4/xfrm4_input.c
+@@ -50,6 +50,7 @@ int xfrm4_transport_finish(struct sk_buff *skb, int async)
+ {
+ 	struct xfrm_offload *xo = xfrm_offload(skb);
+ 	struct iphdr *iph = ip_hdr(skb);
++	struct net_device *dev = skb->dev;
+ 
+ 	iph->protocol = XFRM_MODE_SKB_CB(skb)->protocol;
+ 
+@@ -73,8 +74,10 @@ int xfrm4_transport_finish(struct sk_buff *skb, int async)
+ 	}
+ 
+ 	NF_HOOK(NFPROTO_IPV4, NF_INET_PRE_ROUTING,
+-		dev_net(skb->dev), NULL, skb, skb->dev, NULL,
++		dev_net(dev), NULL, skb, dev, NULL,
+ 		xfrm4_rcv_encap_finish);
++	if (async)
++		dev_put(dev);
+ 	return 0;
+ }
+ 
+diff --git a/net/ipv6/xfrm6_input.c b/net/ipv6/xfrm6_input.c
+index 9005fc156a20e6..699a001ac16629 100644
+--- a/net/ipv6/xfrm6_input.c
++++ b/net/ipv6/xfrm6_input.c
+@@ -43,6 +43,7 @@ static int xfrm6_transport_finish2(struct net *net, struct sock *sk,
+ int xfrm6_transport_finish(struct sk_buff *skb, int async)
+ {
+ 	struct xfrm_offload *xo = xfrm_offload(skb);
++	struct net_device *dev = skb->dev;
+ 	int nhlen = -skb_network_offset(skb);
+ 
+ 	skb_network_header(skb)[IP6CB(skb)->nhoff] =
+@@ -68,8 +69,10 @@ int xfrm6_transport_finish(struct sk_buff *skb, int async)
+ 	}
+ 
+ 	NF_HOOK(NFPROTO_IPV6, NF_INET_PRE_ROUTING,
+-		dev_net(skb->dev), NULL, skb, skb->dev, NULL,
++		dev_net(dev), NULL, skb, dev, NULL,
+ 		xfrm6_transport_finish2);
++	if (async)
++		dev_put(dev);
+ 	return 0;
+ }
+ 
+diff --git a/net/xfrm/xfrm_input.c b/net/xfrm/xfrm_input.c
+index 8edcb32735e595..0288d98e66ee48 100644
+--- a/net/xfrm/xfrm_input.c
++++ b/net/xfrm/xfrm_input.c
+@@ -726,8 +726,11 @@ int xfrm_input(struct sk_buff *skb, int nexthdr, __be32 spi, int encap_type)
+ 		err = -EAFNOSUPPORT;
+ 		rcu_read_lock();
+ 		afinfo = xfrm_state_afinfo_get_rcu(x->props.family);
+-		if (likely(afinfo))
++		if (likely(afinfo)) {
++			if (async && !xfrm_gro)
++				dev_hold(skb->dev);
+ 			err = afinfo->transport_finish(skb, xfrm_gro || async);
++		}
+ 		rcu_read_unlock();
+ 		if (xfrm_gro) {
+ 			sp = skb_sec_path(skb);
+-- 
+2.53.0
+
