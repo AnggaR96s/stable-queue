@@ -1,0 +1,141 @@
+From cc4e2b797c1e6c523f1dddc378e7268ac7a48217 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 10 Jun 2026 11:25:49 -0400
+Subject: drm/xe: fix job timeout recovery for unstarted jobs and kernel queues
+
+From: Rodrigo Vivi <rodrigo.vivi@intel.com>
+
+[ Upstream commit 347ccc0453fca2c669e8dc8a72000e76ca4adf10 ]
+
+A job that GuC never scheduled (never started) indicates a GuC
+scheduling failure; previously such jobs were silently errored out
+instead of triggering a GT reset to recover. Trigger a GT reset and
+resubmit them, but only when the queue was not already killed or banned:
+an unstarted job on an already banned queue is the ban working as
+intended and must neither clear the ban nor kick off a reset, otherwise
+a banned userspace queue could be resurrected and spam GT resets.
+
+Kernel queues are always recovered this way and wedge the device once
+recovery attempts are exhausted, since kernel work must not silently
+fail. A started job that times out on a userspace VM bind queue stays
+banned rather than being reset and retried.
+
+The queue is banned early in the timeout handler to signal the G2H
+scheduling-done handler so it wakes the disable-scheduling waiter;
+without it the waiter sleeps the full 5s timeout. When a reset is
+warranted the ban is cleared before rearming so that
+guc_exec_queue_start() can resubmit jobs after the GT reset - a
+still-banned queue would block resubmission and cause an infinite TDR
+loop. The already-banned case is gated out before this point via
+skip_timeout_check, so it is unaffected.
+
+v2: (Himal) Do it for any queue type, not just kernel/migration
+v3: - (Sashiko and Sanjay): don't clear the ban / GT reset for already
+      killed/banned queues on unstarted-job timeout
+    - Update commit message
+    - (Matt) Add Fixes tag
+
+Fixes: fe05cee4d953 ("drm/xe: Don't short circuit TDR on jobs not started")
+Cc: Matthew Auld <matthew.auld@intel.com>
+Cc: Matthew Brost <matthew.brost@intel.com>
+Cc: Sanjay Yadav <sanjay.kumar.yadav@intel.com>
+Cc: Himal Prasad Ghimiray <himal.prasad.ghimiray@intel.com>
+Assisted-by: GitHub-Copilot:claude-sonnet-4.6
+Assisted-by: GitHub-Copilot:claude-opus-4.8
+Tested-by: Sanjay Yadav <sanjay.kumar.yadav@intel.com>
+Reviewed-by: Sanjay Yadav <sanjay.kumar.yadav@intel.com>
+Reviewed-by: Matthew Brost <matthew.brost@intel.com>
+Reviewed-by: Himal Prasad Ghimiray <himal.prasad.ghimiray@intel.com>
+Link: https://patch.msgid.link/20260610152548.404575-3-rodrigo.vivi@intel.com
+Signed-off-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+(cherry picked from commit b1107d085e7e8ed15ba6f80c102528a9c8a6cb0e)
+Signed-off-by: Matthew Brost <matthew.brost@intel.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/gpu/drm/xe/xe_guc_submit.c | 49 +++++++++++++++++++++---------
+ 1 file changed, 35 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_guc_submit.c b/drivers/gpu/drm/xe/xe_guc_submit.c
+index e948f40fa17896..6365eca9816092 100644
+--- a/drivers/gpu/drm/xe/xe_guc_submit.c
++++ b/drivers/gpu/drm/xe/xe_guc_submit.c
+@@ -159,6 +159,11 @@ static void set_exec_queue_banned(struct xe_exec_queue *q)
+ 	atomic_or(EXEC_QUEUE_STATE_BANNED, &q->guc->state);
+ }
+ 
++static void clear_exec_queue_banned(struct xe_exec_queue *q)
++{
++	atomic_andnot(EXEC_QUEUE_STATE_BANNED, &q->guc->state);
++}
++
+ static bool exec_queue_suspended(struct xe_exec_queue *q)
+ {
+ 	return atomic_read(&q->guc->state) & EXEC_QUEUE_STATE_SUSPENDED;
+@@ -1326,7 +1331,8 @@ static bool check_timeout(struct xe_exec_queue *q, struct xe_sched_job *job)
+ 			   xe_sched_job_seqno(job), xe_sched_job_lrc_seqno(job),
+ 			   q->guc->id);
+ 
+-		return xe_sched_invalidate_job(job, 2);
++		/* GuC never scheduled this job - let the caller trigger a GT reset. */
++		return true;
+ 	}
+ 
+ 	ctx_timestamp = lower_32_bits(xe_lrc_timestamp(q->lrc[0]));
+@@ -1423,6 +1429,21 @@ static void disable_scheduling(struct xe_exec_queue *q, bool immediate)
+ 			       G2H_LEN_DW_SCHED_CONTEXT_MODE_SET, 1);
+ }
+ 
++/*
++ * Recover via GT reset for a kernel queue, or for a GuC scheduling failure (job
++ * never started) on a queue that was not already killed or banned. An already
++ * banned queue must stay banned, so its unstarted jobs do not clear the ban or
++ * trigger a reset.
++ */
++static bool timeout_needs_gt_reset(struct xe_exec_queue *q, struct xe_sched_job *job,
++				   bool skip_timeout_check)
++{
++	if (q->flags & EXEC_QUEUE_FLAG_KERNEL)
++		return true;
++
++	return !skip_timeout_check && !xe_sched_job_started(job);
++}
++
+ static enum drm_gpu_sched_stat
+ guc_exec_queue_timedout_job(struct drm_sched_job *drm_job)
+ {
+@@ -1573,19 +1594,19 @@ guc_exec_queue_timedout_job(struct drm_sched_job *drm_job)
+ 			       xe_sched_job_seqno(job), xe_sched_job_lrc_seqno(job),
+ 			       q->guc->id, q->flags);
+ 
+-	/*
+-	 * Kernel jobs should never fail, nor should VM jobs if they do
+-	 * somethings has gone wrong and the GT needs a reset
+-	 */
+-	xe_gt_WARN(q->gt, q->flags & EXEC_QUEUE_FLAG_KERNEL,
+-		   "Kernel-submitted job timed out\n");
+-	xe_gt_WARN(q->gt, q->flags & EXEC_QUEUE_FLAG_VM && !exec_queue_killed(q),
+-		   "VM job timed out on non-killed execqueue\n");
+-	if (!wedged && (q->flags & EXEC_QUEUE_FLAG_KERNEL ||
+-			(q->flags & EXEC_QUEUE_FLAG_VM && !exec_queue_killed(q)))) {
+-		if (!xe_sched_invalidate_job(job, 2)) {
+-			xe_gt_reset_async(q->gt);
+-			goto rearm;
++	if (!wedged) {
++		if (timeout_needs_gt_reset(q, job, skip_timeout_check)) {
++			if (!xe_sched_invalidate_job(job, 2)) {
++				clear_exec_queue_banned(q);
++				xe_gt_reset_async(q->gt);
++				goto rearm;
++			}
++			if (q->flags & EXEC_QUEUE_FLAG_KERNEL) {
++				xe_gt_WARN(q->gt, true, "Kernel-submitted job timed out\n");
++				xe_device_declare_wedged(gt_to_xe(q->gt));
++			}
++		} else if (q->flags & EXEC_QUEUE_FLAG_VM && !exec_queue_killed(q)) {
++			xe_gt_WARN(q->gt, true, "VM job timed out on non-killed execqueue\n");
+ 		}
+ 	}
+ 
+-- 
+2.53.0
+

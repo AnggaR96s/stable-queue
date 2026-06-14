@@ -1,0 +1,85 @@
+From 9cbae74b1410efacb9733c9348cdc17065d7f8e1 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 25 May 2026 16:23:45 +1000
+Subject: VFS: fix possible failure to unlock in nfsd4_create_file()
+
+From: NeilBrown <neilb@ownmail.net>
+
+[ Upstream commit e824bbd4d224cce4b5fb59cc9dcd3447fe0b7e44 ]
+
+atomic_create() in fs/namei.c drops the reference to the dentry
+when it returns an error.
+This behaviour was imported into dentry_create() so that it
+will drop the reference if an error is returned from atomic_create(),
+though not if vfs_create() returns an error (in the case where
+->atomic_create is not supported).
+
+The caller - nfsd4_create_file() - is made aware of this by checking
+path->dentry, which will either be a counted reference to a dentry, or
+an error pointer.
+
+However the change to use start_creating()/end_creating() (which landed
+shortly before the dentry_create() change landed, though was likely
+developed around the same time) means that nfsd4_create_file() *needs* a
+valid dentry so that it can unlock the parent.
+
+The net result is that if NFSD exports a filesystem which uses
+->atomic_create, and if a call to ->atomic_create returns an error, then
+nfsd4_create_file() will pass an error pointer to end_creating()
+and the parent will not be unlocked.
+
+Fix this by changing dentry_create() to make sure path->dentry is always
+a valid dentry, never an error-pointer.  The actual error is already
+returned a different way.
+
+Note that if ->atomic_create() returns a different dentry (which may not
+be possible in practice) we are guaranteed (because it is only ever
+provided by d_spliace_alias()) that it will have the same d_parent and
+so it will have the same effect when passed to end_creating().
+
+Fixes: 64a989dbd144 ("VFS/knfsd: Teach dentry_create() to use atomic_open()")
+Signed-off-by: NeilBrown <neil@brown.name>
+Link: https://patch.msgid.link/177969022571.3379282.16448744624428323496@noble.neil.brown.name
+Reviewed-by: Jeff Layton <jlayton@kernel.org>
+Reviewed-by: Benjamin Coddington <bcodding@hammerspace.com>
+Reviewed-by: Jori Koolstra <jkoolstra@xs4all.nl>
+Signed-off-by: Christian Brauner (Amutable) <brauner@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/namei.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/fs/namei.c b/fs/namei.c
+index 9e5500dad14f59..d615cd62885198 100644
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -5002,6 +5002,7 @@ struct file *dentry_create(struct path *path, int flags, umode_t mode,
+ {
+ 	struct file *file __free(fput) = NULL;
+ 	struct dentry *dentry = path->dentry;
++	struct dentry *orig_dentry = dentry;
+ 	struct dentry *dir = dentry->d_parent;
+ 	struct inode *dir_inode = d_inode(dir);
+ 	struct mnt_idmap *idmap;
+@@ -5021,9 +5022,18 @@ struct file *dentry_create(struct path *path, int flags, umode_t mode,
+ 		if (create_error)
+ 			flags &= ~O_CREAT;
+ 
++		/* atomic_open will dput(dentry) on error */
++		dget(orig_dentry);
+ 		dentry = atomic_open(path, dentry, file, flags, mode);
+ 		error = PTR_ERR_OR_ZERO(dentry);
+ 
++		if (IS_ERR(dentry))
++			/* keep the original */
++			dentry = orig_dentry;
++		else
++			/* Drop the extra reference */
++			dput(orig_dentry);
++
+ 		if (unlikely(create_error) && error == -ENOENT)
+ 			error = create_error;
+ 
+-- 
+2.53.0
+
