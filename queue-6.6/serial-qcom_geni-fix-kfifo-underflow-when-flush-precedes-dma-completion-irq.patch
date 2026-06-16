@@ -1,0 +1,69 @@
+From stable+bounces-260880-greg=kroah.com@vger.kernel.org Sat Jun  6 18:19:51 2026
+From: Sasha Levin <sashal@kernel.org>
+Date: Sat,  6 Jun 2026 08:49:44 -0400
+Subject: serial: qcom_geni: fix kfifo underflow when flush precedes DMA completion IRQ
+To: stable@vger.kernel.org
+Cc: Viken Dadhaniya <viken.dadhaniya@oss.qualcomm.com>, stable <stable@kernel.org>, Bartosz Golaszewski <bartosz.golaszewski@oss.qualcomm.com>, Greg Kroah-Hartman <gregkh@linuxfoundation.org>, Sasha Levin <sashal@kernel.org>
+Message-ID: <20260606124944.2878832-1-sashal@kernel.org>
+
+From: Viken Dadhaniya <viken.dadhaniya@oss.qualcomm.com>
+
+[ Upstream commit 452d6fa37ae9b021f4f6d397dbae077f7296f6f4 ]
+
+When uart_flush_buffer() runs before the DMA completion IRQ is delivered,
+the following race can occur (all steps serialized by uart_port_lock):
+
+  1. DMA starts: tx_remaining = N, kfifo contains N bytes
+  2. DMA completes in hardware; IRQ is pending but not yet delivered
+  3. uart_flush_buffer() acquires the port lock and calls kfifo_reset(),
+     making kfifo_len() = 0 while tx_remaining remains N
+  4. uart_flush_buffer() releases the port lock
+  5. DMA IRQ fires; handle_tx_dma() acquires the port lock and calls
+     uart_xmit_advance(uport, tx_remaining) on an empty kfifo
+
+uart_xmit_advance() increments kfifo->out by tx_remaining. Since
+kfifo_reset() already set both in and out to 0, out wraps past in,
+causing kfifo_len() to return UART_XMIT_SIZE - tx_remaining. The next
+start_tx_dma() call then submits a DMA transfer of stale buffer data.
+
+Fix this by snapshotting kfifo_len() at the start of handle_tx_dma()
+and skipping uart_xmit_advance() when fifo_len < tx_remaining, which
+indicates the kfifo was reset by a preceding flush.
+
+Fixes: 2aaa43c70778 ("tty: serial: qcom-geni-serial: add support for serial engine DMA")
+Cc: stable <stable@kernel.org>
+Signed-off-by: Viken Dadhaniya <viken.dadhaniya@oss.qualcomm.com>
+Reviewed-by: Bartosz Golaszewski <bartosz.golaszewski@oss.qualcomm.com>
+Link: https://patch.msgid.link/20260506-serial-dma-stale-tx-buf-v1-1-e3ccb360d719@oss.qualcomm.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/tty/serial/qcom_geni_serial.c |   15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+--- a/drivers/tty/serial/qcom_geni_serial.c
++++ b/drivers/tty/serial/qcom_geni_serial.c
+@@ -962,8 +962,21 @@ static void qcom_geni_serial_handle_tx_d
+ {
+ 	struct qcom_geni_serial_port *port = to_dev_port(uport);
+ 	struct circ_buf *xmit = &uport->state->xmit;
++	unsigned int chars_pending = uart_circ_chars_pending(xmit);
++
++	/*
++	 * Only advance the buffer if it still contains the bytes that were
++	 * transferred. uart_flush_buffer() may have run before this IRQ
++	 * fired: it clears the circular buffer under the port lock, making
++	 * chars_pending = 0 while tx_remaining remains non-zero. Calling
++	 * uart_xmit_advance() in that case would advance xmit->tail past
++	 * xmit->head, making uart_circ_chars_pending() wrap to
++	 * UART_XMIT_SIZE - tx_remaining and triggering a spurious large DMA
++	 * transfer of stale data.
++	 */
++	if (chars_pending >= port->tx_remaining)
++		uart_xmit_advance(uport, port->tx_remaining);
+ 
+-	uart_xmit_advance(uport, port->tx_remaining);
+ 	geni_se_tx_dma_unprep(&port->se, port->tx_dma_addr, port->tx_remaining);
+ 	port->tx_dma_addr = 0;
+ 	port->tx_remaining = 0;
