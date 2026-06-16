@@ -1,0 +1,120 @@
+From stable+bounces-249027-greg=kroah.com@vger.kernel.org Sun May 17 00:39:15 2026
+From: Sasha Levin <sashal@kernel.org>
+Date: Sat, 16 May 2026 15:09:10 -0400
+Subject: smb: client: validate dacloffset before building DACL pointers
+To: stable@vger.kernel.org
+Cc: Michael Bommarito <michael.bommarito@gmail.com>, Steve French <stfrench@microsoft.com>, Sasha Levin <sashal@kernel.org>
+Message-ID: <20260516190910.4016968-1-sashal@kernel.org>
+
+From: Michael Bommarito <michael.bommarito@gmail.com>
+
+[ Upstream commit f98b48151cc502ada59d9778f0112d21f2586ca3 ]
+
+parse_sec_desc(), build_sec_desc(), and the chown path in
+id_mode_to_cifs_acl() all add the server-supplied dacloffset to pntsd
+before proving a DACL header fits inside the returned security
+descriptor.
+
+On 32-bit builds a malicious server can return dacloffset near
+U32_MAX, wrap the derived DACL pointer below end_of_acl, and then slip
+past the later pointer-based bounds checks. build_sec_desc() and
+id_mode_to_cifs_acl() can then dereference DACL fields from the wrapped
+pointer in the chmod/chown rewrite paths.
+
+Validate dacloffset numerically before building any DACL pointer and
+reuse the same helper at the three DACL entry points.
+
+Fixes: bc3e9dd9d104 ("cifs: Change SIDs in ACEs while transferring file ownership.")
+Cc: stable@vger.kernel.org
+Assisted-by: Claude:claude-opus-4-6
+Signed-off-by: Michael Bommarito <michael.bommarito@gmail.com>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+[ renamed smb_ntsd/smb_acl structs to cifs_ntsd/cifs_acl and kept existing inline ACL size check instead of using missing validate_dacl() helper ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/cifs/cifsacl.c |   35 ++++++++++++++++++++++++++++++++---
+ 1 file changed, 32 insertions(+), 3 deletions(-)
+
+--- a/fs/cifs/cifsacl.c
++++ b/fs/cifs/cifsacl.c
+@@ -1254,6 +1254,17 @@ static int parse_sid(struct cifs_sid *ps
+ 	return 0;
+ }
+ 
++static bool dacl_offset_valid(unsigned int acl_len, __u32 dacloffset)
++{
++	if (acl_len < sizeof(struct cifs_acl))
++		return false;
++
++	if (dacloffset < sizeof(struct cifs_ntsd))
++		return false;
++
++	return dacloffset <= acl_len - sizeof(struct cifs_acl);
++}
++
+ 
+ /* Convert CIFS ACL to POSIX form */
+ static int parse_sec_desc(struct cifs_sb_info *cifs_sb,
+@@ -1274,7 +1285,6 @@ static int parse_sec_desc(struct cifs_sb
+ 	group_sid_ptr = (struct cifs_sid *)((char *)pntsd +
+ 				le32_to_cpu(pntsd->gsidoffset));
+ 	dacloffset = le32_to_cpu(pntsd->dacloffset);
+-	dacl_ptr = (struct cifs_acl *)((char *)pntsd + dacloffset);
+ 	cifs_dbg(NOISY, "revision %d type 0x%x ooffset 0x%x goffset 0x%x sacloffset 0x%x dacloffset 0x%x\n",
+ 		 pntsd->revision, pntsd->type, le32_to_cpu(pntsd->osidoffset),
+ 		 le32_to_cpu(pntsd->gsidoffset),
+@@ -1305,11 +1315,18 @@ static int parse_sec_desc(struct cifs_sb
+ 		return rc;
+ 	}
+ 
+-	if (dacloffset)
++	if (dacloffset) {
++		if (!dacl_offset_valid(acl_len, dacloffset)) {
++			cifs_dbg(VFS, "Server returned illegal DACL offset\n");
++			return -EINVAL;
++		}
++
++		dacl_ptr = (struct cifs_acl *)((char *)pntsd + dacloffset);
+ 		parse_dacl(dacl_ptr, end_of_acl, owner_sid_ptr,
+ 			   group_sid_ptr, fattr, get_mode_from_special_sid);
+-	else
++	} else {
+ 		cifs_dbg(FYI, "no ACL\n"); /* BB grant all or default perms? */
++	}
+ 
+ 	return rc;
+ }
+@@ -1332,6 +1349,11 @@ static int build_sec_desc(struct cifs_nt
+ 
+ 	dacloffset = le32_to_cpu(pntsd->dacloffset);
+ 	if (dacloffset) {
++		if (!dacl_offset_valid(secdesclen, dacloffset)) {
++			cifs_dbg(VFS, "Server returned illegal DACL offset\n");
++			return -EINVAL;
++		}
++
+ 		dacl_ptr = (struct cifs_acl *)((char *)pntsd + dacloffset);
+ 		rc = validate_dacl(dacl_ptr, end_of_acl);
+ 		if (rc)
+@@ -1694,6 +1716,12 @@ id_mode_to_cifs_acl(struct inode *inode,
+ 		nsecdesclen = sizeof(struct cifs_ntsd) + (sizeof(struct cifs_sid) * 2);
+ 		dacloffset = le32_to_cpu(pntsd->dacloffset);
+ 		if (dacloffset) {
++			if (!dacl_offset_valid(secdesclen, dacloffset)) {
++				cifs_dbg(VFS, "Server returned illegal DACL offset\n");
++				rc = -EINVAL;
++				goto id_mode_to_cifs_acl_exit;
++			}
++
+ 			dacl_ptr = (struct cifs_acl *)((char *)pntsd + dacloffset);
+ 			rc = validate_dacl(dacl_ptr, (char *)pntsd + secdesclen);
+ 			if (rc) {
+@@ -1736,6 +1764,7 @@ id_mode_to_cifs_acl(struct inode *inode,
+ 		rc = ops->set_acl(pnntsd, nsecdesclen, inode, path, aclflag);
+ 		cifs_dbg(NOISY, "set_cifs_acl rc: %d\n", rc);
+ 	}
++id_mode_to_cifs_acl_exit:
+ 	cifs_put_tlink(tlink);
+ 
+ 	kfree(pnntsd);
