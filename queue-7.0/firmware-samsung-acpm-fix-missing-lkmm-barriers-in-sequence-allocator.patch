@@ -1,0 +1,105 @@
+From stable+bounces-266788-greg=kroah.com@vger.kernel.org Wed Jun 17 16:28:23 2026
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 17 Jun 2026 10:27:39 -0400
+Subject: firmware: samsung: acpm: Fix missing LKMM barriers in sequence allocator
+To: stable@vger.kernel.org
+Cc: Tudor Ambarus <tudor.ambarus@linaro.org>, Krzysztof Kozlowski <krzk@kernel.org>, Sasha Levin <sashal@kernel.org>
+Message-ID: <20260617142739.3938338-5-sashal@kernel.org>
+
+From: Tudor Ambarus <tudor.ambarus@linaro.org>
+
+[ Upstream commit bf296f83a3ddab1ab875edc4e8862cb10553064f ]
+
+Sashiko identified memory ordering races in [1].
+
+The ACPM driver uses a globally shared 'bitmap_seqnum' to track
+available sequence numbers. Even though threads now strictly free their
+own sequence numbers, the allocation and freeing of these bits across
+concurrent threads are effectively lockless operations and require
+explicit LKMM memory barriers.
+
+Previously, the driver used plain bitwise operators (test_bit, set_bit,
+clear_bit), which lack ordering guarantees. This creates two race
+conditions on weakly ordered architectures like ARM64:
+
+1. Polling Release Violation: The polling thread copies its payload and
+   calls clear_bit(). Without a release barrier, the CPU can reorder
+   the memory operations, making the cleared bit globally visible
+   before the payload reads have fully completed.
+2. TX Acquire Violation: The TX thread loops on test_bit(), calls
+   set_bit(), and then wipes the payload buffer via memset(). Without
+   an acquire barrier, the CPU can speculatively execute the memset()
+   before the bit is safely and formally claimed.
+
+If these reorderings overlap, a new TX thread can claim the sequence
+number and overwrite the buffer while the original polling thread is
+still actively reading from it.
+
+Fix this by upgrading the bitwise operators. Wrap the TX allocation in
+test_and_set_bit_lock() to establish formal LKMM Acquire semantics, and
+pair it with clear_bit_unlock() in the polling path to enforce Release
+semantics.
+
+Cc: stable@vger.kernel.org
+Fixes: a88927b534ba ("firmware: add Exynos ACPM protocol driver")
+Closes: https://sashiko.dev/#/patchset/20260423-acpm-fixes-sashiko-reports-v1-0-2217b790925e%40linaro.org [1]
+Signed-off-by: Tudor Ambarus <tudor.ambarus@linaro.org>
+Link: https://patch.msgid.link/20260505-acpm-fixes-sashiko-reports-v5-6-43b5ee7f1674@linaro.org
+Signed-off-by: Krzysztof Kozlowski <krzk@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/firmware/samsung/exynos-acpm.c |   18 +++++++++++-------
+ 1 file changed, 11 insertions(+), 7 deletions(-)
+
+--- a/drivers/firmware/samsung/exynos-acpm.c
++++ b/drivers/firmware/samsung/exynos-acpm.c
+@@ -7,7 +7,7 @@
+ 
+ #include <linux/bitfield.h>
+ #include <linux/bitmap.h>
+-#include <linux/bits.h>
++#include <linux/bitops.h>
+ #include <linux/cleanup.h>
+ #include <linux/container_of.h>
+ #include <linux/delay.h>
+@@ -340,7 +340,7 @@ static int acpm_dequeue_by_polling(struc
+ 				acpm_get_saved_rx(achan, xfer, seqnum);
+ 
+ 			/* Relinquish ownership of the sequence slot */
+-			clear_bit(seqnum - 1, achan->bitmap_seqnum);
++			clear_bit_unlock(seqnum - 1, achan->bitmap_seqnum);
+ 			return 0;
+ 		}
+ 
+@@ -397,11 +397,18 @@ static void acpm_prepare_xfer(struct acp
+ 	struct acpm_rx_data *rx_data;
+ 	u32 *txd = (u32 *)xfer->txd;
+ 
+-	/* Prevent chan->seqnum from being re-used */
++	/*
++	 * Prevent chan->seqnum from being re-used.
++	 * test_and_set_bit_lock() provides formal LKMM Acquire semantics.
++	 * It pairs with the RX thread's clear_bit_unlock() to ensure the CPU
++	 * does not speculatively execute the rx_data buffer wipe (memset)
++	 * before the sequence number is safely claimed.
++	 */
+ 	do {
+ 		if (++achan->seqnum == ACPM_SEQNUM_MAX)
+ 			achan->seqnum = 1;
+-	} while (test_bit(achan->seqnum - 1, achan->bitmap_seqnum));
++		/* Flag the index based on seqnum. (seqnum: 1~63, bitmap: 0~62) */
++	} while (test_and_set_bit_lock(achan->seqnum - 1, achan->bitmap_seqnum));
+ 
+ 	txd[0] |= FIELD_PREP(ACPM_PROTOCOL_SEQNUM, achan->seqnum);
+ 
+@@ -411,9 +418,6 @@ static void acpm_prepare_xfer(struct acp
+ 	memset(rx_data->cmd, 0, sizeof(*rx_data->cmd) * rx_data->n_cmd);
+ 	/* zero means no response expected */
+ 	rx_data->rxcnt = xfer->rxcnt;
+-
+-	/* Flag the index based on seqnum. (seqnum: 1~63, bitmap: 0~62) */
+-	set_bit(achan->seqnum - 1, achan->bitmap_seqnum);
+ }
+ 
+ /**
