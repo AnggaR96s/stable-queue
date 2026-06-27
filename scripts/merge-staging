@@ -1,0 +1,247 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# merge-staging - fold staging-$v directories into queue-$v
+#
+# Each staging-$v holds newly queued *.patch files plus a "series" file
+# listing them in apply order.  Merging moves the patches into queue-$v,
+# appends the staging series entries to the end of queue-$v/series, and
+# removes the now-empty staging dir.  Everything is staged with git so the
+# result can be reviewed and committed.
+#
+# Usage:
+#   merge-staging                 merge every active version (from
+#                                 active_kernel_versions) that has a staging dir
+#   merge-staging 6.6 7.1         merge only the named versions (overrides the
+#                                 active list, e.g. to handle an EOL version)
+#   merge-staging all             merge every staging-* dir that is present
+#   merge-staging --commit ...    also create the git commit when done
+#
+# A patch name that already exists in the target queue is treated as a hard
+# error: nothing is changed until every requested version is conflict-free.
+# Other (non-conflict) problems are reported as warnings and the merge
+# continues.  Exit status is non-zero if any requested version failed.
+
+REAL_SCRIPT=$(realpath -e "${BASH_SOURCE[0]}")
+SCRIPT_TOP="${SCRIPT_TOP:-$(dirname "${REAL_SCRIPT}")}"
+TOP="$(dirname "${SCRIPT_TOP}")"
+
+DO_COMMIT=0
+declare -a VERSIONS=()
+declare -a MERGED=()
+
+usage() {
+	sed -n '4,24p' "${REAL_SCRIPT}" | sed 's/^#\s\?//'
+}
+
+# echo the basenames of the *.patch files in staging-$1, one per line
+list_patches() {
+	local p
+	shopt -s nullglob
+	for p in "staging-$1"/*.patch; do
+		basename "$p"
+	done
+	shopt -u nullglob
+}
+
+# move a tracked-or-untracked file under git
+git_move() {
+	local src="$1" dst="$2"
+	if git ls-files --error-unmatch "$src" >/dev/null 2>&1; then
+		git mv "$src" "$dst"
+	else
+		mv "$src" "$dst" && git add "$dst"
+	fi
+}
+
+# remove a tracked-or-untracked file under git
+git_remove() {
+	local f="$1"
+	if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then
+		git rm -q "$f" >/dev/null
+	else
+		rm -f "$f"
+	fi
+}
+
+# append the entries of series file $1 to series file $2, skipping any that
+# are already present and keeping the staging order
+append_series() {
+	local src="$1" dst="$2" line
+	# make sure the existing series ends with a newline before appending
+	if [ -s "$dst" ] && [ -n "$(tail -c1 "$dst")" ]; then
+		echo >> "$dst"
+	fi
+	while IFS= read -r line || [ -n "$line" ]; do
+		[ -z "$line" ] && continue
+		if grep -qxF "$line" "$dst" 2>/dev/null; then
+			echo "  series: $line already present, not re-adding" >&2
+			continue
+		fi
+		printf '%s\n' "$line" >> "$dst"
+	done < "$src"
+}
+
+# remove the (expected-to-be-empty) staging dir
+remove_staging_dir() {
+	local d="$1"
+	if [ -n "$(git ls-files "$d")" ]; then
+		git rm -rq "$d" >/dev/null
+	fi
+	[ -d "$d" ] || return 0
+	if ! rmdir "$d" 2>/dev/null; then
+		echo "  warning: $d is not empty, leaving it in place:" >&2
+		ls -A "$d" | sed 's/^/    /' >&2
+		return 1
+	fi
+}
+
+merge_version() {
+	local v="$1"
+	local staging="staging-$v"
+	local queue="queue-$v"
+	local patches=() p
+
+	if [ ! -d "$staging" ]; then
+		echo "staging-$v: no such directory, skipping"
+		return 0
+	fi
+
+	while IFS= read -r p; do
+		[ -n "$p" ] && patches+=("$p")
+	done < <(list_patches "$v")
+
+	# empty staging dir: nothing to merge, just drop it
+	if [ ${#patches[@]} -eq 0 ] && [ ! -f "$staging/series" ]; then
+		echo "staging-$v: empty, removing"
+		remove_staging_dir "$staging"
+		return $?
+	fi
+
+	if [ ${#patches[@]} -eq 0 ]; then
+		echo "staging-$v: a series file but no patches - skipping, please check" >&2
+		return 1
+	fi
+
+	echo "staging-$v: merging ${#patches[@]} patch(es) into queue-$v"
+	mkdir -p "$queue"
+
+	# warn about patches that are not referenced by the staging series
+	if [ -f "$staging/series" ]; then
+		for p in "${patches[@]}"; do
+			grep -qxF "$p" "$staging/series" || \
+				echo "  warning: $p is not listed in $staging/series" >&2
+		done
+	else
+		echo "  warning: no $staging/series; patches moved but queue series not updated" >&2
+	fi
+
+	# warn about series entries with no corresponding patch
+	if [ -f "$staging/series" ]; then
+		while IFS= read -r p || [ -n "$p" ]; do
+			[ -z "$p" ] && continue
+			[ -f "$staging/$p" ] || [ -f "$queue/$p" ] || \
+				echo "  warning: series entry '$p' has no patch in $staging or $queue" >&2
+		done < "$staging/series"
+	fi
+
+	for p in "${patches[@]}"; do
+		git_move "$staging/$p" "$queue/$p" || return 1
+	done
+
+	if [ -f "$staging/series" ]; then
+		append_series "$staging/series" "$queue/series"
+		git add "$queue/series"
+		git_remove "$staging/series"
+	fi
+
+	remove_staging_dir "$staging" || return 1
+	MERGED+=("$v")
+	return 0
+}
+
+# ----- argument parsing -----------------------------------------------------
+
+for arg in "$@"; do
+	case "$arg" in
+	--commit)	DO_COMMIT=1 ;;
+	-h|--help)	usage; exit 0 ;;
+	-*)		echo "unknown option: $arg" >&2; usage >&2; exit 1 ;;
+	*)		VERSIONS+=("$arg") ;;
+	esac
+done
+
+cd "$TOP" || exit 1
+
+if [ ! -f active_kernel_versions ]; then
+	echo "error: active_kernel_versions not found in $TOP" >&2
+	exit 1
+fi
+
+# no versions given -> every active version that has a staging dir
+if [ ${#VERSIONS[@]} -eq 0 ]; then
+	while IFS= read -r v; do
+		[ -z "$v" ] && continue
+		[ -d "staging-$v" ] && VERSIONS+=("$v")
+	done < active_kernel_versions
+# the "all" keyword -> every staging-* dir present
+elif [ ${#VERSIONS[@]} -eq 1 ] && [ "${VERSIONS[0]}" = "all" ]; then
+	VERSIONS=()
+	shopt -s nullglob
+	for d in staging-*/; do
+		d="${d%/}"
+		VERSIONS+=("${d#staging-}")
+	done
+	shopt -u nullglob
+fi
+
+if [ ${#VERSIONS[@]} -eq 0 ]; then
+	echo "nothing to do: no matching staging-* directories"
+	exit 0
+fi
+
+# ----- pre-flight: refuse to overwrite existing queue patches ---------------
+
+declare -a COLLISIONS=()
+for v in "${VERSIONS[@]}"; do
+	[ -d "staging-$v" ] || continue
+	while IFS= read -r p; do
+		[ -z "$p" ] && continue
+		[ -e "queue-$v/$p" ] && COLLISIONS+=("queue-$v/$p")
+	done < <(list_patches "$v")
+done
+
+if [ ${#COLLISIONS[@]} -gt 0 ]; then
+	echo "error: refusing to overwrite existing queue patches:" >&2
+	printf '  %s\n' "${COLLISIONS[@]}" >&2
+	echo "resolve these and re-run; nothing was changed." >&2
+	exit 1
+fi
+
+# ----- merge ----------------------------------------------------------------
+
+RC=0
+for v in "${VERSIONS[@]}"; do
+	merge_version "$v" || RC=1
+done
+
+# ----- optional commit ------------------------------------------------------
+
+if [ "$DO_COMMIT" -eq 1 ]; then
+	if git diff --cached --quiet; then
+		echo "nothing staged, not committing"
+	else
+		msg="merge staging into queue"
+		[ ${#MERGED[@]} -gt 0 ] && msg="$msg: ${MERGED[*]}"
+		git commit -q -m "$msg" && echo "committed: $msg"
+	fi
+else
+	if ! git diff --cached --quiet; then
+		echo
+		echo "changes staged; review with 'git status' and commit, e.g.:"
+		[ ${#MERGED[@]} -gt 0 ] && \
+			echo "  git commit -m 'merge staging into queue: ${MERGED[*]}'"
+	fi
+fi
+
+exit $RC
