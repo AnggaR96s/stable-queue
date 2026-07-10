@@ -1,0 +1,154 @@
+From 49bd6abe10fe9f28e9e19b4dd1a29e70bf1381c4 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 10 Jul 2026 11:19:54 +0000
+Subject: virtio_net: Support dynamic rss indirection table size
+
+From: Philo Lu <lulie@linux.alibaba.com>
+
+commit 86a48a00efdf61197b6658e52c6140463eb313dc upstream.
+
+When reading/writing virtio_net_ctrl_rss, the indirection table size is
+obtained from vi->rss_indir_table_size, initialized during virtnet_probe().
+However, the indirection_table was statically sized as
+VIRTIO_NET_RSS_MAX_TABLE_LEN=128, potentially causing issues when
+vi->rss_indir_table_size exceeds this limit.
+
+This patch implements dynamic allocation for the indirection table,
+allocated alongside vi->rss after vi->rss_indir_table_size is initialized,
+and freed in virtnet_remove().
+
+In virtnet_commit_rss_command(), scatter-gather lists for RSS are
+initialized differently based on hash_report presence, so indirection_table
+is unused when !vi->has_rss. Therefore, allocation is unnecessary for
+hash_report-only scenarios.
+
+Fixes: c7114b1249fa ("drivers/net/virtio_net: Added basic RSS support.")
+Signed-off-by: Philo Lu <lulie@linux.alibaba.com>
+Signed-off-by: Xuan Zhuo <xuanzhuo@linux.alibaba.com>
+Acked-by: Joe Damato <jdamato@fastly.com>
+Acked-by: Michael S. Tsirkin <mst@redhat.com>
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+[ Hyokyung Kim: 6.6.y predates the refactor that moved the RSS config into
+  struct virtnet_info, so struct virtio_net_ctrl_rss is still embedded in
+  struct control_buf and reached through the heap-allocated vi->ctrl. Every
+  adaptation below follows from that single difference:
+  - the new allocation and all indirection_table accesses use vi->ctrl->rss
+    in place of upstream's vi->rss;
+  - because vi->ctrl is allocated in virtnet_alloc_queues() (via init_vqs())
+    and freed in virtnet_free_queues(), the table is allocated and freed there
+    too, not in virtnet_probe()/virtnet_remove(), so its lifetime tracks
+    vi->ctrl across the probe error-unwind and freeze/restore paths;
+  - since freeing the table now dereferences vi->ctrl, vi->ctrl is set to NULL
+    after each kfree so a re-entered virtnet_free_queues() cannot dereference
+    or free a stale pointer;
+  - the table is allocated with kcalloc() so it is zero-filled when
+    reallocated on the restore path (upstream never reallocates it). ]
+Signed-off-by: Hyokyung Kim <pulpannie@gmail.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/net/virtio_net.c | 43 +++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 38 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/net/virtio_net.c b/drivers/net/virtio_net.c
+index 33f61922c13994..5bcd1296851c6c 100644
+--- a/drivers/net/virtio_net.c
++++ b/drivers/net/virtio_net.c
+@@ -208,15 +208,16 @@ struct receive_queue {
+  * because table sizes may be differ according to the device configuration.
+  */
+ #define VIRTIO_NET_RSS_MAX_KEY_SIZE     40
+-#define VIRTIO_NET_RSS_MAX_TABLE_LEN    128
+ struct virtio_net_ctrl_rss {
+ 	u32 hash_types;
+ 	u16 indirection_table_mask;
+ 	u16 unclassified_queue;
+-	u16 indirection_table[VIRTIO_NET_RSS_MAX_TABLE_LEN];
++	u16 hash_cfg_reserved; /* for HASH_CONFIG (see virtio_net_hash_config for details) */
+ 	u16 max_tx_vq;
+ 	u8 hash_key_length;
+ 	u8 key[VIRTIO_NET_RSS_MAX_KEY_SIZE];
++
++	u16 *indirection_table;
+ };
+ 
+ /* Control VQ buffers: protected by the rtnl lock */
+@@ -3011,6 +3012,25 @@ static int virtnet_set_ringparam(struct net_device *dev,
+ 	return 0;
+ }
+ 
++static int rss_indirection_table_alloc(struct virtio_net_ctrl_rss *rss, u16 indir_table_size)
++{
++	if (!indir_table_size) {
++		rss->indirection_table = NULL;
++		return 0;
++	}
++
++	rss->indirection_table = kcalloc(indir_table_size, sizeof(u16), GFP_KERNEL);
++	if (!rss->indirection_table)
++		return -ENOMEM;
++
++	return 0;
++}
++
++static void rss_indirection_table_free(struct virtio_net_ctrl_rss *rss)
++{
++	kfree(rss->indirection_table);
++}
++
+ static bool virtnet_commit_rss_command(struct virtnet_info *vi)
+ {
+ 	struct net_device *dev = vi->dev;
+@@ -3020,11 +3040,15 @@ static bool virtnet_commit_rss_command(struct virtnet_info *vi)
+ 	/* prepare sgs */
+ 	sg_init_table(sgs, 4);
+ 
+-	sg_buf_size = offsetof(struct virtio_net_ctrl_rss, indirection_table);
++	sg_buf_size = offsetof(struct virtio_net_ctrl_rss, hash_cfg_reserved);
+ 	sg_set_buf(&sgs[0], &vi->ctrl->rss, sg_buf_size);
+ 
+-	sg_buf_size = sizeof(uint16_t) * (vi->ctrl->rss.indirection_table_mask + 1);
+-	sg_set_buf(&sgs[1], vi->ctrl->rss.indirection_table, sg_buf_size);
++	if (vi->has_rss) {
++		sg_buf_size = sizeof(uint16_t) * vi->rss_indir_table_size;
++		sg_set_buf(&sgs[1], vi->ctrl->rss.indirection_table, sg_buf_size);
++	} else {
++		sg_set_buf(&sgs[1], &vi->ctrl->rss.hash_cfg_reserved, sizeof(uint16_t));
++	}
+ 
+ 	sg_buf_size = offsetof(struct virtio_net_ctrl_rss, key)
+ 			- offsetof(struct virtio_net_ctrl_rss, max_tx_vq);
+@@ -4080,7 +4104,10 @@ static void virtnet_free_queues(struct virtnet_info *vi)
+ 
+ 	kfree(vi->rq);
+ 	kfree(vi->sq);
++	if (vi->ctrl)
++		rss_indirection_table_free(&vi->ctrl->rss);
+ 	kfree(vi->ctrl);
++	vi->ctrl = NULL;
+ }
+ 
+ static void _free_receive_bufs(struct virtnet_info *vi)
+@@ -4266,6 +4293,9 @@ static int virtnet_alloc_queues(struct virtnet_info *vi)
+ 		vi->ctrl = kzalloc(sizeof(*vi->ctrl), GFP_KERNEL);
+ 		if (!vi->ctrl)
+ 			goto err_ctrl;
++		if ((vi->has_rss || vi->has_rss_hash_report) &&
++		    rss_indirection_table_alloc(&vi->ctrl->rss, vi->rss_indir_table_size))
++			goto err_sq;
+ 	} else {
+ 		vi->ctrl = NULL;
+ 	}
+@@ -4298,7 +4328,10 @@ static int virtnet_alloc_queues(struct virtnet_info *vi)
+ err_rq:
+ 	kfree(vi->sq);
+ err_sq:
++	if (vi->ctrl)
++		rss_indirection_table_free(&vi->ctrl->rss);
+ 	kfree(vi->ctrl);
++	vi->ctrl = NULL;
+ err_ctrl:
+ 	return -ENOMEM;
+ }
+-- 
+2.53.0
+
