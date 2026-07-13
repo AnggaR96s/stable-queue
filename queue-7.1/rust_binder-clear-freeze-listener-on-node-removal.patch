@@ -1,0 +1,115 @@
+From bc4a9828897871ff3e5a1f8a1d346decbf4ee95e Mon Sep 17 00:00:00 2001
+From: Alice Ryhl <aliceryhl@google.com>
+Date: Fri, 3 Jul 2026 11:25:12 +0000
+Subject: rust_binder: clear freeze listener on node removal
+
+From: Alice Ryhl <aliceryhl@google.com>
+
+commit bc4a9828897871ff3e5a1f8a1d346decbf4ee95e upstream.
+
+Generally userspace is supposed to explicitly clear freeze listeners
+before they drop the refcount on the node ref to zero, but there's
+nothing forcing that. Currently, in this scenario the freeze listener
+remains in the freeze_listeners rbtree and in the remote node's freeze
+listener list, even though the ref for which the listener is registered
+is gone. This could potentially lead to a memory leak due to a refcount
+cycle. Thus, remove the freeze listener in this scenario.
+
+Cc: stable <stable@kernel.org>
+Fixes: eafedbc7c050 ("rust_binder: add Rust Binder driver")
+Signed-off-by: Alice Ryhl <aliceryhl@google.com>
+Link: https://patch.msgid.link/20260703-remove-freeze-on-remove-node-v3-1-6e0c4547af46@google.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/android/binder/freeze.rs  |   11 +++++++++--
+ drivers/android/binder/node.rs    |   10 ++++++----
+ drivers/android/binder/process.rs |   12 +++++++++++-
+ 3 files changed, 26 insertions(+), 7 deletions(-)
+
+--- a/drivers/android/binder/freeze.rs
++++ b/drivers/android/binder/freeze.rs
+@@ -154,10 +154,17 @@ impl DeliverToRead for FreezeMessage {
+ }
+ 
+ impl FreezeListener {
+-    pub(crate) fn on_process_exit(&self, proc: &Arc<Process>) {
++    /// Called when this freeze listener is cleared abnormally.
++    ///
++    /// This occurs either because the process exited or because the process dropped its last
++    /// refcount on the node ref without explicitly removing the freeze listener first.
++    ///
++    /// The returned `KVVec` is just a value that should be dropped outside of the lock.
++    pub(crate) fn on_process_cleanup(&self, proc: &Process) -> KVVec<Arc<Process>> {
+         if !self.is_clearing {
+-            self.node.remove_freeze_listener(proc);
++            return self.node.remove_freeze_listener(proc);
+         }
++        KVVec::new()
+     }
+ }
+ 
+--- a/drivers/android/binder/node.rs
++++ b/drivers/android/binder/node.rs
+@@ -682,12 +682,13 @@ impl Node {
+         }
+     }
+ 
+-    pub(crate) fn remove_freeze_listener(&self, p: &Arc<Process>) {
+-        let _unused_capacity;
++    pub(crate) fn remove_freeze_listener(&self, p: &Process) -> KVVec<Arc<Process>> {
+         let mut guard = self.owner.inner.lock();
+         let inner = self.inner.access_mut(&mut guard);
+         let len = inner.freeze_list.len();
+-        inner.freeze_list.retain(|proc| !Arc::ptr_eq(proc, p));
++        inner
++            .freeze_list
++            .retain(|proc| !core::ptr::eq::<Process>(&**proc, p));
+         if len == inner.freeze_list.len() {
+             pr_warn!(
+                 "Could not remove freeze listener for {}\n",
+@@ -695,8 +696,9 @@ impl Node {
+             );
+         }
+         if inner.freeze_list.is_empty() {
+-            _unused_capacity = mem::take(&mut inner.freeze_list);
++            return mem::take(&mut inner.freeze_list);
+         }
++        KVVec::new()
+     }
+ 
+     pub(crate) fn freeze_list<'a>(&'a self, guard: &'a ProcessInner) -> &'a [Arc<Process>] {
+--- a/drivers/android/binder/process.rs
++++ b/drivers/android/binder/process.rs
+@@ -946,6 +946,8 @@ impl Process {
+ 
+         // To preserve original binder behaviour, we only fail requests where the manager tries to
+         // increment references on itself.
++        let _to_free_freeze_listener;
++        let _to_free_freeze_listener_cleanup;
+         let mut refs = self.node_refs.lock();
+         if let Some(info) = refs.by_handle.get_mut(&handle) {
+             if info.node_ref().update(inc, strong) {
+@@ -961,6 +963,14 @@ impl Process {
+                 unsafe { info.node_ref2().node.remove_node_info(info) };
+ 
+                 let id = info.node_ref().node.global_id();
++
++                if let Some(freeze) = *info.freeze() {
++                    if let Some(fl) = refs.freeze_listeners.remove(&freeze) {
++                        _to_free_freeze_listener_cleanup = fl.on_process_cleanup(&self);
++                        _to_free_freeze_listener = fl;
++                    }
++                }
++
+                 refs.by_handle.remove(&handle);
+                 refs.by_node.remove(&id);
+                 refs.handle_is_present.release_id(handle as usize);
+@@ -1384,7 +1394,7 @@ impl Process {
+         // Clean up freeze listeners.
+         let freeze_listeners = take(&mut self.node_refs.lock().freeze_listeners);
+         for listener in freeze_listeners.values() {
+-            listener.on_process_exit(&self);
++            listener.on_process_cleanup(&self);
+         }
+         drop(freeze_listeners);
+ 
