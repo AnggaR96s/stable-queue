@@ -1,0 +1,98 @@
+From e5b6125d20982675dafda33db0e9b73759272ed9 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 17 Jul 2026 19:29:21 +0200
+Subject: af_unix: Don't use skb_recv_datagram() in unix_stream_read_skb().
+
+From: Kuniyuki Iwashima <kuniyu@google.com>
+
+[ Upstream commit d0aac85449dec992bb8dc2503f2cb9e94ef436db ]
+
+unix_stream_read_skb() calls skb_recv_datagram() with MSG_DONTWAIT,
+which is mostly equivalent to sock_error(sk) + skb_dequeue().
+
+In the following patch, we will add a new field to cache the number
+of bytes in the receive queue.  Then, we want to avoid introducing
+atomic ops in the fast path, so we will reuse the receive queue lock.
+
+As a preparation for the change, let's not use skb_recv_datagram()
+in unix_stream_read_skb().
+
+Note that sock_error() is now moved out of the u->iolock mutex as
+the mutex does not synchronise the peer's close() at all.
+
+Signed-off-by: Kuniyuki Iwashima <kuniyu@google.com>
+Link: https://patch.msgid.link/20250702223606.1054680-4-kuniyu@google.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Heiko Stuebner <heiko.stuebner@cherry.de>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ net/unix/af_unix.c | 39 ++++++++++++++++++++++-----------------
+ 1 file changed, 22 insertions(+), 17 deletions(-)
+
+diff --git a/net/unix/af_unix.c b/net/unix/af_unix.c
+index a18a4b0229707f..f1e81843c1b0bc 100644
+--- a/net/unix/af_unix.c
++++ b/net/unix/af_unix.c
+@@ -2720,6 +2720,7 @@ static struct sk_buff *manage_oob(struct sk_buff *skb, struct sock *sk,
+ 
+ static int unix_stream_read_skb(struct sock *sk, skb_read_actor_t recv_actor)
+ {
++	struct sk_buff_head *queue = &sk->sk_receive_queue;
+ 	struct unix_sock *u = unix_sk(sk);
+ 	struct sk_buff *skb;
+ 	int err;
+@@ -2727,30 +2728,34 @@ static int unix_stream_read_skb(struct sock *sk, skb_read_actor_t recv_actor)
+ 	if (unlikely(READ_ONCE(sk->sk_state) != TCP_ESTABLISHED))
+ 		return -ENOTCONN;
+ 
+-	mutex_lock(&u->iolock);
+-	skb = skb_recv_datagram(sk, MSG_DONTWAIT, &err);
+-	mutex_unlock(&u->iolock);
+-	if (!skb)
++	err = sock_error(sk);
++	if (err)
+ 		return err;
+ 
+-#if IS_ENABLED(CONFIG_AF_UNIX_OOB)
+-	if (unlikely(skb == READ_ONCE(u->oob_skb))) {
+-		bool drop = false;
++	mutex_lock(&u->iolock);
++	spin_lock(&queue->lock);
+ 
+-		spin_lock(&sk->sk_receive_queue.lock);
+-		if (likely(skb == u->oob_skb)) {
+-			WRITE_ONCE(u->oob_skb, NULL);
+-			drop = true;
+-		}
+-		spin_unlock(&sk->sk_receive_queue.lock);
++	skb = __skb_dequeue(queue);
++	if (!skb) {
++		spin_unlock(&queue->lock);
++		mutex_unlock(&u->iolock);
++		return -EAGAIN;
++	}
+ 
+-		if (drop) {
+-			kfree_skb_reason(skb, SKB_DROP_REASON_UNIX_SKIP_OOB);
+-			return -EAGAIN;
+-		}
++#if IS_ENABLED(CONFIG_AF_UNIX_OOB)
++	if (skb == u->oob_skb) {
++		WRITE_ONCE(u->oob_skb, NULL);
++		spin_unlock(&queue->lock);
++		mutex_unlock(&u->iolock);
++
++		kfree_skb_reason(skb, SKB_DROP_REASON_UNIX_SKIP_OOB);
++		return -EAGAIN;
+ 	}
+ #endif
+ 
++	spin_unlock(&queue->lock);
++	mutex_unlock(&u->iolock);
++
+ 	return recv_actor(sk, skb);
+ }
+ 
+-- 
+2.53.0
+
