@@ -1,0 +1,349 @@
+From dbfa789755b99806f2d543053abb1dc6a122c54a Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Sat, 8 Jun 2024 11:01:16 +0200
+Subject: selftests/hid: convert the hid_bpf selftests with struct_ops
+
+From: Benjamin Tissoires <bentiss@kernel.org>
+
+[ Upstream commit d7696738d66b4f1379fe77eef61cd1047d7f0773 ]
+
+We drop the need for the attach() bpf syscall, but we need to set up
+the hid_id field before calling __load().
+
+The .bpf.c part is mechanical: we create one struct_ops per HID-BPF
+program, as all the tests are for one program at a time.
+
+Link: https://lore.kernel.org/r/20240608-hid_bpf_struct_ops-v3-4-6ac6ade58329@kernel.org
+Signed-off-by: Benjamin Tissoires <bentiss@kernel.org>
+Stable-dep-of: eebbef7c468a ("selftests/hid: Cover hid_bpf_get_data() size overflow")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ tools/testing/selftests/hid/hid_bpf.c         | 59 +++++++-------
+ tools/testing/selftests/hid/progs/hid.c       | 76 +++++++++++++------
+ .../selftests/hid/progs/hid_bpf_helpers.h     | 19 +----
+ 3 files changed, 89 insertions(+), 65 deletions(-)
+
+diff --git a/tools/testing/selftests/hid/hid_bpf.c b/tools/testing/selftests/hid/hid_bpf.c
+index 2cf96f818f2578..06591bbda0d87b 100644
+--- a/tools/testing/selftests/hid/hid_bpf.c
++++ b/tools/testing/selftests/hid/hid_bpf.c
+@@ -444,7 +444,7 @@ FIXTURE(hid_bpf) {
+ 	int hid_id;
+ 	pthread_t tid;
+ 	struct hid *skel;
+-	int hid_links[3]; /* max number of programs loaded in a single test */
++	struct bpf_link *hid_links[3]; /* max number of programs loaded in a single test */
+ };
+ static void detach_bpf(FIXTURE_DATA(hid_bpf) * self)
+ {
+@@ -456,7 +456,7 @@ static void detach_bpf(FIXTURE_DATA(hid_bpf) * self)
+ 
+ 	for (i = 0; i < ARRAY_SIZE(self->hid_links); i++) {
+ 		if (self->hid_links[i])
+-			close(self->hid_links[i]);
++			bpf_link__destroy(self->hid_links[i]);
+ 	}
+ 
+ 	hid__destroy(self->skel);
+@@ -511,14 +511,7 @@ static void load_programs(const struct test_program programs[],
+ 			  FIXTURE_DATA(hid_bpf) * self,
+ 			  const FIXTURE_VARIANT(hid_bpf) * variant)
+ {
+-	int attach_fd, err = -EINVAL;
+-	struct attach_prog_args args = {
+-		.retval = -1,
+-	};
+-	DECLARE_LIBBPF_OPTS(bpf_test_run_opts, tattr,
+-			    .ctx_in = &args,
+-			    .ctx_size_in = sizeof(args),
+-	);
++	int err = -EINVAL;
+ 
+ 	ASSERT_LE(progs_count, ARRAY_SIZE(self->hid_links))
+ 		TH_LOG("too many programs are to be loaded");
+@@ -529,35 +522,41 @@ static void load_programs(const struct test_program programs[],
+ 
+ 	for (int i = 0; i < progs_count; i++) {
+ 		struct bpf_program *prog;
++		struct bpf_map *map;
++		int *ops_hid_id;
+ 
+ 		prog = bpf_object__find_program_by_name(*self->skel->skeleton->obj,
+ 							programs[i].name);
+ 		ASSERT_OK_PTR(prog) TH_LOG("can not find program by name '%s'", programs[i].name);
+ 
+ 		bpf_program__set_autoload(prog, true);
++
++		map = bpf_object__find_map_by_name(*self->skel->skeleton->obj,
++							  programs[i].name + 4);
++		ASSERT_OK_PTR(map) TH_LOG("can not find struct_ops by name '%s'",
++					  programs[i].name + 4);
++
++		/* hid_id is the first field of struct hid_bpf_ops */
++		ops_hid_id = bpf_map__initial_value(map, NULL);
++		ASSERT_OK_PTR(ops_hid_id) TH_LOG("unable to retrieve struct_ops data");
++
++		*ops_hid_id = self->hid_id;
+ 	}
+ 
+ 	err = hid__load(self->skel);
+ 	ASSERT_OK(err) TH_LOG("hid_skel_load failed: %d", err);
+ 
+-	attach_fd = bpf_program__fd(self->skel->progs.attach_prog);
+-	ASSERT_GE(attach_fd, 0) TH_LOG("locate attach_prog: %d", attach_fd);
+-
+ 	for (int i = 0; i < progs_count; i++) {
+-		struct bpf_program *prog;
++		struct bpf_map *map;
+ 
+-		prog = bpf_object__find_program_by_name(*self->skel->skeleton->obj,
+-							programs[i].name);
+-		ASSERT_OK_PTR(prog) TH_LOG("can not find program by name '%s'", programs[i].name);
+-
+-		args.prog_fd = bpf_program__fd(prog);
+-		args.hid = self->hid_id;
+-		args.insert_head = programs[i].insert_head;
+-		err = bpf_prog_test_run_opts(attach_fd, &tattr);
+-		ASSERT_GE(args.retval, 0)
+-			TH_LOG("attach_hid(%s): %d", programs[i].name, args.retval);
++		map = bpf_object__find_map_by_name(*self->skel->skeleton->obj,
++							  programs[i].name + 4);
++		ASSERT_OK_PTR(map) TH_LOG("can not find struct_ops by name '%s'",
++					  programs[i].name + 4);
+ 
+-		self->hid_links[i] = args.retval;
++		self->hid_links[i] = bpf_map__attach_struct_ops(map);
++		ASSERT_OK_PTR(self->hid_links[i]) TH_LOG("failed to attach struct ops '%s'",
++							 programs[i].name + 4);
+ 	}
+ 
+ 	self->hidraw_fd = open_hidraw(self->dev_id);
+@@ -632,13 +631,17 @@ TEST_F(hid_bpf, test_attach_detach)
+ 		{ .name = "hid_first_event" },
+ 		{ .name = "hid_second_event" },
+ 	};
++	struct bpf_link *link;
+ 	__u8 buf[10] = {0};
+-	int err, link;
++	int err, link_fd;
+ 
+ 	LOAD_PROGRAMS(progs);
+ 
+ 	link = self->hid_links[0];
+-	ASSERT_GT(link, 0) TH_LOG("HID-BPF link not created");
++	ASSERT_OK_PTR(link) TH_LOG("HID-BPF link not created");
++
++	link_fd = bpf_link__fd(link);
++	ASSERT_GE(link_fd, 0) TH_LOG("HID-BPF link FD not valid");
+ 
+ 	/* inject one event */
+ 	buf[0] = 1;
+@@ -657,7 +660,7 @@ TEST_F(hid_bpf, test_attach_detach)
+ 
+ 	/* pin the first program and immediately unpin it */
+ #define PIN_PATH "/sys/fs/bpf/hid_first_event"
+-	err = bpf_obj_pin(link, PIN_PATH);
++	err = bpf_obj_pin(link_fd, PIN_PATH);
+ 	ASSERT_OK(err) TH_LOG("error while calling bpf_obj_pin");
+ 	remove(PIN_PATH);
+ #undef PIN_PATH
+diff --git a/tools/testing/selftests/hid/progs/hid.c b/tools/testing/selftests/hid/progs/hid.c
+index 1e558826b809e1..fb3d506f92c9ff 100644
+--- a/tools/testing/selftests/hid/progs/hid.c
++++ b/tools/testing/selftests/hid/progs/hid.c
+@@ -14,8 +14,8 @@ struct attach_prog_args {
+ __u64 callback_check = 52;
+ __u64 callback2_check = 52;
+ 
+-SEC("?fmod_ret/hid_bpf_device_event")
+-int BPF_PROG(hid_first_event, struct hid_bpf_ctx *hid_ctx)
++SEC("?struct_ops/hid_device_event")
++int BPF_PROG(hid_first_event, struct hid_bpf_ctx *hid_ctx, enum hid_report_type type)
+ {
+ 	__u8 *rw_data = hid_bpf_get_data(hid_ctx, 0 /* offset */, 3 /* size */);
+ 
+@@ -29,8 +29,14 @@ int BPF_PROG(hid_first_event, struct hid_bpf_ctx *hid_ctx)
+ 	return hid_ctx->size;
+ }
+ 
+-SEC("?fmod_ret/hid_bpf_device_event")
+-int BPF_PROG(hid_second_event, struct hid_bpf_ctx *hid_ctx)
++SEC(".struct_ops.link")
++struct hid_bpf_ops first_event = {
++	.hid_device_event = (void *)hid_first_event,
++	.hid_id = 2,
++};
++
++SEC("?struct_ops/hid_device_event")
++int BPF_PROG(hid_second_event, struct hid_bpf_ctx *hid_ctx, enum hid_report_type type)
+ {
+ 	__u8 *rw_data = hid_bpf_get_data(hid_ctx, 0 /* offset */, 4 /* size */);
+ 
+@@ -42,8 +48,13 @@ int BPF_PROG(hid_second_event, struct hid_bpf_ctx *hid_ctx)
+ 	return hid_ctx->size;
+ }
+ 
+-SEC("?fmod_ret/hid_bpf_device_event")
+-int BPF_PROG(hid_change_report_id, struct hid_bpf_ctx *hid_ctx)
++SEC(".struct_ops.link")
++struct hid_bpf_ops second_event = {
++	.hid_device_event = (void *)hid_second_event,
++};
++
++SEC("?struct_ops/hid_device_event")
++int BPF_PROG(hid_change_report_id, struct hid_bpf_ctx *hid_ctx, enum hid_report_type type)
+ {
+ 	__u8 *rw_data = hid_bpf_get_data(hid_ctx, 0 /* offset */, 3 /* size */);
+ 
+@@ -55,15 +66,10 @@ int BPF_PROG(hid_change_report_id, struct hid_bpf_ctx *hid_ctx)
+ 	return 9;
+ }
+ 
+-SEC("syscall")
+-int attach_prog(struct attach_prog_args *ctx)
+-{
+-	ctx->retval = hid_bpf_attach_prog(ctx->hid,
+-					  ctx->prog_fd,
+-					  ctx->insert_head ? HID_BPF_FLAG_INSERT_HEAD :
+-							     HID_BPF_FLAG_NONE);
+-	return 0;
+-}
++SEC(".struct_ops.link")
++struct hid_bpf_ops change_report_id = {
++	.hid_device_event = (void *)hid_change_report_id,
++};
+ 
+ struct hid_hw_request_syscall_args {
+ 	/* data needs to come at offset 0 so we can use it in calls */
+@@ -135,7 +141,12 @@ static const __u8 rdesc[] = {
+ 	0xc0,			/* END_COLLECTION */
+ };
+ 
+-SEC("?fmod_ret/hid_bpf_rdesc_fixup")
++/*
++ * the following program is marked as sleepable (struct_ops.s).
++ * This is not strictly mandatory but is a nice test for
++ * sleepable struct_ops
++ */
++SEC("?struct_ops.s/hid_rdesc_fixup")
+ int BPF_PROG(hid_rdesc_fixup, struct hid_bpf_ctx *hid_ctx)
+ {
+ 	__u8 *data = hid_bpf_get_data(hid_ctx, 0 /* offset */, 4096 /* size */);
+@@ -154,8 +165,13 @@ int BPF_PROG(hid_rdesc_fixup, struct hid_bpf_ctx *hid_ctx)
+ 	return sizeof(rdesc) + 73;
+ }
+ 
+-SEC("?fmod_ret/hid_bpf_device_event")
+-int BPF_PROG(hid_test_insert1, struct hid_bpf_ctx *hid_ctx)
++SEC(".struct_ops.link")
++struct hid_bpf_ops rdesc_fixup = {
++	.hid_rdesc_fixup = (void *)hid_rdesc_fixup,
++};
++
++SEC("?struct_ops/hid_device_event")
++int BPF_PROG(hid_test_insert1, struct hid_bpf_ctx *hid_ctx, enum hid_report_type type)
+ {
+ 	__u8 *data = hid_bpf_get_data(hid_ctx, 0 /* offset */, 4 /* size */);
+ 
+@@ -171,8 +187,14 @@ int BPF_PROG(hid_test_insert1, struct hid_bpf_ctx *hid_ctx)
+ 	return 0;
+ }
+ 
+-SEC("?fmod_ret/hid_bpf_device_event")
+-int BPF_PROG(hid_test_insert2, struct hid_bpf_ctx *hid_ctx)
++SEC(".struct_ops.link")
++struct hid_bpf_ops test_insert1 = {
++	.hid_device_event = (void *)hid_test_insert1,
++	.flags = BPF_F_BEFORE,
++};
++
++SEC("?struct_ops/hid_device_event")
++int BPF_PROG(hid_test_insert2, struct hid_bpf_ctx *hid_ctx, enum hid_report_type type)
+ {
+ 	__u8 *data = hid_bpf_get_data(hid_ctx, 0 /* offset */, 4 /* size */);
+ 
+@@ -188,8 +210,13 @@ int BPF_PROG(hid_test_insert2, struct hid_bpf_ctx *hid_ctx)
+ 	return 0;
+ }
+ 
+-SEC("?fmod_ret/hid_bpf_device_event")
+-int BPF_PROG(hid_test_insert3, struct hid_bpf_ctx *hid_ctx)
++SEC(".struct_ops.link")
++struct hid_bpf_ops test_insert2 = {
++	.hid_device_event = (void *)hid_test_insert2,
++};
++
++SEC("?struct_ops/hid_device_event")
++int BPF_PROG(hid_test_insert3, struct hid_bpf_ctx *hid_ctx, enum hid_report_type type)
+ {
+ 	__u8 *data = hid_bpf_get_data(hid_ctx, 0 /* offset */, 4 /* size */);
+ 
+@@ -204,3 +231,8 @@ int BPF_PROG(hid_test_insert3, struct hid_bpf_ctx *hid_ctx)
+ 
+ 	return 0;
+ }
++
++SEC(".struct_ops.link")
++struct hid_bpf_ops test_insert3 = {
++	.hid_device_event = (void *)hid_test_insert3,
++};
+diff --git a/tools/testing/selftests/hid/progs/hid_bpf_helpers.h b/tools/testing/selftests/hid/progs/hid_bpf_helpers.h
+index 65e657ac11985d..fe57613c50f879 100644
+--- a/tools/testing/selftests/hid/progs/hid_bpf_helpers.h
++++ b/tools/testing/selftests/hid/progs/hid_bpf_helpers.h
+@@ -20,9 +20,6 @@
+ #define HID_REQ_SET_REPORT       HID_REQ_SET_REPORT___not_used
+ #define HID_REQ_SET_IDLE         HID_REQ_SET_IDLE___not_used
+ #define HID_REQ_SET_PROTOCOL     HID_REQ_SET_PROTOCOL___not_used
+-#define HID_BPF_FLAG_NONE        HID_BPF_FLAG_NONE___not_used
+-#define HID_BPF_FLAG_INSERT_HEAD HID_BPF_FLAG_INSERT_HEAD___not_used
+-#define HID_BPF_FLAG_MAX         HID_BPF_FLAG_MAX___not_used
+ 
+ #include "vmlinux.h"
+ 
+@@ -40,9 +37,6 @@
+ #undef HID_REQ_SET_REPORT
+ #undef HID_REQ_SET_IDLE
+ #undef HID_REQ_SET_PROTOCOL
+-#undef HID_BPF_FLAG_NONE
+-#undef HID_BPF_FLAG_INSERT_HEAD
+-#undef HID_BPF_FLAG_MAX
+ 
+ #include <bpf/bpf_helpers.h>
+ #include <bpf/bpf_tracing.h>
+@@ -57,10 +51,8 @@ enum hid_report_type {
+ };
+ 
+ struct hid_bpf_ctx {
+-	__u32 index;
+-	const struct hid_device *hid;
++	struct hid_device *hid;
+ 	__u32 allocated_size;
+-	enum hid_report_type report_type;
+ 	union {
+ 		__s32 retval;
+ 		__s32 size;
+@@ -76,17 +68,14 @@ enum hid_class_request {
+ 	HID_REQ_SET_PROTOCOL		= 0x0B,
+ };
+ 
+-enum hid_bpf_attach_flags {
+-	HID_BPF_FLAG_NONE = 0,
+-	HID_BPF_FLAG_INSERT_HEAD = _BITUL(0),
+-	HID_BPF_FLAG_MAX,
+-};
++#ifndef BPF_F_BEFORE
++#define BPF_F_BEFORE (1U << 3)
++#endif
+ 
+ /* following are kfuncs exported by HID for HID-BPF */
+ extern __u8 *hid_bpf_get_data(struct hid_bpf_ctx *ctx,
+ 			      unsigned int offset,
+ 			      const size_t __sz) __ksym;
+-extern int hid_bpf_attach_prog(unsigned int hid_id, int prog_fd, u32 flags) __ksym;
+ extern struct hid_bpf_ctx *hid_bpf_allocate_context(unsigned int hid_id) __ksym;
+ extern void hid_bpf_release_context(struct hid_bpf_ctx *ctx) __ksym;
+ extern int hid_bpf_hw_request(struct hid_bpf_ctx *ctx,
+-- 
+2.53.0
+
