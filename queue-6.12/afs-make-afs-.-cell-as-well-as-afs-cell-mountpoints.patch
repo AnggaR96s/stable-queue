@@ -1,0 +1,171 @@
+From 2da5282858db98556664367dd83806dddd02eae3 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 7 Jan 2025 18:34:49 +0000
+Subject: afs: Make /afs/.<cell> as well as /afs/<cell> mountpoints
+
+From: David Howells <dhowells@redhat.com>
+
+[ Upstream commit 92f08e9d3cf0f8005ac6fcb931e3c388efc3ac49 ]
+
+When a cell is instantiated, automatically create an /afs/.<cell>
+mountpoint to match the /afs/<cell> mountpoint to match other AFS clients.
+
+Signed-off-by: David Howells <dhowells@redhat.com>
+Link: https://lore.kernel.org/r/20250107183454.608451-2-dhowells@redhat.com
+cc: Marc Dionne <marc.dionne@auristor.com>
+cc: linux-afs@lists.infradead.org
+Signed-off-by: Christian Brauner <brauner@kernel.org>
+Stable-dep-of: c9c3b615a462 ("afs: Fix misplaced inc of net->cells_outstanding")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/afs/cell.c    | 13 +++++++-----
+ fs/afs/dynroot.c | 52 ++++++++++++++++++++++++++++++------------------
+ 2 files changed, 41 insertions(+), 24 deletions(-)
+
+diff --git a/fs/afs/cell.c b/fs/afs/cell.c
+index caa09875f52099..1aba6d4d03a9b0 100644
+--- a/fs/afs/cell.c
++++ b/fs/afs/cell.c
+@@ -146,18 +146,20 @@ static struct afs_cell *afs_alloc_cell(struct afs_net *net,
+ 		return ERR_PTR(-ENOMEM);
+ 	}
+ 
+-	cell->name = kmalloc(namelen + 1, GFP_KERNEL);
++	cell->name = kmalloc(1 + namelen + 1, GFP_KERNEL);
+ 	if (!cell->name) {
+ 		kfree(cell);
+ 		return ERR_PTR(-ENOMEM);
+ 	}
+ 
+-	cell->net = net;
++	cell->name[0] = '.';
++	cell->name++;
+ 	cell->name_len = namelen;
+ 	for (i = 0; i < namelen; i++)
+ 		cell->name[i] = tolower(name[i]);
+ 	cell->name[i] = 0;
+ 
++	cell->net = net;
+ 	refcount_set(&cell->ref, 1);
+ 	atomic_set(&cell->active, 0);
+ 	INIT_WORK(&cell->manager, afs_manage_cell_work);
+@@ -211,7 +213,7 @@ static struct afs_cell *afs_alloc_cell(struct afs_net *net,
+ 	if (ret == -EINVAL)
+ 		printk(KERN_ERR "kAFS: bad VL server IP address\n");
+ error:
+-	kfree(cell->name);
++	kfree(cell->name - 1);
+ 	kfree(cell);
+ 	_leave(" = %d", ret);
+ 	return ERR_PTR(ret);
+@@ -502,7 +504,7 @@ static void afs_cell_destroy(struct rcu_head *rcu)
+ 	afs_put_vlserverlist(net, rcu_access_pointer(cell->vl_servers));
+ 	afs_unuse_cell(net, cell->alias_of, afs_cell_trace_unuse_alias);
+ 	key_put(cell->anonymous_key);
+-	kfree(cell->name);
++	kfree(cell->name - 1);
+ 	kfree(cell);
+ 
+ 	afs_dec_cells_outstanding(net);
+@@ -710,7 +712,8 @@ static void afs_deactivate_cell(struct afs_net *net, struct afs_cell *cell)
+ 	afs_proc_cell_remove(cell);
+ 
+ 	mutex_lock(&net->proc_cells_lock);
+-	hlist_del_rcu(&cell->proc_link);
++	if (!hlist_unhashed(&cell->proc_link))
++		hlist_del_rcu(&cell->proc_link);
+ 	afs_dynroot_rmdir(net, cell);
+ 	mutex_unlock(&net->proc_cells_lock);
+ 
+diff --git a/fs/afs/dynroot.c b/fs/afs/dynroot.c
+index c4d2711e20ad44..f80a4244b9d274 100644
+--- a/fs/afs/dynroot.c
++++ b/fs/afs/dynroot.c
+@@ -271,7 +271,8 @@ const struct dentry_operations afs_dynroot_dentry_operations = {
+ int afs_dynroot_mkdir(struct afs_net *net, struct afs_cell *cell)
+ {
+ 	struct super_block *sb = net->dynroot_sb;
+-	struct dentry *root, *subdir;
++	struct dentry *root, *subdir, *dsubdir;
++	char *dotname = cell->name - 1;
+ 	int ret;
+ 
+ 	if (!sb || atomic_read(&sb->s_active) == 0)
+@@ -286,34 +287,31 @@ int afs_dynroot_mkdir(struct afs_net *net, struct afs_cell *cell)
+ 		goto unlock;
+ 	}
+ 
+-	/* Note that we're retaining an extra ref on the dentry */
++	dsubdir = lookup_one_len(dotname, root, cell->name_len + 1);
++	if (IS_ERR(dsubdir)) {
++		ret = PTR_ERR(dsubdir);
++		dput(subdir);
++		goto unlock;
++	}
++
++	/* Note that we're retaining extra refs on the dentries. */
+ 	subdir->d_fsdata = (void *)1UL;
++	dsubdir->d_fsdata = (void *)1UL;
+ 	ret = 0;
+ unlock:
+ 	inode_unlock(root->d_inode);
+ 	return ret;
+ }
+ 
+-/*
+- * Remove a manually added cell mount directory.
+- * - The caller must hold net->proc_cells_lock
+- */
+-void afs_dynroot_rmdir(struct afs_net *net, struct afs_cell *cell)
++static void afs_dynroot_rm_one_dir(struct dentry *root, const char *name, size_t name_len)
+ {
+-	struct super_block *sb = net->dynroot_sb;
+-	struct dentry *root, *subdir;
+-
+-	if (!sb || atomic_read(&sb->s_active) == 0)
+-		return;
+-
+-	root = sb->s_root;
+-	inode_lock(root->d_inode);
++	struct dentry *subdir;
+ 
+ 	/* Don't want to trigger a lookup call, which will re-add the cell */
+-	subdir = try_lookup_one_len(cell->name, root, cell->name_len);
++	subdir = try_lookup_one_len(name, root, name_len);
+ 	if (IS_ERR_OR_NULL(subdir)) {
+ 		_debug("lookup %ld", PTR_ERR(subdir));
+-		goto no_dentry;
++		return;
+ 	}
+ 
+ 	_debug("rmdir %pd %u", subdir, d_count(subdir));
+@@ -324,8 +322,24 @@ void afs_dynroot_rmdir(struct afs_net *net, struct afs_cell *cell)
+ 		dput(subdir);
+ 	}
+ 	dput(subdir);
+-no_dentry:
+-	inode_unlock(root->d_inode);
++}
++
++/*
++ * Remove a manually added cell mount directory.
++ * - The caller must hold net->proc_cells_lock
++ */
++void afs_dynroot_rmdir(struct afs_net *net, struct afs_cell *cell)
++{
++	struct super_block *sb = net->dynroot_sb;
++	char *dotname = cell->name - 1;
++
++	if (!sb || atomic_read(&sb->s_active) == 0)
++		return;
++
++	inode_lock(sb->s_root->d_inode);
++	afs_dynroot_rm_one_dir(sb->s_root, cell->name, cell->name_len);
++	afs_dynroot_rm_one_dir(sb->s_root, dotname, cell->name_len + 1);
++	inode_unlock(sb->s_root->d_inode);
+ 	_leave("");
+ }
+ 
+-- 
+2.53.0
+
