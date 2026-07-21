@@ -1,0 +1,131 @@
+From stable+bounces-275098-greg=kroah.com@vger.kernel.org Thu Jul 16 01:56:21 2026
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 15 Jul 2026 19:55:28 -0400
+Subject: Bluetooth: hci_sync: annotate data-races around hdev->req_status
+To: stable@vger.kernel.org
+Cc: Cen Zhang <zzzccc427@gmail.com>, Luiz Augusto von Dentz <luiz.von.dentz@intel.com>, Sasha Levin <sashal@kernel.org>
+Message-ID: <20260715235529.525959-3-sashal@kernel.org>
+
+From: Cen Zhang <zzzccc427@gmail.com>
+
+[ Upstream commit b6807cfc195ef99e1ac37b2e1e60df40295daa8c ]
+
+__hci_cmd_sync_sk() sets hdev->req_status under hdev->req_lock:
+
+    hdev->req_status = HCI_REQ_PEND;
+
+However, several other functions read or write hdev->req_status without
+holding any lock:
+
+  - hci_send_cmd_sync() reads req_status in hci_cmd_work (workqueue)
+  - hci_cmd_sync_complete() reads/writes from HCI event completion
+  - hci_cmd_sync_cancel() / hci_cmd_sync_cancel_sync() read/write
+  - hci_abort_conn() reads in connection abort path
+
+Since __hci_cmd_sync_sk() runs on hdev->req_workqueue while
+hci_send_cmd_sync() runs on hdev->workqueue, these are different
+workqueues that can execute concurrently on different CPUs. The plain
+C accesses constitute a data race.
+
+Add READ_ONCE()/WRITE_ONCE() annotations on all concurrent accesses
+to hdev->req_status to prevent potential compiler optimizations that
+could affect correctness (e.g., load fusing in the wait_event
+condition or store reordering).
+
+Signed-off-by: Cen Zhang <zzzccc427@gmail.com>
+Signed-off-by: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+Stable-dep-of: 12917f591cea ("Bluetooth: hci_conn: Fix null ptr deref in hci_abort_conn()")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/bluetooth/hci_core.c |    2 +-
+ net/bluetooth/hci_sync.c |   20 ++++++++++----------
+ 2 files changed, 11 insertions(+), 11 deletions(-)
+
+--- a/net/bluetooth/hci_core.c
++++ b/net/bluetooth/hci_core.c
+@@ -4060,7 +4060,7 @@ static void hci_send_cmd_sync(struct hci
+ 		return;
+ 	}
+ 
+-	if (hci_req_status_pend(hdev) &&
++	if (READ_ONCE(hdev->req_status) == HCI_REQ_PEND &&
+ 	    !hci_dev_test_and_set_flag(hdev, HCI_CMD_PENDING)) {
+ 		kfree_skb(hdev->req_skb);
+ 		hdev->req_skb = skb_clone(hdev->sent_cmd, GFP_KERNEL);
+--- a/net/bluetooth/hci_sync.c
++++ b/net/bluetooth/hci_sync.c
+@@ -25,11 +25,11 @@ static void hci_cmd_sync_complete(struct
+ {
+ 	bt_dev_dbg(hdev, "result 0x%2.2x", result);
+ 
+-	if (hdev->req_status != HCI_REQ_PEND)
++	if (READ_ONCE(hdev->req_status) != HCI_REQ_PEND)
+ 		return;
+ 
+ 	hdev->req_result = result;
+-	hdev->req_status = HCI_REQ_DONE;
++	WRITE_ONCE(hdev->req_status, HCI_REQ_DONE);
+ 
+ 	/* Free the request command so it is not used as response */
+ 	kfree_skb(hdev->req_skb);
+@@ -168,20 +168,20 @@ struct sk_buff *__hci_cmd_sync_sk(struct
+ 
+ 	hci_cmd_sync_add(&req, opcode, plen, param, event, sk);
+ 
+-	hdev->req_status = HCI_REQ_PEND;
++	WRITE_ONCE(hdev->req_status, HCI_REQ_PEND);
+ 
+ 	err = hci_req_sync_run(&req);
+ 	if (err < 0)
+ 		return ERR_PTR(err);
+ 
+ 	err = wait_event_interruptible_timeout(hdev->req_wait_q,
+-					       hdev->req_status != HCI_REQ_PEND,
++					       READ_ONCE(hdev->req_status) != HCI_REQ_PEND,
+ 					       timeout);
+ 
+ 	if (err == -ERESTARTSYS)
+ 		return ERR_PTR(-EINTR);
+ 
+-	switch (hdev->req_status) {
++	switch (READ_ONCE(hdev->req_status)) {
+ 	case HCI_REQ_DONE:
+ 		err = -bt_to_errno(hdev->req_result);
+ 		break;
+@@ -195,7 +195,7 @@ struct sk_buff *__hci_cmd_sync_sk(struct
+ 		break;
+ 	}
+ 
+-	hdev->req_status = 0;
++	WRITE_ONCE(hdev->req_status, 0);
+ 	hdev->req_result = 0;
+ 	skb = hdev->req_rsp;
+ 	hdev->req_rsp = NULL;
+@@ -689,9 +689,9 @@ void hci_cmd_sync_cancel(struct hci_dev
+ {
+ 	bt_dev_dbg(hdev, "err 0x%2.2x", err);
+ 
+-	if (hdev->req_status == HCI_REQ_PEND) {
++	if (READ_ONCE(hdev->req_status) == HCI_REQ_PEND) {
+ 		hdev->req_result = err;
+-		hdev->req_status = HCI_REQ_CANCELED;
++		WRITE_ONCE(hdev->req_status, HCI_REQ_CANCELED);
+ 
+ 		queue_work(hdev->workqueue, &hdev->cmd_sync_cancel_work);
+ 	}
+@@ -707,12 +707,12 @@ void hci_cmd_sync_cancel_sync(struct hci
+ {
+ 	bt_dev_dbg(hdev, "err 0x%2.2x", err);
+ 
+-	if (hdev->req_status == HCI_REQ_PEND) {
++	if (READ_ONCE(hdev->req_status) == HCI_REQ_PEND) {
+ 		/* req_result is __u32 so error must be positive to be properly
+ 		 * propagated.
+ 		 */
+ 		hdev->req_result = err < 0 ? -err : err;
+-		hdev->req_status = HCI_REQ_CANCELED;
++		WRITE_ONCE(hdev->req_status, HCI_REQ_CANCELED);
+ 
+ 		wake_up_interruptible(&hdev->req_wait_q);
+ 	}
