@@ -1,0 +1,138 @@
+From stable+bounces-275249-greg=kroah.com@vger.kernel.org Thu Jul 16 13:21:32 2026
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 16 Jul 2026 07:21:21 -0400
+Subject: ksmbd: track the connection owning a byte-range lock
+To: stable@vger.kernel.org
+Cc: Namjae Jeon <linkinjeon@kernel.org>, Musaab Khan <musaab.khan@protonmail.com>, Steve French <stfrench@microsoft.com>, Sasha Levin <sashal@kernel.org>
+Message-ID: <20260716112121.1735294-2-sashal@kernel.org>
+
+From: Namjae Jeon <linkinjeon@kernel.org>
+
+[ Upstream commit c1016dd1d8b2bcd1158bbaabe94a31bb7e7431fb ]
+
+SMB2_LOCK adds each granted byte-range lock to both the file lock list
+and the lock list of the connection which handled the request.  The
+final close and durable handle paths, however, remove the connection
+list entry while holding fp->conn->llist_lock.
+
+With SMB3 multichannel, the connection handling the LOCK request can be
+different from the connection which opened the file.  The entry can
+therefore be removed under a different spinlock from the one protecting
+the list it belongs to.  A concurrent traversal can then access freed
+struct ksmbd_lock and struct file_lock objects.
+
+Record the connection owning each lock's clist entry and hold a
+reference to it while the entry is linked.  Use that connection and its
+llist_lock for unlock, rollback, close, and durable preserve.  Durable
+reconnect assigns the new connection as the owner when publishing the
+locks again.
+
+Fixes: f5a544e3bab7 ("ksmbd: add support for SMB3 multichannel")
+Cc: stable@vger.kernel.org
+Reported-by: Musaab Khan <musaab.khan@protonmail.com>
+Signed-off-by: Namjae Jeon <linkinjeon@kernel.org>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/smb/server/smb2pdu.c   |   10 ++++++++--
+ fs/smb/server/vfs_cache.c |   23 +++++++++++++++++------
+ fs/smb/server/vfs_cache.h |    1 +
+ 3 files changed, 26 insertions(+), 8 deletions(-)
+
+--- a/fs/smb/server/smb2pdu.c
++++ b/fs/smb/server/smb2pdu.c
+@@ -7660,9 +7660,11 @@ int smb2_lock(struct ksmbd_work *work)
+ 						nolock = 0;
+ 						list_del(&cmp_lock->flist);
+ 						list_del(&cmp_lock->clist);
++						cmp_lock->conn = NULL;
+ 						spin_unlock(&conn->llist_lock);
+ 						up_read(&conn_list_lock);
+ 
++						ksmbd_conn_put(conn);
+ 						locks_free_lock(cmp_lock->fl);
+ 						kfree(cmp_lock);
+ 						goto out_check_cl;
+@@ -7797,6 +7799,7 @@ skip:
+ 				goto out2;
+ 			} else if (!rc) {
+ 				list_add(&smb_lock->llist, &rollback_list);
++				smb_lock->conn = ksmbd_conn_get(work->conn);
+ 				spin_lock(&work->conn->llist_lock);
+ 				list_add_tail(&smb_lock->clist,
+ 					      &work->conn->lock_list);
+@@ -7851,11 +7854,14 @@ out:
+ 		}
+ 
+ 		list_del(&smb_lock->llist);
+-		spin_lock(&work->conn->llist_lock);
++		conn = smb_lock->conn;
++		spin_lock(&conn->llist_lock);
+ 		if (!list_empty(&smb_lock->flist))
+ 			list_del(&smb_lock->flist);
+ 		list_del(&smb_lock->clist);
+-		spin_unlock(&work->conn->llist_lock);
++		smb_lock->conn = NULL;
++		spin_unlock(&conn->llist_lock);
++		ksmbd_conn_put(conn);
+ 
+ 		locks_free_lock(smb_lock->fl);
+ 		if (rlock)
+--- a/fs/smb/server/vfs_cache.c
++++ b/fs/smb/server/vfs_cache.c
+@@ -391,10 +391,14 @@ static void __ksmbd_close_fd(struct ksmb
+ 	 * there are not accesses to fp->lock_list.
+ 	 */
+ 	list_for_each_entry_safe(smb_lock, tmp_lock, &fp->lock_list, flist) {
+-		if (!list_empty(&smb_lock->clist) && fp->conn) {
+-			spin_lock(&fp->conn->llist_lock);
+-			list_del(&smb_lock->clist);
+-			spin_unlock(&fp->conn->llist_lock);
++		struct ksmbd_conn *conn = smb_lock->conn;
++
++		if (conn) {
++			spin_lock(&conn->llist_lock);
++			list_del_init(&smb_lock->clist);
++			smb_lock->conn = NULL;
++			spin_unlock(&conn->llist_lock);
++			ksmbd_conn_put(conn);
+ 		}
+ 
+ 		list_del(&smb_lock->flist);
+@@ -1086,9 +1090,15 @@ static bool session_fd_check(struct ksmb
+ 	up_write(&ci->m_lock);
+ 
+ 	list_for_each_entry_safe(smb_lock, tmp_lock, &fp->lock_list, flist) {
+-		spin_lock(&conn->llist_lock);
++		struct ksmbd_conn *lock_conn = smb_lock->conn;
++
++		if (!lock_conn)
++			continue;
++		spin_lock(&lock_conn->llist_lock);
+ 		list_del_init(&smb_lock->clist);
+-		spin_unlock(&conn->llist_lock);
++		smb_lock->conn = NULL;
++		spin_unlock(&lock_conn->llist_lock);
++		ksmbd_conn_put(lock_conn);
+ 	}
+ 
+ 	fp->conn = NULL;
+@@ -1209,6 +1219,7 @@ int ksmbd_reopen_durable_fd(struct ksmbd
+ 	}
+ 
+ 	list_for_each_entry(smb_lock, &fp->lock_list, flist) {
++		smb_lock->conn = ksmbd_conn_get(conn);
+ 		spin_lock(&conn->llist_lock);
+ 		list_add_tail(&smb_lock->clist, &conn->lock_list);
+ 		spin_unlock(&conn->llist_lock);
+--- a/fs/smb/server/vfs_cache.h
++++ b/fs/smb/server/vfs_cache.h
+@@ -32,6 +32,7 @@ struct ksmbd_session;
+ 
+ struct ksmbd_lock {
+ 	struct file_lock *fl;
++	struct ksmbd_conn *conn;
+ 	struct list_head clist;
+ 	struct list_head flist;
+ 	struct list_head llist;
