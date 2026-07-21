@@ -1,0 +1,116 @@
+From stable+bounces-273960-greg=kroah.com@vger.kernel.org Mon Jul 13 20:33:58 2026
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 13 Jul 2026 14:33:47 -0400
+Subject: iio: imu: inv_icm42600: stabilized timestamp in interrupt
+To: stable@vger.kernel.org
+Cc: Jean-Baptiste Maneyrol <jean-baptiste.maneyrol@tdk.com>, Jonathan Cameron <Jonathan.Cameron@huawei.com>, Sasha Levin <sashal@kernel.org>
+Message-ID: <20260713183348.1951183-3-sashal@kernel.org>
+
+From: Jean-Baptiste Maneyrol <jean-baptiste.maneyrol@tdk.com>
+
+[ Upstream commit d7bd473632d07f8a54655c270c0940cc3671c548 ]
+
+Use IRQF_ONESHOT flag to ensure the timestamp is not updated in the
+hard handler during the thread handler. And compute and use the
+effective watermark value that correspond to this first timestamp.
+
+This way we can ensure the timestamp is always corresponding to the
+value used by the timestamping mechanism. Otherwise, it is possible
+that between FIFO count read and FIFO processing the timestamp is
+overwritten in the hard handler.
+
+Fixes: ec74ae9fd37c ("iio: imu: inv_icm42600: add accurate timestamping")
+Cc: stable@vger.kernel.org
+Signed-off-by: Jean-Baptiste Maneyrol <jean-baptiste.maneyrol@tdk.com>
+Link: https://lore.kernel.org/r/20240529154717.651863-1-inv.git-commit@tdk.com
+Signed-off-by: Jonathan Cameron <Jonathan.Cameron@huawei.com>
+Stable-dep-of: affe3f077d7a ("iio: imu: inv_icm42600: fix timestamping by limiting FIFO reading")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/iio/imu/inv_icm42600/inv_icm42600_buffer.c |   19 +++++++++++++++++--
+ drivers/iio/imu/inv_icm42600/inv_icm42600_buffer.h |    2 ++
+ drivers/iio/imu/inv_icm42600/inv_icm42600_core.c   |    1 +
+ 3 files changed, 20 insertions(+), 2 deletions(-)
+
+--- a/drivers/iio/imu/inv_icm42600/inv_icm42600_buffer.c
++++ b/drivers/iio/imu/inv_icm42600/inv_icm42600_buffer.c
+@@ -222,10 +222,15 @@ int inv_icm42600_buffer_update_watermark
+ 	latency_accel = period_accel * wm_accel;
+ 
+ 	/* 0 value for watermark means that the sensor is turned off */
++	if (wm_gyro == 0 && wm_accel == 0)
++		return 0;
++
+ 	if (latency_gyro == 0) {
+ 		watermark = wm_accel;
++		st->fifo.watermark.eff_accel = wm_accel;
+ 	} else if (latency_accel == 0) {
+ 		watermark = wm_gyro;
++		st->fifo.watermark.eff_gyro = wm_gyro;
+ 	} else {
+ 		/* compute the smallest latency that is a multiple of both */
+ 		if (latency_gyro <= latency_accel)
+@@ -241,6 +246,13 @@ int inv_icm42600_buffer_update_watermark
+ 		watermark = latency / period;
+ 		if (watermark < 1)
+ 			watermark = 1;
++		/* update effective watermark */
++		st->fifo.watermark.eff_gyro = latency / period_gyro;
++		if (st->fifo.watermark.eff_gyro < 1)
++			st->fifo.watermark.eff_gyro = 1;
++		st->fifo.watermark.eff_accel = latency / period_accel;
++		if (st->fifo.watermark.eff_accel < 1)
++			st->fifo.watermark.eff_accel = 1;
+ 	}
+ 
+ 	/* compute watermark value in bytes */
+@@ -517,7 +529,7 @@ int inv_icm42600_buffer_fifo_parse(struc
+ 	/* handle gyroscope timestamp and FIFO data parsing */
+ 	if (st->fifo.nb.gyro > 0) {
+ 		ts = iio_priv(st->indio_gyro);
+-		inv_sensors_timestamp_interrupt(ts, st->fifo.nb.gyro,
++		inv_sensors_timestamp_interrupt(ts, st->fifo.watermark.eff_gyro,
+ 						st->timestamp.gyro);
+ 		ret = inv_icm42600_gyro_parse_fifo(st->indio_gyro);
+ 		if (ret)
+@@ -527,7 +539,7 @@ int inv_icm42600_buffer_fifo_parse(struc
+ 	/* handle accelerometer timestamp and FIFO data parsing */
+ 	if (st->fifo.nb.accel > 0) {
+ 		ts = iio_priv(st->indio_accel);
+-		inv_sensors_timestamp_interrupt(ts, st->fifo.nb.accel,
++		inv_sensors_timestamp_interrupt(ts, st->fifo.watermark.eff_accel,
+ 						st->timestamp.accel);
+ 		ret = inv_icm42600_accel_parse_fifo(st->indio_accel);
+ 		if (ret)
+@@ -578,6 +590,9 @@ int inv_icm42600_buffer_init(struct inv_
+ 	unsigned int val;
+ 	int ret;
+ 
++	st->fifo.watermark.eff_gyro = 1;
++	st->fifo.watermark.eff_accel = 1;
++
+ 	/*
+ 	 * Default FIFO configuration (bits 7 to 5)
+ 	 * - use invalid value
+--- a/drivers/iio/imu/inv_icm42600/inv_icm42600_buffer.h
++++ b/drivers/iio/imu/inv_icm42600/inv_icm42600_buffer.h
+@@ -32,6 +32,8 @@ struct inv_icm42600_fifo {
+ 	struct {
+ 		unsigned int gyro;
+ 		unsigned int accel;
++		unsigned int eff_gyro;
++		unsigned int eff_accel;
+ 	} watermark;
+ 	size_t count;
+ 	struct {
+--- a/drivers/iio/imu/inv_icm42600/inv_icm42600_core.c
++++ b/drivers/iio/imu/inv_icm42600/inv_icm42600_core.c
+@@ -523,6 +523,7 @@ static int inv_icm42600_irq_init(struct
+ 	if (ret)
+ 		return ret;
+ 
++	irq_type |= IRQF_ONESHOT;
+ 	return devm_request_threaded_irq(dev, irq, inv_icm42600_irq_timestamp,
+ 					 inv_icm42600_irq_handler, irq_type,
+ 					 "inv_icm42600", st);
