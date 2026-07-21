@@ -1,0 +1,161 @@
+From stable+bounces-275243-greg=kroah.com@vger.kernel.org Thu Jul 16 13:20:57 2026
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 16 Jul 2026 07:20:42 -0400
+Subject: vfs: make LAST_XXX private to fs/namei.c
+To: stable@vger.kernel.org
+Cc: Jori Koolstra <jkoolstra@xs4all.nl>, Amir Goldstein <amir73il@gmail.com>, NeilBrown <neil@brown.name>, Namjae Jeon <linkinjeon@kernel.org>, "Christian Brauner (Amutable)" <brauner@kernel.org>, Sasha Levin <sashal@kernel.org>
+Message-ID: <20260716112043.1732826-2-sashal@kernel.org>
+
+From: Jori Koolstra <jkoolstra@xs4all.nl>
+
+[ Upstream commit f2f1dddccae50f7a1d088285c53c376e26cedf67 ]
+
+The only user of LAST_XXX outside of fs/namei.c is fs/smb/server/vfs.c;
+ksmbd_vfs_path_lookup() calls vfs_path_parent_lookup() and expects a
+LAST_NORM last type (or it will be ENOENT). ksmbd_vfs_rename() also calls
+vfs_path_parent_lookup() but forgets the LAST_NORM check.
+
+It does not really make sense to have vfs_path_parent_lookup() expose
+the last_type because it is only needed to ensure it is LAST_NORM. So
+let's do this check in vfs_path_parent_lookup() instead and keep the
+LAST_XXX internal to fs/namei.c. This changes the ENOENT errno in
+ksmbd_vfs_path_lookup() to EINVAL, which matches better with how this is
+handled by callers of filename_parentat().
+
+Signed-off-by: Jori Koolstra <jkoolstra@xs4all.nl>
+Link: https://patch.msgid.link/20260528175854.57626-1-jkoolstra@xs4all.nl
+Reviewed-by: Amir Goldstein <amir73il@gmail.com>
+Reviewed-by: NeilBrown <neil@brown.name>
+Reviewed-by: Namjae Jeon <linkinjeon@kernel.org>
+Signed-off-by: Christian Brauner (Amutable) <brauner@kernel.org>
+Stable-dep-of: 1c8951963d8e ("ksmbd: fix path resolution in ksmbd_vfs_kern_path_create")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/namei.c            |   20 ++++++++++++++++----
+ fs/smb/server/vfs.c   |   15 +++------------
+ include/linux/namei.h |    7 +------
+ 3 files changed, 20 insertions(+), 22 deletions(-)
+
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -125,6 +125,11 @@
+ 
+ #define EMBEDDED_NAME_MAX	(PATH_MAX - offsetof(struct filename, iname))
+ 
++/*
++ * Type of the last component on LOOKUP_PARENT
++ */
++enum {LAST_NORM, LAST_ROOT, LAST_DOT, LAST_DOTDOT};
++
+ struct filename *
+ getname_flags(const char __user *filename, int flags)
+ {
+@@ -2736,15 +2741,22 @@ EXPORT_SYMBOL(kern_path);
+  * @flags: lookup flags
+  * @parent: pointer to struct path to fill
+  * @last: last component
+- * @type: type of the last component
+  * @root: pointer to struct path of the base directory
+  */
+ int vfs_path_parent_lookup(struct filename *filename, unsigned int flags,
+-			   struct path *parent, struct qstr *last, int *type,
++			   struct path *parent, struct qstr *last,
+ 			   const struct path *root)
+ {
+-	return  __filename_parentat(AT_FDCWD, filename, flags, parent, last,
+-				    type, root);
++	int type;
++	int err =  __filename_parentat(AT_FDCWD, filename, flags, parent, last,
++				       &type, root);
++	if (err)
++		return err;
++	if (unlikely(type != LAST_NORM)) {
++		path_put(parent);
++		return -EINVAL;
++	}
++	return 0;
+ }
+ EXPORT_SYMBOL(vfs_path_parent_lookup);
+ 
+--- a/fs/smb/server/vfs.c
++++ b/fs/smb/server/vfs.c
+@@ -18,7 +18,6 @@
+ #include <linux/vmalloc.h>
+ #include <linux/sched/xacct.h>
+ #include <linux/crc32c.h>
+-#include <linux/namei.h>
+ 
+ #include "glob.h"
+ #include "oplock.h"
+@@ -73,7 +72,7 @@ static int ksmbd_vfs_path_lookup_locked(
+ 	struct qstr last;
+ 	struct filename *filename;
+ 	struct path *root_share_path = &share_conf->vfs_path;
+-	int err, type;
++	int err;
+ 	struct dentry *d;
+ 
+ 	if (pathname[0] == '\0') {
+@@ -88,19 +87,13 @@ static int ksmbd_vfs_path_lookup_locked(
+ 		return PTR_ERR(filename);
+ 
+ 	err = vfs_path_parent_lookup(filename, flags,
+-				     parent_path, &last, &type,
++				     parent_path, &last,
+ 				     root_share_path);
+ 	if (err) {
+ 		putname(filename);
+ 		return err;
+ 	}
+ 
+-	if (unlikely(type != LAST_NORM)) {
+-		path_put(parent_path);
+-		putname(filename);
+-		return -ENOENT;
+-	}
+-
+ 	err = mnt_want_write(parent_path->mnt);
+ 	if (err) {
+ 		path_put(parent_path);
+@@ -708,7 +701,6 @@ int ksmbd_vfs_rename(struct ksmbd_work *
+ 	struct filename *to;
+ 	struct ksmbd_share_config *share_conf = work->tcon->share_conf;
+ 	struct ksmbd_file *parent_fp;
+-	int new_type;
+ 	int err, lookup_flags = LOOKUP_NO_SYMLINKS;
+ 
+ 	if (ksmbd_override_fsids(work))
+@@ -718,8 +710,7 @@ int ksmbd_vfs_rename(struct ksmbd_work *
+ 
+ retry:
+ 	err = vfs_path_parent_lookup(to, lookup_flags | LOOKUP_BENEATH,
+-				     &new_path, &new_last, &new_type,
+-				     &share_conf->vfs_path);
++				     &new_path, &new_last, &share_conf->vfs_path);
+ 	if (err)
+ 		goto out1;
+ 
+--- a/include/linux/namei.h
++++ b/include/linux/namei.h
+@@ -12,11 +12,6 @@ enum { MAX_NESTED_LINKS = 8 };
+ 
+ #define MAXSYMLINKS 40
+ 
+-/*
+- * Type of the last component on LOOKUP_PARENT
+- */
+-enum {LAST_NORM, LAST_ROOT, LAST_DOT, LAST_DOTDOT};
+-
+ /* pathwalk mode */
+ #define LOOKUP_FOLLOW		0x0001	/* follow links at the end */
+ #define LOOKUP_DIRECTORY	0x0002	/* require a directory */
+@@ -63,7 +58,7 @@ extern void done_path_create(struct path
+ extern struct dentry *kern_path_locked(const char *, struct path *);
+ extern struct dentry *user_path_locked_at(int , const char __user *, struct path *);
+ int vfs_path_parent_lookup(struct filename *filename, unsigned int flags,
+-			   struct path *parent, struct qstr *last, int *type,
++			   struct path *parent, struct qstr *last,
+ 			   const struct path *root);
+ int vfs_path_lookup(struct dentry *, struct vfsmount *, const char *,
+ 		    unsigned int, struct path *);
