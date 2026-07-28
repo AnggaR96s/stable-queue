@@ -1,0 +1,241 @@
+From 888665737ba5355d21889fb98178599eaffcda8b Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 3 Oct 2025 09:46:37 -0400
+Subject: iomap: optional zero range dirty folio processing
+
+From: Brian Foster <bfoster@redhat.com>
+
+[ Upstream commit 395ed1ef0012e1bb1e4050e84ba0173b3623112a ]
+
+The only way zero range can currently process unwritten mappings
+with dirty pagecache is to check whether the range is dirty before
+mapping lookup and then flush when at least one underlying mapping
+is unwritten. This ordering is required to prevent iomap lookup from
+racing with folio writeback and reclaim.
+
+Since zero range can skip ranges of unwritten mappings that are
+clean in cache, this operation can be improved by allowing the
+filesystem to provide a set of dirty folios that require zeroing. In
+turn, rather than flush or iterate file offsets, zero range can
+iterate on folios in the batch and advance over clean or uncached
+ranges in between.
+
+Add a folio_batch in struct iomap and provide a helper for
+filesystems to populate the batch at lookup time. Update the folio
+lookup path to return the next folio in the batch, if provided, and
+advance the iter if the folio starts beyond the current offset.
+
+Signed-off-by: Brian Foster <bfoster@redhat.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Signed-off-by: Christian Brauner <brauner@kernel.org>
+Stable-dep-of: 7a6fd6b21d7e ("iomap: fix incorrect did_zero setting in iomap_zero_iter()")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/iomap/buffered-io.c | 90 +++++++++++++++++++++++++++++++++++++++---
+ fs/iomap/iter.c        |  6 +++
+ include/linux/iomap.h  |  4 ++
+ 3 files changed, 95 insertions(+), 5 deletions(-)
+
+diff --git a/fs/iomap/buffered-io.c b/fs/iomap/buffered-io.c
+index 66d16483df4441..d856093db9d278 100644
+--- a/fs/iomap/buffered-io.c
++++ b/fs/iomap/buffered-io.c
+@@ -790,6 +790,28 @@ static struct folio *__iomap_get_folio(struct iomap_iter *iter,
+ 	if (!mapping_large_folio_support(iter->inode->i_mapping))
+ 		len = min_t(size_t, len, PAGE_SIZE - offset_in_page(pos));
+ 
++	if (iter->fbatch) {
++		struct folio *folio = folio_batch_next(iter->fbatch);
++
++		if (!folio)
++			return NULL;
++
++		/*
++		 * The folio mapping generally shouldn't have changed based on
++		 * fs locks, but be consistent with filemap lookup and retry
++		 * the iter if it does.
++		 */
++		folio_lock(folio);
++		if (unlikely(folio->mapping != iter->inode->i_mapping)) {
++			iter->iomap.flags |= IOMAP_F_STALE;
++			folio_unlock(folio);
++			return NULL;
++		}
++
++		folio_get(folio);
++		return folio;
++	}
++
+ 	if (write_ops && write_ops->get_folio)
+ 		return write_ops->get_folio(iter, pos, len);
+ 	return iomap_get_folio(iter, pos, len);
+@@ -850,6 +872,8 @@ static int iomap_write_begin(struct iomap_iter *iter,
+ 	int status = 0;
+ 
+ 	len = min_not_zero(len, *plen);
++	*foliop = NULL;
++	*plen = 0;
+ 
+ 	if (fatal_signal_pending(current))
+ 		return -EINTR;
+@@ -858,6 +882,15 @@ static int iomap_write_begin(struct iomap_iter *iter,
+ 	if (IS_ERR(folio))
+ 		return PTR_ERR(folio);
+ 
++	/*
++	 * No folio means we're done with a batch. We still have range to
++	 * process so return and let the caller iterate and refill the batch.
++	 */
++	if (!folio) {
++		WARN_ON_ONCE(!iter->fbatch);
++		return 0;
++	}
++
+ 	/*
+ 	 * Now we have a locked folio, before we do anything with it we need to
+ 	 * check that the iomap we have cached is not stale. The inode extent
+@@ -878,6 +911,22 @@ static int iomap_write_begin(struct iomap_iter *iter,
+ 		}
+ 	}
+ 
++	/*
++	 * The folios in a batch may not be contiguous. If we've skipped
++	 * forward, advance the iter to the pos of the current folio. If the
++	 * folio starts beyond the end of the mapping, it may have been trimmed
++	 * since the lookup for whatever reason. Return a NULL folio to
++	 * terminate the op.
++	 */
++	if (folio_pos(folio) > iter->pos) {
++		len = min_t(u64, folio_pos(folio) - iter->pos,
++				 iomap_length(iter));
++		status = iomap_iter_advance(iter, len);
++		len = iomap_length(iter);
++		if (status || !len)
++			goto out_unlock;
++	}
++
+ 	pos = iomap_trim_folio_range(iter, folio, poffset, &len);
+ 
+ 	if (srcmap->type == IOMAP_INLINE)
+@@ -1424,6 +1473,12 @@ static int iomap_zero_iter(struct iomap_iter *iter, bool *did_zero,
+ 		if (iter->iomap.flags & IOMAP_F_STALE)
+ 			break;
+ 
++		/* a NULL folio means we're done with a folio batch */
++		if (!folio) {
++			status = iomap_iter_advance_full(iter);
++			break;
++		}
++
+ 		/* warn about zeroing folios beyond eof that won't write back */
+ 		WARN_ON_ONCE(folio_pos(folio) > iter->inode->i_size);
+ 
+@@ -1448,6 +1503,26 @@ static int iomap_zero_iter(struct iomap_iter *iter, bool *did_zero,
+ 	return status;
+ }
+ 
++loff_t
++iomap_fill_dirty_folios(
++	struct iomap_iter	*iter,
++	loff_t			offset,
++	loff_t			length)
++{
++	struct address_space	*mapping = iter->inode->i_mapping;
++	pgoff_t			start = offset >> PAGE_SHIFT;
++	pgoff_t			end = (offset + length - 1) >> PAGE_SHIFT;
++
++	iter->fbatch = kmalloc(sizeof(struct folio_batch), GFP_KERNEL);
++	if (!iter->fbatch)
++		return offset + length;
++	folio_batch_init(iter->fbatch);
++
++	filemap_get_folios_dirty(mapping, &start, end, iter->fbatch);
++	return (start << PAGE_SHIFT);
++}
++EXPORT_SYMBOL_GPL(iomap_fill_dirty_folios);
++
+ int
+ iomap_zero_range(struct inode *inode, loff_t pos, loff_t len, bool *did_zero,
+ 		const struct iomap_ops *ops,
+@@ -1477,7 +1552,7 @@ iomap_zero_range(struct inode *inode, loff_t pos, loff_t len, bool *did_zero,
+ 	 * flushing on partial eof zeroing, special case it to zero the
+ 	 * unaligned start portion if already dirty in pagecache.
+ 	 */
+-	if (off &&
++	if (!iter.fbatch && off &&
+ 	    filemap_range_needs_writeback(mapping, pos, pos + plen - 1)) {
+ 		iter.len = plen;
+ 		while ((ret = iomap_iter(&iter, ops)) > 0)
+@@ -1494,13 +1569,18 @@ iomap_zero_range(struct inode *inode, loff_t pos, loff_t len, bool *did_zero,
+ 	 * if dirty and the fs returns a mapping that might convert on
+ 	 * writeback.
+ 	 */
+-	range_dirty = filemap_range_needs_writeback(inode->i_mapping,
+-					iter.pos, iter.pos + iter.len - 1);
++	range_dirty = filemap_range_needs_writeback(mapping, iter.pos,
++					iter.pos + iter.len - 1);
+ 	while ((ret = iomap_iter(&iter, ops)) > 0) {
+ 		const struct iomap *srcmap = iomap_iter_srcmap(&iter);
+ 
+-		if (srcmap->type == IOMAP_HOLE ||
+-		    srcmap->type == IOMAP_UNWRITTEN) {
++		if (WARN_ON_ONCE(iter.fbatch &&
++				 srcmap->type != IOMAP_UNWRITTEN))
++			return -EIO;
++
++		if (!iter.fbatch &&
++		    (srcmap->type == IOMAP_HOLE ||
++		     srcmap->type == IOMAP_UNWRITTEN)) {
+ 			s64 status;
+ 
+ 			if (range_dirty) {
+diff --git a/fs/iomap/iter.c b/fs/iomap/iter.c
+index 91d2024e00da4e..8692e5e41c6df6 100644
+--- a/fs/iomap/iter.c
++++ b/fs/iomap/iter.c
+@@ -8,6 +8,12 @@
+ 
+ static inline void iomap_iter_reset_iomap(struct iomap_iter *iter)
+ {
++	if (iter->fbatch) {
++		folio_batch_release(iter->fbatch);
++		kfree(iter->fbatch);
++		iter->fbatch = NULL;
++	}
++
+ 	iter->status = 0;
+ 	memset(&iter->iomap, 0, sizeof(iter->iomap));
+ 	memset(&iter->srcmap, 0, sizeof(iter->srcmap));
+diff --git a/include/linux/iomap.h b/include/linux/iomap.h
+index 4469b2318b08e5..53428ce1262f4e 100644
+--- a/include/linux/iomap.h
++++ b/include/linux/iomap.h
+@@ -9,6 +9,7 @@
+ #include <linux/types.h>
+ #include <linux/mm_types.h>
+ #include <linux/blkdev.h>
++#include <linux/pagevec.h>
+ 
+ struct address_space;
+ struct fiemap_extent_info;
+@@ -241,6 +242,7 @@ struct iomap_iter {
+ 	unsigned flags;
+ 	struct iomap iomap;
+ 	struct iomap srcmap;
++	struct folio_batch *fbatch;
+ 	void *private;
+ };
+ 
+@@ -347,6 +349,8 @@ bool iomap_dirty_folio(struct address_space *mapping, struct folio *folio);
+ int iomap_file_unshare(struct inode *inode, loff_t pos, loff_t len,
+ 		const struct iomap_ops *ops,
+ 		const struct iomap_write_ops *write_ops);
++loff_t iomap_fill_dirty_folios(struct iomap_iter *iter, loff_t offset,
++		loff_t length);
+ int iomap_zero_range(struct inode *inode, loff_t pos, loff_t len,
+ 		bool *did_zero, const struct iomap_ops *ops,
+ 		const struct iomap_write_ops *write_ops, void *private);
+-- 
+2.53.0
+

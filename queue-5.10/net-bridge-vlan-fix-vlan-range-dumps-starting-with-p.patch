@@ -1,0 +1,149 @@
+From 6b75a67d001de62da1d44c241414e3828f4bc37e Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 21 Jul 2026 17:09:21 +0300
+Subject: net: bridge: vlan: fix vlan range dumps starting with pvid
+
+From: Nikolay Aleksandrov <razor@blackwall.org>
+
+[ Upstream commit 43171c97e4714bf601b468401b37732244639c21 ]
+
+There is a bug in all range dumps that rely on br_vlan_can_enter_range()
+when the PVID is a range starting VLAN, all following VLANs that match
+its flags can enter the range, but when the range is filled in only the
+PVID VLAN is dumped and the rest of the range is discarded because
+br_vlan_fill_vids() checks for the PVID flag. Since the PVID VLAN can
+be only one, we need to break ranges around it, the best way to do that
+consistently for all is to alter br_vlan_can_enter_range() to take into
+account the PVID and return false to break the range when it's matched.
+
+Before the fix:
+$ ip l add br0 type bridge vlan_filtering 1
+$ ip l add dumdum type dummy
+$ ip l set dumdum master br0
+$ ip l set br0 up
+$ ip l set dumdum up
+$ bridge vlan add dev dumdum vid 1 pvid untagged master
+$ bridge vlan add dev dumdum vid 2 untagged master
+$ bridge vlan show dev dumdum # use legacy dump to show all vlans
+port              vlan-id
+dumdum            1 PVID Egress Untagged
+                  2 Egress Untagged
+
+$ bridge -d vlan show dev dumdum # use the new dump (RTM_GETVLAN)
+port              vlan-id
+dumdum            1 PVID Egress Untagged
+                    state forwarding mcast_router 1
+
+VLAN 2 is missing, and if there are more matching VLANs afterwards
+they'd be missing too.
+
+After the fix:
+[ same setup steps ]
+$ bridge vlan show dev dumdum
+port              vlan-id
+dumdum            1 PVID Egress Untagged
+                  2 Egress Untagged
+$ bridge -d vlan show dev dumdum # use the new dump (RTM_GETVLAN)
+port              vlan-id
+dumdum            1 PVID Egress Untagged
+                    state forwarding mcast_router 1
+                  2 Egress Untagged
+                    state forwarding mcast_router 1
+
+Fixes: 0ab558795184 ("net: bridge: vlan: add rtm range support")
+Signed-off-by: Nikolay Aleksandrov <razor@blackwall.org>
+Reviewed-by: Ido Schimmel <idosch@nvidia.com>
+Link: https://patch.msgid.link/20260721140922.682265-2-razor@blackwall.org
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ net/bridge/br_netlink_tunnel.c |  3 ++-
+ net/bridge/br_private.h        |  6 ++++--
+ net/bridge/br_vlan.c           | 10 ++++++----
+ net/bridge/br_vlan_options.c   |  3 +--
+ 4 files changed, 13 insertions(+), 9 deletions(-)
+
+diff --git a/net/bridge/br_netlink_tunnel.c b/net/bridge/br_netlink_tunnel.c
+index 8914290c75d480..e4aab077527011 100644
+--- a/net/bridge/br_netlink_tunnel.c
++++ b/net/bridge/br_netlink_tunnel.c
+@@ -268,7 +268,8 @@ static void __vlan_tunnel_handle_range(const struct net_bridge_port *p,
+ 	if (!*v_start)
+ 		goto out_init;
+ 
+-	if (v && curr_change && br_vlan_can_enter_range(v, *v_end)) {
++	if (v && curr_change &&
++	    br_vlan_can_enter_range(v, *v_end, br_get_pvid(vg))) {
+ 		*v_end = v;
+ 		return;
+ 	}
+diff --git a/net/bridge/br_private.h b/net/bridge/br_private.h
+index b3a98ae8fbd619..17327852c807d9 100644
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -1093,7 +1093,8 @@ void br_vlan_notify(const struct net_bridge *br,
+ 		    u16 vid, u16 vid_range,
+ 		    int cmd);
+ bool br_vlan_can_enter_range(const struct net_bridge_vlan *v_curr,
+-			     const struct net_bridge_vlan *range_end);
++			     const struct net_bridge_vlan *range_end,
++			     u16 pvid);
+ 
+ static inline struct net_bridge_vlan_group *br_vlan_group(
+ 					const struct net_bridge *br)
+@@ -1309,7 +1310,8 @@ static inline void br_vlan_notify(const struct net_bridge *br,
+ }
+ 
+ static inline bool br_vlan_can_enter_range(const struct net_bridge_vlan *v_curr,
+-					   const struct net_bridge_vlan *range_end)
++					   const struct net_bridge_vlan *range_end,
++					   u16 pvid)
+ {
+ 	return true;
+ }
+diff --git a/net/bridge/br_vlan.c b/net/bridge/br_vlan.c
+index 258702134d9bfc..2eb9e33130e604 100644
+--- a/net/bridge/br_vlan.c
++++ b/net/bridge/br_vlan.c
+@@ -1764,9 +1764,11 @@ void br_vlan_notify(const struct net_bridge *br,
+ 
+ /* check if v_curr can enter a range ending in range_end */
+ bool br_vlan_can_enter_range(const struct net_bridge_vlan *v_curr,
+-			     const struct net_bridge_vlan *range_end)
++			     const struct net_bridge_vlan *range_end,
++			     u16 pvid)
+ {
+-	return v_curr->vid - range_end->vid == 1 &&
++	return v_curr->vid != pvid && range_end->vid != pvid &&
++	       v_curr->vid - range_end->vid == 1 &&
+ 	       range_end->flags == v_curr->flags &&
+ 	       br_vlan_opts_eq_range(v_curr, range_end);
+ }
+@@ -1848,8 +1850,8 @@ static int br_vlan_dump_dev(const struct net_device *dev,
+ 			idx += range_end->vid - range_start->vid + 1;
+ 
+ 			range_start = v;
+-		} else if (dump_stats || v->vid == pvid ||
+-			   !br_vlan_can_enter_range(v, range_end)) {
++		} else if (dump_stats ||
++			   !br_vlan_can_enter_range(v, range_end, pvid)) {
+ 			u16 vlan_flags = br_vlan_flags(range_start, pvid);
+ 
+ 			if (!br_vlan_fill_vids(skb, range_start->vid,
+diff --git a/net/bridge/br_vlan_options.c b/net/bridge/br_vlan_options.c
+index f290f514054714..29fb37e7046ad3 100644
+--- a/net/bridge/br_vlan_options.c
++++ b/net/bridge/br_vlan_options.c
+@@ -234,8 +234,7 @@ int br_vlan_process_options(const struct net_bridge *br,
+ 				continue;
+ 			}
+ 
+-			if (v->vid == pvid ||
+-			    !br_vlan_can_enter_range(v, curr_end)) {
++			if (!br_vlan_can_enter_range(v, curr_end, pvid)) {
+ 				br_vlan_notify(br, p, curr_start->vid,
+ 					       curr_end->vid, RTM_NEWVLAN);
+ 				curr_start = v;
+-- 
+2.53.0
+
