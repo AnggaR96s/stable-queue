@@ -1,0 +1,131 @@
+From d56031508684b1745ac66a34aa184f981de0c56f Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 6 Aug 2026 22:14:04 +0000
+Subject: Bluetooth: hci_conn: fix potential UAF in create_big_sync
+
+From: David Carlier <devnexen@gmail.com>
+
+[ Upstream commit 0beddb0c380bed5f5b8e61ddbe14635bb73d0b41 ]
+
+Add hci_conn_valid() check in create_big_sync() to detect stale
+connections before proceeding with BIG creation. Handle the
+resulting -ECANCELED in create_big_complete() and re-validate the
+connection under hci_dev_lock() before dereferencing, matching the
+pattern used by create_le_conn_complete() and create_pa_complete().
+
+Keep the hci_conn object alive across the async boundary by taking
+a reference via hci_conn_get() when queueing create_big_sync(), and
+dropping it in the completion callback. The refcount and the lock
+are complementary: the refcount keeps the object allocated, while
+hci_dev_lock() serializes hci_conn_hash_del()'s list_del_rcu() on
+hdev->conn_hash, as required by hci_conn_del().
+
+hci_conn_put() is called outside hci_dev_unlock() so the final put
+(which resolves to kfree() via bt_link_release) does not run under
+hdev->lock, though the release path would be safe either way.
+
+Without this, create_big_complete() would unconditionally
+dereference the conn pointer on error, causing a use-after-free
+via hci_connect_cfm() and hci_conn_del().
+
+Fixes: eca0ae4aea66 ("Bluetooth: Add initial implementation of BIS connections")
+Cc: stable@vger.kernel.org
+Co-developed-by: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+Signed-off-by: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+Signed-off-by: David Carlier <devnexen@gmail.com>
+Signed-off-by: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+[ kept stable's `qos->bcast.out.phy == 0x02` context line instead of upstream's renamed `qos->bcast.out.phys == BIT(1)` ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+[ Backported to 6.1.y: included inline helper hci_conn_valid() in
+  include/net/bluetooth/hci_core.h from upstream commit 881559af5f5c ]
+Signed-off-by: Todd Kjos <tkjos@google.com>
+---
+ include/net/bluetooth/hci_core.h | 18 ++++++++++++++++++
+ net/bluetooth/hci_conn.c         | 19 ++++++++++++++++++-
+ 2 files changed, 36 insertions(+), 1 deletion(-)
+
+diff --git a/include/net/bluetooth/hci_core.h b/include/net/bluetooth/hci_core.h
+index e67b1e5e0d2c8..76764d399b23e 100644
+--- a/include/net/bluetooth/hci_core.h
++++ b/include/net/bluetooth/hci_core.h
+@@ -1069,6 +1069,24 @@ static inline unsigned int hci_conn_count(struct hci_dev *hdev)
+ 	return c->acl_num + c->amp_num + c->sco_num + c->le_num + c->iso_num;
+ }
+ 
++static inline bool hci_conn_valid(struct hci_dev *hdev, struct hci_conn *conn)
++{
++	struct hci_conn_hash *h = &hdev->conn_hash;
++	struct hci_conn  *c;
++
++	rcu_read_lock();
++
++	list_for_each_entry_rcu(c, &h->list, list) {
++		if (c == conn) {
++			rcu_read_unlock();
++			return true;
++		}
++	}
++	rcu_read_unlock();
++
++	return false;
++}
++
+ static inline __u8 hci_conn_lookup_type(struct hci_dev *hdev, __u16 handle)
+ {
+ 	struct hci_conn_hash *h = &hdev->conn_hash;
+diff --git a/net/bluetooth/hci_conn.c b/net/bluetooth/hci_conn.c
+index 54cfcab763638..aa5404412cbd3 100644
+--- a/net/bluetooth/hci_conn.c
++++ b/net/bluetooth/hci_conn.c
+@@ -2088,6 +2088,9 @@ static int create_big_sync(struct hci_dev *hdev, void *data)
+ 	u32 flags = 0;
+ 	int err;
+ 
++	if (!hci_conn_valid(hdev, conn))
++		return -ECANCELED;
++
+ 	if (qos->out.phy == 0x02)
+ 		flags |= MGMT_ADV_FLAG_SEC_2M;
+ 
+@@ -2194,11 +2197,24 @@ static void create_big_complete(struct hci_dev *hdev, void *data, int err)
+ 
+ 	bt_dev_dbg(hdev, "conn %p", conn);
+ 
++	if (err == -ECANCELED)
++		goto done;
++
++	hci_dev_lock(hdev);
++
++	if (!hci_conn_valid(hdev, conn))
++		goto unlock;
++
+ 	if (err) {
+ 		bt_dev_err(hdev, "Unable to create BIG: %d", err);
+ 		hci_connect_cfm(conn, err);
+ 		hci_conn_del(conn);
+ 	}
++
++unlock:
++	hci_dev_unlock(hdev);
++done:
++	hci_conn_put(conn);
+ }
+ 
+ struct hci_conn *hci_connect_bis(struct hci_dev *hdev, bdaddr_t *dst,
+@@ -2223,10 +2239,11 @@ struct hci_conn *hci_connect_bis(struct hci_dev *hdev, bdaddr_t *dst,
+ 	}
+ 
+ 	/* Queue start periodic advertising and create BIG */
+-	err = hci_cmd_sync_queue(hdev, create_big_sync, conn,
++	err = hci_cmd_sync_queue(hdev, create_big_sync, hci_conn_get(conn),
+ 				 create_big_complete);
+ 	if (err < 0) {
+ 		hci_conn_drop(conn);
++		hci_conn_put(conn);
+ 		return ERR_PTR(err);
+ 	}
+ 
+-- 
+2.53.0
+
