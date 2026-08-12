@@ -1,0 +1,264 @@
+From 31e783ee84c8e2a10849ab2e654f916f65a51df2 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Sun, 31 May 2026 23:45:20 +0800
+Subject: ALSA: usb-audio: Add QUIRK_FLAG_MIXER_GET_CUR_BROKEN
+
+From: Rong Zhang <i@rong.moe>
+
+[ Upstream commit ad2c7d2c42af943a3e711bdc1e4fd55b76fcbe55 ]
+
+Since commit 86aa1ea1f15c ("ALSA: usb-audio: Do not expose sticky
+mixers"), the UAC mixer core utilizes volume SET_CUR and GET_CUR to
+identify devices with sticky mixers. Unfortunately, even though most
+devices with sticky GET_CUR also have corresponding sticky SET_CUR,
+which I actually met more since the commit had been merged, there is
+also a rare case that some devices may have volume mixers that responds
+to SET_CUR properly but with its GET_CUR stubbed. This cause the sticky
+check to consider the mixer to be sticky and unnecessarily disable it.
+
+As the sticky check can't distinguish between sticky mixers and working
+SET_CUR but broken GET_CUR, add QUIRK_FLAG_MIXER_GET_CUR_BROKEN to tell
+that the device should fall into the second category when GET_CUR
+returns a constant value. In this case, the sticky check becomes
+non-fatal and only disables GET_CUR instead of the whole mixer. The
+current volume will then be provided by the internal cache that stores
+the last set volume.
+
+An info message prompting users to check MIXER_GET_CUR_BROKEN for
+potential sticky mixers is also added, so that users can learn how to do
+some experiments to determine what's going on. If the mixer surprisingly
+turns out to be non-sticky, they can submit a patch for a new quirk
+table entry.
+
+Signed-off-by: Rong Zhang <i@rong.moe>
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+Link: https://patch.msgid.link/20260531-uac-quirk-get-cur-vol-v4-1-ede643dca151@rong.moe
+Stable-dep-of: c973e61895db ("ALSA: usb-audio: Add QUIRK_FLAG_MIXER_GET_CUR_BROKEN for Logitech PRO X 2 LIGHTSPEED")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ Documentation/sound/alsa-configuration.rst | 12 +++++
+ sound/usb/mixer.c                          | 60 ++++++++++++++++++----
+ sound/usb/mixer.h                          |  1 +
+ sound/usb/quirks.c                         |  1 +
+ sound/usb/usbaudio.h                       | 13 +++++
+ 5 files changed, 77 insertions(+), 10 deletions(-)
+
+diff --git a/Documentation/sound/alsa-configuration.rst b/Documentation/sound/alsa-configuration.rst
+index 4b30cd63c5a5a..78fb484e8b04f 100644
+--- a/Documentation/sound/alsa-configuration.rst
++++ b/Documentation/sound/alsa-configuration.rst
+@@ -2389,6 +2389,18 @@ quirk_flags
+           from snd_usb_handle_sync_urb. Instead fall through and enqueue a
+           packet_info containing only size-0 packets, so the OUT ring keeps
+           moving (emits silence). Needed by Behringer Flow 8 (1397:050c).
++        * bit 30: ``mixer_get_cur_broken``
++          Some mixers are sticky, which means that setting their current volume
++          is a no-op, and reading the current volume returns a constant value.
++          The sticky check disables these mixers to prevent confusing userspace.
++          However, some devices do have a tunable volume despite the reported
++          current volume being constant. As the sticky check can't distinguish
++          between the two categories, setting this flag tells that the device
++          should fall into the second category when GET_CUR returns a constant
++          value, resulting in the sticky check being non-fatal and only
++          disabling GET_CUR instead of the whole mixer. The current volume will
++          then be provided by the internal cache that stores the last set
++          volume
+ 
+ This module supports multiple devices, autoprobe and hotplugging.
+ 
+diff --git a/sound/usb/mixer.c b/sound/usb/mixer.c
+index dbcefcaf7c361..142f5ca7a72d2 100644
+--- a/sound/usb/mixer.c
++++ b/sound/usb/mixer.c
+@@ -434,6 +434,11 @@ int snd_usb_get_cur_mix_value(struct usb_mixer_elem_info *cval,
+ 		*value = cval->cache_val[index];
+ 		return 0;
+ 	}
++
++	/* The current value is always provided by the cache after initialization. */
++	if (cval->get_cur_broken)
++		return -ENXIO;
++
+ 	err = get_cur_mix_raw(cval, channel, value);
+ 	if (err < 0) {
+ 		if (!cval->head.mixer->ignore_ctl_error)
+@@ -1234,7 +1239,7 @@ static void init_cur_mix_raw(struct usb_mixer_elem_info *cval, int ch, int idx)
+ 	err = snd_usb_get_cur_mix_value(cval, ch, idx, &val);
+ 	if (!err)
+ 		return;
+-	if (!cval->head.mixer->ignore_ctl_error)
++	if (!cval->head.mixer->ignore_ctl_error && !cval->get_cur_broken)
+ 		usb_audio_warn(cval->head.mixer->chip,
+ 			       "%d:%d: failed to get current value for ch %d (%d)\n",
+ 			       cval->head.id, mixer_ctrl_intf(cval->head.mixer),
+@@ -1248,8 +1253,16 @@ static void init_cur_mix_raw(struct usb_mixer_elem_info *cval, int ch, int idx)
+  * Some devices' volume control mixers are sticky, which accept SET_CUR but
+  * do absolutely nothing.
+  *
+- * Prevent sticky mixers from being registered, otherwise they confuses
+- * userspace and results in ineffective volume control.
++ * Check the return values of GET_CUR with different SET_CUR values. Consider
++ * the mixer as sticky if GET_CUR always returns a constant value.
++ *
++ * Some devices have effective SET_CUR despite GET_CUR being constant. Do not
++ * consider the mixer as sticky if a quirk flag indicates that.
++ *
++ * Gate the registration of sticky mixers to prevent confusing userspace, so
++ * that they won't cause ineffective volume control. However, for mixers with
++ * effective SET_CUR but broken GET_CUR, the registration can continue normally
++ * but further GET_CUR requests will be gated.
+  */
+ static int check_sticky_volume_control(struct usb_mixer_elem_info *cval,
+ 				       int channel, int saved)
+@@ -1269,10 +1282,22 @@ static int check_sticky_volume_control(struct usb_mixer_elem_info *cval,
+ 			return 0;
+ 	}
+ 
++	if (cval->head.mixer->chip->quirk_flags & QUIRK_FLAG_MIXER_GET_CUR_BROKEN) {
++		usb_audio_info(cval->head.mixer->chip,
++			       "%d:%d: broken mixer GET_CUR (%d/%d/%d => %d)\n",
++			       cval->head.id, mixer_ctrl_intf(cval->head.mixer),
++			       cval->min, cval->max, cval->res, saved);
++
++		cval->get_cur_broken = 1;
++		return -ENXIO;
++	}
++
+ 	usb_audio_err(cval->head.mixer->chip,
+ 		      "%d:%d: sticky mixer values (%d/%d/%d => %d), disabling\n",
+ 		      cval->head.id, mixer_ctrl_intf(cval->head.mixer),
+ 		      cval->min, cval->max, cval->res, saved);
++	usb_audio_info(cval->head.mixer->chip,
++		       "check MIXER_GET_CUR_BROKEN if you believe the mixer is non-sticky");
+ 
+ 	return -ENODEV;
+ }
+@@ -1315,7 +1340,7 @@ static void check_volume_control_res(struct usb_mixer_elem_info *cval,
+ static int get_min_max_with_quirks(struct usb_mixer_elem_info *cval,
+ 				   int default_min, struct snd_kcontrol *kctl)
+ {
+-	int i, idx, ret;
++	int i, idx, ret = 0;
+ 
+ 	/* for failsafe */
+ 	cval->min = default_min;
+@@ -1371,8 +1396,10 @@ static int get_min_max_with_quirks(struct usb_mixer_elem_info *cval,
+ 				goto no_checks;
+ 
+ 			ret = check_sticky_volume_control(cval, minchn, saved);
+-			if (ret < 0)
++			if (ret == -ENODEV)
+ 				goto sticky;
++			if (ret)
++				goto no_checks;
+ 
+ 			if (cval->min + cval->res < cval->max)
+ 				check_volume_control_res(cval, minchn, saved);
+@@ -1381,6 +1408,16 @@ static int get_min_max_with_quirks(struct usb_mixer_elem_info *cval,
+ 		}
+ 
+ no_checks:
++		/*
++		 * Got a non-fatal failure during sanity checks.
++		 *
++		 * Do not propagate mixer values written by sanity checks.
++		 * Instead, rely on init_cur_mix_raw() to initialize the mixer
++		 * properly.
++		 */
++		if (ret)
++			cval->cached = 0;
++
+ 		cval->initialized = 1;
+ 	}
+ 
+@@ -3538,7 +3575,8 @@ void snd_usb_mixer_notify_id(struct usb_mixer_interface *mixer, int unitid)
+ 			continue;
+ 		info = mixer_elem_list_to_info(list);
+ 		/* invalidate cache, so the value is read from the device */
+-		info->cached = 0;
++		if (!info->get_cur_broken)
++			info->cached = 0;
+ 		snd_ctl_notify(mixer->chip->card, SNDRV_CTL_EVENT_MASK_VALUE,
+ 			       &list->kctl->id);
+ 	}
+@@ -3635,10 +3673,12 @@ static void snd_usb_mixer_interrupt_v2(struct usb_mixer_interface *mixer,
+ 		switch (attribute) {
+ 		case UAC2_CS_CUR:
+ 			/* invalidate cache, so the value is read from the device */
+-			if (channel)
+-				info->cached &= ~BIT(channel);
+-			else /* master channel */
+-				info->cached = 0;
++			if (!info->get_cur_broken) {
++				if (channel)
++					info->cached &= ~BIT(channel);
++				else /* master channel */
++					info->cached = 0;
++			}
+ 
+ 			snd_ctl_notify(mixer->chip->card, SNDRV_CTL_EVENT_MASK_VALUE,
+ 				       &info->head.kctl->id);
+diff --git a/sound/usb/mixer.h b/sound/usb/mixer.h
+index afbb3dd9f177b..3fa1bd96f8588 100644
+--- a/sound/usb/mixer.h
++++ b/sound/usb/mixer.h
+@@ -94,6 +94,7 @@ struct usb_mixer_elem_info {
+ 	int cache_val[MAX_CHANNELS];
+ 	u8 initialized;
+ 	u8 min_mute;
++	u8 get_cur_broken;
+ 	void *private_data;
+ };
+ 
+diff --git a/sound/usb/quirks.c b/sound/usb/quirks.c
+index 33eb8be48af87..688993bfa8fd1 100644
+--- a/sound/usb/quirks.c
++++ b/sound/usb/quirks.c
+@@ -2611,6 +2611,7 @@ static const char *const snd_usb_audio_quirk_flag_names[] = {
+ 	QUIRK_STRING_ENTRY(MIXER_PLAYBACK_LINEAR_VOL),
+ 	QUIRK_STRING_ENTRY(MIXER_CAPTURE_LINEAR_VOL),
+ 	QUIRK_STRING_ENTRY(IFB_SILENCE_ON_EMPTY),
++	QUIRK_STRING_ENTRY(MIXER_GET_CUR_BROKEN),
+ 	NULL
+ };
+ 
+diff --git a/sound/usb/usbaudio.h b/sound/usb/usbaudio.h
+index 9afcad8f143a0..e472aef6eb879 100644
+--- a/sound/usb/usbaudio.h
++++ b/sound/usb/usbaudio.h
+@@ -242,6 +242,17 @@ extern bool snd_usb_skip_validation;
+  *  from snd_usb_handle_sync_urb. Instead fall through and enqueue a
+  *  packet_info containing only size-0 packets, so the OUT ring keeps
+  *  moving (emits silence). Needed by Behringer Flow 8 (1397:050c).
++ * QUIRK_FLAG_MIXER_GET_CUR_BROKEN
++ *  Some mixers are sticky, which means that setting their current volume is a
++ *  no-op, and reading the current volume returns a constant value. The sticky
++ *  check disables these mixers to prevent confusing userspace. However, some
++ *  devices do have a tunable volume despite the reported current volume being
++ *  constant. As the sticky check can't distinguish between the two categories,
++ *  setting this flag tells that the device should fall into the second
++ *  category when GET_CUR returns a constant value, resulting in the sticky
++ *  check being non-fatal and only disabling GET_CUR instead of the whole mixer.
++ *  The current volume will then be provided by the internal cache that stores
++ *  the last set volume
+  */
+ 
+ enum {
+@@ -275,6 +286,7 @@ enum {
+ 	QUIRK_TYPE_MIXER_PLAYBACK_LINEAR_VOL	= 27,
+ 	QUIRK_TYPE_MIXER_CAPTURE_LINEAR_VOL	= 28,
+ 	QUIRK_TYPE_IFB_SILENCE_ON_EMPTY		= 29,
++	QUIRK_TYPE_MIXER_GET_CUR_BROKEN		= 30,
+ /* Please also edit snd_usb_audio_quirk_flag_names */
+ };
+ 
+@@ -310,5 +322,6 @@ enum {
+ #define QUIRK_FLAG_MIXER_PLAYBACK_LINEAR_VOL	QUIRK_FLAG(MIXER_PLAYBACK_LINEAR_VOL)
+ #define QUIRK_FLAG_MIXER_CAPTURE_LINEAR_VOL	QUIRK_FLAG(MIXER_CAPTURE_LINEAR_VOL)
+ #define QUIRK_FLAG_IFB_SILENCE_ON_EMPTY		QUIRK_FLAG(IFB_SILENCE_ON_EMPTY)
++#define QUIRK_FLAG_MIXER_GET_CUR_BROKEN		QUIRK_FLAG(MIXER_GET_CUR_BROKEN)
+ 
+ #endif /* __USBAUDIO_H */
+-- 
+2.53.0
+
