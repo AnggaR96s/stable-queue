@@ -1,0 +1,133 @@
+From d669da60a3510c5f2a2f147565f4fd24a692062d Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 13 Aug 2026 19:00:03 -0300
+Subject: selftests/xsk: account reclaimed invalid Tx descriptors
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+From: Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+
+[ Upstream commit f49d99eaee7c32badc7ddfaecbb01ce4d037d695 ]
+
+Invalid Tx descriptors are now returned through the completion ring,
+regardless of whether they form a standalone packet or belong to an
+invalid multi-buffer packet.
+
+The selftests previously counted only descriptors belonging to valid
+packets, with a special exception for some invalid multi-buffer packets
+in verbatim streams. This undercounts completion entries when a
+standalone invalid descriptor or another invalid packet is reclaimed by
+the kernel.
+
+Keep valid_pkts as the number of packets expected on the Rx side, but
+count every descriptor submitted to the Tx ring in valid_frags, as every
+such descriptor is now expected to be returned through the completion
+ring.
+
+Make fragment counting in verbatim mode follow the packet boundary
+instead of stopping at the first invalid fragment. Update custom stream
+generation so an invalid middle fragment terminates the generated Rx
+packet while Tx completion accounting still covers the complete invalid
+packet.
+
+Also add explicit end fragments after invalid middle descriptors. This
+exercises the kernel drain logic and verifies that subsequent valid
+packets are not interpreted as continuations of the invalid packet.
+
+[ rbm: in testapp_invalid_desc_mb() hunk, use umem_size instead of umem_sz
+]
+
+Reviewed-by: Jason Xing <kernelxing@tencent.com>
+Signed-off-by: Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+Acked-by: Stanislav Fomichev <sdf@fomichev.me>
+Link: https://patch.msgid.link/20260719135609.147823-7-maciej.fijalkowski@intel.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Ricardo B. Marlière (SUSE) <ricardo@marliere.net>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ .../selftests/bpf/prog_tests/test_xsk.c       | 26 ++++++++++---------
+ 1 file changed, 14 insertions(+), 12 deletions(-)
+
+diff --git a/tools/testing/selftests/bpf/prog_tests/test_xsk.c b/tools/testing/selftests/bpf/prog_tests/test_xsk.c
+index 1c48a3b5ee736..31bf8a3fcd666 100644
+--- a/tools/testing/selftests/bpf/prog_tests/test_xsk.c
++++ b/tools/testing/selftests/bpf/prog_tests/test_xsk.c
+@@ -414,14 +414,14 @@ static u32 pkt_nb_frags(u32 frame_size, struct pkt_stream *pkt_stream, struct pk
+ 	}
+ 
+ 	/* Search for the end of the packet in verbatim mode */
+-	if (!pkt_continues(pkt->options) || !pkt->valid)
++	if (!pkt_continues(pkt->options))
+ 		return nb_frags;
+ 
+ 	next_frag = pkt_stream->current_pkt_nb;
+ 	pkt++;
+ 	while (next_frag++ < pkt_stream->nb_pkts) {
+ 		nb_frags++;
+-		if (!pkt_continues(pkt->options) || !pkt->valid)
++		if (!pkt_continues(pkt->options))
+ 			break;
+ 		pkt++;
+ 	}
+@@ -652,11 +652,11 @@ static struct pkt_stream *__pkt_stream_generate_custom(struct ifobject *ifobj, s
+ 			if (!frame->valid || !pkt_continues(frame->options))
+ 				payload++;
+ 		} else {
+-			if (frame->valid)
++			if (frame->valid) {
+ 				len += frame->len;
+-			if (frame->valid && pkt_continues(frame->options))
+-				continue;
+-
++				if (pkt_continues(frame->options))
++					continue;
++			}
+ 			pkt->pkt_nb = pkt_nb;
+ 			pkt->len = len;
+ 			pkt->valid = frame->valid;
+@@ -1236,10 +1236,9 @@ static int __send_pkts(struct ifobject *ifobject, struct xsk_socket_info *xsk, b
+ 			}
+ 		}
+ 
+-		if (pkt && pkt->valid) {
++		if (pkt && pkt->valid)
+ 			valid_pkts++;
+-			valid_frags += nb_frags;
+-		}
++		valid_frags += nb_frags;
+ 	}
+ 
+ 	pthread_mutex_lock(&pacing_mutex);
+@@ -2075,13 +2074,16 @@ int testapp_invalid_desc_mb(struct test_spec *test)
+ 		{0, 0, 0, false, 0},
+ 		/* Invalid address in the second frame */
+ 		{0, XSK_UMEM__LARGE_FRAME_SIZE, 0, false, XDP_PKT_CONTD},
+-		{umem_size, XSK_UMEM__LARGE_FRAME_SIZE, 0, false, XDP_PKT_CONTD},
++		{umem_size * 2, XSK_UMEM__LARGE_FRAME_SIZE, 0, false, XDP_PKT_CONTD},
++		{0, MIN_PKT_SIZE, 0, false, 0},
+ 		/* Invalid len in the middle */
+ 		{0, XSK_UMEM__LARGE_FRAME_SIZE, 0, false, XDP_PKT_CONTD},
+ 		{0, XSK_UMEM__INVALID_FRAME_SIZE, 0, false, XDP_PKT_CONTD},
++		{0, MIN_PKT_SIZE, 0, false, 0},
+ 		/* Invalid options in the middle */
+ 		{0, XSK_UMEM__LARGE_FRAME_SIZE, 0, false, XDP_PKT_CONTD},
+ 		{0, XSK_UMEM__LARGE_FRAME_SIZE, 0, false, XSK_DESC__INVALID_OPTION},
++		{0, MIN_PKT_SIZE, 0, false, 0},
+ 		/* Transmit 2 frags, receive 3 */
+ 		{0, XSK_UMEM__MAX_FRAME_SIZE, 0, true, XDP_PKT_CONTD},
+ 		{0, XSK_UMEM__MAX_FRAME_SIZE, 0, true, 0},
+@@ -2093,8 +2095,8 @@ int testapp_invalid_desc_mb(struct test_spec *test)
+ 
+ 	if (umem->unaligned_mode) {
+ 		/* Crossing a chunk boundary allowed */
+-		pkts[12].valid = true;
+-		pkts[13].valid = true;
++		pkts[15].valid = true;
++		pkts[16].valid = true;
+ 	}
+ 
+ 	test->mtu = MAX_ETH_JUMBO_SIZE;
+-- 
+2.53.0
+
