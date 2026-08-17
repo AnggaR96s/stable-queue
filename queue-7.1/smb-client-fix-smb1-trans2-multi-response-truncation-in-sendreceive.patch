@@ -1,0 +1,96 @@
+From 26fa4d17c023dbe5427a92d3a7bd9ae1d1e58bc5 Mon Sep 17 00:00:00 2001
+From: Frank Sorenson <sorenson@redhat.com>
+Date: Tue, 4 Aug 2026 14:21:12 -0500
+Subject: smb: client: fix SMB1 TRANS2 multi-response truncation in SendReceive()
+
+From: Frank Sorenson <sorenson@redhat.com>
+
+commit 26fa4d17c023dbe5427a92d3a7bd9ae1d1e58bc5 upstream.
+
+When a TRANS2 response is split across multiple secondary packets,
+coalesce_t2() assembles the payload into the large response buffer.
+Two bugs cause SendReceive() to copy only a small fraction of the
+assembled buffer into the caller's output buffer.
+
+This manifests when listing a large directory on an SMB1 share
+(observed against Windows XP); the first getdents returns only
+partial results, and subsequent getdents returns EINVAL.
+
+Bug 1: coalesce_t2() computes the coalesced size as:
+
+  *pdu_len += total_in_src;
+
+cifs_demultiplex_thread() resets *pdu_len to each secondary's own
+pdu_length before calling coalesce_t2(), so this accumulates from
+the wrong baseline on every secondary after the first.
+
+Bug 2: after reassembly, cifs_demultiplex_thread() sets
+mid->resp_buf_size to the final secondary's raw packet size.  This
+value is later used as the memcpy length, so only a portion of the
+coalesced response is copied.
+
+Fix both by replacing the stale *pdu_len arithmetic with
+smbCalcSize(), which reads the BCC field that coalesce_t2()
+maintains correctly throughout reassembly.
+
+Fixes: 83bfbd0bb902 ("cifs: Remove the RFC1002 header from smb_hdr")
+Cc: stable@vger.kernel.org
+Signed-off-by: Frank Sorenson <sorenson@redhat.com>
+Reviewed-by: Paulo Alcantara <pc@manguebit.org>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/smb/client/smb1transport.c | 28 ++++++++++++++++++++++------
+ 1 file changed, 22 insertions(+), 6 deletions(-)
+
+diff --git a/fs/smb/client/smb1transport.c b/fs/smb/client/smb1transport.c
+index 53abb29fe71b..966f2cf83a51 100644
+--- a/fs/smb/client/smb1transport.c
++++ b/fs/smb/client/smb1transport.c
+@@ -260,9 +260,23 @@ SendReceive(const unsigned int xid, struct cifs_ses *ses,
+ 		goto out;
+ 
+ 	if (out_buf) {
+-		*pbytes_returned = resp_iov.iov_len;
+-		if (resp_iov.iov_len)
+-			memcpy(out_buf, resp_iov.iov_base, resp_iov.iov_len);
++		/* Use smbCalcSize() for both single- and multi-part T2 responses,
++		 * both here and in coalesce_t2().
++		 */
++		unsigned int copy_len;
++		if (WARN_ON_ONCE(!resp_iov.iov_base)) {
++			rc = -EIO;
++			goto out;
++		}
++		copy_len = smbCalcSize(resp_iov.iov_base);
++		if (copy_len > CIFSMaxBufSize + MAX_CIFS_HDR_SIZE) {
++			cifs_dbg(VFS, "response size %u exceeds buffer\n",
++				 copy_len);
++			rc = -ENOBUFS;
++			goto out;
++		}
++		*pbytes_returned = copy_len;
++		memcpy(out_buf, resp_iov.iov_base, copy_len);
+ 	}
+ 
+ out:
+@@ -386,11 +400,13 @@ coalesce_t2(char *second_buf, struct smb_hdr *target_hdr, unsigned int *pdu_len)
+ 	}
+ 	put_bcc(byte_count, target_hdr);
+ 
+-	byte_count = *pdu_len;
+-	byte_count += total_in_src;
++	/* use smbCalcSize() rather than *pdu_len: the demux loop resets
++	 * *pdu_len to each secondary's pdu_length, making it unreliable.
++	 */
++	byte_count = smbCalcSize(target_hdr);
+ 	/* don't allow buffer to overflow */
+ 	if (byte_count > CIFSMaxBufSize + MAX_CIFS_HDR_SIZE) {
+-		cifs_dbg(FYI, "coalesced BCC exceeds buffer size (%u)\n",
++		cifs_dbg(FYI, "coalesced size exceeds buffer size (%u)\n",
+ 			 byte_count);
+ 		return -ENOBUFS;
+ 	}
+-- 
+2.55.0
+
