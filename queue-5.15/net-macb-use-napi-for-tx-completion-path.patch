@@ -1,0 +1,101 @@
+From stable+bounces-290826-greg=kroah.com@vger.kernel.org Wed Jul 29 19:59:48 2026
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 29 Jul 2026 12:24:23 -0400
+Subject: net: macb: use NAPI for TX completion path
+To: stable@vger.kernel.org
+Cc: Robert Hancock <robert.hancock@calian.com>, Jakub Kicinski <kuba@kernel.org>, Sasha Levin <sashal@kernel.org>
+Message-ID: <20260729162427.3522161-2-sashal@kernel.org>
+
+From: Robert Hancock <robert.hancock@calian.com>
+
+[ Upstream commit 138badbc21a0113ce783270c426210d6451da5d1 ]
+
+This driver was using the TX IRQ handler to perform all TX completion
+tasks. Under heavy TX network load, this can cause significant irqs-off
+latencies (found to be in the hundreds of microseconds using ftrace).
+This can cause other issues, such as overrunning serial UART FIFOs when
+using high baud rates with limited UART FIFO sizes.
+
+Switch to using a NAPI poll handler to perform the TX completion work
+to get this out of hard IRQ context and avoid the IRQ latency impact. A
+separate NAPI instance is used for TX and RX to avoid checking the other
+ring's state unnecessarily when doing the poll, and so that the NAPI
+budget handling can work for both TX and RX packets.
+
+A new per-queue tx_ptr_lock spinlock has been added to avoid using the
+main device lock (with IRQs needing to be disabled) across the entire TX
+mapping operation, and also to protect the TX queue pointers from
+concurrent access between the TX start and TX poll operations.
+
+The TX Used Bit Read interrupt (TXUBR) handling also needs to be moved into
+the TX NAPI poll handler to maintain the proper order of operations. A flag
+is used to notify the poll handler that a UBR condition needs to be
+handled. The macb_tx_restart handler has had some locking added for global
+register access, since this could now potentially happen concurrently on
+different queues.
+
+Signed-off-by: Robert Hancock <robert.hancock@calian.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Stable-dep-of: 27f575836cfe ("net: macb: drop in-flight Tx SKBs on close")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/ethernet/cadence/macb_main.c |   12 ++++++------
+ 1 file changed, 6 insertions(+), 6 deletions(-)
+
+--- a/drivers/net/ethernet/cadence/macb_main.c
++++ b/drivers/net/ethernet/cadence/macb_main.c
+@@ -997,7 +997,7 @@ static int macb_halt_tx(struct macb *bp)
+ 					bp, TSR);
+ }
+ 
+-static void macb_tx_unmap(struct macb *bp, struct macb_tx_skb *tx_skb)
++static void macb_tx_unmap(struct macb *bp, struct macb_tx_skb *tx_skb, int budget)
+ {
+ 	if (tx_skb->mapping) {
+ 		if (tx_skb->mapped_as_page)
+@@ -1010,7 +1010,7 @@ static void macb_tx_unmap(struct macb *b
+ 	}
+ 
+ 	if (tx_skb->skb) {
+-		dev_kfree_skb_any(tx_skb->skb);
++		napi_consume_skb(tx_skb->skb, budget);
+ 		tx_skb->skb = NULL;
+ 	}
+ }
+@@ -1100,7 +1100,7 @@ static void macb_tx_error_task(struct wo
+ 		if (ctrl & MACB_BIT(TX_USED)) {
+ 			/* skb is set for the last buffer of the frame */
+ 			while (!skb) {
+-				macb_tx_unmap(bp, tx_skb);
++				macb_tx_unmap(bp, tx_skb, 0);
+ 				tail++;
+ 				tx_skb = macb_tx_skb(queue, tail);
+ 				skb = tx_skb->skb;
+@@ -1130,7 +1130,7 @@ static void macb_tx_error_task(struct wo
+ 			desc->ctrl = ctrl | MACB_BIT(TX_USED);
+ 		}
+ 
+-		macb_tx_unmap(bp, tx_skb);
++		macb_tx_unmap(bp, tx_skb, 0);
+ 	}
+ 
+ 	/* Set end of TX queue */
+@@ -1254,7 +1254,7 @@ static void macb_tx_interrupt(struct mac
+ 			}
+ 
+ 			/* Now we can safely release resources */
+-			macb_tx_unmap(bp, tx_skb);
++			macb_tx_unmap(bp, tx_skb, 0);
+ 
+ 			/* skb is set only for the last buffer of the frame.
+ 			 * WARNING: at this point skb has been freed by
+@@ -2094,7 +2094,7 @@ dma_error:
+ 	for (i = queue->tx_head; i != tx_head; i++) {
+ 		tx_skb = macb_tx_skb(queue, i);
+ 
+-		macb_tx_unmap(bp, tx_skb);
++		macb_tx_unmap(bp, tx_skb, 0);
+ 	}
+ 
+ 	return 0;

@@ -1,0 +1,136 @@
+From stable+bounces-290825-greg=kroah.com@vger.kernel.org Wed Jul 29 18:34:52 2026
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 29 Jul 2026 12:24:22 -0400
+Subject: net: macb: simplify/cleanup NAPI reschedule checking
+To: stable@vger.kernel.org
+Cc: Robert Hancock <robert.hancock@calian.com>, Jakub Kicinski <kuba@kernel.org>, Sasha Levin <sashal@kernel.org>
+Message-ID: <20260729162427.3522161-1-sashal@kernel.org>
+
+From: Robert Hancock <robert.hancock@calian.com>
+
+[ Upstream commit 1900e30d0ef74755213811cc23079b1be51298fe ]
+
+Previously the macb_poll method was checking the RSR register after
+completing its RX receive work to see if additional packets had been
+received since IRQs were disabled, since this controller does not
+maintain the pending IRQ status across IRQ disable. It also had to
+double-check the register after re-enabling IRQs to detect if packets
+were received after the first check but before IRQs were enabled.
+
+Using the RSR register for this purpose is problematic since it reflects
+the global device state rather than the per-queue state, so if packets
+are being received on multiple queues it may end up retriggering receive
+on a queue where the packets did not actually arrive and not on the one
+where they did arrive. This will also cause problems with an upcoming
+change to use NAPI for the TX path where use of multiple queues is more
+likely.
+
+Add a macb_rx_pending function to check the RX ring to see if more
+packets have arrived in the queue, and use that to check if NAPI should
+be rescheduled rather than the RSR register. By doing this, we can just
+ignore the global RSR register entirely, and thus save some extra device
+register accesses at the same time.
+
+This also makes the previous first check for pending packets rather
+redundant, since it would be checking the RX ring state which was just
+checked in the receive work function. Therefore we can get rid of it and
+just check after enabling interrupts whether packets are already
+pending.
+
+Signed-off-by: Robert Hancock <robert.hancock@calian.com>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Stable-dep-of: 27f575836cfe ("net: macb: drop in-flight Tx SKBs on close")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/ethernet/cadence/macb_main.c |   65 ++++++++++++++-----------------
+ 1 file changed, 31 insertions(+), 34 deletions(-)
+
+--- a/drivers/net/ethernet/cadence/macb_main.c
++++ b/drivers/net/ethernet/cadence/macb_main.c
+@@ -1626,54 +1626,51 @@ static int macb_rx(struct macb_queue *qu
+ 	return received;
+ }
+ 
++static bool macb_rx_pending(struct macb_queue *queue)
++{
++	struct macb *bp = queue->bp;
++	unsigned int		entry;
++	struct macb_dma_desc	*desc;
++
++	entry = macb_rx_ring_wrap(bp, queue->rx_tail);
++	desc = macb_rx_desc(queue, entry);
++
++	/* Make hw descriptor updates visible to CPU */
++	rmb();
++
++	return (desc->addr & MACB_BIT(RX_USED)) != 0;
++}
++
+ static int macb_poll(struct napi_struct *napi, int budget)
+ {
+ 	struct macb_queue *queue = container_of(napi, struct macb_queue, napi);
+ 	struct macb *bp = queue->bp;
+ 	int work_done;
+-	u32 status;
+ 
+-	status = macb_readl(bp, RSR);
+-	macb_writel(bp, RSR, status);
++	work_done = bp->macbgem_ops.mog_rx(queue, napi, budget);
+ 
+-	netdev_vdbg(bp->dev, "poll: status = %08lx, budget = %d\n",
+-		    (unsigned long)status, budget);
++	netdev_vdbg(bp->dev, "poll: queue = %u, work_done = %d, budget = %d\n",
++		    (unsigned int)(queue - bp->queues), work_done, budget);
+ 
+-	work_done = bp->macbgem_ops.mog_rx(queue, napi, budget);
+-	if (work_done < budget) {
+-		napi_complete_done(napi, work_done);
++	if (work_done < budget && napi_complete_done(napi, work_done)) {
++		queue_writel(queue, IER, bp->rx_intr_mask);
+ 
+-		/* RSR bits only seem to propagate to raise interrupts when
+-		 * interrupts are enabled at the time, so if bits are already
+-		 * set due to packets received while interrupts were disabled,
++		/* Packet completions only seem to propagate to raise
++		 * interrupts when interrupts are enabled at the time, so if
++		 * packets were received while interrupts were disabled,
+ 		 * they will not cause another interrupt to be generated when
+ 		 * interrupts are re-enabled.
+-		 * Check for this case here. This has been seen to happen
+-		 * around 30% of the time under heavy network load.
++		 * Check for this case here to avoid losing a wakeup. This can
++		 * potentially race with the interrupt handler doing the same
++		 * actions if an interrupt is raised just after enabling them,
++		 * but this should be harmless.
+ 		 */
+-		status = macb_readl(bp, RSR);
+-		if (status) {
++		if (macb_rx_pending(queue)) {
++			queue_writel(queue, IDR, bp->rx_intr_mask);
+ 			if (bp->caps & MACB_CAPS_ISR_CLEAR_ON_WRITE)
+ 				queue_writel(queue, ISR, MACB_BIT(RCOMP));
+-			napi_reschedule(napi);
+-		} else {
+-			queue_writel(queue, IER, bp->rx_intr_mask);
+-
+-			/* In rare cases, packets could have been received in
+-			 * the window between the check above and re-enabling
+-			 * interrupts. Therefore, a double-check is required
+-			 * to avoid losing a wakeup. This can potentially race
+-			 * with the interrupt handler doing the same actions
+-			 * if an interrupt is raised just after enabling them,
+-			 * but this should be harmless.
+-			 */
+-			status = macb_readl(bp, RSR);
+-			if (unlikely(status)) {
+-				queue_writel(queue, IDR, bp->rx_intr_mask);
+-				if (bp->caps & MACB_CAPS_ISR_CLEAR_ON_WRITE)
+-					queue_writel(queue, ISR, MACB_BIT(RCOMP));
+-				napi_schedule(napi);
+-			}
++			netdev_vdbg(bp->dev, "poll: packets pending, reschedule\n");
++			napi_schedule(napi);
+ 		}
+ 	}
+ 
