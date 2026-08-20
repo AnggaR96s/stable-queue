@@ -1,0 +1,191 @@
+From stable+bounces-287874-greg=kroah.com@vger.kernel.org Wed Jul 22 16:03:31 2026
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 22 Jul 2026 09:55:03 -0400
+Subject: VFS/audit: introduce kern_path_parent() for audit
+To: stable@vger.kernel.org
+Cc: NeilBrown <neil@brown.name>, Christian Brauner <brauner@kernel.org>, Sasha Levin <sashal@kernel.org>
+Message-ID: <20260722135506.1367414-1-sashal@kernel.org>
+
+From: NeilBrown <neil@brown.name>
+
+[ Upstream commit 76a53de6f7ff0641570364234fb4489f4d4fc8e9 ]
+
+audit_alloc_mark() and audit_get_nd() both need to perform a path
+lookup getting the parent dentry (which must exist) and the final
+target (following a LAST_NORM name) which sometimes doesn't need to
+exist.
+
+They don't need the parent to be locked, but use kern_path_locked() or
+kern_path_locked_negative() anyway.  This is somewhat misleading to the
+casual reader.
+
+This patch introduces a more targeted function, kern_path_parent(),
+which returns not holding locks.  On success the "path" will
+be set to the parent, which must be found, and the return value is the
+dentry of the target, which might be negative.
+
+This will clear the way to rename kern_path_locked() which is
+otherwise only used to prepare for removing something.
+
+It also allows us to remove kern_path_locked_negative(), which is
+transformed into the new kern_path_parent().
+
+Signed-off-by: NeilBrown <neil@brown.name>
+Signed-off-by: Christian Brauner <brauner@kernel.org>
+Stable-dep-of: 81905b5acbe7 ("audit: fix recursive locking deadlock in audit_dupe_exe()")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/namei.c              |   42 ++++++++++++++++++++++++++++++++++++++++++
+ include/linux/namei.h   |    1 +
+ kernel/audit.h          |    4 ++--
+ kernel/audit_fsnotify.c |   11 ++++-------
+ kernel/audit_watch.c    |    9 ++++++---
+ 5 files changed, 55 insertions(+), 12 deletions(-)
+
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -2439,6 +2439,48 @@ static struct filename *filename_parenta
+ 	return name;
+ }
+ 
++/**
++ * kern_path_parent: lookup path returning parent and target
++ * @name: path name
++ * @path: path to store parent in
++ *
++ * The path @name should end with a normal component, not "." or ".." or "/".
++ * A lookup is performed and if successful the parent information
++ * is store in @parent and the dentry is returned.
++ *
++ * The dentry maybe negative, the parent will be positive.
++ *
++ * Returns:  dentry or error.
++ */
++struct dentry *kern_path_parent(const char *name, struct path *path)
++{
++	struct filename *filename;
++	struct path parent_path;
++	struct dentry *d;
++	struct qstr last;
++	int type;
++
++	filename = filename_parentat(AT_FDCWD, getname_kernel(name), 0,
++				     &parent_path, &last, &type);
++	if (IS_ERR(filename))
++		return ERR_CAST(filename);
++	if (unlikely(type != LAST_NORM)) {
++		path_put(&parent_path);
++		d = ERR_PTR(-EINVAL);
++		goto out;
++	}
++
++	d = lookup_one_len_unlocked(last.name, parent_path.dentry, last.len);
++	if (IS_ERR(d)) {
++		path_put(&parent_path);
++		goto out;
++	}
++	*path = parent_path;
++out:
++	putname(filename);
++	return d;
++}
++
+ /* does lookup, returns the object with parent locked */
+ struct dentry *kern_path_locked(const char *name, struct path *path)
+ {
+--- a/include/linux/namei.h
++++ b/include/linux/namei.h
+@@ -61,6 +61,7 @@ static inline int user_path_at(int dfd,
+ }
+ 
+ extern int kern_path(const char *, unsigned, struct path *);
++struct dentry *kern_path_parent(const char *name, struct path *parent);
+ 
+ extern struct dentry *kern_path_create(int, const char *, struct path *, unsigned int);
+ extern struct dentry *user_path_create(int, const char __user *, struct path *, unsigned int);
+--- a/kernel/audit.h
++++ b/kernel/audit.h
+@@ -271,8 +271,8 @@ extern struct audit_fsnotify_mark *audit
+ extern char *audit_mark_path(struct audit_fsnotify_mark *mark);
+ extern void audit_remove_mark(struct audit_fsnotify_mark *audit_mark);
+ extern void audit_remove_mark_rule(struct audit_krule *krule);
+-extern int audit_mark_compare(struct audit_fsnotify_mark *mark,
+-			      unsigned long ino, dev_t dev);
++extern int audit_mark_compare(struct audit_fsnotify_mark *mark, u64 ino,
++			      dev_t dev);
+ extern int audit_dupe_exe(struct audit_krule *new, struct audit_krule *old);
+ extern int audit_exe_compare(struct task_struct *tsk,
+ 			     struct audit_fsnotify_mark *mark);
+--- a/kernel/audit_fsnotify.c
++++ b/kernel/audit_fsnotify.c
+@@ -57,7 +57,7 @@ char *audit_mark_path(struct audit_fsnot
+ 	return mark->path;
+ }
+ 
+-int audit_mark_compare(struct audit_fsnotify_mark *mark, unsigned long ino, dev_t dev)
++int audit_mark_compare(struct audit_fsnotify_mark *mark, u64 ino, dev_t dev)
+ {
+ 	if (mark->ino == AUDIT_INO_UNSET)
+ 		return 0;
+@@ -76,17 +76,14 @@ struct audit_fsnotify_mark *audit_alloc_
+ 	struct audit_fsnotify_mark *audit_mark;
+ 	struct path path;
+ 	struct dentry *dentry;
+-	struct inode *inode;
+ 	int ret;
+ 
+ 	if (pathname[0] != '/' || pathname[len-1] == '/')
+ 		return ERR_PTR(-EINVAL);
+ 
+-	dentry = kern_path_locked(pathname, &path);
++	dentry = kern_path_parent(pathname, &path);
+ 	if (IS_ERR(dentry))
+-		return (void *)dentry; /* returning an error */
+-	inode = path.dentry->d_inode;
+-	inode_unlock(inode);
++		return ERR_CAST(dentry); /* returning an error */
+ 
+ 	audit_mark = kzalloc(sizeof(*audit_mark), GFP_KERNEL);
+ 	if (unlikely(!audit_mark)) {
+@@ -100,7 +97,7 @@ struct audit_fsnotify_mark *audit_alloc_
+ 	audit_update_mark(audit_mark, dentry->d_inode);
+ 	audit_mark->rule = krule;
+ 
+-	ret = fsnotify_add_inode_mark(&audit_mark->mark, inode, 0);
++	ret = fsnotify_add_inode_mark(&audit_mark->mark, path.dentry->d_inode, 0);
+ 	if (ret < 0) {
+ 		audit_mark->path = NULL;
+ 		fsnotify_put_mark(&audit_mark->mark);
+--- a/kernel/audit_watch.c
++++ b/kernel/audit_watch.c
+@@ -243,7 +243,7 @@ static void audit_watch_log_rule_change(
+ /* Update inode info in audit rules based on filesystem event. */
+ static void audit_update_watch(struct audit_parent *parent,
+ 			       const struct qstr *dname, dev_t dev,
+-			       unsigned long ino, unsigned invalidating)
++			       u64 ino, unsigned int invalidating)
+ {
+ 	struct audit_watch *owatch, *nwatch, *nextw;
+ 	struct audit_krule *r, *nextr;
+@@ -346,15 +346,18 @@ static void audit_remove_parent_watches(
+ /* Get path information necessary for adding watches. */
+ static int audit_get_nd(struct audit_watch *watch, struct path *parent)
+ {
+-	struct dentry *d = kern_path_locked(watch->path, parent);
++	struct dentry *d;
++
++	d = kern_path_parent(watch->path, parent);
+ 	if (IS_ERR(d))
+ 		return PTR_ERR(d);
++
+ 	if (d_is_positive(d)) {
+ 		/* update watch filter fields */
+ 		watch->dev = d->d_sb->s_dev;
+ 		watch->ino = d_backing_inode(d)->i_ino;
+ 	}
+-	inode_unlock(d_backing_inode(parent->dentry));
++
+ 	dput(d);
+ 	return 0;
+ }
