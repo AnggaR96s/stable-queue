@@ -1,0 +1,271 @@
+From stable+bounces-299930-greg=kroah.com@vger.kernel.org Tue Aug 11 21:11:42 2026
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 11 Aug 2026 14:56:17 -0400
+Subject: fsnotify: opt-in for permission events at file open time
+To: stable@vger.kernel.org
+Cc: Amir Goldstein <amir73il@gmail.com>, Linus Torvalds <torvalds@linux-foundation.org>, Jan Kara <jack@suse.cz>, Sasha Levin <sashal@kernel.org>
+Message-ID: <20260811185619.3386946-2-sashal@kernel.org>
+
+From: Amir Goldstein <amir73il@gmail.com>
+
+[ Upstream commit a94204f4d48e28a711b7ed10399f749286c433e3 ]
+
+Legacy inotify/fanotify listeners can add watches for events on inode,
+parent or mount and expect to get events (e.g. FS_MODIFY) on files that
+were already open at the time of setting up the watches.
+
+fanotify permission events are typically used by Anti-malware sofware,
+that is watching the entire mount and it is not common to have more that
+one Anti-malware engine installed on a system.
+
+To reduce the overhead of the fsnotify_file_perm() hooks on every file
+access, relax the semantics of the legacy FAN_ACCESS_PERM event to generate
+events only if there were *any* permission event listeners on the
+filesystem at the time that the file was opened.
+
+The new semantic is implemented by extending the FMODE_NONOTIFY bit into
+two FMODE_NONOTIFY_* bits, that are used to store a mode for which of the
+events types to report.
+
+This is going to apply to the new fanotify pre-content events in order
+to reduce the cost of the new pre-content event vfs hooks.
+
+[Thanks to Bert Karwatzki <spasswolf@web.de> for reporting a bug in this
+code with CONFIG_FANOTIFY_ACCESS_PERMISSIONS disabled]
+
+Suggested-by: Linus Torvalds <torvalds@linux-foundation.org>
+Link: https://lore.kernel.org/linux-fsdevel/CAHk-=wj8L=mtcRTi=NECHMGfZQgXOp_uix1YVh04fEmrKaMnXA@mail.gmail.com/
+Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+Signed-off-by: Jan Kara <jack@suse.cz>
+Link: https://patch.msgid.link/5ea5f8e283d1edb55aa79c35187bfe344056af14.1731684329.git.josef@toxicpanda.com
+Stable-dep-of: db1856ea9196 ("binfmt_misc: restore write access when removing an entry")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/notify/fsnotify.c     |   38 ++++++++++++++++++++++++++++++++++++++
+ fs/open.c                |    8 +++++++-
+ include/linux/fs.h       |   43 ++++++++++++++++++++++++++++++++++++++-----
+ include/linux/fsnotify.h |   39 +++++++++++++++++++++++----------------
+ 4 files changed, 106 insertions(+), 22 deletions(-)
+
+--- a/fs/notify/fsnotify.c
++++ b/fs/notify/fsnotify.c
+@@ -630,6 +630,44 @@ out:
+ }
+ EXPORT_SYMBOL_GPL(fsnotify);
+ 
++#ifdef CONFIG_FANOTIFY_ACCESS_PERMISSIONS
++/*
++ * At open time we check fsnotify_sb_has_priority_watchers() and set the
++ * FMODE_NONOTIFY_ mode bits accordignly.
++ * Later, fsnotify permission hooks do not check if there are permission event
++ * watches, but that there were permission event watches at open time.
++ */
++void file_set_fsnotify_mode(struct file *file)
++{
++	struct super_block *sb = file->f_path.dentry->d_sb;
++
++	/* Is it a file opened by fanotify? */
++	if (FMODE_FSNOTIFY_NONE(file->f_mode))
++		return;
++
++	/*
++	 * Permission events is a super set of pre-content events, so if there
++	 * are no permission event watchers, there are also no pre-content event
++	 * watchers and this is implied from the single FMODE_NONOTIFY_PERM bit.
++	 */
++	if (likely(!fsnotify_sb_has_priority_watchers(sb,
++						FSNOTIFY_PRIO_CONTENT))) {
++		file->f_mode |= FMODE_NONOTIFY_PERM;
++		return;
++	}
++
++	/*
++	 * If there are permission event watchers but no pre-content event
++	 * watchers, set FMODE_NONOTIFY | FMODE_NONOTIFY_PERM to indicate that.
++	 */
++	if (likely(!fsnotify_sb_has_priority_watchers(sb,
++						FSNOTIFY_PRIO_PRE_CONTENT))) {
++		file->f_mode |= FMODE_NONOTIFY | FMODE_NONOTIFY_PERM;
++		return;
++	}
++}
++#endif
++
+ static __init int fsnotify_init(void)
+ {
+ 	int ret;
+--- a/fs/open.c
++++ b/fs/open.c
+@@ -912,7 +912,7 @@ static int do_dentry_open(struct file *f
+ 	f->f_sb_err = file_sample_sb_err(f);
+ 
+ 	if (unlikely(f->f_flags & O_PATH)) {
+-		f->f_mode = FMODE_PATH | FMODE_OPENED;
++		f->f_mode = FMODE_PATH | FMODE_OPENED | FMODE_NONOTIFY;
+ 		f->f_op = &empty_fops;
+ 		return 0;
+ 	}
+@@ -940,6 +940,12 @@ static int do_dentry_open(struct file *f
+ 	if (error)
+ 		goto cleanup_all;
+ 
++	/*
++	 * Set FMODE_NONOTIFY_* bits according to existing permission watches.
++	 * If FMODE_NONOTIFY was already set for an fanotify fd, this doesn't
++	 * change anything.
++	 */
++	file_set_fsnotify_mode(f);
+ 	error = fsnotify_open_perm(f);
+ 	if (error)
+ 		goto cleanup_all;
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -171,13 +171,20 @@ typedef int (dio_iodone_t)(struct kiocb
+ 
+ #define	FMODE_NOREUSE		((__force fmode_t)(1 << 23))
+ 
+-/* FMODE_* bit 24 */
+-
+ /* File is embedded in backing_file object */
+-#define FMODE_BACKING		((__force fmode_t)(1 << 25))
++#define FMODE_BACKING		((__force fmode_t)(1 << 24))
++
++/*
++ * Together with FMODE_NONOTIFY_PERM defines which fsnotify events shouldn't be
++ * generated (see below)
++ */
++#define FMODE_NONOTIFY		((__force fmode_t)(1 << 25))
+ 
+-/* File was opened by fanotify and shouldn't generate fanotify events */
+-#define FMODE_NONOTIFY		((__force fmode_t)(1 << 26))
++/*
++ * Together with FMODE_NONOTIFY defines which fsnotify events shouldn't be
++ * generated (see below)
++ */
++#define FMODE_NONOTIFY_PERM	((__force fmode_t)(1 << 26))
+ 
+ /* File is capable of returning -EAGAIN if I/O will block */
+ #define FMODE_NOWAIT		((__force fmode_t)(1 << 27))
+@@ -189,6 +196,32 @@ typedef int (dio_iodone_t)(struct kiocb
+ #define FMODE_NOACCOUNT		((__force fmode_t)(1 << 29))
+ 
+ /*
++ * The two FMODE_NONOTIFY* define which fsnotify events should not be generated
++ * for a file. These are the possible values of (f->f_mode &
++ * FMODE_FSNOTIFY_MASK) and their meaning:
++ *
++ * FMODE_NONOTIFY - suppress all (incl. non-permission) events.
++ * FMODE_NONOTIFY_PERM - suppress permission (incl. pre-content) events.
++ * FMODE_NONOTIFY | FMODE_NONOTIFY_PERM - suppress only pre-content events.
++ */
++#define FMODE_FSNOTIFY_MASK \
++	(FMODE_NONOTIFY | FMODE_NONOTIFY_PERM)
++
++#define FMODE_FSNOTIFY_NONE(mode) \
++	((mode & FMODE_FSNOTIFY_MASK) == FMODE_NONOTIFY)
++#ifdef CONFIG_FANOTIFY_ACCESS_PERMISSIONS
++#define FMODE_FSNOTIFY_PERM(mode) \
++	((mode & FMODE_FSNOTIFY_MASK) == 0 || \
++	 (mode & FMODE_FSNOTIFY_MASK) == (FMODE_NONOTIFY | FMODE_NONOTIFY_PERM))
++#define FMODE_FSNOTIFY_HSM(mode) \
++	((mode & FMODE_FSNOTIFY_MASK) == 0)
++#else
++#define FMODE_FSNOTIFY_PERM(mode)	0
++#define FMODE_FSNOTIFY_HSM(mode)	0
++#endif
++
++
++/*
+  * Attribute flags.  These should be or-ed together to figure out what
+  * has been changed!
+  */
+--- a/include/linux/fsnotify.h
++++ b/include/linux/fsnotify.h
+@@ -108,38 +108,35 @@ static inline void fsnotify_dentry(struc
+ 	fsnotify_parent(dentry, mask, dentry, FSNOTIFY_EVENT_DENTRY);
+ }
+ 
+-static inline int fsnotify_file(struct file *file, __u32 mask)
++static inline int fsnotify_path(const struct path *path, __u32 mask)
+ {
+-	const struct path *path;
++	return fsnotify_parent(path->dentry, mask, path, FSNOTIFY_EVENT_PATH);
++}
+ 
++static inline int fsnotify_file(struct file *file, __u32 mask)
++{
+ 	/*
+ 	 * FMODE_NONOTIFY are fds generated by fanotify itself which should not
+ 	 * generate new events. We also don't want to generate events for
+ 	 * FMODE_PATH fds (involves open & close events) as they are just
+ 	 * handle creation / destruction events and not "real" file events.
+ 	 */
+-	if (file->f_mode & (FMODE_NONOTIFY | FMODE_PATH))
++	if (FMODE_FSNOTIFY_NONE(file->f_mode))
+ 		return 0;
+ 
+-	path = &file->f_path;
+-	/* Permission events require group prio >= FSNOTIFY_PRIO_CONTENT */
+-	if (mask & ALL_FSNOTIFY_PERM_EVENTS &&
+-	    !fsnotify_sb_has_priority_watchers(path->dentry->d_sb,
+-					       FSNOTIFY_PRIO_CONTENT))
+-		return 0;
+-
+-	return fsnotify_parent(path->dentry, mask, path, FSNOTIFY_EVENT_PATH);
++	return fsnotify_path(&file->f_path, mask);
+ }
+ 
+ #ifdef CONFIG_FANOTIFY_ACCESS_PERMISSIONS
++
++void file_set_fsnotify_mode(struct file *file);
++
+ /*
+  * fsnotify_file_area_perm - permission hook before access to file range
+  */
+ static inline int fsnotify_file_area_perm(struct file *file, int perm_mask,
+ 					  const loff_t *ppos, size_t count)
+ {
+-	__u32 fsnotify_mask = FS_ACCESS_PERM;
+-
+ 	/*
+ 	 * filesystem may be modified in the context of permission events
+ 	 * (e.g. by HSM filling a file on access), so sb freeze protection
+@@ -150,7 +147,10 @@ static inline int fsnotify_file_area_per
+ 	if (!(perm_mask & MAY_READ))
+ 		return 0;
+ 
+-	return fsnotify_file(file, fsnotify_mask);
++	if (likely(!FMODE_FSNOTIFY_PERM(file->f_mode)))
++		return 0;
++
++	return fsnotify_path(&file->f_path, FS_ACCESS_PERM);
+ }
+ 
+ /*
+@@ -168,16 +168,23 @@ static inline int fsnotify_open_perm(str
+ {
+ 	int ret;
+ 
++	if (likely(!FMODE_FSNOTIFY_PERM(file->f_mode)))
++		return 0;
++
+ 	if (file->f_flags & __FMODE_EXEC) {
+-		ret = fsnotify_file(file, FS_OPEN_EXEC_PERM);
++		ret = fsnotify_path(&file->f_path, FS_OPEN_EXEC_PERM);
+ 		if (ret)
+ 			return ret;
+ 	}
+ 
+-	return fsnotify_file(file, FS_OPEN_PERM);
++	return fsnotify_path(&file->f_path, FS_OPEN_PERM);
+ }
+ 
+ #else
++static inline void file_set_fsnotify_mode(struct file *file)
++{
++}
++
+ static inline int fsnotify_file_area_perm(struct file *file, int perm_mask,
+ 					  const loff_t *ppos, size_t count)
+ {
