@@ -1,0 +1,140 @@
+From 4eec4178b43ba9498e56aab3fcfe9d46b86a9375 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 4 Dec 2023 11:33:28 -0800
+Subject: packet: add a generic drop reason for receive
+
+From: Yan Zhai <yan@cloudflare.com>
+
+[ Upstream commit 2f57dd94bdef083855366138646b26b05f410d99 ]
+
+Commit da37845fdce2 ("packet: uses kfree_skb() for errors.") switches
+from consume_skb to kfree_skb to improve error handling. However, this
+could bring a lot of noises when we monitor real packet drops in
+kfree_skb[1], because in tpacket_rcv or packet_rcv only packet clones
+can be freed, not actual packets.
+
+Adding a generic drop reason to allow distinguish these "clone drops".
+
+[1]: https://lore.kernel.org/netdev/CABWYdi00L+O30Q=Zah28QwZ_5RU-xcxLFUK2Zj08A8MrLk9jzg@mail.gmail.com/
+Fixes: da37845fdce2 ("packet: uses kfree_skb() for errors.")
+Suggested-by: Eric Dumazet <edumazet@google.com>
+Suggested-by: Willem de Bruijn <willemdebruijn.kernel@gmail.com>
+Signed-off-by: Yan Zhai <yan@cloudflare.com>
+Reviewed-by: Eric Dumazet <edumazet@google.com>
+Reviewed-by: Willem de Bruijn <willemb@google.com>
+Link: https://lore.kernel.org/r/ZW4piNbx3IenYnuw@debian.debian
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Stable-dep-of: f60b396ee174 ("net/sched: act_api: fix TOCTOU NULL deref on a->goto_chain")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/net/dropreason-core.h |  6 ++++++
+ net/packet/af_packet.c        | 20 +++++++-------------
+ 2 files changed, 13 insertions(+), 13 deletions(-)
+
+diff --git a/include/net/dropreason-core.h b/include/net/dropreason-core.h
+index 845dce805de7f..6ff543fe8a8b5 100644
+--- a/include/net/dropreason-core.h
++++ b/include/net/dropreason-core.h
+@@ -81,6 +81,7 @@
+ 	FN(IPV6_NDISC_NS_OTHERHOST)	\
+ 	FN(QUEUE_PURGE)			\
+ 	FN(TC_ERROR)			\
++	FN(PACKET_SOCK_ERROR)		\
+ 	FNe(MAX)
+ 
+ /**
+@@ -348,6 +349,11 @@ enum skb_drop_reason {
+ 	SKB_DROP_REASON_QUEUE_PURGE,
+ 	/** @SKB_DROP_REASON_TC_ERROR: generic internal tc error. */
+ 	SKB_DROP_REASON_TC_ERROR,
++	/**
++	 * @SKB_DROP_REASON_PACKET_SOCK_ERROR: generic packet socket errors
++	 * after its filter matches an incoming packet.
++	 */
++	SKB_DROP_REASON_PACKET_SOCK_ERROR,
+ 	/**
+ 	 * @SKB_DROP_REASON_MAX: the maximum of core drop reasons, which
+ 	 * shouldn't be used as a real 'reason' - only for tracing code gen
+diff --git a/net/packet/af_packet.c b/net/packet/af_packet.c
+index 455a70aa9a9e9..116578fbd9a1c 100644
+--- a/net/packet/af_packet.c
++++ b/net/packet/af_packet.c
+@@ -2186,13 +2186,13 @@ static int packet_rcv_vnet(struct msghdr *msg, const struct sk_buff *skb,
+ static int packet_rcv(struct sk_buff *skb, struct net_device *dev,
+ 		      struct packet_type *pt, struct net_device *orig_dev)
+ {
++	enum skb_drop_reason drop_reason = SKB_CONSUMED;
+ 	struct sock *sk;
+ 	struct sockaddr_ll *sll;
+ 	struct packet_sock *po;
+ 	u8 *skb_head = skb->data;
+ 	int skb_len = skb->len;
+ 	unsigned int snaplen, res;
+-	bool is_drop_n_account = false;
+ 
+ 	if (skb->pkt_type == PACKET_LOOPBACK)
+ 		goto drop;
+@@ -2282,9 +2282,9 @@ static int packet_rcv(struct sk_buff *skb, struct net_device *dev,
+ 	return 0;
+ 
+ drop_n_acct:
+-	is_drop_n_account = true;
+ 	atomic_inc(&po->tp_drops);
+ 	atomic_inc(&sk->sk_drops);
++	drop_reason = SKB_DROP_REASON_PACKET_SOCK_ERROR;
+ 
+ drop_n_restore:
+ 	if (skb_head != skb->data && skb_shared(skb)) {
+@@ -2292,16 +2292,14 @@ static int packet_rcv(struct sk_buff *skb, struct net_device *dev,
+ 		skb->len = skb_len;
+ 	}
+ drop:
+-	if (!is_drop_n_account)
+-		consume_skb(skb);
+-	else
+-		kfree_skb(skb);
++	kfree_skb_reason(skb, drop_reason);
+ 	return 0;
+ }
+ 
+ static int tpacket_rcv(struct sk_buff *skb, struct net_device *dev,
+ 		       struct packet_type *pt, struct net_device *orig_dev)
+ {
++	enum skb_drop_reason drop_reason = SKB_CONSUMED;
+ 	struct sock *sk;
+ 	struct packet_sock *po;
+ 	struct sockaddr_ll *sll;
+@@ -2315,7 +2313,6 @@ static int tpacket_rcv(struct sk_buff *skb, struct net_device *dev,
+ 	struct sk_buff *copy_skb = NULL;
+ 	struct timespec64 ts;
+ 	__u32 ts_status;
+-	bool is_drop_n_account = false;
+ 	unsigned int slot_id = 0;
+ 	int vnet_hdr_sz = 0;
+ 
+@@ -2568,19 +2565,16 @@ static int tpacket_rcv(struct sk_buff *skb, struct net_device *dev,
+ 		skb->len = skb_len;
+ 	}
+ drop:
+-	if (!is_drop_n_account)
+-		consume_skb(skb);
+-	else
+-		kfree_skb(skb);
++	kfree_skb_reason(skb, drop_reason);
+ 	return 0;
+ 
+ drop_n_account:
+ 	spin_unlock(&sk->sk_receive_queue.lock);
+ 	atomic_inc(&po->tp_drops);
+-	is_drop_n_account = true;
++	drop_reason = SKB_DROP_REASON_PACKET_SOCK_ERROR;
+ 
+ 	sk->sk_data_ready(sk);
+-	kfree_skb(copy_skb);
++	kfree_skb_reason(copy_skb, drop_reason);
+ 	goto drop_n_restore;
+ }
+ 
+-- 
+2.53.0
+
