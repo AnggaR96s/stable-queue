@@ -1,0 +1,66 @@
+From stable+bounces-307179-greg=kroah.com@vger.kernel.org Sun Aug 23 16:28:32 2026
+From: Sasha Levin <sashal@kernel.org>
+Date: Sun, 23 Aug 2026 10:28:20 -0400
+Subject: mmc: atmel-mci: Fix use-after-free in atmci_remove due to race condition
+To: stable@vger.kernel.org
+Cc: Pei Xiao <xiaopei01@kylinos.cn>, Ulf Hansson <ulfh@kernel.org>, Sasha Levin <sashal@kernel.org>
+Message-ID: <20260823142820.2437217-1-sashal@kernel.org>
+
+From: Pei Xiao <xiaopei01@kylinos.cn>
+
+[ Upstream commit c125ee35a49a0518521b52b27631eef061b8719a ]
+
+In atmci_probe, &host->bh_work is bound with atmci_work_func, and
+atmci_interrupt, atmci_timeout_timer and atmci_dma_complete can all
+queue this work on system_bh_wq.
+
+If we remove the module, atmci_remove makes cleanup and the memory
+allocated for host with devm_kzalloc() is released after the remove
+callback returns, while the work mentioned above may still be pending
+or running. The sequence of operations that may lead to a UAF bug is
+as follows:
+
+CPU0                                      CPU1
+
+                                          | atmci_interrupt
+                                          | queue_work(system_bh_wq,
+                                          |            &host->bh_work)
+atmci_remove                              |
+atmci_cleanup_slot(...)                   |
+atmci_writel(host, ATMCI_IDR, ~0UL)       |
+timer_delete_sync(&host->timer)           |
+dma_release_channel(host->dma.chan)       |
+free_irq(platform_get_irq(pdev, 0), host) |
+                                          | atmci_work_func
+                                          | // use host
+// devm resources released after          |
+// remove returns, host is freed          |
+                                          | // use host (use-after-free)
+
+Fix it by canceling the work after all the sources that can schedule
+it (IRQ handler, timeout timer and DMA completion callback) have been
+stopped, and before proceeding with the remaining cleanup in
+atmci_remove.
+
+Fixes: 7d2be0749a59 ("atmel-mci: Driver for Atmel on-chip MMC controllers")
+Assisted-by: Codex:deepseek-v4-flash
+Signed-off-by: Pei Xiao <xiaopei01@kylinos.cn>
+Cc: stable@vger.kernel.org
+Signed-off-by: Ulf Hansson <ulfh@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/mmc/host/atmel-mci.c |    2 ++
+ 1 file changed, 2 insertions(+)
+
+--- a/drivers/mmc/host/atmel-mci.c
++++ b/drivers/mmc/host/atmel-mci.c
+@@ -2658,6 +2658,8 @@ static void atmci_remove(struct platform
+ 
+ 	free_irq(platform_get_irq(pdev, 0), host);
+ 
++	cancel_work_sync(&host->bh_work);
++
+ 	clk_disable_unprepare(host->mck);
+ 
+ 	pm_runtime_disable(&pdev->dev);
