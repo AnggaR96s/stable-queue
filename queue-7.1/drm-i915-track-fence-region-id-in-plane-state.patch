@@ -1,0 +1,319 @@
+From stable+bounces-307400-greg=kroah.com@vger.kernel.org Mon Aug 24 13:22:27 2026
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 24 Aug 2026 07:22:09 -0400
+Subject: drm/i915: Track fence region ID in plane state
+To: stable@vger.kernel.org
+Cc: "Ville Syrj�l�" <ville.syrjala@linux.intel.com>, "Jani Nikula" <jani.nikula@intel.com>, "Sasha Levin" <sashal@kernel.org>
+Message-ID: <20260824112212.417899-2-sashal@kernel.org>
+
+From: Ville Syrjälä <ville.syrjala@linux.intel.com>
+
+[ Upstream commit eb3dd9640731ae3ace871190f80474a8e7bae121 ]
+
+Get rid of the needlessly complicated PLANE_HAS_FENCE +
+intel_parent_vma_fence_id() dance by simply tracking the
+fence_id directly in the plane state.
+
+v2: Don't request the redundant fence for fbdev (Jani)
+    Assign *out_fence_id with '=' instead of '|=' (Sashiko,Jani)
+
+Reviewed-by: Jani Nikula <jani.nikula@intel.com>
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patch.msgid.link/20260407170942.16515-1-ville.syrjala@linux.intel.com
+Stable-dep-of: fc6487579083 ("drm/xe: Fix DPT allocation paths.")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/gpu/drm/i915/display/intel_display_types.h |    5 +--
+ drivers/gpu/drm/i915/display/intel_fb_pin.c        |   33 +++++++++++----------
+ drivers/gpu/drm/i915/display/intel_fb_pin.h        |    5 +--
+ drivers/gpu/drm/i915/display/intel_fbc.c           |   11 +------
+ drivers/gpu/drm/i915/display/intel_fbdev.c         |    9 +----
+ drivers/gpu/drm/i915/display/intel_plane.c         |    3 +
+ drivers/gpu/drm/i915/i915_initial_plane.c          |    2 -
+ drivers/gpu/drm/xe/display/xe_fb_pin.c             |    8 ++---
+ drivers/gpu/drm/xe/display/xe_initial_plane.c      |    2 -
+ 9 files changed, 37 insertions(+), 41 deletions(-)
+
+--- a/drivers/gpu/drm/i915/display/intel_display_types.h
++++ b/drivers/gpu/drm/i915/display/intel_display_types.h
+@@ -684,14 +684,15 @@ struct intel_plane_state {
+ 
+ 	struct i915_vma *ggtt_vma;
+ 	struct i915_vma *dpt_vma;
+-	unsigned long flags;
+-#define PLANE_HAS_FENCE BIT(0)
+ 
+ 	struct intel_fb_view view;
+ 
+ 	/* for legacy cursor fb unpin */
+ 	struct drm_vblank_work unpin_work;
+ 
++	/* fenced region ID (-1 if none) */
++	s8 fence_id;
++
+ 	/* Plane pxp decryption state */
+ 	bool decrypt;
+ 
+--- a/drivers/gpu/drm/i915/display/intel_fb_pin.c
++++ b/drivers/gpu/drm/i915/display/intel_fb_pin.c
+@@ -26,7 +26,6 @@ static struct i915_vma *
+ intel_fb_pin_to_dpt(const struct drm_framebuffer *fb,
+ 		    const struct i915_gtt_view *view,
+ 		    unsigned int alignment,
+-		    unsigned long *out_flags,
+ 		    struct intel_dpt *dpt)
+ {
+ 	struct intel_display *display = to_intel_display(fb->dev);
+@@ -114,8 +113,7 @@ intel_fb_pin_to_ggtt(const struct drm_fr
+ 		     unsigned int alignment,
+ 		     unsigned int phys_alignment,
+ 		     unsigned int vtd_guard,
+-		     bool uses_fence,
+-		     unsigned long *out_flags)
++		     int *out_fence_id)
+ {
+ 	struct intel_display *display = to_intel_display(fb->dev);
+ 	struct drm_i915_private *i915 = to_i915(fb->dev);
+@@ -175,7 +173,10 @@ retry:
+ 		goto err_unpin;
+ 	}
+ 
+-	if (uses_fence && i915_vma_is_map_and_fenceable(vma)) {
++	if (out_fence_id)
++		*out_fence_id = -1;
++
++	if (out_fence_id && i915_vma_is_map_and_fenceable(vma)) {
+ 		/*
+ 		 * Install a fence for tiled scan-out. Pre-i965 always needs a
+ 		 * fence, whereas 965+ only requires a fence if using
+@@ -201,7 +202,7 @@ retry:
+ 		ret = 0;
+ 
+ 		if (vma->fence)
+-			*out_flags |= PLANE_HAS_FENCE;
++			*out_fence_id = vma->fence->id;
+ 	}
+ 
+ 	i915_vma_get(vma);
+@@ -223,9 +224,9 @@ err:
+ 	return vma;
+ }
+ 
+-void intel_fb_unpin_vma(struct i915_vma *vma, unsigned long flags)
++void intel_fb_unpin_vma(struct i915_vma *vma, int fence_id)
+ {
+-	if (flags & PLANE_HAS_FENCE)
++	if (fence_id >= 0)
+ 		i915_vma_unpin_fence(vma);
+ 	i915_vma_unpin(vma);
+ 	i915_vma_put(vma);
+@@ -269,17 +270,18 @@ int intel_plane_pin_fb(struct intel_plan
+ 	struct i915_vma *vma;
+ 
+ 	if (!intel_fb_uses_dpt(&fb->base)) {
++		int fence_id = -1;
++
+ 		vma = intel_fb_pin_to_ggtt(&fb->base, &plane_state->view.gtt,
+ 					   intel_plane_fb_min_alignment(plane_state),
+ 					   intel_plane_fb_min_phys_alignment(plane_state),
+ 					   intel_plane_fb_vtd_guard(plane_state),
+-					   intel_plane_uses_fence(plane_state),
+-					   &plane_state->flags);
++					   intel_plane_uses_fence(plane_state) ? &fence_id : NULL);
+ 		if (IS_ERR(vma))
+ 			return PTR_ERR(vma);
+ 
+ 		plane_state->ggtt_vma = vma;
+-
++		plane_state->fence_id = fence_id;
+ 	} else {
+ 		unsigned int alignment = intel_plane_fb_min_alignment(plane_state);
+ 
+@@ -290,8 +292,7 @@ int intel_plane_pin_fb(struct intel_plan
+ 		plane_state->ggtt_vma = vma;
+ 
+ 		vma = intel_fb_pin_to_dpt(&fb->base, &plane_state->view.gtt,
+-					  alignment, &plane_state->flags,
+-					  fb->dpt);
++					  alignment, fb->dpt);
+ 		if (IS_ERR(vma)) {
+ 			i915_dpt_unpin_from_ggtt(fb->dpt);
+ 			plane_state->ggtt_vma = NULL;
+@@ -336,12 +337,14 @@ void intel_plane_unpin_fb(struct intel_p
+ 
+ 	if (!intel_fb_uses_dpt(&fb->base)) {
+ 		vma = fetch_and_zero(&old_plane_state->ggtt_vma);
+-		if (vma)
+-			intel_fb_unpin_vma(vma, old_plane_state->flags);
++		if (vma) {
++			intel_fb_unpin_vma(vma, old_plane_state->fence_id);
++			old_plane_state->fence_id = -1;
++		}
+ 	} else {
+ 		vma = fetch_and_zero(&old_plane_state->dpt_vma);
+ 		if (vma)
+-			intel_fb_unpin_vma(vma, old_plane_state->flags);
++			intel_fb_unpin_vma(vma, -1);
+ 
+ 		vma = fetch_and_zero(&old_plane_state->ggtt_vma);
+ 		if (vma)
+--- a/drivers/gpu/drm/i915/display/intel_fb_pin.h
++++ b/drivers/gpu/drm/i915/display/intel_fb_pin.h
+@@ -20,10 +20,9 @@ intel_fb_pin_to_ggtt(const struct drm_fr
+ 		     unsigned int alignment,
+ 		     unsigned int phys_alignment,
+ 		     unsigned int vtd_guard,
+-		     bool uses_fence,
+-		     unsigned long *out_flags);
++		     int *out_fence_id);
+ 
+-void intel_fb_unpin_vma(struct i915_vma *vma, unsigned long flags);
++void intel_fb_unpin_vma(struct i915_vma *vma, int fence_id);
+ 
+ int intel_plane_pin_fb(struct intel_plane_state *new_plane_state,
+ 		       const struct intel_plane_state *old_plane_state);
+--- a/drivers/gpu/drm/i915/display/intel_fbc.c
++++ b/drivers/gpu/drm/i915/display/intel_fbc.c
+@@ -1458,13 +1458,10 @@ static void intel_fbc_update_state(struc
+ 
+ 	fbc_state->fence_y_offset = intel_plane_fence_y_offset(plane_state);
+ 
+-	drm_WARN_ON(display->drm, plane_state->flags & PLANE_HAS_FENCE &&
++	drm_WARN_ON(display->drm, plane_state->fence_id >= 0 &&
+ 		    !intel_fbc_has_fences(display));
+ 
+-	if (plane_state->flags & PLANE_HAS_FENCE)
+-		fbc_state->fence_id = intel_parent_vma_fence_id(display, plane_state->ggtt_vma);
+-	else
+-		fbc_state->fence_id = -1;
++	fbc_state->fence_id = plane_state->fence_id;
+ 
+ 	fbc_state->cfb_stride = intel_fbc_cfb_stride(plane_state);
+ 	fbc_state->cfb_size = intel_fbc_cfb_size(plane_state);
+@@ -1487,9 +1484,7 @@ static bool intel_fbc_is_fence_ok(const
+ 	 * so have no fence associated with it) due to aperture constraints
+ 	 * at the time of pinning.
+ 	 */
+-	return DISPLAY_VER(display) >= 9 ||
+-		(plane_state->flags & PLANE_HAS_FENCE &&
+-		 intel_parent_vma_fence_id(display, plane_state->ggtt_vma) != -1);
++	return DISPLAY_VER(display) >= 9 || plane_state->fence_id >= 0;
+ }
+ 
+ static bool intel_fbc_is_cfb_ok(const struct intel_plane_state *plane_state)
+--- a/drivers/gpu/drm/i915/display/intel_fbdev.c
++++ b/drivers/gpu/drm/i915/display/intel_fbdev.c
+@@ -60,7 +60,6 @@
+ struct intel_fbdev {
+ 	struct intel_framebuffer *fb;
+ 	struct i915_vma *vma;
+-	unsigned long vma_flags;
+ };
+ 
+ static struct intel_fbdev *to_intel_fbdev(struct drm_fb_helper *fb_helper)
+@@ -141,7 +140,7 @@ static void intel_fbdev_fb_destroy(struc
+ 	 * the info->screen_base mmaping. Leaking the VMA is simpler than
+ 	 * trying to rectify all the possible error paths leading here.
+ 	 */
+-	intel_fb_unpin_vma(ifbdev->vma, ifbdev->vma_flags);
++	intel_fb_unpin_vma(ifbdev->vma, -1);
+ 	drm_framebuffer_remove(fb_helper->fb);
+ 
+ 	drm_client_release(&fb_helper->client);
+@@ -269,7 +268,6 @@ int intel_fbdev_driver_fbdev_probe(struc
+ 	struct fb_info *info = helper->info;
+ 	struct ref_tracker *wakeref;
+ 	struct i915_vma *vma;
+-	unsigned long flags = 0;
+ 	bool prealloc = false;
+ 	struct drm_gem_object *obj;
+ 	int ret;
+@@ -314,7 +312,7 @@ int intel_fbdev_driver_fbdev_probe(struc
+ 				   fb->min_alignment, 0,
+ 				   intel_fb_view_vtd_guard(&fb->base, &fb->normal_view,
+ 							   DRM_MODE_ROTATE_0),
+-				   false, &flags);
++				   NULL);
+ 	if (IS_ERR(vma)) {
+ 		ret = PTR_ERR(vma);
+ 		goto out_unlock;
+@@ -345,14 +343,13 @@ int intel_fbdev_driver_fbdev_probe(struc
+ 	drm_dbg_kms(display->drm, "allocated %dx%d fb\n", fb->base.width, fb->base.height);
+ 	ifbdev->fb = fb;
+ 	ifbdev->vma = vma;
+-	ifbdev->vma_flags = flags;
+ 
+ 	intel_display_rpm_put(display, wakeref);
+ 
+ 	return 0;
+ 
+ out_unpin:
+-	intel_fb_unpin_vma(vma, flags);
++	intel_fb_unpin_vma(vma, -1);
+ out_unlock:
+ 	intel_display_rpm_put(display, wakeref);
+ 
+--- a/drivers/gpu/drm/i915/display/intel_plane.c
++++ b/drivers/gpu/drm/i915/display/intel_plane.c
+@@ -70,6 +70,7 @@ static void intel_plane_state_reset(stru
+ 	__drm_atomic_helper_plane_state_reset(&plane_state->uapi, &plane->base);
+ 
+ 	plane_state->scaler_id = -1;
++	plane_state->fence_id = -1;
+ }
+ 
+ struct intel_plane *intel_plane_alloc(void)
+@@ -137,7 +138,7 @@ intel_plane_duplicate_state(struct drm_p
+ 
+ 	intel_state->ggtt_vma = NULL;
+ 	intel_state->dpt_vma = NULL;
+-	intel_state->flags = 0;
++	intel_state->fence_id = -1;
+ 	intel_state->damage = DRM_RECT_INIT(0, 0, 0, 0);
+ 
+ 	/* add reference to fb */
+--- a/drivers/gpu/drm/i915/i915_initial_plane.c
++++ b/drivers/gpu/drm/i915/i915_initial_plane.c
+@@ -268,7 +268,7 @@ i915_initial_plane_setup(struct drm_plan
+ 	plane_state->ggtt_vma = i915_vma_get(vma);
+ 	if (intel_plane_uses_fence(plane_state) &&
+ 	    i915_vma_pin_fence(vma) == 0 && vma->fence)
+-		plane_state->flags |= PLANE_HAS_FENCE;
++		plane_state->fence_id = vma->fence->id;
+ 
+ 	plane_state->surf = i915_ggtt_offset(plane_state->ggtt_vma);
+ 
+--- a/drivers/gpu/drm/xe/display/xe_fb_pin.c
++++ b/drivers/gpu/drm/xe/display/xe_fb_pin.c
+@@ -418,15 +418,15 @@ intel_fb_pin_to_ggtt(const struct drm_fr
+ 		     unsigned int alignment,
+ 		     unsigned int phys_alignment,
+ 		     unsigned int vtd_guard,
+-		     bool uses_fence,
+-		     unsigned long *out_flags)
++		     int *out_fence_id)
+ {
+-	*out_flags = 0;
++	if (out_fence_id)
++		*out_fence_id = -1;
+ 
+ 	return __xe_pin_fb_vma(to_intel_framebuffer(fb), view, alignment);
+ }
+ 
+-void intel_fb_unpin_vma(struct i915_vma *vma, unsigned long flags)
++void intel_fb_unpin_vma(struct i915_vma *vma, int fence_id)
+ {
+ 	__xe_unpin_fb_vma(vma);
+ }
+--- a/drivers/gpu/drm/xe/display/xe_initial_plane.c
++++ b/drivers/gpu/drm/xe/display/xe_initial_plane.c
+@@ -153,7 +153,7 @@ xe_initial_plane_setup(struct drm_plane_
+ 	struct i915_vma *vma;
+ 
+ 	vma = intel_fb_pin_to_ggtt(fb, &plane_state->view.gtt,
+-				   0, 0, 0, false, &plane_state->flags);
++				   0, 0, 0, NULL);
+ 	if (IS_ERR(vma))
+ 		return PTR_ERR(vma);
+ 
