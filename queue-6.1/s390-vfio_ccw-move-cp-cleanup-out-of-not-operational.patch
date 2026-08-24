@@ -1,0 +1,127 @@
+From stable+bounces-307351-greg=kroah.com@vger.kernel.org Mon Aug 24 11:56:57 2026
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 24 Aug 2026 05:56:28 -0400
+Subject: s390/vfio_ccw: Move cp cleanup out of not operational
+To: stable@vger.kernel.org
+Cc: Eric Farman <farman@linux.ibm.com>, Matthew Rosato <mjrosato@linux.ibm.com>, Christian Borntraeger <borntraeger@linux.ibm.com>, Sasha Levin <sashal@kernel.org>
+Message-ID: <20260824095630.4066777-2-sashal@kernel.org>
+
+From: Eric Farman <farman@linux.ibm.com>
+
+[ Upstream commit 0c11f61a876ed6fcca53d442ed3f33ea8362a0f9 ]
+
+The fsm_notoper() routine is called when the device has been
+lost, and is (by definition) no longer operational. Since this
+can happen asynchronously from the normal behavior of the
+driver, the cleanup may happen when holding other locks
+in the calling sequence (notably, the cio subchannel lock).
+
+Push the cleanup of the private->cp resources to a workqueue,
+where it can be done out from under that lock sequence and
+a future patch can safely manage the locking requirements.
+
+Fixes: 204b394a23ad ("vfio/ccw: Move FSM open/close to MDEV open/close")
+Cc: stable@vger.kernel.org
+Signed-off-by: Eric Farman <farman@linux.ibm.com>
+Reviewed-by: Matthew Rosato <mjrosato@linux.ibm.com>
+Signed-off-by: Christian Borntraeger <borntraeger@linux.ibm.com>
+Stable-dep-of: 16b0798024c0 ("s390/vfio_ccw: Implement a crw lock")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/s390/cio/vfio_ccw_drv.c     |   10 ++++++++++
+ drivers/s390/cio/vfio_ccw_fsm.c     |    3 +--
+ drivers/s390/cio/vfio_ccw_ops.c     |   12 ++++++++++++
+ drivers/s390/cio/vfio_ccw_private.h |    2 ++
+ 4 files changed, 25 insertions(+), 2 deletions(-)
+
+--- a/drivers/s390/cio/vfio_ccw_drv.c
++++ b/drivers/s390/cio/vfio_ccw_drv.c
+@@ -116,6 +116,15 @@ static void vfio_ccw_crw_todo(struct wor
+ 		eventfd_signal(private->crw_trigger, 1);
+ }
+ 
++static void vfio_ccw_notoper_todo(struct work_struct *work)
++{
++	struct vfio_ccw_private *private;
++
++	private = container_of(work, struct vfio_ccw_private, notoper_work);
++
++	cp_free(&private->cp);
++}
++
+ /*
+  * Css driver callbacks
+  */
+@@ -141,6 +150,7 @@ static struct vfio_ccw_private *vfio_ccw
+ 	INIT_LIST_HEAD(&private->crw);
+ 	INIT_WORK(&private->io_work, vfio_ccw_sch_io_todo);
+ 	INIT_WORK(&private->crw_work, vfio_ccw_crw_todo);
++	INIT_WORK(&private->notoper_work, vfio_ccw_notoper_todo);
+ 
+ 	private->cp.guest_cp = kcalloc(CCWCHAIN_LEN_MAX, sizeof(struct ccw1),
+ 				       GFP_KERNEL);
+--- a/drivers/s390/cio/vfio_ccw_fsm.c
++++ b/drivers/s390/cio/vfio_ccw_fsm.c
+@@ -176,8 +176,7 @@ static void fsm_notoper(struct vfio_ccw_
+ 	css_sched_sch_todo(sch, SCH_TODO_UNREG);
+ 	private->state = VFIO_CCW_STATE_NOT_OPER;
+ 
+-	/* This is usually handled during CLOSE event */
+-	cp_free(&private->cp);
++	queue_work(vfio_ccw_work_q, &private->notoper_work);
+ }
+ 
+ /*
+--- a/drivers/s390/cio/vfio_ccw_ops.c
++++ b/drivers/s390/cio/vfio_ccw_ops.c
+@@ -89,9 +89,16 @@ static void vfio_ccw_mdev_release_dev(st
+ 	/*
+ 	 * Ensure these work items are fully drained, so none can
+ 	 * fire after being released.
++	 *
++	 * notoper_work should have nothing to do here, because only
++	 * open devices could have channel_program resources in use
++	 * and those would be released during close. Nevertheless,
++	 * call flush here as well to be certain anything that was
++	 * allocated is freed.
+ 	 */
+ 	cancel_work_sync(&private->io_work);
+ 	cancel_work_sync(&private->crw_work);
++	flush_work(&private->notoper_work);
+ 
+ 	/*
+ 	 * We cannot free vfio_ccw_private here because it includes
+@@ -173,9 +180,14 @@ static void vfio_ccw_mdev_close_device(s
+ 	/*
+ 	 * Ensure these work items are drained, in the event the
+ 	 * device is re-opened instead of released.
++	 *
++	 * notoper_work needs to be given a chance to run if it
++	 * is queued, so any memory associated with the channel
++	 * program can be returned.
+ 	 */
+ 	cancel_work_sync(&private->io_work);
+ 	cancel_work_sync(&private->crw_work);
++	flush_work(&private->notoper_work);
+ 
+ 	vfio_ccw_unregister_dev_regions(private);
+ }
+--- a/drivers/s390/cio/vfio_ccw_private.h
++++ b/drivers/s390/cio/vfio_ccw_private.h
+@@ -88,6 +88,7 @@ struct vfio_ccw_crw {
+  * @req_trigger: eventfd ctx for signaling userspace to return device
+  * @io_work: work for deferral process of I/O handling
+  * @crw_work: work for deferral process of CRW handling
++ * @notoper_work: work for deferred processing in not-operational state
+  * @release_comp: synchronization helper for vfio device release
+  * @parent: parent data structures for mdevs created
+  */
+@@ -114,6 +115,7 @@ struct vfio_ccw_private {
+ 	struct eventfd_ctx	*req_trigger;
+ 	struct work_struct	io_work;
+ 	struct work_struct	crw_work;
++	struct work_struct	notoper_work;
+ 
+ 	struct completion	release_comp;
+ 
