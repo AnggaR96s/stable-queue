@@ -1,0 +1,219 @@
+From stable+bounces-306848-greg=kroah.com@vger.kernel.org Fri Aug 21 16:49:40 2026
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 21 Aug 2026 10:49:25 -0400
+Subject: inet: frags: save a pair of atomic operations in reassembly
+To: stable@vger.kernel.org
+Cc: Eric Dumazet <edumazet@google.com>, Jacob Keller <jacob.e.keller@intel.com>, Paolo Abeni <pabeni@redhat.com>, Sasha Levin <sashal@kernel.org>
+Message-ID: <20260821144926.3428433-4-sashal@kernel.org>
+
+From: Eric Dumazet <edumazet@google.com>
+
+[ Upstream commit ca0359df45a55a9eb4d6dc09a481064abf78320f ]
+
+As mentioned in commit 648700f76b03 ("inet: frags:
+use rhashtables for reassembly units"):
+
+  A followup patch will even remove the refcount hold/release
+  left from prior implementation and save a couple of atomic
+  operations.
+
+This patch implements this idea, seven years later.
+
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Reviewed-by: Jacob Keller <jacob.e.keller@intel.com>
+Link: https://patch.msgid.link/20250312082250.1803501-5-edumazet@google.com
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Stable-dep-of: 653d7ddf6cba ("inet: frags: publish queues before arming timer")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/ieee802154/6lowpan/reassembly.c     |    5 ++++-
+ net/ipv4/inet_fragment.c                |   18 ++++++++----------
+ net/ipv4/ip_fragment.c                  |    5 ++++-
+ net/ipv6/netfilter/nf_conntrack_reasm.c |    5 ++++-
+ net/ipv6/reassembly.c                   |    9 ++++-----
+ 5 files changed, 24 insertions(+), 18 deletions(-)
+
+--- a/net/ieee802154/6lowpan/reassembly.c
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -304,17 +304,20 @@ int lowpan_frag_rcv(struct sk_buff *skb,
+ 		goto err;
+ 	}
+ 
++	rcu_read_lock();
+ 	fq = fq_find(net, cb, &hdr.source, &hdr.dest);
+ 	if (fq != NULL) {
+-		int ret, refs = 1;
++		int ret, refs = 0;
+ 
+ 		spin_lock(&fq->q.lock);
+ 		ret = lowpan_frag_queue(fq, skb, frag_type, &refs);
+ 		spin_unlock(&fq->q.lock);
+ 
++		rcu_read_unlock();
+ 		inet_frag_putn(&fq->q, refs);
+ 		return ret;
+ 	}
++	rcu_read_unlock();
+ 
+ err:
+ 	kfree_skb(skb);
+--- a/net/ipv4/inet_fragment.c
++++ b/net/ipv4/inet_fragment.c
+@@ -375,7 +375,8 @@ static struct inet_frag_queue *inet_frag
+ 
+ 	timer_setup(&q->timer, f->frag_expire, 0);
+ 	spin_lock_init(&q->lock);
+-	refcount_set(&q->refcnt, 3);
++	/* One reference for the timer, one for the hash table. */
++	refcount_set(&q->refcnt, 2);
+ 
+ 	return q;
+ }
+@@ -397,7 +398,11 @@ static struct inet_frag_queue *inet_frag
+ 	*prev = rhashtable_lookup_get_insert_key(&fqdir->rhashtable, &q->key,
+ 						 &q->node, f->rhash_params);
+ 	if (*prev) {
+-		int refs = 2;
++		/* We could not insert in the hash table,
++		 * we need to cancel what inet_frag_alloc()
++		 * anticipated.
++		 */
++		int refs = 1;
+ 
+ 		q->flags |= INET_FRAG_COMPLETE;
+ 		inet_frag_kill(q, &refs);
+@@ -407,7 +412,6 @@ static struct inet_frag_queue *inet_frag
+ 	return q;
+ }
+ 
+-/* TODO : call from rcu_read_lock() and no longer use refcount_inc_not_zero() */
+ struct inet_frag_queue *inet_frag_find(struct fqdir *fqdir, void *key)
+ {
+ 	/* This pairs with WRITE_ONCE() in fqdir_pre_exit(). */
+@@ -417,17 +421,11 @@ struct inet_frag_queue *inet_frag_find(s
+ 	if (!high_thresh || frag_mem_limit(fqdir) > high_thresh)
+ 		return NULL;
+ 
+-	rcu_read_lock();
+-
+ 	prev = rhashtable_lookup(&fqdir->rhashtable, key, fqdir->f->rhash_params);
+ 	if (!prev)
+ 		fq = inet_frag_create(fqdir, key, &prev);
+-	if (!IS_ERR_OR_NULL(prev)) {
++	if (!IS_ERR_OR_NULL(prev))
+ 		fq = prev;
+-		if (!refcount_inc_not_zero(&fq->refcnt))
+-			fq = NULL;
+-	}
+-	rcu_read_unlock();
+ 	return fq;
+ }
+ EXPORT_SYMBOL(inet_frag_find);
+--- a/net/ipv4/ip_fragment.c
++++ b/net/ipv4/ip_fragment.c
+@@ -477,18 +477,21 @@ int ip_defrag(struct net *net, struct sk
+ 	__IP_INC_STATS(net, IPSTATS_MIB_REASMREQDS);
+ 
+ 	/* Lookup (or create) queue header */
++	rcu_read_lock();
+ 	qp = ip_find(net, ip_hdr(skb), user, vif);
+ 	if (qp) {
+-		int ret, refs = 1;
++		int ret, refs = 0;
+ 
+ 		spin_lock(&qp->q.lock);
+ 
+ 		ret = ip_frag_queue(qp, skb, &refs);
+ 
+ 		spin_unlock(&qp->q.lock);
++		rcu_read_unlock();
+ 		inet_frag_putn(&qp->q, refs);
+ 		return ret;
+ 	}
++	rcu_read_unlock();
+ 
+ 	__IP_INC_STATS(net, IPSTATS_MIB_REASMFAILS);
+ 	kfree_skb(skb);
+--- a/net/ipv6/netfilter/nf_conntrack_reasm.c
++++ b/net/ipv6/netfilter/nf_conntrack_reasm.c
+@@ -451,7 +451,7 @@ int nf_ct_frag6_gather(struct net *net,
+ 	struct frag_hdr *fhdr;
+ 	struct frag_queue *fq;
+ 	struct ipv6hdr *hdr;
+-	int refs = 1;
++	int refs = 0;
+ 	u8 prevhdr;
+ 
+ 	/* Jumbo payload inhibits frag. header */
+@@ -478,9 +478,11 @@ int nf_ct_frag6_gather(struct net *net,
+ 	hdr = ipv6_hdr(skb);
+ 	fhdr = (struct frag_hdr *)skb_transport_header(skb);
+ 
++	rcu_read_lock();
+ 	fq = fq_find(net, fhdr->identification, user, hdr,
+ 		     skb->dev ? skb->dev->ifindex : 0);
+ 	if (fq == NULL) {
++		rcu_read_unlock();
+ 		pr_debug("Can't find and can't create new queue\n");
+ 		return -ENOMEM;
+ 	}
+@@ -494,6 +496,7 @@ int nf_ct_frag6_gather(struct net *net,
+ 	}
+ 
+ 	spin_unlock_bh(&fq->q.lock);
++	rcu_read_unlock();
+ 	inet_frag_putn(&fq->q, refs);
+ 	return ret;
+ }
+--- a/net/ipv6/reassembly.c
++++ b/net/ipv6/reassembly.c
+@@ -305,9 +305,7 @@ static int ip6_frag_reasm(struct frag_qu
+ 	skb_postpush_rcsum(skb, skb_network_header(skb),
+ 			   skb_network_header_len(skb));
+ 
+-	rcu_read_lock();
+ 	__IP6_INC_STATS(net, __in6_dev_stats_get(dev, skb), IPSTATS_MIB_REASMOKS);
+-	rcu_read_unlock();
+ 	fq->q.rb_fragments = RB_ROOT;
+ 	fq->q.fragments_tail = NULL;
+ 	fq->q.last_run_head = NULL;
+@@ -319,9 +317,7 @@ out_oversize:
+ out_oom:
+ 	net_dbg_ratelimited("ip6_frag_reasm: no memory for reassembly\n");
+ out_fail:
+-	rcu_read_lock();
+ 	__IP6_INC_STATS(net, __in6_dev_stats_get(dev, skb), IPSTATS_MIB_REASMFAILS);
+-	rcu_read_unlock();
+ 	inet_frag_kill(&fq->q, refs);
+ 	return -1;
+ }
+@@ -379,10 +375,11 @@ static int ipv6_frag_rcv(struct sk_buff
+ 	}
+ 
+ 	iif = skb->dev ? skb->dev->ifindex : 0;
++	rcu_read_lock();
+ 	fq = fq_find(net, fhdr->identification, hdr, iif);
+ 	if (fq) {
+ 		u32 prob_offset = 0;
+-		int ret, refs = 1;
++		int ret, refs = 0;
+ 
+ 		spin_lock(&fq->q.lock);
+ 
+@@ -391,6 +388,7 @@ static int ipv6_frag_rcv(struct sk_buff
+ 				     &prob_offset, &refs);
+ 
+ 		spin_unlock(&fq->q.lock);
++		rcu_read_unlock();
+ 		inet_frag_putn(&fq->q, refs);
+ 		if (prob_offset) {
+ 			__IP6_INC_STATS(net, __in6_dev_get_safely(skb->dev),
+@@ -400,6 +398,7 @@ static int ipv6_frag_rcv(struct sk_buff
+ 		}
+ 		return ret;
+ 	}
++	rcu_read_unlock();
+ 
+ 	__IP6_INC_STATS(net, ip6_dst_idev(skb_dst(skb)), IPSTATS_MIB_REASMFAILS);
+ 	kfree_skb(skb);
