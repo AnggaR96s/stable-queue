@@ -1,0 +1,210 @@
+From stable+bounces-308842-greg=kroah.com@vger.kernel.org Wed Aug 26 00:06:04 2026
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 25 Aug 2026 18:05:48 -0400
+Subject: ext4: make some fast commit functions reuse extents path
+To: stable@vger.kernel.org
+Cc: Baokun Li <libaokun1@huawei.com>, Jan Kara <jack@suse.cz>, Ojaswin Mujoo <ojaswin@linux.ibm.com>, Theodore Ts'o <tytso@mit.edu>, Sasha Levin <sashal@kernel.org>
+Message-ID: <20260825220549.2781247-2-sashal@kernel.org>
+
+From: Baokun Li <libaokun1@huawei.com>
+
+[ Upstream commit 2352e3e461926b59f01c1e39fbb0494891cff997 ]
+
+The ext4_find_extent() can update the extent path so that it does not have
+to allocate and free the path repeatedly, thus reducing the consumption of
+memory allocation and freeing in the following functions:
+
+    ext4_ext_clear_bb
+    ext4_ext_replay_set_iblocks
+    ext4_fc_replay_add_range
+    ext4_fc_set_bitmaps_and_counters
+
+No functional changes. Note that ext4_find_extent() does not support error
+pointers, so in this case set path to NULL first.
+
+Signed-off-by: Baokun Li <libaokun1@huawei.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Reviewed-by: Ojaswin Mujoo <ojaswin@linux.ibm.com>
+Tested-by: Ojaswin Mujoo <ojaswin@linux.ibm.com>
+Link: https://patch.msgid.link/20240822023545.1994557-25-libaokun@huaweicloud.com
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Stable-dep-of: d8b8dd3530bf ("ext4: propagate errors from fast commit range replay")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/ext4/extents.c     |   51 +++++++++++++++++++++-----------------------------
+ fs/ext4/fast_commit.c |   11 ++++++----
+ 2 files changed, 29 insertions(+), 33 deletions(-)
+
+--- a/fs/ext4/extents.c
++++ b/fs/ext4/extents.c
+@@ -6092,12 +6092,9 @@ int ext4_ext_replay_set_iblocks(struct i
+ 	if (IS_ERR(path))
+ 		return PTR_ERR(path);
+ 	ex = path[path->p_depth].p_ext;
+-	if (!ex) {
+-		ext4_free_ext_path(path);
++	if (!ex)
+ 		goto out;
+-	}
+ 	end = le32_to_cpu(ex->ee_block) + ext4_ext_get_actual_len(ex);
+-	ext4_free_ext_path(path);
+ 
+ 	/* Count the number of data blocks */
+ 	cur = 0;
+@@ -6123,32 +6120,28 @@ int ext4_ext_replay_set_iblocks(struct i
+ 	ret = skip_hole(inode, &cur);
+ 	if (ret < 0)
+ 		goto out;
+-	path = ext4_find_extent(inode, cur, NULL, 0);
++	path = ext4_find_extent(inode, cur, path, 0);
+ 	if (IS_ERR(path))
+ 		goto out;
+ 	numblks += path->p_depth;
+-	ext4_free_ext_path(path);
+ 	while (cur < end) {
+-		path = ext4_find_extent(inode, cur, NULL, 0);
++		path = ext4_find_extent(inode, cur, path, 0);
+ 		if (IS_ERR(path))
+ 			break;
+ 		ex = path[path->p_depth].p_ext;
+-		if (!ex) {
+-			ext4_free_ext_path(path);
+-			return 0;
+-		}
++		if (!ex)
++			goto cleanup;
++
+ 		cur = max(cur + 1, le32_to_cpu(ex->ee_block) +
+ 					ext4_ext_get_actual_len(ex));
+ 		ret = skip_hole(inode, &cur);
+-		if (ret < 0) {
+-			ext4_free_ext_path(path);
++		if (ret < 0)
+ 			break;
+-		}
+-		path2 = ext4_find_extent(inode, cur, NULL, 0);
+-		if (IS_ERR(path2)) {
+-			ext4_free_ext_path(path);
++
++		path2 = ext4_find_extent(inode, cur, path2, 0);
++		if (IS_ERR(path2))
+ 			break;
+-		}
++
+ 		for (i = 0; i <= max(path->p_depth, path2->p_depth); i++) {
+ 			cmp1 = cmp2 = 0;
+ 			if (i <= path->p_depth)
+@@ -6160,13 +6153,14 @@ int ext4_ext_replay_set_iblocks(struct i
+ 			if (cmp1 != cmp2 && cmp2 != 0)
+ 				numblks++;
+ 		}
+-		ext4_free_ext_path(path);
+-		ext4_free_ext_path(path2);
+ 	}
+ 
+ out:
+ 	inode->i_blocks = numblks << (inode->i_sb->s_blocksize_bits - 9);
+ 	ext4_mark_inode_dirty(NULL, inode);
++cleanup:
++	ext4_free_ext_path(path);
++	ext4_free_ext_path(path2);
+ 	return 0;
+ }
+ 
+@@ -6187,12 +6181,9 @@ int ext4_ext_clear_bb(struct inode *inod
+ 	if (IS_ERR(path))
+ 		return PTR_ERR(path);
+ 	ex = path[path->p_depth].p_ext;
+-	if (!ex) {
+-		ext4_free_ext_path(path);
+-		return 0;
+-	}
++	if (!ex)
++		goto out;
+ 	end = le32_to_cpu(ex->ee_block) + ext4_ext_get_actual_len(ex);
+-	ext4_free_ext_path(path);
+ 
+ 	cur = 0;
+ 	while (cur < end) {
+@@ -6202,16 +6193,16 @@ int ext4_ext_clear_bb(struct inode *inod
+ 		if (ret < 0)
+ 			break;
+ 		if (ret > 0) {
+-			path = ext4_find_extent(inode, map.m_lblk, NULL, 0);
+-			if (!IS_ERR_OR_NULL(path)) {
++			path = ext4_find_extent(inode, map.m_lblk, path, 0);
++			if (!IS_ERR(path)) {
+ 				for (j = 0; j < path->p_depth; j++) {
+-
+ 					ext4_mb_mark_bb(inode->i_sb,
+ 							path[j].p_block, 1, false);
+ 					ext4_fc_record_regions(inode->i_sb, inode->i_ino,
+ 							0, path[j].p_block, 1, 1);
+ 				}
+-				ext4_free_ext_path(path);
++			} else {
++				path = NULL;
+ 			}
+ 			ext4_mb_mark_bb(inode->i_sb, map.m_pblk, map.m_len, false);
+ 			ext4_fc_record_regions(inode->i_sb, inode->i_ino,
+@@ -6220,5 +6211,7 @@ int ext4_ext_clear_bb(struct inode *inod
+ 		cur = cur + map.m_len;
+ 	}
+ 
++out:
++	ext4_free_ext_path(path);
+ 	return 0;
+ }
+--- a/fs/ext4/fast_commit.c
++++ b/fs/ext4/fast_commit.c
+@@ -1798,7 +1798,7 @@ static int ext4_fc_replay_add_range(stru
+ 
+ 		if (ret == 0) {
+ 			/* Range is not mapped */
+-			path = ext4_find_extent(inode, cur, NULL, 0);
++			path = ext4_find_extent(inode, cur, path, 0);
+ 			if (IS_ERR(path))
+ 				goto out;
+ 			memset(&newex, 0, sizeof(newex));
+@@ -1814,7 +1814,6 @@ static int ext4_fc_replay_add_range(stru
+ 			up_write((&EXT4_I(inode)->i_data_sem));
+ 			if (IS_ERR(path))
+ 				goto out;
+-			ext4_free_ext_path(path);
+ 			goto next;
+ 		}
+ 
+@@ -1862,6 +1861,7 @@ next:
+ 	ext4_ext_replay_shrink_inode(inode, i_size_read(inode) >>
+ 					sb->s_blocksize_bits);
+ out:
++	ext4_free_ext_path(path);
+ 	iput(inode);
+ 	return 0;
+ }
+@@ -1962,12 +1962,13 @@ static void ext4_fc_set_bitmaps_and_coun
+ 				break;
+ 
+ 			if (ret > 0) {
+-				path = ext4_find_extent(inode, map.m_lblk, NULL, 0);
++				path = ext4_find_extent(inode, map.m_lblk, path, 0);
+ 				if (!IS_ERR(path)) {
+ 					for (j = 0; j < path->p_depth; j++)
+ 						ext4_mb_mark_bb(inode->i_sb,
+ 							path[j].p_block, 1, true);
+-					ext4_free_ext_path(path);
++				} else {
++					path = NULL;
+ 				}
+ 				cur += ret;
+ 				ext4_mb_mark_bb(inode->i_sb, map.m_pblk,
+@@ -1978,6 +1979,8 @@ static void ext4_fc_set_bitmaps_and_coun
+ 		}
+ 		iput(inode);
+ 	}
++
++	ext4_free_ext_path(path);
+ }
+ 
+ /*
