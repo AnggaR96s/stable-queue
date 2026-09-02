@@ -1,0 +1,136 @@
+From 05cfc0e0923dba3f6ab137404d6a24655ba4b05e Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 25 Aug 2026 09:17:57 -0400
+Subject: mptcp: pm: fix memory leak from alloc-during-teardown race
+
+From: Shardul Bankar <shardul.b@mpiricsoftware.com>
+
+[ Upstream commit efc33b5102ff859bacd390a5f30112d8e0c084c0 ]
+
+mptcp_pm_destroy() empties msk->pm.anno_list and
+msk->pm.userspace_pm_local_addr_list under msk->pm.lock during socket
+teardown, dropping the lock between the two.
+
+A concurrent userspace PM genl ANNOUNCE on the same msk holds a sock
+reference via mptcp_token_get_sock() and, in
+mptcp_pm_nl_announce_doit(), calls
+mptcp_userspace_pm_append_new_local_addr() and
+mptcp_pm_announced_alloc(). Both take msk->pm.lock briefly to add to
+their respective lists. Because the genl handler holds a sock reference,
+mptcp_pm_destroy() may run on the same msk via mptcp_disconnect(), which
+invokes mptcp_destroy_common() without dropping the sock refcount,
+before the handler completes.
+
+If the lock acquisitions interleave such that mptcp_pm_destroy() empties
+a list first, the later alloc adds its entry to a list head that nothing
+else iterates for this msk, and the entry leaks. kmemleak reports both
+mptcp_pm_add_addr objects (from mptcp_pm_announced_alloc()) and
+mptcp_pm_addr_entry objects (from
+mptcp_userspace_pm_append_new_local_addr()) under sustained concurrent
+ANNOUNCE + close load against the userspace PM.
+
+Add an MPTCP_PM_DESTROYING bit in msk->pm.status, set by
+mptcp_pm_destroy() under pm.lock before the lists are emptied and
+checked under pm.lock by the alloc paths. Either the alloc takes pm.lock
+first, in which case its entry is on the list when mptcp_pm_destroy()
+frees it; or mptcp_pm_destroy() takes pm.lock first, in which case the
+later alloc observes the bit and refuses.
+
+Found by an MPTCP protocol-flow harness extending BRF (arXiv:2305.08782).
+
+Fixes: 9ab4807c84a4 ("mptcp: netlink: Add MPTCP_PM_CMD_ANNOUNCE")
+Cc: stable@vger.kernel.org
+Signed-off-by: Shardul Bankar <shardul.b@mpiricsoftware.com>
+Reviewed-by: Matthieu Baerts (NGI0) <matttbe@kernel.org>
+Signed-off-by: Matthieu Baerts (NGI0) <matttbe@kernel.org>
+Link: https://patch.msgid.link/20260803-net-mptcp-misc-fixes-7-2-rc6-v2-6-b8f496d71664@kernel.org
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+[ set MPTCP_PM_DESTROYING in mptcp_destroy_common() since mptcp_pm_destroy() doesn't exist yet ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/mptcp/pm_netlink.c   |  3 +++
+ net/mptcp/pm_userspace.c | 10 +++++++---
+ net/mptcp/protocol.c     |  5 +++++
+ net/mptcp/protocol.h     |  7 ++++---
+ 4 files changed, 19 insertions(+), 6 deletions(-)
+
+diff --git a/net/mptcp/pm_netlink.c b/net/mptcp/pm_netlink.c
+index 74e211e8adad4..0d8316bc50775 100644
+--- a/net/mptcp/pm_netlink.c
++++ b/net/mptcp/pm_netlink.c
+@@ -408,6 +408,9 @@ bool mptcp_pm_alloc_anno_list(struct mptcp_sock *msk,
+ 
+ 	lockdep_assert_held(&msk->pm.lock);
+ 
++	if (msk->pm.status & BIT(MPTCP_PM_DESTROYING))
++		return false;
++
+ 	add_entry = mptcp_lookup_anno_list_by_saddr(msk, addr);
+ 
+ 	if (add_entry) {
+diff --git a/net/mptcp/pm_userspace.c b/net/mptcp/pm_userspace.c
+index 42f46e92780c2..52ab9a3f070a8 100644
+--- a/net/mptcp/pm_userspace.c
++++ b/net/mptcp/pm_userspace.c
+@@ -13,9 +13,9 @@ void mptcp_free_local_addr_list(struct mptcp_sock *msk)
+ 	struct sock *sk = (struct sock *)msk;
+ 	LIST_HEAD(free_list);
+ 
+-	if (!mptcp_pm_is_userspace(msk))
+-		return;
+-
++	/* Free the userspace local address list unconditionally: the socket
++	 * can be reused (mptcp_disconnect()) and re-selected to a different PM
++	 */
+ 	spin_lock_bh(&msk->pm.lock);
+ 	list_splice_init(&msk->pm.userspace_pm_local_addr_list, &free_list);
+ 	spin_unlock_bh(&msk->pm.lock);
+@@ -53,6 +53,10 @@ static int mptcp_userspace_pm_append_new_local_addr(struct mptcp_sock *msk,
+ 	bitmap_zero(id_bitmap, MPTCP_PM_MAX_ADDR_ID + 1);
+ 
+ 	spin_lock_bh(&msk->pm.lock);
++	if (msk->pm.status & BIT(MPTCP_PM_DESTROYING)) {
++		spin_unlock_bh(&msk->pm.lock);
++		return -EINVAL;
++	}
+ 	list_for_each_entry(e, &msk->pm.userspace_pm_local_addr_list, list) {
+ 		addr_match = mptcp_addresses_equal(&e->addr, &entry->addr, true);
+ 		if (addr_match && entry->addr.id == 0 && needs_id)
+diff --git a/net/mptcp/protocol.c b/net/mptcp/protocol.c
+index 00314933da2a7..2ce20884d7305 100644
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -3540,6 +3540,11 @@ void mptcp_destroy_common(struct mptcp_sock *msk)
+ 	sk_forward_alloc_add(sk, msk->rmem_fwd_alloc);
+ 	WRITE_ONCE(msk->rmem_fwd_alloc, 0);
+ 	mptcp_token_destroy(msk);
++
++	spin_lock_bh(&msk->pm.lock);
++	msk->pm.status |= BIT(MPTCP_PM_DESTROYING);
++	spin_unlock_bh(&msk->pm.lock);
++
+ 	mptcp_pm_free_anno_list(msk);
+ 	mptcp_free_local_addr_list(msk);
+ }
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+index ebefde9c22be3..e835028fc4e50 100644
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -180,9 +180,10 @@ enum mptcp_pm_status {
+ 	MPTCP_PM_ESTABLISHED,
+ 	MPTCP_PM_SUBFLOW_ESTABLISHED,
+ 	MPTCP_PM_ALREADY_ESTABLISHED,	/* persistent status, set after ESTABLISHED event */
+-	MPTCP_PM_MPC_ENDPOINT_ACCOUNTED /* persistent status, set after MPC local address is
+-					 * accounted int id_avail_bitmap
+-					 */
++	MPTCP_PM_MPC_ENDPOINT_ACCOUNTED, /* persistent status, set after MPC local address is
++					  * accounted int id_avail_bitmap
++					  */
++	MPTCP_PM_DESTROYING,		/* To fence out PM list allocs */
+ };
+ 
+ enum mptcp_pm_type {
+-- 
+2.53.0
+
