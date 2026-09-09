@@ -1,0 +1,317 @@
+From stable+bounces-317761-greg=kroah.com@vger.kernel.org Tue Sep  8 14:42:44 2026
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue,  8 Sep 2026 08:19:53 -0400
+Subject: iomap: split out the per-bio logic from iomap_dio_bio_iter
+To: stable@vger.kernel.org
+Cc: Christoph Hellwig <hch@lst.de>, Damien Le Moal <dlemoal@kernel.org>, "Darrick J. Wong" <djwong@kernel.org>, Anuj Gupta <anuj20.g@samsung.com>, Jens Axboe <axboe@kernel.dk>, Sasha Levin <sashal@kernel.org>
+Message-ID: <20260908121955.2049107-4-sashal@kernel.org>
+
+From: Christoph Hellwig <hch@lst.de>
+
+[ Upstream commit 2631c94602297090febd8f93d6f96d9d2045466d ]
+
+Factor out a separate helper that builds and submits a single bio.
+
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Damien Le Moal <dlemoal@kernel.org>
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Tested-by: Anuj Gupta <anuj20.g@samsung.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Stable-dep-of: 14b007e17881 ("block: validate user space vectors during extraction")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ block/bio.c               |    2 
+ fs/iomap/direct-io.c      |  157 ++++++++++++++++++++++++++--------------------
+ include/linux/blk_types.h |    3 
+ include/linux/iomap.h     |    9 ++
+ 4 files changed, 104 insertions(+), 67 deletions(-)
+
+--- a/block/bio.c
++++ b/block/bio.c
+@@ -1243,7 +1243,7 @@ int bio_iov_iter_get_pages(struct bio *b
+ 		ssize_t ret;
+ 
+ 		ret = iov_iter_extract_bvecs(iter, bio->bi_io_vec,
+-				UINT_MAX - bio->bi_iter.bi_size,
++				BIO_MAX_SIZE - bio->bi_iter.bi_size,
+ 				&bio->bi_vcnt, bio->bi_max_vecs, flags);
+ 		if (ret <= 0) {
+ 			if (!bio->bi_vcnt)
+--- a/fs/iomap/direct-io.c
++++ b/fs/iomap/direct-io.c
+@@ -233,32 +233,48 @@ static void iomap_dio_done(struct iomap_
+ void iomap_dio_bio_end_io(struct bio *bio)
+ {
+ 	struct iomap_dio *dio = bio->bi_private;
++	bool should_bounce = (dio->flags & IOMAP_DIO_BOUNCE);
+ 	bool should_dirty = (dio->flags & IOMAP_DIO_DIRTY);
+ 
+ 	if (bio->bi_status)
+ 		iomap_dio_set_error(dio, blk_status_to_errno(bio->bi_status));
+ 
+-	if (atomic_dec_and_test(&dio->ref))
+-		iomap_dio_done(dio);
+-
+-	if (should_dirty) {
++	if (should_bounce) {
++		bio_iov_iter_unbounce(bio, !!dio->error, should_dirty);
++		bio_put(bio);
++	} else if (should_dirty) {
+ 		bio_check_pages_dirty(bio);
+ 	} else {
+ 		bio_release_pages(bio, false);
+ 		bio_put(bio);
+ 	}
++
++	if (atomic_dec_and_test(&dio->ref))
++		iomap_dio_done(dio);
+ }
+ EXPORT_SYMBOL_GPL(iomap_dio_bio_end_io);
+ 
+ u32 iomap_finish_ioend_direct(struct iomap_ioend *ioend)
+ {
+ 	struct iomap_dio *dio = ioend->io_bio.bi_private;
++	bool should_bounce = (dio->flags & IOMAP_DIO_BOUNCE);
+ 	bool should_dirty = (dio->flags & IOMAP_DIO_DIRTY);
+ 	u32 vec_count = ioend->io_bio.bi_vcnt;
+ 
+ 	if (ioend->io_error)
+ 		iomap_dio_set_error(dio, ioend->io_error);
+ 
++	if (should_bounce) {
++		bio_iov_iter_unbounce(&ioend->io_bio, !!dio->error,
++				should_dirty);
++		bio_put(&ioend->io_bio);
++	} else if (should_dirty) {
++		bio_check_pages_dirty(&ioend->io_bio);
++	} else {
++		bio_release_pages(&ioend->io_bio, false);
++		bio_put(&ioend->io_bio);
++	}
++
+ 	if (atomic_dec_and_test(&dio->ref)) {
+ 		/*
+ 		 * Try to avoid another context switch for the completion given
+@@ -276,13 +292,6 @@ u32 iomap_finish_ioend_direct(struct iom
+ 		iomap_dio_done(dio);
+ 	}
+ 
+-	if (should_dirty) {
+-		bio_check_pages_dirty(&ioend->io_bio);
+-	} else {
+-		bio_release_pages(&ioend->io_bio, false);
+-		bio_put(&ioend->io_bio);
+-	}
+-
+ 	/*
+ 	 * Return the number of bvecs completed as even direct I/O completions
+ 	 * do significant per-folio work and we'll still want to give up the
+@@ -334,6 +343,65 @@ static inline bool iomap_dio_can_use_fua
+ 	return !bdev_write_cache(iomap->bdev) || bdev_fua(iomap->bdev);
+ }
+ 
++static ssize_t iomap_dio_bio_iter_one(struct iomap_iter *iter,
++		struct iomap_dio *dio, loff_t pos, unsigned int alignment,
++		blk_opf_t op)
++{
++	unsigned int nr_vecs;
++	struct bio *bio;
++	ssize_t ret;
++
++	if (dio->flags & IOMAP_DIO_BOUNCE)
++		nr_vecs = bio_iov_bounce_nr_vecs(dio->submit.iter, op);
++	else
++		nr_vecs = bio_iov_vecs_to_alloc(dio->submit.iter, BIO_MAX_VECS);
++
++	bio = iomap_dio_alloc_bio(iter, dio, nr_vecs, op);
++	fscrypt_set_bio_crypt_ctx(bio, iter->inode,
++			pos >> iter->inode->i_blkbits, GFP_KERNEL);
++	bio->bi_iter.bi_sector = iomap_sector(&iter->iomap, pos);
++	bio->bi_write_hint = iter->inode->i_write_hint;
++	bio->bi_ioprio = dio->iocb->ki_ioprio;
++	bio->bi_private = dio;
++	bio->bi_end_io = iomap_dio_bio_end_io;
++
++	if (dio->flags & IOMAP_DIO_BOUNCE)
++		ret = bio_iov_iter_bounce(bio, dio->submit.iter);
++	else
++		ret = bio_iov_iter_get_pages(bio, dio->submit.iter,
++					     alignment - 1);
++	if (unlikely(ret))
++		goto out_put_bio;
++	ret = bio->bi_iter.bi_size;
++
++	/*
++	 * An atomic write bio must cover the complete length.  If it doesn't,
++	 * error out.
++	 */
++	if ((op & REQ_ATOMIC) && WARN_ON_ONCE(ret != iomap_length(iter))) {
++		ret = -EINVAL;
++		goto out_put_bio;
++	}
++
++	if (dio->flags & IOMAP_DIO_WRITE)
++		task_io_account_write(ret);
++	else if ((dio->flags & IOMAP_DIO_DIRTY) &&
++		 !(dio->flags & IOMAP_DIO_BOUNCE))
++		bio_set_pages_dirty(bio);
++
++	/*
++	 * We can only poll for single bio I/Os.
++	 */
++	if (iov_iter_count(dio->submit.iter))
++		dio->iocb->ki_flags &= ~IOCB_HIPRI;
++	iomap_dio_submit_bio(iter, dio, bio, pos);
++	return ret;
++
++out_put_bio:
++	bio_put(bio);
++	return ret;
++}
++
+ static int iomap_dio_bio_iter(struct iomap_iter *iter, struct iomap_dio *dio)
+ {
+ 	const struct iomap *iomap = &iter->iomap;
+@@ -342,13 +410,14 @@ static int iomap_dio_bio_iter(struct iom
+ 	const loff_t length = iomap_length(iter);
+ 	loff_t pos = iter->pos;
+ 	blk_opf_t bio_opf = REQ_SYNC | REQ_IDLE;
+-	struct bio *bio;
+ 	bool need_zeroout = false;
+-	int ret = 0;
+ 	u64 copied = 0;
+ 	size_t orig_count;
++	unsigned int alignment;
++	ssize_t ret = 0;
+ 
+-	if ((pos | length) & (bdev_logical_block_size(iomap->bdev) - 1))
++	alignment = bdev_logical_block_size(iomap->bdev);
++	if ((pos | length) & (alignment - 1))
+ 		return -EINVAL;
+ 
+ 	if (dio->flags & IOMAP_DIO_WRITE) {
+@@ -427,68 +496,27 @@ static int iomap_dio_bio_iter(struct iom
+ 	}
+ 
+ 	do {
+-		size_t n;
+-
+ 		/*
+ 		 * If completions already occurred and reported errors, give up now and
+ 		 * don't bother submitting more bios.
+ 		 */
+-		if (unlikely(data_race(dio->error))) {
+-			ret = 0;
++		if (unlikely(data_race(dio->error)))
+ 			goto out;
+-		}
+ 
+-		bio = iomap_dio_alloc_bio(iter, dio,
+-				bio_iov_vecs_to_alloc(dio->submit.iter,
+-						BIO_MAX_VECS), bio_opf);
+-		fscrypt_set_bio_crypt_ctx(bio, inode, pos >> inode->i_blkbits,
+-					  GFP_KERNEL);
+-		bio->bi_iter.bi_sector = iomap_sector(iomap, pos);
+-		bio->bi_write_hint = inode->i_write_hint;
+-		bio->bi_ioprio = dio->iocb->ki_ioprio;
+-		bio->bi_private = dio;
+-		bio->bi_end_io = iomap_dio_bio_end_io;
+-
+-		ret = bio_iov_iter_get_pages(bio, dio->submit.iter,
+-				bdev_logical_block_size(iomap->bdev) - 1);
+-		if (unlikely(ret)) {
++		ret = iomap_dio_bio_iter_one(iter, dio, pos, alignment, bio_opf);
++		if (unlikely(ret < 0)) {
+ 			/*
+ 			 * We have to stop part way through an IO. We must fall
+ 			 * through to the sub-block tail zeroing here, otherwise
+ 			 * this short IO may expose stale data in the tail of
+ 			 * the block we haven't written data to.
+ 			 */
+-			bio_put(bio);
+-			goto zero_tail;
+-		}
+-
+-		n = bio->bi_iter.bi_size;
+-		if (WARN_ON_ONCE((bio_opf & REQ_ATOMIC) && n != length)) {
+-			/*
+-			 * An atomic write bio must cover the complete length,
+-			 * which it doesn't, so error. We may need to zero out
+-			 * the tail (complete FS block), similar to when
+-			 * bio_iov_iter_get_pages() returns an error, above.
+-			 */
+-			ret = -EINVAL;
+-			bio_put(bio);
+-			goto zero_tail;
++			break;
+ 		}
+-		if (dio->flags & IOMAP_DIO_WRITE)
+-			task_io_account_write(n);
+-		else if (dio->flags & IOMAP_DIO_DIRTY)
+-			bio_set_pages_dirty(bio);
+-
+-		dio->size += n;
+-		copied += n;
+-
+-		/*
+-		 * We can only poll for single bio I/Os.
+-		 */
+-		if (iov_iter_count(dio->submit.iter))
+-			dio->iocb->ki_flags &= ~IOCB_HIPRI;
+-		iomap_dio_submit_bio(iter, dio, bio, pos);
+-		pos += n;
++		dio->size += ret;
++		copied += ret;
++		pos += ret;
++		ret = 0;
+ 	} while (iov_iter_count(dio->submit.iter));
+ 
+ 	/*
+@@ -497,7 +525,6 @@ static int iomap_dio_bio_iter(struct iom
+ 	 * the block tail in the latter case, we can expose stale data via mmap
+ 	 * reads of the EOF block.
+ 	 */
+-zero_tail:
+ 	if (need_zeroout ||
+ 	    ((dio->flags & IOMAP_DIO_WRITE) && pos >= i_size_read(inode))) {
+ 		/* zero out from the end of the write to the end of the block */
+@@ -644,7 +671,7 @@ __iomap_dio_rw(struct kiocb *iocb, struc
+ 	dio->i_size = i_size_read(inode);
+ 	dio->dops = dops;
+ 	dio->error = 0;
+-	dio->flags = 0;
++	dio->flags = dio_flags & IOMAP_DIO_BOUNCE;
+ 	dio->done_before = done_before;
+ 
+ 	dio->submit.iter = iter;
+--- a/include/linux/blk_types.h
++++ b/include/linux/blk_types.h
+@@ -269,7 +269,8 @@ struct bio {
+ };
+ 
+ #define BIO_RESET_BYTES		offsetof(struct bio, bi_max_vecs)
+-#define BIO_MAX_SECTORS		(UINT_MAX >> SECTOR_SHIFT)
++#define BIO_MAX_SIZE		UINT_MAX
++#define BIO_MAX_SECTORS		(BIO_MAX_SIZE >> SECTOR_SHIFT)
+ 
+ static inline struct bio_vec *bio_inline_vecs(struct bio *bio)
+ {
+--- a/include/linux/iomap.h
++++ b/include/linux/iomap.h
+@@ -518,6 +518,15 @@ struct iomap_dio_ops {
+  */
+ #define IOMAP_DIO_PARTIAL		(1 << 2)
+ 
++/*
++ * Bounce buffer instead of using zero copy access.
++ *
++ * This is needed if the device needs stable data to checksum or generate
++ * parity.  The file system must hook into the I/O submission and offload
++ * completions to user context for reads when this is set.
++ */
++#define IOMAP_DIO_BOUNCE		(1 << 4)
++
+ ssize_t iomap_dio_rw(struct kiocb *iocb, struct iov_iter *iter,
+ 		const struct iomap_ops *ops, const struct iomap_dio_ops *dops,
+ 		unsigned int dio_flags, void *private, size_t done_before);
