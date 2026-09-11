@@ -1,0 +1,150 @@
+From a24152381091582c891f284a079c4dd1a5cab732 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 11 Dec 2024 10:09:07 +0800
+Subject: RDMA/erdma: Add the query_qp command to the cmdq
+
+From: Boshi Yu <boshiyu@linux.alibaba.com>
+
+[ Upstream commit 1cccbd3eec3d6370ddf9a003c1a1baeb8c155b3b ]
+
+Certian QP attributes, such as sq_draining, can only be obtained
+by querying the hardware on the erdma RoCEv2 device. To address this,
+we add the query_qp command to the cmdq and parse the response to
+retrieve corresponding QP attributes.
+
+Signed-off-by: Boshi Yu <boshiyu@linux.alibaba.com>
+Link: https://patch.msgid.link/20241211020930.68833-8-boshiyu@linux.alibaba.com
+Reviewed-by: Cheng Xu <chengyou@linux.alibaba.com>
+Signed-off-by: Leon Romanovsky <leon@kernel.org>
+Stable-dep-of: 652befcba956 ("RDMA/erdma: complete object teardown when the destroy command fails")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/infiniband/hw/erdma/erdma_hw.h    | 12 +++++
+ drivers/infiniband/hw/erdma/erdma_verbs.c | 58 +++++++++++++++++++----
+ 2 files changed, 60 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/infiniband/hw/erdma/erdma_hw.h b/drivers/infiniband/hw/erdma/erdma_hw.h
+index 3b0f7fc4ff312..809e77dde271a 100644
+--- a/drivers/infiniband/hw/erdma/erdma_hw.h
++++ b/drivers/infiniband/hw/erdma/erdma_hw.h
+@@ -154,6 +154,7 @@ enum CMDQ_RDMA_OPCODE {
+ 	CMDQ_OPCODE_SET_GID = 14,
+ 	CMDQ_OPCODE_CREATE_AH = 15,
+ 	CMDQ_OPCODE_DESTROY_AH = 16,
++	CMDQ_OPCODE_QUERY_QP = 17,
+ };
+ 
+ enum CMDQ_COMMON_OPCODE {
+@@ -362,6 +363,17 @@ struct erdma_cmdq_mod_qp_req_rocev2 {
+ 	struct erdma_av_cfg av_cfg;
+ };
+ 
++/* query qp response mask */
++#define ERDMA_CMD_QUERY_QP_RESP_SQ_PSN_MASK GENMASK_ULL(23, 0)
++#define ERDMA_CMD_QUERY_QP_RESP_RQ_PSN_MASK GENMASK_ULL(47, 24)
++#define ERDMA_CMD_QUERY_QP_RESP_QP_STATE_MASK GENMASK_ULL(55, 48)
++#define ERDMA_CMD_QUERY_QP_RESP_SQ_DRAINING_MASK GENMASK_ULL(56, 56)
++
++struct erdma_cmdq_query_qp_req_rocev2 {
++	u64 hdr;
++	u32 qpn;
++};
++
+ /* create qp cfg0 */
+ #define ERDMA_CMD_CREATE_QP_SQ_DEPTH_MASK GENMASK(31, 20)
+ #define ERDMA_CMD_CREATE_QP_QPN_MASK GENMASK(19, 0)
+diff --git a/drivers/infiniband/hw/erdma/erdma_verbs.c b/drivers/infiniband/hw/erdma/erdma_verbs.c
+index 707ca315bdfcc..3f2d2941e3103 100644
+--- a/drivers/infiniband/hw/erdma/erdma_verbs.c
++++ b/drivers/infiniband/hw/erdma/erdma_verbs.c
+@@ -1566,6 +1566,19 @@ static void erdma_attr_to_av(const struct rdma_ah_attr *ah_attr,
+ 		av->ntype = ERDMA_NETWORK_TYPE_IPV6;
+ }
+ 
++static void erdma_av_to_attr(struct erdma_av *av, struct rdma_ah_attr *ah_attr)
++{
++	ah_attr->type = RDMA_AH_ATTR_TYPE_ROCE;
++
++	rdma_ah_set_sl(ah_attr, av->sl);
++	rdma_ah_set_port_num(ah_attr, av->port);
++	rdma_ah_set_ah_flags(ah_attr, IB_AH_GRH);
++
++	rdma_ah_set_grh(ah_attr, NULL, av->flow_label, av->sgid_index,
++			av->hop_limit, av->traffic_class);
++	rdma_ah_set_dgid_raw(ah_attr, av->dgid);
++}
++
+ static int ib_qps_to_erdma_qps[ERDMA_PROTO_COUNT][IB_QPS_ERR + 1] = {
+ 	[ERDMA_PROTO_IWARP] = {
+ 		[IB_QPS_RESET] = ERDMA_QPS_IWARP_IDLE,
+@@ -1767,8 +1780,11 @@ static enum ib_qp_state query_qp_state(struct erdma_qp *qp)
+ int erdma_query_qp(struct ib_qp *ibqp, struct ib_qp_attr *qp_attr,
+ 		   int qp_attr_mask, struct ib_qp_init_attr *qp_init_attr)
+ {
++	struct erdma_cmdq_query_qp_req_rocev2 req;
+ 	struct erdma_dev *dev;
+ 	struct erdma_qp *qp;
++	u64 resp;
++	int ret;
+ 
+ 	if (ibqp && qp_attr && qp_init_attr) {
+ 		qp = to_eqp(ibqp);
+@@ -1795,8 +1811,37 @@ int erdma_query_qp(struct ib_qp *ibqp, struct ib_qp_attr *qp_attr,
+ 
+ 	qp_init_attr->cap = qp_attr->cap;
+ 
+-	qp_attr->qp_state = query_qp_state(qp);
+-	qp_attr->cur_qp_state = query_qp_state(qp);
++	if (erdma_device_rocev2(dev)) {
++		/* Query hardware to get some attributes */
++		erdma_cmdq_build_reqhdr(&req.hdr, CMDQ_SUBMOD_RDMA,
++					CMDQ_OPCODE_QUERY_QP);
++		req.qpn = QP_ID(qp);
++
++		ret = erdma_post_cmd_wait(&dev->cmdq, &req, sizeof(req), &resp,
++					  NULL);
++		if (ret)
++			return ret;
++
++		qp_attr->sq_psn =
++			FIELD_GET(ERDMA_CMD_QUERY_QP_RESP_SQ_PSN_MASK, resp);
++		qp_attr->rq_psn =
++			FIELD_GET(ERDMA_CMD_QUERY_QP_RESP_RQ_PSN_MASK, resp);
++		qp_attr->qp_state = rocev2_to_ib_qps(
++			FIELD_GET(ERDMA_CMD_QUERY_QP_RESP_QP_STATE_MASK, resp));
++		qp_attr->cur_qp_state = qp_attr->qp_state;
++		qp_attr->sq_draining = FIELD_GET(
++			ERDMA_CMD_QUERY_QP_RESP_SQ_DRAINING_MASK, resp);
++
++		qp_attr->pkey_index = 0;
++		qp_attr->dest_qp_num = qp->attrs.rocev2.dst_qpn;
++
++		if (qp->ibqp.qp_type == IB_QPT_RC)
++			erdma_av_to_attr(&qp->attrs.rocev2.av,
++					 &qp_attr->ah_attr);
++	} else {
++		qp_attr->qp_state = query_qp_state(qp);
++		qp_attr->cur_qp_state = qp_attr->qp_state;
++	}
+ 
+ 	return 0;
+ }
+@@ -2188,14 +2233,7 @@ int erdma_query_ah(struct ib_ah *ibah, struct rdma_ah_attr *ah_attr)
+ 	struct erdma_ah *ah = to_eah(ibah);
+ 
+ 	memset(ah_attr, 0, sizeof(*ah_attr));
+-
+-	ah_attr->type = RDMA_AH_ATTR_TYPE_ROCE;
+-	rdma_ah_set_sl(ah_attr, ah->av.sl);
+-	rdma_ah_set_port_num(ah_attr, ah->av.port);
+-	rdma_ah_set_ah_flags(ah_attr, IB_AH_GRH);
+-	rdma_ah_set_grh(ah_attr, NULL, ah->av.flow_label, ah->av.sgid_index,
+-			ah->av.hop_limit, ah->av.traffic_class);
+-	rdma_ah_set_dgid_raw(ah_attr, ah->av.dgid);
++	erdma_av_to_attr(&ah->av, ah_attr);
+ 
+ 	return 0;
+ }
+-- 
+2.53.0
+

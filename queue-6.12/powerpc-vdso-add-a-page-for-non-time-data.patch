@@ -1,0 +1,250 @@
+From b909715cda5e2d6f07bebed13ab0356d6f94eed6 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 2 Oct 2024 10:39:28 +0200
+Subject: powerpc/vdso: Add a page for non-time data
+
+From: Christophe Leroy <christophe.leroy@csgroup.eu>
+
+[ Upstream commit c39b1dcf055d420a498d1047c645b776e4d1a7aa ]
+
+The page containing VDSO time data is swapped with the one containing
+TIME namespace data when a process uses a non-root time namespace.
+For other data like powerpc specific data and RNG data, it means
+tracking whether time namespace is the root one or not to know which
+page to use.
+
+Simplify the logic behind by moving time data out of first data page
+so that the first data page which contains everything else always
+remains the first page. Time data is in the second or third page
+depending on selected time namespace.
+
+While we are playing with get_datapage macro, directly take into
+account the data offset inside the macro instead of adding that offset
+afterwards.
+
+Signed-off-by: Christophe Leroy <christophe.leroy@csgroup.eu>
+Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://patch.msgid.link/0557d3ec898c1d0ea2fc59fa8757618e524c5d94.1727858295.git.christophe.leroy@csgroup.eu
+Stable-dep-of: 3f7c9f9c36b4 ("s390/irqflags: Add out-of-line definitions of arch_local_irq_*() for KMSAN")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ arch/powerpc/include/asm/vdso_datapage.h | 24 +++++++-----------------
+ arch/powerpc/kernel/vdso.c               | 16 ++++++++++------
+ arch/powerpc/kernel/vdso/cacheflush.S    |  2 +-
+ arch/powerpc/kernel/vdso/datapage.S      |  4 ++--
+ arch/powerpc/kernel/vdso/getrandom.S     |  3 +--
+ arch/powerpc/kernel/vdso/gettimeofday.S  |  5 ++---
+ arch/powerpc/kernel/vdso/vdso32.lds.S    |  2 +-
+ arch/powerpc/kernel/vdso/vdso64.lds.S    |  2 +-
+ 8 files changed, 25 insertions(+), 33 deletions(-)
+
+diff --git a/arch/powerpc/include/asm/vdso_datapage.h b/arch/powerpc/include/asm/vdso_datapage.h
+index 248dee138f7bf..33069afccb3c6 100644
+--- a/arch/powerpc/include/asm/vdso_datapage.h
++++ b/arch/powerpc/include/asm/vdso_datapage.h
+@@ -82,8 +82,9 @@ struct vdso_arch_data {
+ 	__u32 syscall_map[SYSCALL_MAP_SIZE];	/* Map of syscalls  */
+ 	__u32 compat_syscall_map[SYSCALL_MAP_SIZE];	/* Map of compat syscalls */
+ 
+-	struct vdso_data data[CS_BASES];
+ 	struct vdso_rng_data rng_data;
++
++	struct vdso_data data[CS_BASES] __aligned(1 << CONFIG_PAGE_SHIFT);
+ };
+ 
+ #else /* CONFIG_PPC64 */
+@@ -95,8 +96,9 @@ struct vdso_arch_data {
+ 	__u64 tb_ticks_per_sec;		/* Timebase tics / sec		0x38 */
+ 	__u32 syscall_map[SYSCALL_MAP_SIZE]; /* Map of syscalls */
+ 	__u32 compat_syscall_map[0];	/* No compat syscalls on PPC32 */
+-	struct vdso_data data[CS_BASES];
+ 	struct vdso_rng_data rng_data;
++
++	struct vdso_data data[CS_BASES] __aligned(1 << CONFIG_PAGE_SHIFT);
+ };
+ 
+ #endif /* CONFIG_PPC64 */
+@@ -105,29 +107,17 @@ extern struct vdso_arch_data *vdso_data;
+ 
+ #else /* __ASSEMBLY__ */
+ 
+-.macro get_datapage ptr
++.macro get_datapage ptr offset=0
+ 	bcl	20, 31, .+4
+ 999:
+ 	mflr	\ptr
+-	addis	\ptr, \ptr, (_vdso_datapage - 999b)@ha
+-	addi	\ptr, \ptr, (_vdso_datapage - 999b)@l
++	addis	\ptr, \ptr, (_vdso_datapage - 999b + \offset)@ha
++	addi	\ptr, \ptr, (_vdso_datapage - 999b + \offset)@l
+ .endm
+ 
+ #include <asm/asm-offsets.h>
+ #include <asm/page.h>
+ 
+-.macro get_realdatapage ptr scratch
+-	get_datapage \ptr
+-#ifdef CONFIG_TIME_NS
+-	lwz	\scratch, VDSO_CLOCKMODE_OFFSET(\ptr)
+-	xoris	\scratch, \scratch, VDSO_CLOCKMODE_TIMENS@h
+-	xori	\scratch, \scratch, VDSO_CLOCKMODE_TIMENS@l
+-	cntlzw	\scratch, \scratch
+-	rlwinm	\scratch, \scratch, PAGE_SHIFT - 5, 1 << PAGE_SHIFT
+-	add	\ptr, \ptr, \scratch
+-#endif
+-.endm
+-
+ #endif /* __ASSEMBLY__ */
+ 
+ #endif /* __KERNEL__ */
+diff --git a/arch/powerpc/kernel/vdso.c b/arch/powerpc/kernel/vdso.c
+index ee4b9d676cff5..6166c1862c06f 100644
+--- a/arch/powerpc/kernel/vdso.c
++++ b/arch/powerpc/kernel/vdso.c
+@@ -48,12 +48,13 @@ long sys_ni_syscall(void);
+  */
+ static union {
+ 	struct vdso_arch_data	data;
+-	u8			page[PAGE_SIZE];
++	u8			page[2 * PAGE_SIZE];
+ } vdso_data_store __page_aligned_data;
+ struct vdso_arch_data *vdso_data = &vdso_data_store.data;
+ 
+ enum vvar_pages {
+-	VVAR_DATA_PAGE_OFFSET,
++	VVAR_BASE_PAGE_OFFSET,
++	VVAR_TIME_PAGE_OFFSET,
+ 	VVAR_TIMENS_PAGE_OFFSET,
+ 	VVAR_NR_PAGES,
+ };
+@@ -119,7 +120,7 @@ static struct vm_special_mapping vdso64_spec __ro_after_init = {
+ #ifdef CONFIG_TIME_NS
+ struct vdso_data *arch_get_vdso_data(void *vvar_page)
+ {
+-	return ((struct vdso_arch_data *)vvar_page)->data;
++	return vvar_page;
+ }
+ 
+ /*
+@@ -153,11 +154,14 @@ static vm_fault_t vvar_fault(const struct vm_special_mapping *sm,
+ 	unsigned long pfn;
+ 
+ 	switch (vmf->pgoff) {
+-	case VVAR_DATA_PAGE_OFFSET:
++	case VVAR_BASE_PAGE_OFFSET:
++		pfn = virt_to_pfn(vdso_data);
++		break;
++	case VVAR_TIME_PAGE_OFFSET:
+ 		if (timens_page)
+ 			pfn = page_to_pfn(timens_page);
+ 		else
+-			pfn = virt_to_pfn(vdso_data);
++			pfn = virt_to_pfn(vdso_data->data);
+ 		break;
+ #ifdef CONFIG_TIME_NS
+ 	case VVAR_TIMENS_PAGE_OFFSET:
+@@ -170,7 +174,7 @@ static vm_fault_t vvar_fault(const struct vm_special_mapping *sm,
+ 		 */
+ 		if (!timens_page)
+ 			return VM_FAULT_SIGBUS;
+-		pfn = virt_to_pfn(vdso_data);
++		pfn = virt_to_pfn(vdso_data->data);
+ 		break;
+ #endif /* CONFIG_TIME_NS */
+ 	default:
+diff --git a/arch/powerpc/kernel/vdso/cacheflush.S b/arch/powerpc/kernel/vdso/cacheflush.S
+index 3b2479bd2f9a1..0085ae464dac9 100644
+--- a/arch/powerpc/kernel/vdso/cacheflush.S
++++ b/arch/powerpc/kernel/vdso/cacheflush.S
+@@ -30,7 +30,7 @@ END_FTR_SECTION_IFSET(CPU_FTR_COHERENT_ICACHE)
+ #ifdef CONFIG_PPC64
+ 	mflr	r12
+   .cfi_register lr,r12
+-	get_realdatapage	r10, r11
++	get_datapage	r10
+ 	mtlr	r12
+   .cfi_restore	lr
+ #endif
+diff --git a/arch/powerpc/kernel/vdso/datapage.S b/arch/powerpc/kernel/vdso/datapage.S
+index 2b19b6201a33a..db8e167f01667 100644
+--- a/arch/powerpc/kernel/vdso/datapage.S
++++ b/arch/powerpc/kernel/vdso/datapage.S
+@@ -28,7 +28,7 @@ V_FUNCTION_BEGIN(__kernel_get_syscall_map)
+ 	mflr	r12
+   .cfi_register lr,r12
+ 	mr.	r4,r3
+-	get_realdatapage	r3, r11
++	get_datapage	r3
+ 	mtlr	r12
+ #ifdef __powerpc64__
+ 	addi	r3,r3,CFG_SYSCALL_MAP64
+@@ -52,7 +52,7 @@ V_FUNCTION_BEGIN(__kernel_get_tbfreq)
+   .cfi_startproc
+ 	mflr	r12
+   .cfi_register lr,r12
+-	get_realdatapage	r3, r11
++	get_datapage	r3
+ #ifndef __powerpc64__
+ 	lwz	r4,(CFG_TB_TICKS_PER_SEC + 4)(r3)
+ #endif
+diff --git a/arch/powerpc/kernel/vdso/getrandom.S b/arch/powerpc/kernel/vdso/getrandom.S
+index f3bbf931931ca..3deddcf89f99b 100644
+--- a/arch/powerpc/kernel/vdso/getrandom.S
++++ b/arch/powerpc/kernel/vdso/getrandom.S
+@@ -31,8 +31,7 @@
+ 	PPC_STL		r2, PPC_MIN_STKFRM + STK_GOT(r1)
+   .cfi_rel_offset r2, PPC_MIN_STKFRM + STK_GOT
+ #endif
+-	get_realdatapage	r8, r11
+-	addi		r8, r8, VDSO_RNG_DATA_OFFSET
++	get_datapage	r8 VDSO_RNG_DATA_OFFSET
+ 	bl		CFUNC(DOTSYM(\funct))
+ 	PPC_LL		r0, PPC_MIN_STKFRM + PPC_LR_STKOFF(r1)
+ #ifdef __powerpc64__
+diff --git a/arch/powerpc/kernel/vdso/gettimeofday.S b/arch/powerpc/kernel/vdso/gettimeofday.S
+index 5540d7021fa25..5333848322ca6 100644
+--- a/arch/powerpc/kernel/vdso/gettimeofday.S
++++ b/arch/powerpc/kernel/vdso/gettimeofday.S
+@@ -32,11 +32,10 @@
+ 	PPC_STL		r2, PPC_MIN_STKFRM + STK_GOT(r1)
+   .cfi_rel_offset r2, PPC_MIN_STKFRM + STK_GOT
+ #endif
+-	get_datapage	r5
+ 	.ifeq	\call_time
+-	addi		r5, r5, VDSO_DATA_OFFSET
++		get_datapage	r5 VDSO_DATA_OFFSET
+ 	.else
+-	addi		r4, r5, VDSO_DATA_OFFSET
++		get_datapage	r4 VDSO_DATA_OFFSET
+ 	.endif
+ 	bl		CFUNC(DOTSYM(\funct))
+ 	PPC_LL		r0, PPC_MIN_STKFRM + PPC_LR_STKOFF(r1)
+diff --git a/arch/powerpc/kernel/vdso/vdso32.lds.S b/arch/powerpc/kernel/vdso/vdso32.lds.S
+index 7b41d5d256e81..1a1b0b6d681a9 100644
+--- a/arch/powerpc/kernel/vdso/vdso32.lds.S
++++ b/arch/powerpc/kernel/vdso/vdso32.lds.S
+@@ -16,7 +16,7 @@ OUTPUT_ARCH(powerpc:common)
+ 
+ SECTIONS
+ {
+-	PROVIDE(_vdso_datapage = . - 2 * PAGE_SIZE);
++	PROVIDE(_vdso_datapage = . - 3 * PAGE_SIZE);
+ 	. = SIZEOF_HEADERS;
+ 
+ 	.hash          	: { *(.hash) }			:text
+diff --git a/arch/powerpc/kernel/vdso/vdso64.lds.S b/arch/powerpc/kernel/vdso/vdso64.lds.S
+index 9481e4b892ed1..e21b5506cad62 100644
+--- a/arch/powerpc/kernel/vdso/vdso64.lds.S
++++ b/arch/powerpc/kernel/vdso/vdso64.lds.S
+@@ -16,7 +16,7 @@ OUTPUT_ARCH(powerpc:common64)
+ 
+ SECTIONS
+ {
+-	PROVIDE(_vdso_datapage = . - 2 * PAGE_SIZE);
++	PROVIDE(_vdso_datapage = . - 3 * PAGE_SIZE);
+ 	. = SIZEOF_HEADERS;
+ 
+ 	.hash		: { *(.hash) }			:text
+-- 
+2.53.0
+

@@ -1,0 +1,166 @@
+From 7f50bd2276776c1f33c69339e945ef6b9d85cba4 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 9 Dec 2022 23:05:53 +0100
+Subject: tracing/osnoise: Add preempt and/or irq disabled options
+
+From: Daniel Bristot de Oliveira <bristot@kernel.org>
+
+[ Upstream commit b5dce2002567a9b1a83ef3e3a8678d8c32be2a78 ]
+
+The osnoise workload runs with preemption and IRQs enabled in such
+a way as to allow all sorts of noise to disturb osnoise's execution.
+hwlat tracer has a similar workload but works with irq disabled,
+allowing only NMIs and the hardware to generate noise.
+
+While thinking about adding an options file to hwlat tracer to
+allow the system to panic, and other features I was thinking
+to add, like having a tracepoint at each noise detection, it
+came to my mind that is easier to make osnoise and also do
+hardware latency detection than making hwlat "feature compatible"
+with osnoise.
+
+Other points are:
+ - osnoise already has an independent cpu file.
+ - osnoise has a more intuitive interface, e.g., runtime/period vs.
+   window/width (and people often need help remembering what it is).
+ - osnoise: tracepoints
+ - osnoise stop options
+ - osnoise options file itself
+
+Moreover, the user-space side (in rtla) is simplified by reusing the
+existing osnoise code.
+
+Finally, people have been asking me about using osnoise for hw latency
+detection, and I have to explain that it was sufficient but not
+necessary. These options make it sufficient and necessary.
+
+Adding a Suggested-by Clark, as he often asked me about this
+possibility.
+
+Link: https://lkml.kernel.org/r/d9c6c19135497054986900f94c8e47410b15316a.1670623111.git.bristot@kernel.org
+
+Cc: Suggested-by: Clark Williams <williams@redhat.com>
+Cc: Juri Lelli <juri.lelli@redhat.com>
+Cc: Bagas Sanjaya <bagasdotme@gmail.com>
+Cc: Daniel Bristot de Oliveira <bristot@kernel.org>
+Cc: Masami Hiramatsu <mhiramat@kernel.org>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Signed-off-by: Daniel Bristot de Oliveira <bristot@kernel.org>
+Signed-off-by: Steven Rostedt (Google) <rostedt@goodmis.org>
+Stable-dep-of: 27d73e81195b ("rcu: Mark accesses to ->rcu_urgent_qs and ->rcu_need_heavy_qs")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ kernel/trace/trace_osnoise.c | 48 ++++++++++++++++++++++++++++++++----
+ 1 file changed, 43 insertions(+), 5 deletions(-)
+
+diff --git a/kernel/trace/trace_osnoise.c b/kernel/trace/trace_osnoise.c
+index 37653a871d75d..366d8c288f5fa 100644
+--- a/kernel/trace/trace_osnoise.c
++++ b/kernel/trace/trace_osnoise.c
+@@ -55,10 +55,17 @@ enum osnoise_options_index {
+ 	OSN_DEFAULTS = 0,
+ 	OSN_WORKLOAD,
+ 	OSN_PANIC_ON_STOP,
++	OSN_PREEMPT_DISABLE,
++	OSN_IRQ_DISABLE,
+ 	OSN_MAX
+ };
+ 
+-static const char * const osnoise_options_str[OSN_MAX] = { "DEFAULTS", "OSNOISE_WORKLOAD", "PANIC_ON_STOP" };
++static const char * const osnoise_options_str[OSN_MAX] = {
++							"DEFAULTS",
++							"OSNOISE_WORKLOAD",
++							"PANIC_ON_STOP",
++							"OSNOISE_PREEMPT_DISABLE",
++							"OSNOISE_IRQ_DISABLE" };
+ 
+ #define OSN_DEFAULT_OPTIONS	0x2
+ unsigned long osnoise_options	= OSN_DEFAULT_OPTIONS;
+@@ -1309,18 +1316,26 @@ static void notify_new_max_latency(u64 latency)
+  */
+ static int run_osnoise(void)
+ {
++	bool disable_irq = test_bit(OSN_IRQ_DISABLE, &osnoise_options);
+ 	struct osnoise_variables *osn_var = this_cpu_osn_var();
+ 	u64 start, sample, last_sample;
+ 	u64 last_int_count, int_count;
+ 	s64 noise = 0, max_noise = 0;
+ 	s64 total, last_total = 0;
+ 	struct osnoise_sample s;
++	bool disable_preemption;
+ 	unsigned int threshold;
+ 	u64 runtime, stop_in;
+ 	u64 sum_noise = 0;
+ 	int hw_count = 0;
+ 	int ret = -1;
+ 
++	/*
++	 * Disabling preemption is only required if IRQs are enabled,
++	 * and the options is set on.
++	 */
++	disable_preemption = !disable_irq && test_bit(OSN_PREEMPT_DISABLE, &osnoise_options);
++
+ 	/*
+ 	 * Considers the current thread as the workload.
+ 	 */
+@@ -1336,6 +1351,15 @@ static int run_osnoise(void)
+ 	 */
+ 	threshold = tracing_thresh ? : 5000;
+ 
++	/*
++	 * Apply PREEMPT and IRQ disabled options.
++	 */
++	if (disable_irq)
++		local_irq_disable();
++
++	if (disable_preemption)
++		preempt_disable();
++
+ 	/*
+ 	 * Make sure NMIs see sampling first
+ 	 */
+@@ -1423,16 +1447,21 @@ static int run_osnoise(void)
+ 		 * cond_resched()
+ 		 */
+ 		if (IS_ENABLED(CONFIG_PREEMPT_RCU)) {
+-			local_irq_disable();
++			if (!disable_irq)
++				local_irq_disable();
++
+ 			rcu_momentary_dyntick_idle();
+-			local_irq_enable();
++
++			if (!disable_irq)
++				local_irq_enable();
+ 		}
+ 
+ 		/*
+ 		 * For the non-preemptive kernel config: let threads runs, if
+-		 * they so wish.
++		 * they so wish, unless set not do to so.
+ 		 */
+-		cond_resched();
++		if (!disable_irq && !disable_preemption)
++			cond_resched();
+ 
+ 		last_sample = sample;
+ 		last_int_count = int_count;
+@@ -1451,6 +1480,15 @@ static int run_osnoise(void)
+ 	 */
+ 	barrier();
+ 
++	/*
++	 * Return to the preemptive state.
++	 */
++	if (disable_preemption)
++		preempt_enable();
++
++	if (disable_irq)
++		local_irq_enable();
++
+ 	/*
+ 	 * Save noise info.
+ 	 */
+-- 
+2.53.0
+

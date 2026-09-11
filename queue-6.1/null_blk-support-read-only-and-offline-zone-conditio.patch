@@ -1,0 +1,259 @@
+From 6d7cd3eed56e79b96dcc45f29d299468855854a8 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 1 Dec 2022 15:10:36 +0900
+Subject: null_blk: support read-only and offline zone conditions
+
+From: Shin'ichiro Kawasaki <shinichiro.kawasaki@wdc.com>
+
+[ Upstream commit d3a5738849e03990618cbb12e10db4eb82dbfda0 ]
+
+In zoned mode, zones with write pointers can have conditions "read-only"
+or "offline". In read-only condition, zones can not be written. In
+offline condition, the zones can be neither written nor read. These
+conditions are intended for zones with media failures, then it is
+difficult to set those conditions to zones on real devices.
+
+To test handling of zones in the conditions, add a feature to null_blk
+to set up zones in read-only or offline condition. Add new configuration
+attributes "zone_readonly" and "zone_offline". Write a sector to the
+attribute files to specify the target zone to set the zone conditions.
+For example, following command lines do it:
+
+   echo 0 > nullb1/zone_readonly
+   echo 524288 > nullb1/zone_offline
+
+When the specified zones are already in read-only or offline condition,
+normal empty condition is restored to the zones. These condition changes
+can be done only after the null_blk device get powered, since status
+area of each zone is not yet allocated before power-on.
+
+Also improve zone condition checks to inhibit all commands for zones in
+offline conditions. In same manner, inhibit write and zone management
+commands for zones in read-only condition.
+
+Signed-off-by: Shin'ichiro Kawasaki <shinichiro.kawasaki@wdc.com>
+Reviewed-by: Damien Le Moal <damien.lemoal@opensource.wdc.com>
+Link: https://lore.kernel.org/r/20221201061036.2342206-1-shinichiro.kawasaki@wdc.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Stable-dep-of: c9d293d6bb05 ("null_blk: register configfs subsystem after creating default devices")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/block/null_blk/main.c     | 22 ++++++-
+ drivers/block/null_blk/null_blk.h |  8 +++
+ drivers/block/null_blk/zoned.c    | 95 ++++++++++++++++++++++++++++++-
+ 3 files changed, 121 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/block/null_blk/main.c b/drivers/block/null_blk/main.c
+index 0790e559c4d19..59cef8db63e86 100644
+--- a/drivers/block/null_blk/main.c
++++ b/drivers/block/null_blk/main.c
+@@ -539,6 +539,24 @@ static ssize_t nullb_device_badblocks_store(struct config_item *item,
+ }
+ CONFIGFS_ATTR(nullb_device_, badblocks);
+ 
++static ssize_t nullb_device_zone_readonly_store(struct config_item *item,
++						const char *page, size_t count)
++{
++	struct nullb_device *dev = to_nullb_device(item);
++
++	return zone_cond_store(dev, page, count, BLK_ZONE_COND_READONLY);
++}
++CONFIGFS_ATTR_WO(nullb_device_, zone_readonly);
++
++static ssize_t nullb_device_zone_offline_store(struct config_item *item,
++					       const char *page, size_t count)
++{
++	struct nullb_device *dev = to_nullb_device(item);
++
++	return zone_cond_store(dev, page, count, BLK_ZONE_COND_OFFLINE);
++}
++CONFIGFS_ATTR_WO(nullb_device_, zone_offline);
++
+ static struct configfs_attribute *nullb_device_attrs[] = {
+ 	&nullb_device_attr_size,
+ 	&nullb_device_attr_completion_nsec,
+@@ -565,6 +583,8 @@ static struct configfs_attribute *nullb_device_attrs[] = {
+ 	&nullb_device_attr_zone_nr_conv,
+ 	&nullb_device_attr_zone_max_open,
+ 	&nullb_device_attr_zone_max_active,
++	&nullb_device_attr_zone_readonly,
++	&nullb_device_attr_zone_offline,
+ 	&nullb_device_attr_virt_boundary,
+ 	&nullb_device_attr_no_sched,
+ 	&nullb_device_attr_shared_tag_bitmap,
+@@ -630,7 +650,7 @@ static ssize_t memb_group_features_show(struct config_item *item, char *page)
+ 			"poll_queues,power,queue_mode,shared_tag_bitmap,size,"
+ 			"submit_queues,use_per_node_hctx,virt_boundary,zoned,"
+ 			"zone_capacity,zone_max_active,zone_max_open,"
+-			"zone_nr_conv,zone_size\n");
++			"zone_nr_conv,zone_offline,zone_readonly,zone_size\n");
+ }
+ 
+ CONFIGFS_ATTR_RO(memb_group_, features);
+diff --git a/drivers/block/null_blk/null_blk.h b/drivers/block/null_blk/null_blk.h
+index 94ff68052b1e4..eb5972c50be86 100644
+--- a/drivers/block/null_blk/null_blk.h
++++ b/drivers/block/null_blk/null_blk.h
+@@ -151,6 +151,8 @@ blk_status_t null_process_zoned_cmd(struct nullb_cmd *cmd, enum req_op op,
+ 				    sector_t sector, sector_t nr_sectors);
+ size_t null_zone_valid_read_len(struct nullb *nullb,
+ 				sector_t sector, unsigned int len);
++ssize_t zone_cond_store(struct nullb_device *dev, const char *page,
++			size_t count, enum blk_zone_cond cond);
+ #else
+ static inline int null_init_zoned_dev(struct nullb_device *dev,
+ 				      struct request_queue *q)
+@@ -174,6 +176,12 @@ static inline size_t null_zone_valid_read_len(struct nullb *nullb,
+ {
+ 	return len;
+ }
++static inline ssize_t zone_cond_store(struct nullb_device *dev,
++				      const char *page, size_t count,
++				      enum blk_zone_cond cond)
++{
++	return -EOPNOTSUPP;
++}
+ #define null_report_zones	NULL
+ #endif /* CONFIG_BLK_DEV_ZONED */
+ #endif /* __NULL_BLK_H */
+diff --git a/drivers/block/null_blk/zoned.c b/drivers/block/null_blk/zoned.c
+index 9255fbb319ab6..78efccc77caa4 100644
+--- a/drivers/block/null_blk/zoned.c
++++ b/drivers/block/null_blk/zoned.c
+@@ -401,8 +401,10 @@ static blk_status_t null_zone_write(struct nullb_cmd *cmd, sector_t sector,
+ 
+ 	null_lock_zone(dev, zone);
+ 
+-	if (zone->cond == BLK_ZONE_COND_FULL) {
+-		/* Cannot write to a full zone */
++	if (zone->cond == BLK_ZONE_COND_FULL ||
++	    zone->cond == BLK_ZONE_COND_READONLY ||
++	    zone->cond == BLK_ZONE_COND_OFFLINE) {
++		/* Cannot write to the zone */
+ 		ret = BLK_STS_IOERR;
+ 		goto unlock;
+ 	}
+@@ -630,7 +632,9 @@ static blk_status_t null_zone_mgmt(struct nullb_cmd *cmd, enum req_op op,
+ 		for (i = dev->zone_nr_conv; i < dev->nr_zones; i++) {
+ 			zone = &dev->zones[i];
+ 			null_lock_zone(dev, zone);
+-			if (zone->cond != BLK_ZONE_COND_EMPTY) {
++			if (zone->cond != BLK_ZONE_COND_EMPTY &&
++			    zone->cond != BLK_ZONE_COND_READONLY &&
++			    zone->cond != BLK_ZONE_COND_OFFLINE) {
+ 				null_reset_zone(dev, zone);
+ 				trace_nullb_zone_op(cmd, i, zone->cond);
+ 			}
+@@ -644,6 +648,12 @@ static blk_status_t null_zone_mgmt(struct nullb_cmd *cmd, enum req_op op,
+ 
+ 	null_lock_zone(dev, zone);
+ 
++	if (zone->cond == BLK_ZONE_COND_READONLY ||
++	    zone->cond == BLK_ZONE_COND_OFFLINE) {
++		ret = BLK_STS_IOERR;
++		goto unlock;
++	}
++
+ 	switch (op) {
+ 	case REQ_OP_ZONE_RESET:
+ 		ret = null_reset_zone(dev, zone);
+@@ -665,6 +675,7 @@ static blk_status_t null_zone_mgmt(struct nullb_cmd *cmd, enum req_op op,
+ 	if (ret == BLK_STS_OK)
+ 		trace_nullb_zone_op(cmd, zone_no, zone->cond);
+ 
++unlock:
+ 	null_unlock_zone(dev, zone);
+ 
+ 	return ret;
+@@ -691,6 +702,8 @@ blk_status_t null_process_zoned_cmd(struct nullb_cmd *cmd, enum req_op op,
+ 	default:
+ 		dev = cmd->nq->dev;
+ 		zone = &dev->zones[null_zone_no(dev, sector)];
++		if (zone->cond == BLK_ZONE_COND_OFFLINE)
++			return BLK_STS_IOERR;
+ 
+ 		null_lock_zone(dev, zone);
+ 		sts = null_process_cmd(cmd, op, sector, nr_sectors);
+@@ -698,3 +711,79 @@ blk_status_t null_process_zoned_cmd(struct nullb_cmd *cmd, enum req_op op,
+ 		return sts;
+ 	}
+ }
++
++/*
++ * Set a zone in the read-only or offline condition.
++ */
++static void null_set_zone_cond(struct nullb_device *dev,
++			       struct nullb_zone *zone, enum blk_zone_cond cond)
++{
++	if (WARN_ON_ONCE(cond != BLK_ZONE_COND_READONLY &&
++			 cond != BLK_ZONE_COND_OFFLINE))
++		return;
++
++	null_lock_zone(dev, zone);
++
++	/*
++	 * If the read-only condition is requested again to zones already in
++	 * read-only condition, restore back normal empty condition. Do the same
++	 * if the offline condition is requested for offline zones. Otherwise,
++	 * set the specified zone condition to the zones. Finish the zones
++	 * beforehand to free up zone resources.
++	 */
++	if (zone->cond == cond) {
++		zone->cond = BLK_ZONE_COND_EMPTY;
++		zone->wp = zone->start;
++		if (dev->memory_backed)
++			null_handle_discard(dev, zone->start, zone->len);
++	} else {
++		if (zone->cond != BLK_ZONE_COND_READONLY &&
++		    zone->cond != BLK_ZONE_COND_OFFLINE)
++			null_finish_zone(dev, zone);
++		zone->cond = cond;
++		zone->wp = (sector_t)-1;
++	}
++
++	null_unlock_zone(dev, zone);
++}
++
++/*
++ * Identify a zone from the sector written to configfs file. Then set zone
++ * condition to the zone.
++ */
++ssize_t zone_cond_store(struct nullb_device *dev, const char *page,
++			size_t count, enum blk_zone_cond cond)
++{
++	unsigned long long sector;
++	unsigned int zone_no;
++	int ret;
++
++	if (!dev->zoned) {
++		pr_err("null_blk device is not zoned\n");
++		return -EINVAL;
++	}
++
++	if (!dev->zones) {
++		pr_err("null_blk device is not yet powered\n");
++		return -EINVAL;
++	}
++
++	ret = kstrtoull(page, 0, &sector);
++	if (ret < 0)
++		return ret;
++
++	zone_no = null_zone_no(dev, sector);
++	if (zone_no >= dev->nr_zones) {
++		pr_err("Sector out of range\n");
++		return -EINVAL;
++	}
++
++	if (dev->zones[zone_no].type == BLK_ZONE_TYPE_CONVENTIONAL) {
++		pr_err("Can not change condition of conventional zones\n");
++		return -EINVAL;
++	}
++
++	null_set_zone_cond(dev, &dev->zones[zone_no], cond);
++
++	return count;
++}
+-- 
+2.53.0
+

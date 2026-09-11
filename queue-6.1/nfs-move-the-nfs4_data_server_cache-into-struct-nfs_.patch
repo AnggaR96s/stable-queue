@@ -1,0 +1,169 @@
+From ec52e2d4cb0475bdd4d3617ad0e8bcf74a17be14 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 10 Apr 2025 16:42:04 -0400
+Subject: nfs: move the nfs4_data_server_cache into struct nfs_net
+
+From: Jeff Layton <jlayton@kernel.org>
+
+[ Upstream commit d5fb22a7c585b12ec3e6cef150689f7386e8cfd0 ]
+
+Since struct nfs4_pnfs_ds should not be shared between net namespaces,
+move from a global list of objects to a per-netns list and spinlock.
+
+Tested-by: Sargun Dillon <sargun@sargun.me>
+Signed-off-by: Jeff Layton <jlayton@kernel.org>
+Reviewed-by: Benjamin Coddington <bcodding@redhat.com>
+Link: https://lore.kernel.org/r/20250410-nfs-ds-netns-v2-2-f80b7979ba80@kernel.org
+Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+Stable-dep-of: 13c23c5cb977 ("NFSv4/pnfs: key the data server cache on the NFS version")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/nfs/client.c   |  7 +++++++
+ fs/nfs/netns.h    |  6 +++++-
+ fs/nfs/pnfs_nfs.c | 31 +++++++++++++++++--------------
+ 3 files changed, 29 insertions(+), 15 deletions(-)
+
+diff --git a/fs/nfs/client.c b/fs/nfs/client.c
+index 38354f70f885c..40e4a3b350466 100644
+--- a/fs/nfs/client.c
++++ b/fs/nfs/client.c
+@@ -1210,6 +1210,10 @@ void nfs_clients_init(struct net *net)
+ 	INIT_LIST_HEAD(&nn->nfs_volume_list);
+ #if IS_ENABLED(CONFIG_NFS_V4)
+ 	idr_init(&nn->cb_ident_idr);
++#endif
++#if IS_ENABLED(CONFIG_NFS_V4_1)
++	INIT_LIST_HEAD(&nn->nfs4_data_server_cache);
++	spin_lock_init(&nn->nfs4_data_server_lock);
+ #endif
+ 	spin_lock_init(&nn->nfs_client_lock);
+ 	nn->boot_time = ktime_get_real();
+@@ -1227,6 +1231,9 @@ void nfs_clients_exit(struct net *net)
+ 	nfs_cleanup_cb_ident_idr(net);
+ 	WARN_ON_ONCE(!list_empty(&nn->nfs_client_list));
+ 	WARN_ON_ONCE(!list_empty(&nn->nfs_volume_list));
++#if IS_ENABLED(CONFIG_NFS_V4_1)
++	WARN_ON_ONCE(!list_empty(&nn->nfs4_data_server_cache));
++#endif
+ }
+ 
+ #ifdef CONFIG_PROC_FS
+diff --git a/fs/nfs/netns.h b/fs/nfs/netns.h
+index a68b21603ea9a..6ba3ea39e928c 100644
+--- a/fs/nfs/netns.h
++++ b/fs/nfs/netns.h
+@@ -31,7 +31,11 @@ struct nfs_net {
+ 	unsigned short nfs_callback_tcpport;
+ 	unsigned short nfs_callback_tcpport6;
+ 	int cb_users[NFS4_MAX_MINOR_VERSION + 1];
+-#endif
++#endif /* CONFIG_NFS_V4 */
++#if IS_ENABLED(CONFIG_NFS_V4_1)
++	struct list_head nfs4_data_server_cache;
++	spinlock_t nfs4_data_server_lock;
++#endif /* CONFIG_NFS_V4_1 */
+ 	struct nfs_netns_client *nfs_client;
+ 	spinlock_t nfs_client_lock;
+ 	ktime_t boot_time;
+diff --git a/fs/nfs/pnfs_nfs.c b/fs/nfs/pnfs_nfs.c
+index 08634d97746fa..a4aceeeafd620 100644
+--- a/fs/nfs/pnfs_nfs.c
++++ b/fs/nfs/pnfs_nfs.c
+@@ -16,6 +16,7 @@
+ #include "nfs4session.h"
+ #include "internal.h"
+ #include "pnfs.h"
++#include "netns.h"
+ 
+ #define NFSDBG_FACILITY		NFSDBG_PNFS
+ 
+@@ -551,14 +552,14 @@ EXPORT_SYMBOL_GPL(pnfs_generic_commit_pagelist);
+ /*
+  * Data server cache
+  *
+- * Data servers can be mapped to different device ids.
+- * nfs4_pnfs_ds reference counting
++ * Data servers can be mapped to different device ids, but should
++ * never be shared between net namespaces.
++ *
++ * nfs4_pnfs_ds reference counting:
+  *   - set to 1 on allocation
+  *   - incremented when a device id maps a data server already in the cache.
+  *   - decremented when deviceid is removed from the cache.
+  */
+-static DEFINE_SPINLOCK(nfs4_ds_cache_lock);
+-static LIST_HEAD(nfs4_data_server_cache);
+ 
+ /* Debug routines */
+ static void
+@@ -651,12 +652,12 @@ _same_data_server_addrs_locked(const struct list_head *dsaddrs1,
+  * Lookup DS by addresses.  nfs4_ds_cache_lock is held
+  */
+ static struct nfs4_pnfs_ds *
+-_data_server_lookup_locked(const struct net *net, const struct list_head *dsaddrs)
++_data_server_lookup_locked(const struct nfs_net *nn, const struct list_head *dsaddrs)
+ {
+ 	struct nfs4_pnfs_ds *ds;
+ 
+-	list_for_each_entry(ds, &nfs4_data_server_cache, ds_node)
+-		if (ds->ds_net == net && _same_data_server_addrs_locked(&ds->ds_addrs, dsaddrs))
++	list_for_each_entry(ds, &nn->nfs4_data_server_cache, ds_node)
++		if (_same_data_server_addrs_locked(&ds->ds_addrs, dsaddrs))
+ 			return ds;
+ 	return NULL;
+ }
+@@ -700,10 +701,11 @@ static void destroy_ds(struct nfs4_pnfs_ds *ds)
+ 
+ void nfs4_pnfs_ds_put(struct nfs4_pnfs_ds *ds)
+ {
+-	if (refcount_dec_and_lock(&ds->ds_count,
+-				&nfs4_ds_cache_lock)) {
++	struct nfs_net *nn = net_generic(ds->ds_net, nfs_net_id);
++
++	if (refcount_dec_and_lock(&ds->ds_count, &nn->nfs4_data_server_lock)) {
+ 		list_del_init(&ds->ds_node);
+-		spin_unlock(&nfs4_ds_cache_lock);
++		spin_unlock(&nn->nfs4_data_server_lock);
+ 		destroy_ds(ds);
+ 	}
+ }
+@@ -765,6 +767,7 @@ nfs4_pnfs_remotestr(struct list_head *dsaddrs, gfp_t gfp_flags)
+ struct nfs4_pnfs_ds *
+ nfs4_pnfs_ds_add(const struct net *net, struct list_head *dsaddrs, gfp_t gfp_flags)
+ {
++	struct nfs_net *nn = net_generic(net, nfs_net_id);
+ 	struct nfs4_pnfs_ds *tmp_ds, *ds = NULL;
+ 	char *remotestr;
+ 
+@@ -780,8 +783,8 @@ nfs4_pnfs_ds_add(const struct net *net, struct list_head *dsaddrs, gfp_t gfp_fla
+ 	/* this is only used for debugging, so it's ok if its NULL */
+ 	remotestr = nfs4_pnfs_remotestr(dsaddrs, gfp_flags);
+ 
+-	spin_lock(&nfs4_ds_cache_lock);
+-	tmp_ds = _data_server_lookup_locked(net, dsaddrs);
++	spin_lock(&nn->nfs4_data_server_lock);
++	tmp_ds = _data_server_lookup_locked(nn, dsaddrs);
+ 	if (tmp_ds == NULL) {
+ 		INIT_LIST_HEAD(&ds->ds_addrs);
+ 		list_splice_init(dsaddrs, &ds->ds_addrs);
+@@ -790,7 +793,7 @@ nfs4_pnfs_ds_add(const struct net *net, struct list_head *dsaddrs, gfp_t gfp_fla
+ 		INIT_LIST_HEAD(&ds->ds_node);
+ 		ds->ds_net = net;
+ 		ds->ds_clp = NULL;
+-		list_add(&ds->ds_node, &nfs4_data_server_cache);
++		list_add(&ds->ds_node, &nn->nfs4_data_server_cache);
+ 		dprintk("%s add new data server %s\n", __func__,
+ 			ds->ds_remotestr);
+ 	} else {
+@@ -802,7 +805,7 @@ nfs4_pnfs_ds_add(const struct net *net, struct list_head *dsaddrs, gfp_t gfp_fla
+ 			refcount_read(&tmp_ds->ds_count));
+ 		ds = tmp_ds;
+ 	}
+-	spin_unlock(&nfs4_ds_cache_lock);
++	spin_unlock(&nn->nfs4_data_server_lock);
+ out:
+ 	return ds;
+ }
+-- 
+2.53.0
+
