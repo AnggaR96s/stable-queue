@@ -1,0 +1,126 @@
+From b99f5099cb8cb3081b5b73da464907bd75a58b09 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 12 Jan 2023 22:59:53 -0800
+Subject: locking/lockdep: Introduce lock_sync()
+
+From: Boqun Feng <boqun.feng@gmail.com>
+
+[ Upstream commit 2f1f043e7bea3fbf4c1869df2f7a0312bc8ca2bf ]
+
+Currently, functions like synchronize_srcu() do not have lockdep
+annotations resembling those of other write-side locking primitives.
+Such annotations might look as follows:
+
+	lock_acquire();
+	lock_release();
+
+Such annotations would tell lockdep that synchronize_srcu() acts like
+an empty critical section that waits for other (read-side) critical
+sections to finish.  This would definitely catch some deadlock, but
+as pointed out by Paul Mckenney [1], this could also introduce false
+positives because of irq-safe/unsafe detection.  Of course, there are
+tricks could help with this:
+
+	might_sleep(); // Existing statement in __synchronize_srcu().
+	if (IS_ENABLED(CONFIG_PROVE_LOCKING)) {
+		local_irq_disable();
+		lock_acquire();
+		lock_release();
+		local_irq_enable();
+	}
+
+But it would be better for lockdep to provide a separate annonation for
+functions like synchronize_srcu(), so that people won't need to repeat
+the ugly tricks above.
+
+Therefore introduce lock_sync(), which is simply an lock+unlock
+pair with no irq safe/unsafe deadlock check.  This works because the
+to-be-annontated functions do not create real critical sections, and
+there is therefore no way that irq can create extra dependencies.
+
+[1]: https://lore.kernel.org/lkml/20180412021233.ewncg5jjuzjw3x62@tardis/
+
+Signed-off-by: Boqun Feng <boqun.feng@gmail.com>
+Acked-by: Waiman Long <longman@redhat.com>
+Signed-off-by: Paul E. McKenney <paulmck@kernel.org>
+[ boqun: Fix typos reported by Davidlohr Bueso and Paul E. Mckenney ]
+Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Signed-off-by: Boqun Feng <boqun.feng@gmail.com>
+Stable-dep-of: 02c6be7d675b ("locking/lockdep: Invalidate stale class_cache entries for zapped classes")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/linux/lockdep.h  |  5 +++++
+ kernel/locking/lockdep.c | 34 ++++++++++++++++++++++++++++++++++
+ 2 files changed, 39 insertions(+)
+
+diff --git a/include/linux/lockdep.h b/include/linux/lockdep.h
+index c6a06273f69a8..4ec21addcec3a 100644
+--- a/include/linux/lockdep.h
++++ b/include/linux/lockdep.h
+@@ -272,6 +272,10 @@ extern void lock_acquire(struct lockdep_map *lock, unsigned int subclass,
+ 
+ extern void lock_release(struct lockdep_map *lock, unsigned long ip);
+ 
++extern void lock_sync(struct lockdep_map *lock, unsigned int subclass,
++		      int read, int check, struct lockdep_map *nest_lock,
++		      unsigned long ip);
++
+ /* lock_is_held_type() returns */
+ #define LOCK_STATE_UNKNOWN	-1
+ #define LOCK_STATE_NOT_HELD	0
+@@ -572,6 +576,7 @@ do {									\
+ #define lock_map_acquire_read(l)		lock_acquire_shared_recursive(l, 0, 0, NULL, _THIS_IP_)
+ #define lock_map_acquire_tryread(l)		lock_acquire_shared_recursive(l, 0, 1, NULL, _THIS_IP_)
+ #define lock_map_release(l)			lock_release(l, _THIS_IP_)
++#define lock_map_sync(l)			lock_sync(l, 0, 0, 1, NULL, _THIS_IP_)
+ 
+ #ifdef CONFIG_PROVE_LOCKING
+ # define might_lock(lock)						\
+diff --git a/kernel/locking/lockdep.c b/kernel/locking/lockdep.c
+index fc4dfaf115a23..585d0b5574a5c 100644
+--- a/kernel/locking/lockdep.c
++++ b/kernel/locking/lockdep.c
+@@ -5649,6 +5649,40 @@ void lock_release(struct lockdep_map *lock, unsigned long ip)
+ }
+ EXPORT_SYMBOL_GPL(lock_release);
+ 
++/*
++ * lock_sync() - A special annotation for synchronize_{s,}rcu()-like API.
++ *
++ * No actual critical section is created by the APIs annotated with this: these
++ * APIs are used to wait for one or multiple critical sections (on other CPUs
++ * or threads), and it means that calling these APIs inside these critical
++ * sections is potential deadlock.
++ *
++ * This annotation acts as an acquire+release annotation pair with hardirqoff
++ * being 1. Since there's no critical section, no interrupt can create extra
++ * dependencies "inside" the annotation, hardirqoff == 1 allows us to avoid
++ * false positives.
++ */
++void lock_sync(struct lockdep_map *lock, unsigned subclass, int read,
++	       int check, struct lockdep_map *nest_lock, unsigned long ip)
++{
++	unsigned long flags;
++
++	if (unlikely(!lockdep_enabled()))
++		return;
++
++	raw_local_irq_save(flags);
++	check_flags(flags);
++
++	lockdep_recursion_inc();
++	__lock_acquire(lock, subclass, 0, read, check, 1, nest_lock, ip, 0, 0);
++
++	if (__lock_release(lock, ip))
++		check_chain_key(current);
++	lockdep_recursion_finish();
++	raw_local_irq_restore(flags);
++}
++EXPORT_SYMBOL_GPL(lock_sync);
++
+ noinstr int lock_is_held_type(const struct lockdep_map *lock, int read)
+ {
+ 	unsigned long flags;
+-- 
+2.53.0
+

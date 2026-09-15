@@ -1,0 +1,185 @@
+From e42e2b88b2d56a458f463cc75e9a642b35c21904 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 11 Jun 2025 07:59:44 -0700
+Subject: net: ethtool: add dedicated callbacks for getting and setting rxfh
+ fields
+
+From: Jakub Kicinski <kuba@kernel.org>
+
+[ Upstream commit 9bb00786fc61e865e121aa20dd12aa4d1311a990 ]
+
+We mux multiple calls to the drivers via the .get_nfc and .set_nfc
+callbacks. This is slightly inconvenient to the drivers as they
+have to de-mux them back. It will also be awkward for netlink code
+to construct struct ethtool_rxnfc when it wants to get info about
+RX Flow Hash, from the RSS module.
+
+Add dedicated driver callbacks. Create struct ethtool_rxfh_fields
+which contains only data relevant to RXFH. Maintain the names of
+the fields to avoid having to heavily modify the drivers.
+
+For now support both callbacks, once all drivers are converted
+ethtool_*et_rxfh_fields() will stop using the rxnfc callbacks.
+
+Link: https://patch.msgid.link/20250611145949.2674086-5-kuba@kernel.org
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Stable-dep-of: f1986bf87b07 ("eth: nfp: bound the ntuple rule dump by the caller's buffer size")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/linux/ethtool.h | 20 +++++++++++++++
+ net/ethtool/ioctl.c     | 55 +++++++++++++++++++++++++++++++++--------
+ 2 files changed, 65 insertions(+), 10 deletions(-)
+
+diff --git a/include/linux/ethtool.h b/include/linux/ethtool.h
+index 913286e16a3e0..a47a98d446094 100644
+--- a/include/linux/ethtool.h
++++ b/include/linux/ethtool.h
+@@ -729,6 +729,19 @@ struct ethtool_rxfh_param {
+ 	u8	input_xfrm;
+ };
+ 
++/**
++ * struct ethtool_rxfh_fields - Rx Flow Hashing (RXFH) header field config
++ * @data: which header fields are used for hashing, bitmask of RXH_* defines
++ * @flow_type: L2-L4 network traffic flow type
++ * @rss_context: RSS context, will only be used if rxfh_per_ctx_fields is
++ *	set in struct ethtool_ops
++ */
++struct ethtool_rxfh_fields {
++	u32 data;
++	u32 flow_type;
++	u32 rss_context;
++};
++
+ /**
+  * struct kernel_ethtool_ts_info - kernel copy of struct ethtool_ts_info
+  * @cmd: command number = %ETHTOOL_GET_TS_INFO
+@@ -867,6 +880,8 @@ struct kernel_ethtool_ts_info {
+  *	will remain unchanged.
+  *	Returns a negative error code or zero. An error code must be returned
+  *	if at least one unsupported change was requested.
++ * @get_rxfh_fields: Get header fields used for flow hashing.
++ * @set_rxfh_fields: Set header fields used for flow hashing.
+  * @create_rxfh_context: Create a new RSS context with the specified RX flow
+  *	hash indirection table, hash key, and hash function.
+  *	The &struct ethtool_rxfh_context for this context is passed in @ctx;
+@@ -1051,6 +1066,11 @@ struct ethtool_ops {
+ 	int	(*get_rxfh)(struct net_device *, struct ethtool_rxfh_param *);
+ 	int	(*set_rxfh)(struct net_device *, struct ethtool_rxfh_param *,
+ 			    struct netlink_ext_ack *extack);
++	int	(*get_rxfh_fields)(struct net_device *,
++				   struct ethtool_rxfh_fields *);
++	int	(*set_rxfh_fields)(struct net_device *,
++				   const struct ethtool_rxfh_fields *,
++				   struct netlink_ext_ack *extack);
+ 	int	(*create_rxfh_context)(struct net_device *,
+ 				       struct ethtool_rxfh_context *ctx,
+ 				       const struct ethtool_rxfh_param *rxfh,
+diff --git a/net/ethtool/ioctl.c b/net/ethtool/ioctl.c
+index f5f2db4b53ca6..c567370d96666 100644
+--- a/net/ethtool/ioctl.c
++++ b/net/ethtool/ioctl.c
+@@ -1047,9 +1047,20 @@ static int ethtool_check_flow_types(struct net_device *dev, u32 input_xfrm)
+ 			continue;
+ 
+ 		info.flow_type = i;
+-		err = ops->get_rxnfc(dev, &info, NULL);
+-		if (err)
+-			continue;
++
++		if (ops->get_rxfh_fields) {
++			struct ethtool_rxfh_fields fields = {
++				.flow_type	= info.flow_type,
++			};
++
++			if (ops->get_rxfh_fields(dev, &fields))
++				continue;
++
++			info.data = fields.data;
++		} else {
++			if (ops->get_rxnfc(dev, &info, NULL))
++				continue;
++		}
+ 
+ 		err = ethtool_check_xfrm_rxfh(input_xfrm, info.data);
+ 		if (err)
+@@ -1063,11 +1074,12 @@ static noinline_for_stack int
+ ethtool_set_rxfh_fields(struct net_device *dev, u32 cmd, void __user *useraddr)
+ {
+ 	const struct ethtool_ops *ops = dev->ethtool_ops;
++	struct ethtool_rxfh_fields fields = {};
+ 	struct ethtool_rxnfc info;
+ 	size_t info_size = sizeof(info);
+ 	int rc;
+ 
+-	if (!ops->set_rxnfc)
++	if (!ops->set_rxnfc && !ops->set_rxfh_fields)
+ 		return -EOPNOTSUPP;
+ 
+ 	rc = ethtool_rxnfc_copy_struct(cmd, &info, &info_size, useraddr);
+@@ -1090,7 +1102,15 @@ ethtool_set_rxfh_fields(struct net_device *dev, u32 cmd, void __user *useraddr)
+ 			return rc;
+ 	}
+ 
+-	return ops->set_rxnfc(dev, &info);
++	if (!ops->set_rxfh_fields)
++		return ops->set_rxnfc(dev, &info);
++
++	fields.data = info.data;
++	fields.flow_type = info.flow_type & ~FLOW_RSS;
++	if (info.flow_type & FLOW_RSS)
++		fields.rss_context = info.rss_context;
++
++	return ops->set_rxfh_fields(dev, &fields, NULL);
+ }
+ 
+ static noinline_for_stack int
+@@ -1101,7 +1121,7 @@ ethtool_get_rxfh_fields(struct net_device *dev, u32 cmd, void __user *useraddr)
+ 	const struct ethtool_ops *ops = dev->ethtool_ops;
+ 	int ret;
+ 
+-	if (!ops->get_rxnfc)
++	if (!ops->get_rxnfc && !ops->get_rxfh_fields)
+ 		return -EOPNOTSUPP;
+ 
+ 	ret = ethtool_rxnfc_copy_struct(cmd, &info, &info_size, useraddr);
+@@ -1112,9 +1132,24 @@ ethtool_get_rxfh_fields(struct net_device *dev, u32 cmd, void __user *useraddr)
+ 	    !ops->rxfh_per_ctx_fields)
+ 		return -EINVAL;
+ 
+-	ret = ops->get_rxnfc(dev, &info, NULL);
+-	if (ret < 0)
+-		return ret;
++	if (ops->get_rxfh_fields) {
++		struct ethtool_rxfh_fields fields = {
++			.flow_type	= info.flow_type & ~FLOW_RSS,
++		};
++
++		if (info.flow_type & FLOW_RSS)
++			fields.rss_context = info.rss_context;
++
++		ret = ops->get_rxfh_fields(dev, &fields);
++		if (ret < 0)
++			return ret;
++
++		info.data = fields.data;
++	} else {
++		ret = ops->get_rxnfc(dev, &info, NULL);
++		if (ret < 0)
++			return ret;
++	}
+ 
+ 	return ethtool_rxnfc_copy_to_user(useraddr, &info, info_size, NULL);
+ }
+@@ -1485,7 +1520,7 @@ static noinline_for_stack int ethtool_set_rxfh(struct net_device *dev,
+ 	u8 *rss_config;
+ 	int ret;
+ 
+-	if (!ops->get_rxnfc || !ops->set_rxfh)
++	if ((!ops->get_rxnfc && !ops->get_rxfh_fields) || !ops->set_rxfh)
+ 		return -EOPNOTSUPP;
+ 
+ 	if (ops->get_rxfh_indir_size)
+-- 
+2.53.0
+

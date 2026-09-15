@@ -1,0 +1,148 @@
+From fe3d8578153c3946b14cbbece25eb2bb77255ff3 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 17 Jul 2024 13:55:50 -0500
+Subject: nvme_core: scan namespaces asynchronously
+
+From: Stuart Hayes <stuart.w.hayes@gmail.com>
+
+[ Upstream commit 4e893ca8117022de68ce1b61c0309e3d17bb8a25 ]
+
+Use async function calls to make namespace scanning happen in parallel.
+
+Without the patch, NVME namespaces are scanned serially, so it can take
+a long time for all of a controller's namespaces to become available,
+especially with a slower (TCP) interface with large number of
+namespaces.
+
+It is not uncommon to have large numbers (hundreds or thousands) of
+namespaces on nvme-of with storage servers.
+
+The time it took for all namespaces to show up after connecting (via
+TCP) to a controller with 1002 namespaces was measured on one system:
+
+network latency   without patch   with patch
+     0                 6s            1s
+    50ms             210s           10s
+   100ms             417s           18s
+
+Measurements taken on another system show the effect of the patch on the
+time nvme_scan_work() took to complete, when connecting to a linux
+nvme-of target with varying numbers of namespaces, on a network of
+400us.
+
+namespaces    without patch   with patch
+     1            16ms           14ms
+     2            24ms           16ms
+     4            49ms           22ms
+     8           101ms           33ms
+    16           207ms           56ms
+   100           1.4s           0.6s
+  1000          12.9s           2.0s
+
+On the same system, connecting to a local PCIe NVMe drive (a Samsung
+PM1733) instead of a network target:
+
+namespaces    without patch   with patch
+     1            13ms           12ms
+     2            41ms           13ms
+
+Signed-off-by: Stuart Hayes <stuart.w.hayes@gmail.com>
+Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+Stable-dep-of: 4ed7f3d7d435 ("nvme: remove stale namespaces by NSID range during scan")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/nvme/host/core.c | 40 +++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 39 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index d02ca033db439..a8f0329393b00 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -4,6 +4,7 @@
+  * Copyright (c) 2011-2014, Intel Corporation.
+  */
+ 
++#include <linux/async.h>
+ #include <linux/blkdev.h>
+ #include <linux/blk-mq.h>
+ #include <linux/blk-integrity.h>
+@@ -3829,6 +3830,35 @@ static void nvme_scan_ns(struct nvme_ctrl *ctrl, unsigned nsid)
+ 	}
+ }
+ 
++/**
++ * struct async_scan_info - keeps track of controller & NSIDs to scan
++ * @ctrl:	Controller on which namespaces are being scanned
++ * @next_nsid:	Index of next NSID to scan in ns_list
++ * @ns_list:	Pointer to list of NSIDs to scan
++ *
++ * Note: There is a single async_scan_info structure shared by all instances
++ * of nvme_scan_ns_async() scanning a given controller, so the atomic
++ * operations on next_nsid are critical to ensure each instance scans a unique
++ * NSID.
++ */
++struct async_scan_info {
++	struct nvme_ctrl *ctrl;
++	atomic_t next_nsid;
++	__le32 *ns_list;
++};
++
++static void nvme_scan_ns_async(void *data, async_cookie_t cookie)
++{
++	struct async_scan_info *scan_info = data;
++	int idx;
++	u32 nsid;
++
++	idx = (u32)atomic_fetch_inc(&scan_info->next_nsid);
++	nsid = le32_to_cpu(scan_info->ns_list[idx]);
++
++	nvme_scan_ns(scan_info->ctrl, nsid);
++}
++
+ static void nvme_remove_invalid_namespaces(struct nvme_ctrl *ctrl,
+ 					unsigned nsid)
+ {
+@@ -3855,11 +3885,15 @@ static int nvme_scan_ns_list(struct nvme_ctrl *ctrl)
+ 	__le32 *ns_list;
+ 	u32 prev = 0;
+ 	int ret = 0, i;
++	ASYNC_DOMAIN(domain);
++	struct async_scan_info scan_info;
+ 
+ 	ns_list = kzalloc(NVME_IDENTIFY_DATA_SIZE, GFP_KERNEL);
+ 	if (!ns_list)
+ 		return -ENOMEM;
+ 
++	scan_info.ctrl = ctrl;
++	scan_info.ns_list = ns_list;
+ 	for (;;) {
+ 		struct nvme_command cmd = {
+ 			.identify.opcode	= nvme_admin_identify,
+@@ -3875,19 +3909,23 @@ static int nvme_scan_ns_list(struct nvme_ctrl *ctrl)
+ 			goto free;
+ 		}
+ 
++		atomic_set(&scan_info.next_nsid, 0);
+ 		for (i = 0; i < nr_entries; i++) {
+ 			u32 nsid = le32_to_cpu(ns_list[i]);
+ 
+ 			if (!nsid)	/* end of the list? */
+ 				goto out;
+-			nvme_scan_ns(ctrl, nsid);
++			async_schedule_domain(nvme_scan_ns_async, &scan_info,
++						&domain);
+ 			while (++prev < nsid)
+ 				nvme_ns_remove_by_nsid(ctrl, prev);
+ 		}
++		async_synchronize_full_domain(&domain);
+ 	}
+  out:
+ 	nvme_remove_invalid_namespaces(ctrl, prev);
+  free:
++	async_synchronize_full_domain(&domain);
+ 	kfree(ns_list);
+ 	return ret;
+ }
+-- 
+2.53.0
+
