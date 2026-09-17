@@ -1,0 +1,182 @@
+From stable+bounces-311894-greg=kroah.com@vger.kernel.org Tue Sep  1 00:11:37 2026
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 31 Aug 2026 14:31:53 -0400
+Subject: KVM: SVM: Use guard(mutex) to simplify SNP vCPU state updates
+To: stable@vger.kernel.org
+Cc: Sean Christopherson <seanjc@google.com>, Tom Lendacky <thomas.lendacky@amd.com>, Sasha Levin <sashal@kernel.org>
+Message-ID: <20260831183157.1673215-2-sashal@kernel.org>
+
+From: Sean Christopherson <seanjc@google.com>
+
+[ Upstream commit 5279d6f7e43d9c5863411482943200bf5ab8a261 ]
+
+Use guard(mutex) in sev_snp_init_protected_guest_state() and pull in its
+lock-protected inner helper.  Without an unlock trampoline (and even with
+one), there is no real need for an inner helper.  Eliminating the helper
+also avoids having to fixup the open coded "lockdep" WARN_ON().
+
+Opportunistically drop the error message if KVM can't obtain the pfn for
+the new target VMSA.  The error message provides zero information that
+can't be gleaned from the fact that the vCPU is stuck.
+
+Reviewed-by: Tom Lendacky <thomas.lendacky@amd.com>
+Link: https://lore.kernel.org/r/20250227012541.3234589-10-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+
+[ This tree lacks upstream commit 1fbee5b01a0fd ("KVM: guest_memfd:
+  Provide "struct page" as output from kvm_gmem_get_pfn()"), so its
+  kvm_gmem_get_pfn() still uses the older pfn-only signature (no
+  struct page **).  Adapted the refactored
+  sev_snp_init_protected_guest_state() to keep calling
+  kvm_gmem_get_pfn() without a page argument and to use
+  kvm_release_pfn_clean(pfn) instead of kvm_release_page_clean(page). ]
+
+Stable-dep-of: 42a39ad5d592 ("KVM: SEV: Track the GPA of the guest-controlled VMSA used for SNP guests")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/x86/kvm/svm/sev.c |  114 +++++++++++++++++++++----------------------------
+ 1 file changed, 49 insertions(+), 65 deletions(-)
+
+--- a/arch/x86/kvm/svm/sev.c
++++ b/arch/x86/kvm/svm/sev.c
+@@ -3911,11 +3911,25 @@ next_range:
+ 	BUG();
+ }
+ 
+-static int __sev_snp_update_protected_guest_state(struct kvm_vcpu *vcpu)
++/*
++ * Invoked as part of svm_vcpu_reset() processing of an init event.
++ */
++void sev_snp_init_protected_guest_state(struct kvm_vcpu *vcpu)
+ {
+ 	struct vcpu_svm *svm = to_svm(vcpu);
++	struct kvm_memory_slot *slot;
++	kvm_pfn_t pfn;
++	gfn_t gfn;
++
++	if (!sev_snp_guest(vcpu->kvm))
++		return;
++
++	guard(mutex)(&svm->sev_es.snp_vmsa_mutex);
+ 
+-	WARN_ON(!mutex_is_locked(&svm->sev_es.snp_vmsa_mutex));
++	if (!svm->sev_es.snp_ap_waiting_for_reset)
++		return;
++
++	svm->sev_es.snp_ap_waiting_for_reset = false;
+ 
+ 	/* Mark the vCPU as offline and not runnable */
+ 	vcpu->arch.pv.pv_unhalted = false;
+@@ -3930,78 +3944,48 @@ static int __sev_snp_update_protected_gu
+ 	 */
+ 	vmcb_mark_all_dirty(svm->vmcb);
+ 
+-	if (VALID_PAGE(svm->sev_es.snp_vmsa_gpa)) {
+-		gfn_t gfn = gpa_to_gfn(svm->sev_es.snp_vmsa_gpa);
+-		struct kvm_memory_slot *slot;
+-		kvm_pfn_t pfn;
+-
+-		slot = gfn_to_memslot(vcpu->kvm, gfn);
+-		if (!slot)
+-			return -EINVAL;
+-
+-		/*
+-		 * The new VMSA will be private memory guest memory, so
+-		 * retrieve the PFN from the gmem backend.
+-		 */
+-		if (kvm_gmem_get_pfn(vcpu->kvm, slot, gfn, &pfn, NULL))
+-			return -EINVAL;
+-
+-		/*
+-		 * From this point forward, the VMSA will always be a
+-		 * guest-mapped page rather than the initial one allocated
+-		 * by KVM in svm->sev_es.vmsa. In theory, svm->sev_es.vmsa
+-		 * could be free'd and cleaned up here, but that involves
+-		 * cleanups like wbinvd_on_all_cpus() which would ideally
+-		 * be handled during teardown rather than guest boot.
+-		 * Deferring that also allows the existing logic for SEV-ES
+-		 * VMSAs to be re-used with minimal SNP-specific changes.
+-		 */
+-		svm->sev_es.snp_has_guest_vmsa = true;
+-
+-		/* Use the new VMSA */
+-		svm->vmcb->control.vmsa_pa = pfn_to_hpa(pfn);
+-
+-		/* Mark the vCPU as runnable */
+-		vcpu->arch.pv.pv_unhalted = false;
+-		vcpu->arch.mp_state = KVM_MP_STATE_RUNNABLE;
+-
+-		svm->sev_es.snp_vmsa_gpa = INVALID_PAGE;
+-
+-		/*
+-		 * gmem pages aren't currently migratable, but if this ever
+-		 * changes then care should be taken to ensure
+-		 * svm->sev_es.vmsa is pinned through some other means.
+-		 */
+-		kvm_release_pfn_clean(pfn);
+-	}
++	if (!VALID_PAGE(svm->sev_es.snp_vmsa_gpa))
++		return;
+ 
+-	return 0;
+-}
++	gfn = gpa_to_gfn(svm->sev_es.snp_vmsa_gpa);
+ 
+-/*
+- * Invoked as part of svm_vcpu_reset() processing of an init event.
+- */
+-void sev_snp_init_protected_guest_state(struct kvm_vcpu *vcpu)
+-{
+-	struct vcpu_svm *svm = to_svm(vcpu);
+-	int ret;
++	slot = gfn_to_memslot(vcpu->kvm, gfn);
++	if (!slot)
++		return;
+ 
+-	if (!sev_snp_guest(vcpu->kvm))
++	/*
++	 * The new VMSA will be private memory guest memory, so retrieve the
++	 * PFN from the gmem backend.
++	 */
++	if (kvm_gmem_get_pfn(vcpu->kvm, slot, gfn, &pfn, NULL))
+ 		return;
+ 
+-	mutex_lock(&svm->sev_es.snp_vmsa_mutex);
++	/*
++	 * From this point forward, the VMSA will always be a guest-mapped page
++	 * rather than the initial one allocated by KVM in svm->sev_es.vmsa. In
++	 * theory, svm->sev_es.vmsa could be free'd and cleaned up here, but
++	 * that involves cleanups like wbinvd_on_all_cpus() which would ideally
++	 * be handled during teardown rather than guest boot.  Deferring that
++	 * also allows the existing logic for SEV-ES VMSAs to be re-used with
++	 * minimal SNP-specific changes.
++	 */
++	svm->sev_es.snp_has_guest_vmsa = true;
+ 
+-	if (!svm->sev_es.snp_ap_waiting_for_reset)
+-		goto unlock;
++	/* Use the new VMSA */
++	svm->vmcb->control.vmsa_pa = pfn_to_hpa(pfn);
+ 
+-	svm->sev_es.snp_ap_waiting_for_reset = false;
++	/* Mark the vCPU as runnable */
++	vcpu->arch.pv.pv_unhalted = false;
++	vcpu->arch.mp_state = KVM_MP_STATE_RUNNABLE;
+ 
+-	ret = __sev_snp_update_protected_guest_state(vcpu);
+-	if (ret)
+-		vcpu_unimpl(vcpu, "snp: AP state update on init failed\n");
++	svm->sev_es.snp_vmsa_gpa = INVALID_PAGE;
+ 
+-unlock:
+-	mutex_unlock(&svm->sev_es.snp_vmsa_mutex);
++	/*
++	 * gmem pages aren't currently migratable, but if this ever changes
++	 * then care should be taken to ensure svm->sev_es.vmsa is pinned
++	 * through some other means.
++	 */
++	kvm_release_pfn_clean(pfn);
+ }
+ 
+ static int sev_snp_ap_creation(struct vcpu_svm *svm)
