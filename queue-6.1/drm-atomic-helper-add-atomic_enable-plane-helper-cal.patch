@@ -1,0 +1,159 @@
+From 9f3328ea57f8bbc6b973abeb59948ed908a79cac Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 9 Feb 2023 16:41:02 +0100
+Subject: drm/atomic-helper: Add atomic_enable plane-helper callback
+
+From: Thomas Zimmermann <tzimmermann@suse.de>
+
+[ Upstream commit 169b9182f192e8725c8de5d7d77f00f6ae6c7fd4 ]
+
+Add atomic_enable to struct drm_plane_helper_funcs. It enables a
+plane independently from updating the plane's content. As such, it is
+the inverse of the atomic_disable plane helper. Useful for hardware
+where plane enable state is independent from plane content.
+
+Signed-off-by: Thomas Zimmermann <tzimmermann@suse.de>
+Reviewed-by: Javier Martinez Canillas <javierm@redhat.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20230209154107.30680-2-tzimmermann@suse.de
+Stable-dep-of: 073a30d75f30 ("drm/vc4: Use managed KMS polling to fix UAF on unbind")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/gpu/drm/drm_atomic_helper.c      | 20 ++++++++++++----
+ include/drm/drm_atomic_helper.h          | 26 +++++++++++++++++++++
+ include/drm/drm_modeset_helper_vtables.h | 29 +++++++++++++++++++++++-
+ 3 files changed, 70 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_atomic_helper.c b/drivers/gpu/drm/drm_atomic_helper.c
+index e737e45a3a702..9199695d42ddd 100644
+--- a/drivers/gpu/drm/drm_atomic_helper.c
++++ b/drivers/gpu/drm/drm_atomic_helper.c
+@@ -2743,6 +2743,11 @@ void drm_atomic_helper_commit_planes(struct drm_device *dev,
+ 			funcs->atomic_disable(plane, old_state);
+ 		} else if (new_plane_state->crtc || disabling) {
+ 			funcs->atomic_update(plane, old_state);
++
++			if (!disabling && funcs->atomic_enable) {
++				if (drm_atomic_plane_enabling(old_plane_state, new_plane_state))
++					funcs->atomic_enable(plane, old_state);
++			}
+ 		}
+ 	}
+ 
+@@ -2803,6 +2808,7 @@ drm_atomic_helper_commit_planes_on_crtc(struct drm_crtc_state *old_crtc_state)
+ 		struct drm_plane_state *new_plane_state =
+ 			drm_atomic_get_new_plane_state(old_state, plane);
+ 		const struct drm_plane_helper_funcs *plane_funcs;
++		bool disabling;
+ 
+ 		plane_funcs = plane->helper_private;
+ 
+@@ -2812,12 +2818,18 @@ drm_atomic_helper_commit_planes_on_crtc(struct drm_crtc_state *old_crtc_state)
+ 		WARN_ON(new_plane_state->crtc &&
+ 			new_plane_state->crtc != crtc);
+ 
+-		if (drm_atomic_plane_disabling(old_plane_state, new_plane_state) &&
+-		    plane_funcs->atomic_disable)
++		disabling = drm_atomic_plane_disabling(old_plane_state, new_plane_state);
++
++		if (disabling && plane_funcs->atomic_disable) {
+ 			plane_funcs->atomic_disable(plane, old_state);
+-		else if (new_plane_state->crtc ||
+-			 drm_atomic_plane_disabling(old_plane_state, new_plane_state))
++		} else if (new_plane_state->crtc || disabling) {
+ 			plane_funcs->atomic_update(plane, old_state);
++
++			if (!disabling && plane_funcs->atomic_enable) {
++				if (drm_atomic_plane_enabling(old_plane_state, new_plane_state))
++					plane_funcs->atomic_enable(plane, old_state);
++			}
++		}
+ 	}
+ 
+ 	if (crtc_funcs && crtc_funcs->atomic_flush)
+diff --git a/include/drm/drm_atomic_helper.h b/include/drm/drm_atomic_helper.h
+index 06d8902a80972..8fc53d249c690 100644
+--- a/include/drm/drm_atomic_helper.h
++++ b/include/drm/drm_atomic_helper.h
+@@ -210,6 +210,32 @@ int drm_atomic_helper_page_flip_target(
+ 			      __drm_atomic_get_current_plane_state((crtc_state)->state, \
+ 								   plane)))
+ 
++/**
++ * drm_atomic_plane_enabling - check whether a plane is being enabled
++ * @old_plane_state: old atomic plane state
++ * @new_plane_state: new atomic plane state
++ *
++ * Checks the atomic state of a plane to determine whether it's being enabled
++ * or not. This also WARNs if it detects an invalid state (both CRTC and FB
++ * need to either both be NULL or both be non-NULL).
++ *
++ * RETURNS:
++ * True if the plane is being enabled, false otherwise.
++ */
++static inline bool drm_atomic_plane_enabling(struct drm_plane_state *old_plane_state,
++					     struct drm_plane_state *new_plane_state)
++{
++	/*
++	 * When enabling a plane, CRTC and FB should always be set together.
++	 * Anything else should be considered a bug in the atomic core, so we
++	 * gently warn about it.
++	 */
++	WARN_ON((!new_plane_state->crtc && new_plane_state->fb) ||
++		(new_plane_state->crtc && !new_plane_state->fb));
++
++	return !old_plane_state->crtc && new_plane_state->crtc;
++}
++
+ /**
+  * drm_atomic_plane_disabling - check whether a plane is being disabled
+  * @old_plane_state: old atomic plane state
+diff --git a/include/drm/drm_modeset_helper_vtables.h b/include/drm/drm_modeset_helper_vtables.h
+index 6f19cf5c210e5..f74745435894b 100644
+--- a/include/drm/drm_modeset_helper_vtables.h
++++ b/include/drm/drm_modeset_helper_vtables.h
+@@ -1267,6 +1267,32 @@ struct drm_plane_helper_funcs {
+ 	 */
+ 	void (*atomic_update)(struct drm_plane *plane,
+ 			      struct drm_atomic_state *state);
++
++	/**
++	 * @atomic_enable:
++	 *
++	 * Drivers should use this function to unconditionally enable a plane.
++	 * This hook is called in-between the &drm_crtc_helper_funcs.atomic_begin
++	 * and drm_crtc_helper_funcs.atomic_flush callbacks. It is called after
++	 * @atomic_update, which will be called for all enabled planes. Drivers
++	 * that use @atomic_enable should set up a plane in @atomic_update and
++	 * afterwards enable the plane in @atomic_enable. If a plane needs to be
++	 * enabled before installing the scanout buffer, drivers can still do
++	 * so in @atomic_update.
++	 *
++	 * Note that the power state of the display pipe when this function is
++	 * called depends upon the exact helpers and calling sequence the driver
++	 * has picked. See drm_atomic_helper_commit_planes() for a discussion of
++	 * the tradeoffs and variants of plane commit helpers.
++	 *
++	 * This callback is used by the atomic modeset helpers, but it is
++	 * optional. If implemented, @atomic_enable should be the inverse of
++	 * @atomic_disable. Drivers that don't want to use either can still
++	 * implement the complete plane update in @atomic_update.
++	 */
++	void (*atomic_enable)(struct drm_plane *plane,
++			      struct drm_atomic_state *state);
++
+ 	/**
+ 	 * @atomic_disable:
+ 	 *
+@@ -1287,7 +1313,8 @@ struct drm_plane_helper_funcs {
+ 	 * the tradeoffs and variants of plane commit helpers.
+ 	 *
+ 	 * This callback is used by the atomic modeset helpers and by the
+-	 * transitional plane helpers, but it is optional.
++	 * transitional plane helpers, but it is optional. It's intended to
++	 * reverse the effects of @atomic_enable.
+ 	 */
+ 	void (*atomic_disable)(struct drm_plane *plane,
+ 			       struct drm_atomic_state *state);
+-- 
+2.53.0
+
