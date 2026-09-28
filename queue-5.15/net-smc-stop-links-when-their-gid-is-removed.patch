@@ -1,0 +1,96 @@
+From 8b5b84fdbf418ec12b7effb6b488bf8bfad3b5b1 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Sat, 16 Oct 2021 11:37:52 +0200
+Subject: net/smc: stop links when their GID is removed
+
+From: Karsten Graul <kgraul@linux.ibm.com>
+
+[ Upstream commit 29397e34c76b57ce596493008176cf374f1cb867 ]
+
+With SMC-Rv2 the GID is an IP address that can be deleted from the
+device. When an IB_EVENT_GID_CHANGE event is provided then iterate over
+all active links and check if their GID is still defined. Otherwise
+stop the affected link.
+
+Signed-off-by: Karsten Graul <kgraul@linux.ibm.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Stable-dep-of: 61cb282fe97b ("net/smc: fix UAF on lgr list traversal in smcr_port_err()")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ net/smc/smc_ib.c | 53 ++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 53 insertions(+)
+
+diff --git a/net/smc/smc_ib.c b/net/smc/smc_ib.c
+index f0ec1f1d50fac..04a8612529b36 100644
+--- a/net/smc/smc_ib.c
++++ b/net/smc/smc_ib.c
+@@ -217,6 +217,58 @@ int smc_ib_determine_gid(struct smc_ib_device *smcibdev, u8 ibport,
+ 	return -ENODEV;
+ }
+ 
++/* check if gid is still defined on smcibdev */
++static bool smc_ib_check_link_gid(u8 gid[SMC_GID_SIZE], bool smcrv2,
++				  struct smc_ib_device *smcibdev, u8 ibport)
++{
++	const struct ib_gid_attr *attr;
++	bool rc = false;
++	int i;
++
++	for (i = 0; !rc && i < smcibdev->pattr[ibport - 1].gid_tbl_len; i++) {
++		attr = rdma_get_gid_attr(smcibdev->ibdev, ibport, i);
++		if (IS_ERR(attr))
++			continue;
++
++		rcu_read_lock();
++		if ((!smcrv2 && attr->gid_type == IB_GID_TYPE_ROCE) ||
++		    (smcrv2 && attr->gid_type == IB_GID_TYPE_ROCE_UDP_ENCAP &&
++		     !(ipv6_addr_type((const struct in6_addr *)&attr->gid)
++				     & IPV6_ADDR_LINKLOCAL)))
++			if (!memcmp(gid, &attr->gid, SMC_GID_SIZE))
++				rc = true;
++		rcu_read_unlock();
++		rdma_put_gid_attr(attr);
++	}
++	return rc;
++}
++
++/* check all links if the gid is still defined on smcibdev */
++static void smc_ib_gid_check(struct smc_ib_device *smcibdev, u8 ibport)
++{
++	struct smc_link_group *lgr;
++	int i;
++
++	spin_lock_bh(&smc_lgr_list.lock);
++	list_for_each_entry(lgr, &smc_lgr_list.list, list) {
++		if (strncmp(smcibdev->pnetid[ibport - 1], lgr->pnet_id,
++			    SMC_MAX_PNETID_LEN))
++			continue; /* lgr is not affected */
++		if (list_empty(&lgr->list))
++			continue;
++		for (i = 0; i < SMC_LINKS_PER_LGR_MAX; i++) {
++			if (lgr->lnk[i].state == SMC_LNK_UNUSED ||
++			    lgr->lnk[i].smcibdev != smcibdev)
++				continue;
++			if (!smc_ib_check_link_gid(lgr->lnk[i].gid,
++						   lgr->smc_version == SMC_V2,
++						   smcibdev, ibport))
++				smcr_port_err(smcibdev, ibport);
++		}
++	}
++	spin_unlock_bh(&smc_lgr_list.lock);
++}
++
+ static int smc_ib_remember_port_attr(struct smc_ib_device *smcibdev, u8 ibport)
+ {
+ 	int rc;
+@@ -255,6 +307,7 @@ static void smc_ib_port_event_work(struct work_struct *work)
+ 		} else {
+ 			clear_bit(port_idx, smcibdev->ports_going_away);
+ 			smcr_port_add(smcibdev, port_idx + 1);
++			smc_ib_gid_check(smcibdev, port_idx + 1);
+ 		}
+ 	}
+ }
+-- 
+2.53.0
+
