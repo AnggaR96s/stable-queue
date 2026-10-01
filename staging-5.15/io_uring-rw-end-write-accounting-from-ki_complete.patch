@@ -1,0 +1,85 @@
+From 2ed7405f4661de09b89433bbb7930de86c6047db Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 16 Sep 2026 20:37:20 -0400
+Subject: io_uring/rw: end write accounting from ->ki_complete
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+From: Jens Axboe <axboe@kernel.dk>
+
+[ Upstream commit 796aa0547557e63338657ed1c487906f9fac4c73 ]
+
+Commit b000145e9907 moved both the fsnotify calls and the write
+accounting out of the kiocb completion handler and into the
+io_req_rw_complete() task_work. However, only the fsnotify part actually
+needed to move as it may sleep. Ending the write accounting is just a
+percpu_up_read() on the superblock writers sem.
+
+Deferring it is a problem, because it makes dropping SB_FREEZE_WRITE
+protection depend on the ring owner getting to running task_work. But
+the task may be blocked in freeze_super(), causing it to never get to
+that:
+
+  task                             io-wq worker
+  --------------------------------------------------------------
+  io_write()
+    io_kiocb_start_write()         (takes sb_writers, hidden from
+                                    lockdep by __sb_writers_release)
+    write_iter() -> -EIOCBQUEUED
+  ioctl(FS_IOC_SHUTDOWN)
+    bdev_freeze()
+      freeze_super()
+        percpu_down_write()        <- waits for the reader above
+                                   io_write()
+                                     kiocb_start_write()
+                                       percpu_down_read()  <- queued
+                                                              behind the
+                                                              writer
+  <bio completes>
+    io_complete_rw()
+      queues io_req_rw_complete()  <- never runs, task is in D state
+
+End the write from io_complete_rw() instead, and leave only the fsnotify
+calls in task_work.
+
+Reported-by: syzbot+2eb3d983669d3e49d4fa@syzkaller.appspotmail.com
+Cc: stable@vger.kernel.org
+Fixes: b000145e9907 ("io_uring/rw: defer fsnotify calls to task context")
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+[ placed write-accounting release after __io_complete_rw_common() to accommodate the older retry path’s early return. ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ io_uring/io_uring.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/io_uring/io_uring.c b/io_uring/io_uring.c
+index 8747c585a0770..8d5791d8f4031 100644
+--- a/io_uring/io_uring.c
++++ b/io_uring/io_uring.c
+@@ -2797,7 +2797,10 @@ static void io_req_task_complete(struct io_kiocb *req, bool *locked)
+ 
+ static void io_req_rw_complete(struct io_kiocb *req, bool *locked)
+ {
+-	io_req_io_end(req);
++	if (req->rw.kiocb.ki_flags & IOCB_WRITE)
++		fsnotify_modify(req->file);
++	else
++		fsnotify_access(req->file);
+ 	io_req_task_complete(req, locked);
+ }
+ 
+@@ -2807,6 +2810,10 @@ static void io_complete_rw(struct kiocb *kiocb, long res, long res2)
+ 
+ 	if (__io_complete_rw_common(req, res))
+ 		return;
++	/* ring owner may block in freeze_super() before task_work runs */
++	if (kiocb->ki_flags & IOCB_WRITE)
++		io_req_end_write(req);
++
+ 	req->result = io_fixup_rw_res(req, res);
+ 	req->io_task_work.func = io_req_rw_complete;
+ 	io_req_task_work_add(req);
+-- 
+2.53.0
+

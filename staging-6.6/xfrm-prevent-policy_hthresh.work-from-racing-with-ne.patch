@@ -1,0 +1,92 @@
+From a22ca81098c06cc5466b8416e18a188ed97841dc Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 29 Sep 2026 16:52:56 -0700
+Subject: xfrm: prevent policy_hthresh.work from racing with netns teardown
+
+From: Tahera Fahimi <taherafahimi@linux.microsoft.com>
+
+An XFRM_MSG_NEWSPDINFO request can queue the per-net work item
+policy_hthresh.work onto the system workqueue. xfrm_hash_rebuild()
+retrieves the enclosing struct net from the work item, so the callback
+can dereference freed memory if it runs after net namespace teardown.
+
+Mainline commit 29fe3a61bcdc ("xfrm: prevent policy_hthresh.work
+from racing with netns teardown") fixes this issue using
+disable_work_sync(). That API is not available in Linux 6.6, so the
+mainline change cannot be directly backported.
+
+Provide the same guarantee with an XFRM-local work_disabled flag. Protect
+the flag and schedule_work() with the existing policy_hthresh seqlock so
+teardown can atomically stop new queueing attempts. Then use
+cancel_work_sync() to synchronize work that was queued before the flag was
+set. This ensures policy_hthresh.work cannot outlive its struct net.
+
+Fixes: 880a6fab8f6b ("xfrm: configure policy hash table thresholds by netlink")
+Assisted-by: GitHub-Copilot:GPT-5.6 Sol
+Signed-off-by: Tahera Fahimi <taherafahimi@linux.microsoft.com>
+Reviewed-by: Allen Pais <apais@linux.microsoft.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/net/netns/xfrm.h |  1 +
+ net/xfrm/xfrm_policy.c   | 19 ++++++++++++++++++-
+ 2 files changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/include/net/netns/xfrm.h b/include/net/netns/xfrm.h
+index 7922ec72eaa68..eb9edddd73092 100644
+--- a/include/net/netns/xfrm.h
++++ b/include/net/netns/xfrm.h
+@@ -23,6 +23,7 @@ struct xfrm_policy_hash {
+ struct xfrm_policy_hthresh {
+ 	struct work_struct	work;
+ 	seqlock_t		lock;
++	bool			work_disabled;
+ 	u8			lbits4;
+ 	u8			rbits4;
+ 	u8			lbits6;
+diff --git a/net/xfrm/xfrm_policy.c b/net/xfrm/xfrm_policy.c
+index 00d9693c13ae7..cc8f4d4b70875 100644
+--- a/net/xfrm/xfrm_policy.c
++++ b/net/xfrm/xfrm_policy.c
+@@ -1384,7 +1384,10 @@ static void xfrm_hash_rebuild(struct work_struct *work)
+ 
+ void xfrm_policy_hash_rebuild(struct net *net)
+ {
+-	schedule_work(&net->xfrm.policy_hthresh.work);
++	write_seqlock(&net->xfrm.policy_hthresh.lock);
++	if (!net->xfrm.policy_hthresh.work_disabled)
++		schedule_work(&net->xfrm.policy_hthresh.work);
++	write_sequnlock(&net->xfrm.policy_hthresh.lock);
+ }
+ EXPORT_SYMBOL(xfrm_policy_hash_rebuild);
+ 
+@@ -4181,6 +4184,7 @@ static int __net_init xfrm_policy_init(struct net *net)
+ 	net->xfrm.policy_hthresh.rbits6 = 128;
+ 
+ 	seqlock_init(&net->xfrm.policy_hthresh.lock);
++	net->xfrm.policy_hthresh.work_disabled = false;
+ 
+ 	INIT_LIST_HEAD(&net->xfrm.policy_all);
+ 	INIT_LIST_HEAD(&net->xfrm.inexact_bins);
+@@ -4206,6 +4210,19 @@ static void xfrm_policy_fini(struct net *net)
+ 	unsigned int sz;
+ 	int dir;
+ 
++	/* Prevent new policy hash rebuilds before draining the work item.
++	 *
++	 * The upstream fix uses disable_work_sync(), which is unavailable
++	 * in v6.6. Protecting work_disabled and schedule_work() with the
++	 * same seqlock closes the check-to-queue race, while the subsequent
++	 * cancel_work_sync() drains work that was queued or running before
++	 * teardown disabled it.
++	 */
++	write_seqlock(&net->xfrm.policy_hthresh.lock);
++	net->xfrm.policy_hthresh.work_disabled = true;
++	write_sequnlock(&net->xfrm.policy_hthresh.lock);
++	cancel_work_sync(&net->xfrm.policy_hthresh.work);
++
+ 	flush_work(&net->xfrm.policy_hash_work);
+ #ifdef CONFIG_XFRM_SUB_POLICY
+ 	xfrm_policy_flush(net, XFRM_POLICY_TYPE_SUB, false);
+-- 
+2.53.0
+

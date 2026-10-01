@@ -1,0 +1,91 @@
+From e7d2442220d18b10f5e058843611470845d43599 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 17 Sep 2026 08:49:25 -0400
+Subject: landlock: Fix use-after-free of the source's parent directory
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+From: Norbert Szetei <norbert@doyensec.com>
+
+[ Upstream commit 2c6dc792538260a8087ac5b22c31b3b8e47c85d6 ]
+
+current_check_refer_path() reads old_dentry->d_parent without holding a
+reference nor a lock on it, and then dereferences it in
+collect_domain_accesses() and in the audit record.
+
+A reference on a child does not pin its parent: __d_move() reassigns
+dentry->d_parent and drops the reference the child held on its former
+parent.  hook_path_rename() is not affected because the rename path
+calls lock_rename() before the hook, so the source cannot be reparented
+under it.  hook_path_link() has no such protection: filename_linkat()
+holds a reference on the source dentry but neither locks nor references
+its parent, so a concurrent rename(2) can reparent the source while
+security_path_link() runs, and the former parent can then be removed and
+freed while the hook walks it.
+
+A process can trigger this after entering a Landlock domain that handles
+at least one filesystem access right.  The process can then race a
+linkat(2) loop against rename(2) and rmdir(2):
+
+  BUG: KASAN: slab-use-after-free in collect_domain_accesses+0x278/0x290
+  Read of size 4 at addr ffff888160bd53f4 by task llrepro2/549
+   collect_domain_accesses+0x278/0x290
+   current_check_refer_path+0x952/0x1120
+   security_path_link+0x1be/0x320
+   filename_linkat+0x342/0x6d0
+   __x64_sys_linkat+0xfa/0x150
+  Freed by task 562:
+   kmem_cache_free+0x139/0x4c0
+   i_callback+0x4b/0x80
+   rcu_core+0x7dc/0x10a0
+
+Take a reference on the dentry selected as the source parent, using
+dget() for the common-mount-root case and dget_parent() otherwise.
+Release it after the hierarchy walk and synchronous audit logging.
+
+Cc: stable@vger.kernel.org
+Fixes: b91c3e4ea756 ("landlock: Add support for file reparenting with LANDLOCK_ACCESS_FS_REFER")
+Signed-off-by: Norbert Szetei <norbert@doyensec.com>
+Reviewed-by: Günther Noack <gnoack3000@gmail.com>
+Tested-by: Günther Noack <gnoack3000@gmail.com>
+Link: https://patch.msgid.link/E9CDD9E6-E960-4DE2-B1AC-5667D52ABB3E@doyensec.com
+[mic: Clarify the caller, reachability, and reference handling]
+Signed-off-by: Mickaël Salaün <mic@digikod.net>
+[ consolidated dput(old_parent) into one release after the hierarchy walks because the older branch lacks audit logging. ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ security/landlock/fs.c | 10 ++++++----
+ 1 file changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/security/landlock/fs.c b/security/landlock/fs.c
+index 8f20a146648cf..4e03da721e633 100644
+--- a/security/landlock/fs.c
++++ b/security/landlock/fs.c
+@@ -911,17 +911,19 @@ static int current_check_refer_path(struct dentry *const old_dentry,
+ 	/*
+ 	 * old_dentry may be the root of the common mount point and
+ 	 * !IS_ROOT(old_dentry) at the same time (e.g. with open_tree() and
+-	 * OPEN_TREE_CLONE).  We do not need to call dget(old_parent) because
+-	 * we keep a reference to old_dentry.
++	 * OPEN_TREE_CLONE).  Pin the dentry used as old_parent in either case.
++	 * Otherwise, dget_parent() safely fetches and pins the current parent
++	 * against a concurrent rename(2).
+ 	 */
+-	old_parent = (old_dentry == mnt_dir.dentry) ? old_dentry :
+-						      old_dentry->d_parent;
++	old_parent = (old_dentry == mnt_dir.dentry) ? dget(old_dentry) :
++						      dget_parent(old_dentry);
+ 
+ 	/* new_dir->dentry is equal to new_dentry->d_parent */
+ 	allow_parent1 = collect_domain_accesses(dom, mnt_dir.dentry, old_parent,
+ 						&layer_masks_parent1);
+ 	allow_parent2 = collect_domain_accesses(
+ 		dom, mnt_dir.dentry, new_dir->dentry, &layer_masks_parent2);
++	dput(old_parent);
+ 
+ 	if (allow_parent1 && allow_parent2)
+ 		return 0;
+-- 
+2.53.0
+

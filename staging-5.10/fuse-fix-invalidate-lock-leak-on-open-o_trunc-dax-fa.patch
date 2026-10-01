@@ -1,0 +1,73 @@
+From ed14c01a1f64c356798e9d7f732f1381e5cdc79e Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 31 Aug 2026 14:00:15 -0400
+Subject: fuse: fix invalidate lock leak on open O_TRUNC DAX failure
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+From: Baokun Li <libaokun@linux.alibaba.com>
+
+[ Upstream commit a927f1867e61b78f39f9da0bbba3c98c2ca151fe ]
+
+fuse_open() takes filemap_invalidate_lock() for a DAX truncate
+(dax_truncate = true) and releases it before the out_inode_unlock
+label.  But when fuse_dax_break_layouts() fails, the goto
+out_inode_unlock skips the unlock and leaks the rwsem, so any later
+fault or truncate on the file stalls on the stale lock.
+
+fuse_dax_break_layouts() can fail with -ERESTARTSYS when a signal
+interrupts the wait for busy DAX pages to drain:
+
+  open("file", O_RDWR | O_TRUNC)
+  └─ fuse_open()
+     ├─ filemap_invalidate_lock()        # dax_truncate
+     └─ fuse_dax_break_layouts()
+        └─ dax_break_layout()
+           └─ wait_page_idle()           # TASK_INTERRUPTIBLE
+              └─ fuse_wait_dax_page()    # unlock, schedule, re-lock
+                 └─ signal → -ERESTARTSYS
+     goto out_inode_unlock               # <- lock leaked
+
+Fix this by moving filemap_invalidate_unlock() below the label so
+that all error paths release the lock, and rename the label to
+out_unlock as it now covers more than just the inode lock.
+
+Fixes: 2fdbb8dd0155 ("fuse: fix deadlock between atomic O_TRUNC and page invalidation")
+Cc: stable@vger.kernel.org # v6.0+
+Signed-off-by: Baokun Li <libaokun@linux.alibaba.com>
+Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+[ changed goto target from out_inode_unlock to out_unlock and relocated the out_unlock label before up_write() on i_mmap_sem, adapting the fix from filemap_invalidate_lock/unlock and fuse_open() to 5.10's i_mmap_sem/down_write/up_write and fuse_open_common() ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/fuse/file.c | 5 ++---
+ 1 file changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/fs/fuse/file.c b/fs/fuse/file.c
+index 956c01a42d31a..9b40d5f067abb 100644
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@ -239,7 +239,7 @@ int fuse_open_common(struct inode *inode, struct file *file, bool isdir)
+ 		down_write(&get_fuse_inode(inode)->i_mmap_sem);
+ 		err = fuse_dax_break_layouts(inode, 0, 0);
+ 		if (err)
+-			goto out_inode_unlock;
++			goto out_unlock;
+ 	}
+ 
+ 	if (is_wb_truncate || dax_truncate)
+@@ -259,10 +259,9 @@ int fuse_open_common(struct inode *inode, struct file *file, bool isdir)
+ 		else if (!(ff->open_flags & FOPEN_KEEP_CACHE))
+ 			invalidate_inode_pages2(inode->i_mapping);
+ 	}
++out_unlock:
+ 	if (dax_truncate)
+ 		up_write(&get_fuse_inode(inode)->i_mmap_sem);
+-
+-out_inode_unlock:
+ 	if (is_wb_truncate || dax_truncate)
+ 		inode_unlock(inode);
+ 
+-- 
+2.53.0
+

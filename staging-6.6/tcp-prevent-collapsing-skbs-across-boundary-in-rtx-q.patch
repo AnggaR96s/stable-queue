@@ -1,0 +1,94 @@
+From a59e11e46491598e7b667b097209a88936e9ea68 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 29 Sep 2026 11:50:40 -0400
+Subject: tcp: prevent collapsing skbs across boundary in rtx queue
+
+From: Willem de Bruijn <willemb@google.com>
+
+[ Upstream commit fc6d80eb504458d6416b75a94188b268c95c6533 ]
+
+tcp_write_collapse_fence() sets TCP_SKB_CB(skb)->eor = 1 on
+tcp_write_queue_tail(sk) to prevent skbs queued after a switch to
+device encryption from being collapsed into earlier skbs.
+
+The fence is a no-op if all earlier data has already been transmitted
+when the switch happens: sk->sk_write_queue is empty. The not yet
+acknowledged earlier skbs wait in sk->tcp_rtx_queue with eor 0.
+
+On a subsequent retransmit or SACK shift, tcp_retrans_try_collapse() or
+tcp_shift_skb_data() can then merge an skb queued after the switch into
+one queued before it.
+
+Both users of the fence are affected:
+
+- psp: devices only encrypt skbs with skb->decrypted set. The merged skb
+  keeps decrypted = 0 from the earlier skb, so merged data sent after
+  psp_sock_assoc_set_tx() is retransmitted in cleartext.
+
+- tls device offload: the merged skb straddles the start marker set in
+  tls_set_device_offload(). The software fallback (fill_sg_in() returns
+  -EINVAL) and the mlx5, nfp and funeth drivers cannot handle such an
+  skb and drop it. Every retransmit rebuilds the same skb, so the
+  connection stalls.
+
+Fix this in two places, for defense in depth:
+
+1. Fall back to tcp_rtx_queue_tail(sk) in tcp_write_collapse_fence()
+   when tcp_write_queue_tail(sk) is NULL.
+
+2. Check !skb_cmp_decrypted(to, from) in tcp_skb_can_collapse(), as
+   tcp_skb_can_collapse_rx() does on receive. skb_shift(), which both
+   collapse paths call, already has a DEBUG_NET_WARN_ON_ONCE() for this
+   condition.
+
+Fixes: e8f69799810c ("net/tls: Add generic NIC offload infrastructure")
+Cc: stable@vger.kernel.org
+Signed-off-by: Willem de Bruijn <willemb@google.com>
+Reviewed-by: Eric Dumazet <edumazet@google.com>
+Reviewed-by: Daniel Zahka <daniel.zahka@gmail.com>
+Link: https://patch.msgid.link/20260924154427.953800-1-willemdebruijn.kernel@gmail.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+[ Applied tcp_write_collapse_fence() changes directly to the existing TLS code blocks because the helper is absent. ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/net/tcp.h    | 1 +
+ net/tls/tls_device.c | 4 ++--
+ 2 files changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index c75d12e5156db..3fe0c1d928407 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -985,6 +985,7 @@ static inline bool tcp_skb_can_collapse(const struct sk_buff *to,
+ {
+ 	return likely(tcp_skb_can_collapse_to(to) &&
+ 		      mptcp_skb_can_collapse(to, from) &&
++		      !skb_cmp_decrypted(to, from) &&
+ 		      skb_pure_zcopy_same(to, from));
+ }
+ 
+diff --git a/net/tls/tls_device.c b/net/tls/tls_device.c
+index 34d321ff11980..bb7057aa828e1 100644
+--- a/net/tls/tls_device.c
++++ b/net/tls/tls_device.c
+@@ -239,7 +239,7 @@ static void tls_device_resync_tx(struct sock *sk, struct tls_context *tls_ctx,
+ 	int err = 0;
+ 	u8 *rcd_sn;
+ 
+-	skb = tcp_write_queue_tail(sk);
++	skb = tcp_write_queue_tail(sk) ?: tcp_rtx_queue_tail(sk);
+ 	if (skb)
+ 		TCP_SKB_CB(skb)->eor = 1;
+ 
+@@ -1157,7 +1157,7 @@ int tls_set_device_offload(struct sock *sk, struct tls_context *ctx)
+ 	 * SKBs where only part of the payload needs to be encrypted.
+ 	 * So mark the last skb in the write queue as end of record.
+ 	 */
+-	skb = tcp_write_queue_tail(sk);
++	skb = tcp_write_queue_tail(sk) ?: tcp_rtx_queue_tail(sk);
+ 	if (skb)
+ 		TCP_SKB_CB(skb)->eor = 1;
+ 
+-- 
+2.53.0
+
