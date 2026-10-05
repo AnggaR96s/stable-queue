@@ -1,0 +1,169 @@
+From fb0fc399544309e2c143b8f28c5126567f5a7009 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Sun, 9 Jun 2024 00:10:39 +0200
+Subject: net: add and use skb_get_hash_net
+
+From: Florian Westphal <fw@strlen.de>
+
+[ Upstream commit b975d3ee5962237c1e2f5d5aeeaaf0dc2173486c ]
+
+Years ago flow dissector gained ability to delegate flow dissection
+to a bpf program, scoped per netns.
+
+Unfortunately, skb_get_hash() only gets an sk_buff argument instead
+of both net+skb.  This means the flow dissector needs to obtain the
+netns pointer from somewhere else.
+
+The netns is derived from skb->dev, and if that is not available, from
+skb->sk.  If neither is set, we hit a (benign) WARN_ON_ONCE().
+
+Trying both dev and sk covers most cases, but not all, as recently
+reported by Christoph Paasch.
+
+In case of nf-generated tcp reset, both sk and dev are NULL:
+
+WARNING: .. net/core/flow_dissector.c:1104
+ skb_flow_dissect_flow_keys include/linux/skbuff.h:1536 [inline]
+ skb_get_hash include/linux/skbuff.h:1578 [inline]
+ nft_trace_init+0x7d/0x120 net/netfilter/nf_tables_trace.c:320
+ nft_do_chain+0xb26/0xb90 net/netfilter/nf_tables_core.c:268
+ nft_do_chain_ipv4+0x7a/0xa0 net/netfilter/nft_chain_filter.c:23
+ nf_hook_slow+0x57/0x160 net/netfilter/core.c:626
+ __ip_local_out+0x21d/0x260 net/ipv4/ip_output.c:118
+ ip_local_out+0x26/0x1e0 net/ipv4/ip_output.c:127
+ nf_send_reset+0x58c/0x700 net/ipv4/netfilter/nf_reject_ipv4.c:308
+ nft_reject_ipv4_eval+0x53/0x90 net/ipv4/netfilter/nft_reject_ipv4.c:30
+ [..]
+
+syzkaller did something like this:
+table inet filter {
+  chain input {
+    type filter hook input priority filter; policy accept;
+    meta nftrace set 1
+    tcp dport 42 reject with tcp reset
+   }
+   chain output {
+    type filter hook output priority filter; policy accept;
+    # empty chain is enough
+   }
+}
+
+... then sends a tcp packet to port 42.
+
+Initial attempt to simply set skb->dev from nf_reject_ipv4 doesn't cover
+all cases: skbs generated via ipv4 igmp_send_report trigger similar splat.
+
+Moreover, Pablo Neira found that nft_hash.c uses __skb_get_hash_symmetric()
+which would trigger same warn splat for such skbs.
+
+Lets allow callers to pass the current netns explicitly.
+The nf_trace infrastructure is adjusted to use the new helper.
+
+__skb_get_hash_symmetric is handled in the next patch.
+
+Reported-by: Christoph Paasch <cpaasch@apple.com>
+Closes: https://github.com/multipath-tcp/mptcp_net-next/issues/494
+Reviewed-by: Willem de Bruijn <willemb@google.com>
+Signed-off-by: Florian Westphal <fw@strlen.de>
+Reviewed-by: Eric Dumazet <edumazet@google.com>
+Link: https://lore.kernel.org/r/20240608221057.16070-2-fw@strlen.de
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Stable-dep-of: 8ec454dcd00c ("ipv6: sr: use skb_get_hash_net() in seg6_make_flowlabel()")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/linux/skbuff.h          | 12 ++++++++++--
+ net/core/flow_dissector.c       | 15 +++++++++++----
+ net/netfilter/nf_tables_trace.c |  2 +-
+ 3 files changed, 22 insertions(+), 7 deletions(-)
+
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index 60462d64c6e0e..171775202bd93 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -1500,7 +1500,7 @@ __skb_set_sw_hash(struct sk_buff *skb, __u32 hash, bool is_l4)
+ 	__skb_set_hash(skb, hash, true, is_l4);
+ }
+ 
+-void __skb_get_hash(struct sk_buff *skb);
++void __skb_get_hash_net(const struct net *net, struct sk_buff *skb);
+ u32 __skb_get_hash_symmetric(const struct sk_buff *skb);
+ u32 skb_get_poff(const struct sk_buff *skb);
+ u32 __skb_get_poff(const struct sk_buff *skb, const void *data,
+@@ -1580,10 +1580,18 @@ void skb_flow_dissect_hash(const struct sk_buff *skb,
+ 			   struct flow_dissector *flow_dissector,
+ 			   void *target_container);
+ 
++static inline __u32 skb_get_hash_net(const struct net *net, struct sk_buff *skb)
++{
++	if (!skb->l4_hash && !skb->sw_hash)
++		__skb_get_hash_net(net, skb);
++
++	return skb->hash;
++}
++
+ static inline __u32 skb_get_hash(struct sk_buff *skb)
+ {
+ 	if (!skb->l4_hash && !skb->sw_hash)
+-		__skb_get_hash(skb);
++		__skb_get_hash_net(NULL, skb);
+ 
+ 	return skb->hash;
+ }
+diff --git a/net/core/flow_dissector.c b/net/core/flow_dissector.c
+index 5ac4cd4f3c683..00364d07ff6b1 100644
+--- a/net/core/flow_dissector.c
++++ b/net/core/flow_dissector.c
+@@ -1853,7 +1853,8 @@ u32 __skb_get_hash_symmetric(const struct sk_buff *skb)
+ EXPORT_SYMBOL_GPL(__skb_get_hash_symmetric);
+ 
+ /**
+- * __skb_get_hash: calculate a flow hash
++ * __skb_get_hash_net: calculate a flow hash
++ * @net: associated network namespace, derived from @skb if NULL
+  * @skb: sk_buff to calculate flow hash from
+  *
+  * This function calculates a flow hash based on src/dst addresses
+@@ -1861,18 +1862,24 @@ EXPORT_SYMBOL_GPL(__skb_get_hash_symmetric);
+  * on success, zero indicates no valid hash.  Also, sets l4_hash in skb
+  * if hash is a canonical 4-tuple hash over transport ports.
+  */
+-void __skb_get_hash(struct sk_buff *skb)
++void __skb_get_hash_net(const struct net *net, struct sk_buff *skb)
+ {
+ 	struct flow_keys keys;
+ 	u32 hash;
+ 
++	memset(&keys, 0, sizeof(keys));
++
++	__skb_flow_dissect(net, skb, &flow_keys_dissector,
++			   &keys, NULL, 0, 0, 0,
++			   FLOW_DISSECTOR_F_STOP_AT_FLOW_LABEL);
++
+ 	__flow_hash_secret_init();
+ 
+-	hash = ___skb_get_hash(skb, &keys, &hashrnd);
++	hash = __flow_hash_from_keys(&keys, &hashrnd);
+ 
+ 	__skb_set_sw_hash(skb, hash, flow_keys_have_l4(&keys));
+ }
+-EXPORT_SYMBOL(__skb_get_hash);
++EXPORT_SYMBOL(__skb_get_hash_net);
+ 
+ __u32 skb_get_hash_perturb(const struct sk_buff *skb,
+ 			   const siphash_key_t *perturb)
+diff --git a/net/netfilter/nf_tables_trace.c b/net/netfilter/nf_tables_trace.c
+index 6d41c0bd3d787..6eedb84b552e5 100644
+--- a/net/netfilter/nf_tables_trace.c
++++ b/net/netfilter/nf_tables_trace.c
+@@ -313,7 +313,7 @@ void nft_trace_init(struct nft_traceinfo *info, const struct nft_pktinfo *pkt,
+ 	net_get_random_once(&trace_key, sizeof(trace_key));
+ 
+ 	info->skbid = (u32)siphash_3u32(hash32_ptr(skb),
+-					skb_get_hash(skb),
++					skb_get_hash_net(nft_net(pkt), skb),
+ 					skb->skb_iif,
+ 					&trace_key);
+ }
+-- 
+2.53.0
+
