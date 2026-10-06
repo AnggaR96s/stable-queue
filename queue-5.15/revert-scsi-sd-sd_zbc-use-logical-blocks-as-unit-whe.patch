@@ -1,0 +1,106 @@
+From c28ea6a86cceb2fe57c7cfd766f6a63278a38a74 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 5 Oct 2026 15:07:13 +0000
+Subject: Revert "scsi: sd: sd_zbc: Use logical blocks as unit when querying
+ zones"
+
+From: Simon Liebold <simonlie@amazon.de>
+
+This reverts commit 9c78f3cf77855600c0d27f5b5acdf918bc61328e, the 5.15.y
+backport of upstream 43af5da09efb.
+
+43af5da09efb is a cleanup ("slightly simplifies sd_zbc_report_zones()"),
+not a fix. It entered 5.15.y only as a Stable-dep-of: 93dde0bf2f39
+("scsi: scsi_debug: Fix REPORT ZONES alloc_len underflow OOB write"),
+which touches only scsi_debug.c and does not actually depend on it.
+
+On its own it zeroes the capacity of host-managed SMR drives at boot. It
+changed the REPORT ZONES loop advance from
+
+	sector += sd_zbc_zone_sectors(sdkp) * i;	/* sector_t, 64-bit */
+to
+	lba += sdkp->zone_blocks * i;			/* u32, wraps */
+
+(zone_info.zone_blocks on 5.15.y after bffcb7d6a287). zone_blocks is
+u32, so the product is computed in 32 bits and wraps before being
+widened into the 64-bit lba. A drive returning >= 8192 zones in one
+REPORT ZONES (~2 TiB+ at 256 MiB zones, i.e. any modern HM-SMR part)
+overflows on the first iteration; the next batch is requested at a
+wrapped LBA, the block layer rejects the backward jump, and sd truncates
+the device to zero:
+
+	sdX: Zone gap at sectors 18219532288..1039663104
+	sdX: failed to revalidate zones
+
+(524288 * 34751 = 18219532288, mod 2^32 = 1039663104.)
+
+Mainline never shipped this: in the same series, patch 7 c976e588b34e
+("scsi: sd: sd_zbc: Hide gap zones") rewrote the loop to advance per
+descriptor from 64-bit device values. 5.15.y took patch 4 and the
+intervening 628617be8968 but not c976e588b34e, keeping the broken
+intermediate state.
+
+Reverting is preferred over pulling in c976e588b34e: it is a ZBC-2
+feature (gap zones, constant zone-starting-LBA granularity) adding ~130
+lines across sd_zbc.c, sd.h and include/scsi/scsi_proto.h. It gains
+nothing for the constant-zone-size HM-SMR drives 5.15.y serves, which
+the restored sector_t advance already handles correctly.
+
+The revert conflicted with bffcb7d6a287 (which renamed the field on the
+advance line); resolved by keeping the restored "sector +=
+sd_zbc_zone_sectors(sdkp) * i", which reads zone_info.zone_blocks via
+logical_to_sectors() and is 64-bit. 93dde0bf2f39 stays in place and is
+unaffected.
+
+Signed-off-by: Simon Liebold <simonlie@amazon.de>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/scsi/sd_zbc.c | 11 ++++++-----
+ 1 file changed, 6 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/scsi/sd_zbc.c b/drivers/scsi/sd_zbc.c
+index 90d0f8ddd179c..d84a9c1d76c5a 100644
+--- a/drivers/scsi/sd_zbc.c
++++ b/drivers/scsi/sd_zbc.c
+@@ -223,7 +223,7 @@ int sd_zbc_report_zones(struct gendisk *disk, sector_t sector,
+ 			unsigned int nr_zones, report_zones_cb cb, void *data)
+ {
+ 	struct scsi_disk *sdkp = scsi_disk(disk);
+-	sector_t lba = sectors_to_logical(sdkp->device, sector);
++	sector_t capacity = logical_to_sectors(sdkp->device, sdkp->capacity);
+ 	unsigned int nr, i;
+ 	unsigned char *buf;
+ 	size_t offset, buflen = 0;
+@@ -234,7 +234,7 @@ int sd_zbc_report_zones(struct gendisk *disk, sector_t sector,
+ 		/* Not a zoned device */
+ 		return -EOPNOTSUPP;
+ 
+-	if (!sdkp->capacity)
++	if (!capacity)
+ 		/* Device gone or invalid */
+ 		return -ENODEV;
+ 
+@@ -242,8 +242,9 @@ int sd_zbc_report_zones(struct gendisk *disk, sector_t sector,
+ 	if (!buf)
+ 		return -ENOMEM;
+ 
+-	while (zone_idx < nr_zones && lba < sdkp->capacity) {
+-		ret = sd_zbc_do_report_zones(sdkp, buf, buflen, lba, true);
++	while (zone_idx < nr_zones && sector < capacity) {
++		ret = sd_zbc_do_report_zones(sdkp, buf, buflen,
++				sectors_to_logical(sdkp->device, sector), true);
+ 		if (ret)
+ 			goto out;
+ 
+@@ -261,7 +262,7 @@ int sd_zbc_report_zones(struct gendisk *disk, sector_t sector,
+ 			zone_idx++;
+ 		}
+ 
+-		lba += sdkp->zone_info.zone_blocks * i;
++		sector += sd_zbc_zone_sectors(sdkp) * i;
+ 	}
+ 
+ 	ret = zone_idx;
+-- 
+2.53.0
+
