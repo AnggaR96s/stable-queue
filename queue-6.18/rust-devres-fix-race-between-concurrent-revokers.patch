@@ -1,0 +1,179 @@
+From rust-for-linux+bounces-50114-greg=kroah.com@vger.kernel.org Mon Oct  5 11:49:00 2026
+From: Alice Ryhl <aliceryhl@google.com>
+Date: Mon, 05 Oct 2026 09:47:28 +0000
+Subject: rust: devres: fix race between concurrent revokers
+To: stable@vger.kernel.org, Greg Kroah-Hartman <gregkh@linuxfoundation.org>,  Sasha Levin <sashal@kernel.org>, Danilo Krummrich <dakr@kernel.org>
+Cc: "Alexandre Courbot" <acourbot@nvidia.com>, "Andreas Hindborg" <a.hindborg@kernel.org>, "Benno Lossin" <lossin@kernel.org>, "Björn Roy Baron" <bjorn3_gh@protonmail.com>, "Boqun Feng" <boqun.feng@gmail.com>, "Boris Brezillon" <boris.brezillon@collabora.com>, "Daniel Almeida" <daniel.almeida@collabora.com>, "Eliot Courtney" <ecourtney@nvidia.com>, "Gary Guo" <gary@garyguo.net>, "Markus Probst" <markus.probst@posteo.de>, "Miguel Ojeda" <ojeda@kernel.org>, "Rafael J. Wysocki" <rafael@kernel.org>, "Trevor Gross" <tmgross@umich.edu>, rust-for-linux@vger.kernel.org, linux-kernel@vger.kernel.org, "Alice Ryhl" <aliceryhl@google.com>, Sashiko <sashiko-bot@kernel.org>
+Message-ID: <20261005-devres-6-18-backport-v1-3-06dcf0e592d5@google.com>
+
+From: Danilo Krummrich <dakr@kernel.org>
+
+commit acc516dfa1972d31836b50abc0115216cd0fccc5 upstream.
+
+There is a potential race condition when two paths try to revoke a
+Devres concurrently.
+
+The driver core's devres_release_all() calls Revocable::revoke() via the
+release callback, while Devres::drop() calls revoke_nosync() on another
+CPU.
+
+The revoker that does not claim the is_available swap returns
+immediately, but the revoker that did may still be executing
+drop_in_place() on the inner data. This can cause a use-after-free when
+the other revoker's caller proceeds to drop adjacent resources that
+drop_in_place() still references (e.g., Devres<DmaMappedSgt> racing with
+SGTable freeing the backing sg_table and pages).
+
+Fix this by adding a Completion. The release callback signals the
+Completion after revoke() finishes, and Devres::drop() waits for it when
+it loses the is_available swap. This ensures the wrapped object is fully
+torn down before Devres::drop() returns.
+
+Cc: stable@vger.kernel.org
+Reported-by: Sashiko <sashiko-bot@kernel.org>
+Closes: https://lore.kernel.org/dri-devel/20260612202841.2577C1F000E9@smtp.kernel.org/
+Fixes: 05aa6fb1c21d ("rust: scatterlist: Add abstraction for sg_table")
+Reviewed-by: Gary Guo <gary@garyguo.net>
+Reviewed-by: Alice Ryhl <aliceryhl@google.com>
+Link: https://patch.msgid.link/20260628174451.2275679-1-dakr@kernel.org
+Signed-off-by: Danilo Krummrich <dakr@kernel.org>
+[ Re-introduce Inner<T> for Arc<Inner<T>> as commit 9aa64d2503c6 ("rust:
+  devres: embed struct devres_node directly") is not in 6.18. ]
+Signed-off-by: Alice Ryhl <aliceryhl@google.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ rust/kernel/devres.rs |   56 +++++++++++++++++++++++++++++++++++---------------
+ 1 file changed, 40 insertions(+), 16 deletions(-)
+
+--- a/rust/kernel/devres.rs
++++ b/rust/kernel/devres.rs
+@@ -13,10 +13,18 @@ use crate::{
+     ffi::c_void,
+     prelude::*,
+     revocable::{Revocable, RevocableGuard},
+-    sync::{aref::ARef, rcu, Arc},
++    sync::{aref::ARef, rcu, Arc, Completion},
+     types::ForeignOwnable,
+ };
+ 
++#[pin_data]
++struct Inner<T> {
++    #[pin]
++    data: Revocable<T>,
++    #[pin]
++    revocation: Completion,
++}
++
+ /// This abstraction is meant to be used by subsystems to containerize [`Device`] bound resources to
+ /// manage their lifetime.
+ ///
+@@ -31,6 +39,10 @@ use crate::{
+ /// After the [`Devres`] has been unbound it is not possible to access the encapsulated resource
+ /// anymore.
+ ///
++/// When a [`Devres`] is dropped, it is guaranteed that `T` has been fully dropped by the time
++/// [`Devres::drop`] returns, even if a concurrent revocation through the release callback is in
++/// progress.
++///
+ /// [`Devres`] users should make sure to simply free the corresponding backing resource in `T`'s
+ /// [`Drop`] implementation.
+ ///
+@@ -104,7 +116,7 @@ pub struct Devres<T: Send + 'static> {
+     /// Has to be stored, since Rust does not guarantee to always return the same address for a
+     /// function. However, the C API uses the address as a key.
+     callback: unsafe extern "C" fn(*mut c_void),
+-    data: Arc<Revocable<T>>,
++    inner: Arc<Inner<T>>,
+ }
+ 
+ impl<T: Send + 'static> Devres<T> {
+@@ -117,43 +129,51 @@ impl<T: Send + 'static> Devres<T> {
+         Error: From<E>,
+     {
+         let callback = Self::devres_callback;
+-        let data = Arc::pin_init(Revocable::new(data), GFP_KERNEL)?;
+-        let devres_data = data.clone();
++        let inner = Arc::pin_init::<Error>(
++            try_pin_init!(Inner {
++                data <- Revocable::new(data),
++                revocation <- Completion::new(),
++            }),
++            GFP_KERNEL,
++        )?;
++        let devres_inner = inner.clone();
+ 
+         // SAFETY:
+         // - `dev.as_raw()` is a pointer to a valid bound device.
+-        // - `data` is guaranteed to be a valid for the duration of the lifetime of `Self`.
++        // - `inner` is guaranteed to be a valid for the duration of the lifetime of `Self`.
+         // - `devm_add_action()` is guaranteed not to call `callback` for the entire lifetime of
+         //   `dev`.
+         to_result(unsafe {
+             bindings::devm_add_action(
+                 dev.as_raw(),
+                 Some(callback),
+-                Arc::as_ptr(&data).cast_mut().cast(),
++                Arc::as_ptr(&inner).cast_mut().cast(),
+             )
+         })?;
+ 
+         // `devm_add_action()` was successful and has consumed the reference count.
+-        core::mem::forget(devres_data);
++        core::mem::forget(devres_inner);
+ 
+         Ok(Self {
+             dev: dev.into(),
+             callback,
+-            data,
++            inner,
+         })
+     }
+ 
+     fn data(&self) -> &Revocable<T> {
+-        &self.data
++        &self.inner.data
+     }
+ 
+     #[allow(clippy::missing_safety_doc)]
+     unsafe extern "C" fn devres_callback(ptr: *mut kernel::ffi::c_void) {
+-        // SAFETY: In `Self::new` we've passed a valid pointer of `Revocable<T>` to
+-        // `devm_add_action()`, hence `ptr` must be a valid pointer to `Revocable<T>`.
+-        let data = unsafe { Arc::from_raw(ptr.cast::<Revocable<T>>()) };
++        // SAFETY: In `Self::new` we've passed a valid pointer of `Inner<T>` to
++        // `devm_add_action()`, hence `ptr` must be a valid pointer to `Inner<T>`.
++        let inner = unsafe { Arc::from_raw(ptr.cast::<Inner<T>>()) };
+ 
+-        data.revoke();
++        if inner.data.revoke() {
++            inner.revocation.complete_all();
++        }
+     }
+ 
+     fn remove_action(&self) -> bool {
+@@ -165,7 +185,7 @@ impl<T: Send + 'static> Devres<T> {
+             bindings::devm_remove_action_nowarn(
+                 self.dev.as_raw(),
+                 Some(self.callback),
+-                core::ptr::from_ref(self.data()).cast_mut().cast(),
++                Arc::as_ptr(&self.inner).cast_mut().cast(),
+             )
+         } == 0)
+     }
+@@ -243,11 +263,15 @@ impl<T: Send + 'static> Drop for Devres<
+         if unsafe { self.data().revoke_nosync() } {
+             // We revoked `self.data` before the devres action did, hence try to remove it.
+             if self.remove_action() {
+-                // SAFETY: In `Self::new` we have taken an additional reference count of `self.data`
++                // SAFETY: In `Self::new` we have taken an additional reference count of `self.inner`
+                 // for `devm_add_action()`. Since `remove_action()` was successful, we have to drop
+                 // this additional reference count.
+-                drop(unsafe { Arc::from_raw(Arc::as_ptr(&self.data)) });
++                drop(unsafe { Arc::from_raw(Arc::as_ptr(&self.inner)) });
+             }
++        } else {
++            // The release callback is concurrently revoking; wait for it to finish
++            // `drop_in_place()` of the wrapped object before returning.
++            self.inner.revocation.wait_for_completion();
+         }
+     }
+ }
