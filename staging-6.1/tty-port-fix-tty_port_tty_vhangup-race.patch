@@ -1,0 +1,206 @@
+From f19a45602ddabecdaf5ed35b2f8d9b3b7af76b3b Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 8 Oct 2026 22:16:27 +0800
+Subject: tty: port: fix tty_port_tty_vhangup() race
+
+From: Johan Hovold <johan@kernel.org>
+
+[ Upstream commit b48820de8c1a596c5b99775524dfce73c6576c5d ]
+
+Drivers rely on tty_port_tty_vhangup() to synchronously hang up their
+ports before tearing down resources as part of deregistration (e.g. on
+physical disconnect).
+
+If tty_port_tty_vhangup() races with another hangup it may however
+return before the port has been shut down. This is in turn can lead to
+use-after-free and NULL-pointer dereferences in racing ioctls (including
+a synchronous hangup) and in processing of racing asynchronous hangups
+(carrier loss).
+
+Add the missing serialisation to tty_port_tty_vhangup() and
+tty_port_hangup() so that the former does not return until the port has
+been shut down also when there is a racing hangup.
+
+Note that serial core does not use tty_port_hangup(), but it already
+holds the port mutex when clearing port->tty and shutting down the port
+in uart_hangup().
+
+Fixes: 7ca0ff9ab321 ("tty: Add a full port_close function")
+Cc: stable@kernel.org	# 2.6.32: 2b5eac0f8c6e: tty: introduce and use tty_port_tty_vhangup() helper
+Cc: stable@kernel.org	# 2.6.32
+Reported-by: syzbot+5fabc1ae99ff40690d84@syzkaller.appspotmail.com
+Link: https://lore.kernel.org/6a944641.4d659fcc.734b4.003c.GAE@google.com
+Signed-off-by: Johan Hovold <johan@kernel.org>
+Link: https://patch.msgid.link/20260910125114.640880-1-johan@kernel.org
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+[ Ting-Han: use mutex_lock()/spin_lock_irqsave() instead of guard(),
+  scoped_guard() and the tty_port_tty class, matching the existing code
+  in this version of tty_port.c ]
+Assisted-by: LLM
+Signed-off-by: Ting-Han Hou <ue081723@gmail.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/tty/tty_port.c   | 74 +++++++++++++++++++++++++++-------------
+ include/linux/tty_port.h | 22 ++----------
+ 2 files changed, 53 insertions(+), 43 deletions(-)
+
+diff --git a/drivers/tty/tty_port.c b/drivers/tty/tty_port.c
+index 6f3b4eeb44b38..82f7ddf449c0b 100644
+--- a/drivers/tty/tty_port.c
++++ b/drivers/tty/tty_port.c
+@@ -350,21 +350,12 @@ void tty_port_tty_set(struct tty_port *port, struct tty_struct *tty)
+ }
+ EXPORT_SYMBOL(tty_port_tty_set);
+ 
+-/**
+- * tty_port_shutdown - internal helper to shutdown the device
+- * @port: tty port to be shut down
+- * @tty: the associated tty
+- *
+- * It is used by tty_port_hangup() and tty_port_close(). Its task is to
+- * shutdown the device if it was initialized (note consoles remain
+- * functioning). It lowers DTR/RTS (if @tty has HUPCL set) and invokes
+- * @port->ops->shutdown().
+- */
+-static void tty_port_shutdown(struct tty_port *port, struct tty_struct *tty)
++static void tty_port_shutdown_locked(struct tty_port *port, struct tty_struct *tty)
+ {
+-	mutex_lock(&port->mutex);
++	lockdep_assert_held(&port->mutex);
++
+ 	if (port->console)
+-		goto out;
++		return;
+ 
+ 	if (tty_port_initialized(port)) {
+ 		tty_port_set_initialized(port, 0);
+@@ -378,7 +369,22 @@ static void tty_port_shutdown(struct tty_port *port, struct tty_struct *tty)
+ 		if (port->ops->shutdown)
+ 			port->ops->shutdown(port);
+ 	}
+-out:
++}
++
++/**
++ * tty_port_shutdown - internal helper to shutdown the device
++ * @port: tty port to be shut down
++ * @tty: the associated tty
++ *
++ * It is used by tty_port_hangup() and tty_port_close(). Its task is to
++ * shutdown the device if it was initialized (note consoles remain
++ * functioning). It lowers DTR/RTS (if @tty has HUPCL set) and invokes
++ * @port->ops->shutdown().
++ */
++static void tty_port_shutdown(struct tty_port *port, struct tty_struct *tty)
++{
++	mutex_lock(&port->mutex);
++	tty_port_shutdown_locked(port, tty);
+ 	mutex_unlock(&port->mutex);
+ }
+ 
+@@ -396,6 +402,7 @@ void tty_port_hangup(struct tty_port *port)
+ 	struct tty_struct *tty;
+ 	unsigned long flags;
+ 
++	mutex_lock(&port->mutex);
+ 	spin_lock_irqsave(&port->lock, flags);
+ 	port->count = 0;
+ 	tty = port->tty;
+@@ -404,26 +411,47 @@ void tty_port_hangup(struct tty_port *port)
+ 	port->tty = NULL;
+ 	spin_unlock_irqrestore(&port->lock, flags);
+ 	tty_port_set_active(port, 0);
+-	tty_port_shutdown(port, tty);
++	tty_port_shutdown_locked(port, tty);
++	mutex_unlock(&port->mutex);
+ 	tty_kref_put(tty);
+ 	wake_up_interruptible(&port->open_wait);
+ 	wake_up_interruptible(&port->delta_msr_wait);
+ }
+ EXPORT_SYMBOL(tty_port_hangup);
+ 
+-void __tty_port_tty_hangup(struct tty_port *port, bool check_clocal, bool async)
++/**
++ * tty_port_tty_hangup - helper to hang up a tty asynchronously
++ * @port: tty port
++ * @check_clocal: hang only ttys with %CLOCAL unset?
++ */
++void tty_port_tty_hangup(struct tty_port *port, bool check_clocal)
+ {
+ 	struct tty_struct *tty = tty_port_tty_get(port);
+ 
+-	if (tty && (!check_clocal || !C_CLOCAL(tty))) {
+-		if (async)
+-			tty_hangup(tty);
+-		else
+-			tty_vhangup(tty);
+-	}
++	if (tty && (!check_clocal || !C_CLOCAL(tty)))
++		tty_hangup(tty);
+ 	tty_kref_put(tty);
+ }
+-EXPORT_SYMBOL_GPL(__tty_port_tty_hangup);
++EXPORT_SYMBOL_GPL(tty_port_tty_hangup);
++
++/**
++ * tty_port_tty_vhangup - helper to hang up a tty synchronously
++ * @port: tty port
++ */
++void tty_port_tty_vhangup(struct tty_port *port)
++{
++	struct tty_struct *tty;
++
++	mutex_lock(&port->mutex);
++	tty = tty_port_tty_get(port);
++	mutex_unlock(&port->mutex);
++
++	if (tty) {
++		tty_vhangup(tty);
++		tty_kref_put(tty);
++	}
++}
++EXPORT_SYMBOL_GPL(tty_port_tty_vhangup);
+ 
+ /**
+  * tty_port_tty_wakeup - helper to wake up a tty
+diff --git a/include/linux/tty_port.h b/include/linux/tty_port.h
+index 1ec146b8d0f42..660edf9e741a1 100644
+--- a/include/linux/tty_port.h
++++ b/include/linux/tty_port.h
+@@ -234,7 +234,8 @@ int tty_port_carrier_raised(struct tty_port *port);
+ void tty_port_raise_dtr_rts(struct tty_port *port);
+ void tty_port_lower_dtr_rts(struct tty_port *port);
+ void tty_port_hangup(struct tty_port *port);
+-void __tty_port_tty_hangup(struct tty_port *port, bool check_clocal, bool async);
++void tty_port_tty_hangup(struct tty_port *port, bool check_clocal);
++void tty_port_tty_vhangup(struct tty_port *port);
+ void tty_port_tty_wakeup(struct tty_port *port);
+ int tty_port_block_til_ready(struct tty_port *port, struct tty_struct *tty,
+ 		struct file *filp);
+@@ -253,23 +254,4 @@ static inline int tty_port_users(struct tty_port *port)
+ 	return port->count + port->blocked_open;
+ }
+ 
+-/**
+- * tty_port_tty_hangup - helper to hang up a tty asynchronously
+- * @port: tty port
+- * @check_clocal: hang only ttys with %CLOCAL unset?
+- */
+-static inline void tty_port_tty_hangup(struct tty_port *port, bool check_clocal)
+-{
+-	__tty_port_tty_hangup(port, check_clocal, true);
+-}
+-
+-/**
+- * tty_port_tty_vhangup - helper to hang up a tty synchronously
+- * @port: tty port
+- */
+-static inline void tty_port_tty_vhangup(struct tty_port *port)
+-{
+-	__tty_port_tty_hangup(port, false, false);
+-}
+-
+ #endif
+-- 
+2.53.0
+
