@@ -1,0 +1,138 @@
+From 503b99187df45a178d02a77162348ed130fe4731 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 13 Oct 2026 09:02:25 +0000
+Subject: sched_ext: Generate qseq from a per-task counter
+
+From: Kuba Piecuch <jpiecuch@google.com>
+
+commit e6ac89b8b1c12e9104df45a14a26e2dfa96ded06 upstream.
+
+finish_dispatch() uses the qseq embedded in p->scx.ops_state to tell
+whether the QUEUED instance of a task it's about to claim is the one
+scx_bpf_dsq_insert() saw. qseq is generated from rq->scx.ops_qseq, but
+the counters of different rqs are independent, so if a task is dequeued
+and re-enqueued on a different rq between scx_bpf_dsq_insert() and
+finish_dispatch(), the new QUEUED instance can end up with the same
+qseq as the old one:
+
+  CPU X                          CPU Z
+  -----                          -----
+                                 enqueue p on rq A, qseq = N
+  ops.dispatch()
+    scx_bpf_dsq_insert(p)
+      records qseq N
+                                 sched_setaffinity(p)
+                                   dequeue p from rq A
+                                   enqueue p on rq B, qseq = N
+  finish_dispatch(p, N)
+    qseq matches, p is claimed
+
+The claim itself is still atomic so the core stays consistent, but an
+insert issued for a previous QUEUED instance gets applied to a new one
+which the BPF scheduler has just received through ops.enqueue(). This
+breaks the guarantee that dispatches targeting a stale instance are
+ignored.
+
+Generate qseq from a per-task counter, p->scx.ops_qseq, instead so that
+consecutive QUEUED instances of a task never share a qseq regardless of
+which rq they're on. The counter is only updated in
+scx_do_enqueue_task() with the task's rq locked, so no additional
+synchronization is needed, and it fits in an existing hole in struct
+sched_ext_entity on 64bit. Remove the now unused rq->scx.ops_qseq.
+
+Never generate qseq 0. NONE and DISPATCHING don't carry a qseq, so
+scx_bpf_dsq_insert() on a task in either state records 0. With a
+per-task counter, every task's first QUEUED instance would otherwise get
+qseq 0 and could be claimed by such an insert. Wrap the counter where
+the QSEQ field wraps so that it can't reach a value that shifts to 0 on
+32bit either.
+
+Fixes: f0e1a0643a59 ("sched_ext: Implement BPF extensible scheduler class")
+Cc: stable@vger.kernel.org # v6.12+
+Assisted-by: Claude:claude-opus-5.5
+Signed-off-by: Kuba Piecuch <jpiecuch@google.com>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+(cherry picked from commit e6ac89b8b1c12e9104df45a14a26e2dfa96ded06)
+[ jpiecuch: code lives in kernel/sched/ext.c and do_enqueue_task(); adjust
+  struct/dump line context, name scx_bpf_dispatch() in the new comment ]
+Signed-off-by: Kuba Piecuch <jpiecuch@google.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/linux/sched/ext.h |  1 +
+ kernel/sched/ext.c        | 20 +++++++++++++++-----
+ kernel/sched/sched.h      |  1 -
+ 3 files changed, 16 insertions(+), 6 deletions(-)
+
+diff --git a/include/linux/sched/ext.h b/include/linux/sched/ext.h
+index 2799e7284fff7..880052a8f027a 100644
+--- a/include/linux/sched/ext.h
++++ b/include/linux/sched/ext.h
+@@ -147,6 +147,7 @@ struct sched_ext_entity {
+ 	s32			sticky_cpu;
+ 	s32			holding_cpu;
+ 	u32			kf_mask;	/* see scx_kf_mask above */
++	u32			ops_qseq;	/* protected by rq lock */
+ 	struct task_struct	*kf_tasks[2];	/* see SCX_CALL_OP_TASK() */
+ 	atomic_long_t		ops_state;
+ 
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index 40dbdfed42c9a..3a1983ef278fc 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -835,6 +835,11 @@ enum scx_ops_state {
+ 	 * dequeue/requeue, the dispatcher can tell whether it still has a claim
+ 	 * on the task being dispatched.
+ 	 *
++	 * QSEQ is generated from the per-task p->scx.ops_qseq counter so that
++	 * it doesn't repeat across QUEUED instances of the same task even if
++	 * the task moves between rqs. 0 is never used as a valid QSEQ since
++	 * NONE and DISPATCHING map to this value.
++	 *
+ 	 * As some 32bit archs can't do 64bit store_release/load_acquire,
+ 	 * p->scx.ops_state is atomic_long_t which leaves 30 bits for QSEQ on
+ 	 * 32bit machines. The dispatch race window QSEQ protects is very narrow
+@@ -2040,8 +2045,14 @@ static void do_enqueue_task(struct rq *rq, struct task_struct *p, u64 enq_flags,
+ 	if (!SCX_HAS_OP(enqueue))
+ 		goto global;
+ 
+-	/* DSQ bypass didn't trigger, enqueue on the BPF scheduler */
+-	qseq = rq->scx.ops_qseq++ << SCX_OPSS_QSEQ_SHIFT;
++	/*
++	 * DSQ bypass didn't trigger, enqueue on the BPF scheduler. Wrap the
++	 * per-task qseq counter where the QSEQ field wraps and skip 0, which is
++	 * what scx_bpf_dispatch() records for a task in NONE or DISPATCHING.
++	 */
++	p->scx.ops_qseq = ((p->scx.ops_qseq + 1) &
++			   (SCX_OPSS_QSEQ_MASK >> SCX_OPSS_QSEQ_SHIFT)) ?: 1;
++	qseq = (unsigned long)p->scx.ops_qseq << SCX_OPSS_QSEQ_SHIFT;
+ 
+ 	WARN_ON_ONCE(atomic_long_read(&p->scx.ops_state) != SCX_OPSS_NONE);
+ 	atomic_long_set(&p->scx.ops_state, SCX_OPSS_QUEUEING | qseq);
+@@ -5053,10 +5064,9 @@ static void scx_dump_state(struct scx_exit_info *ei, size_t dump_len)
+ 		seq_buf_init(&ns, buf, avail);
+ 
+ 		dump_newline(&ns);
+-		dump_line(&ns, "CPU %-4d: nr_run=%u flags=0x%x cpu_rel=%d ops_qseq=%lu pnt_seq=%lu",
++		dump_line(&ns, "CPU %-4d: nr_run=%u flags=0x%x cpu_rel=%d pnt_seq=%lu",
+ 			  cpu, rq->scx.nr_running, rq->scx.flags,
+-			  rq->scx.cpu_released, rq->scx.ops_qseq,
+-			  rq->scx.pnt_seq);
++			  rq->scx.cpu_released, rq->scx.pnt_seq);
+ 		dump_line(&ns, "          curr=%s[%d] class=%ps",
+ 			  rq->curr->comm, rq->curr->pid,
+ 			  rq->curr->sched_class);
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 0073c5b7d07a3..5e788dc39f630 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -796,7 +796,6 @@ struct scx_rq {
+ 	struct scx_dispatch_q	local_dsq;
+ 	struct list_head	runnable_list;		/* runnable tasks on this rq */
+ 	struct list_head	ddsp_deferred_locals;	/* deferred ddsps from enq */
+-	unsigned long		ops_qseq;
+ 	u64			extra_enq_flags;	/* see move_task_to_local_dsq() */
+ 	u32			nr_running;
+ 	u32			flags;
+-- 
+2.53.0
+
