@@ -1,0 +1,113 @@
+From ea09dcc88f45d5414a2b923816946349de77af46 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 13 Oct 2026 19:05:01 -0400
+Subject: readdir: take no inode lock on an immutable directory
+
+From: Christian Brauner <brauner@kernel.org>
+
+[ Upstream commit e08f57a7dcb83818c058e415988c23beb6c5a47f ]
+
+iterate_dir() takes the directory's i_rwsem shared and holds it across
+->iterate_shared(). For a directory that never has an entry and is
+never removed the lock keeps nothing still, it only orders every reader
+and every writer of that inode behind each other.
+
+For the directory of a nullfs instance that matters. The instance of
+the initial mount namespace is the root of every empty mount namespace
+and the private instance is the root of every kernel thread, so one
+inode is shared across users who have nothing else in common. And a
+reader can hold the lock for as long as it likes: back the getdents()
+buffer with a mapping of a file on a FUSE mount of your own, let the
+copy of "." and ".." fault and let the server wait. Queue an exclusive
+taker behind it, a mkdir() in that directory goes through start_dirop()
+before the read-only mount is reported, and from then on every lookup
+that misses the dcache in that directory, every create and every mount
+on it waits until the server answers. One user of an empty mount
+namespace stalls all the others.
+
+Add FOP_IMMUTABLE for the file operations of a directory that never
+changes and is never removed and let iterate_dir() skip the lock for
+it. The flag never changes for a file, ->f_pos is protected by
+f_pos_lock since directories are FMODE_ATOMIC_POS, IS_DEADDIR can't be
+set on such a directory and neither touch_atime() nor fsnotify take
+i_rwsem. Set it on the nullfs directory. The placeholder directories of
+libfs never have an entry either but their owners remove them, so they
+keep the lock.
+
+Fixes: 9d4e752a24f7 ("namespace: allow creating empty mount namespaces")
+Cc: stable@vger.kernel.org # v7.1+
+Link: https://patch.msgid.link/20261002-work-mount-fixes-4-v1-19-dd44b89d44ce@kernel.org
+Signed-off-by: Christian Brauner (Amutable) <brauner@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/nullfs.c        |  1 +
+ fs/readdir.c       | 13 +++++++++----
+ include/linux/fs.h |  2 ++
+ 3 files changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/fs/nullfs.c b/fs/nullfs.c
+index fc79ca42bb178..c89181daf208c 100644
+--- a/fs/nullfs.c
++++ b/fs/nullfs.c
+@@ -34,6 +34,7 @@ static const struct file_operations nullfs_dir_operations = {
+ 	.fsync		= noop_fsync,
+ 	.lock		= nullfs_nolock,
+ 	.flock		= nullfs_nolock,
++	.fop_flags	= FOP_IMMUTABLE,
+ };
+ 
+ static int nullfs_fs_fill_super(struct super_block *s, struct fs_context *fc)
+diff --git a/fs/readdir.c b/fs/readdir.c
+index 76bb1ae3a4504..f2288841337ad 100644
+--- a/fs/readdir.c
++++ b/fs/readdir.c
+@@ -87,6 +87,8 @@ EXPORT_SYMBOL(wrap_directory_iterator);
+ int iterate_dir(struct file *file, struct dir_context *ctx)
+ {
+ 	struct inode *inode = file_inode(file);
++	/* never an entry, never removed: nothing for the lock to keep still */
++	bool locked = !(file->f_op->fop_flags & FOP_IMMUTABLE);
+ 	int res = -ENOTDIR;
+ 
+ 	if (!file->f_op->iterate_shared)
+@@ -100,9 +102,11 @@ int iterate_dir(struct file *file, struct dir_context *ctx)
+ 	if (res)
+ 		goto out;
+ 
+-	res = down_read_killable(&inode->i_rwsem);
+-	if (res)
+-		goto out;
++	if (locked) {
++		res = down_read_killable(&inode->i_rwsem);
++		if (res)
++			goto out;
++	}
+ 
+ 	res = -ENOENT;
+ 	if (!IS_DEADDIR(inode)) {
+@@ -112,7 +116,8 @@ int iterate_dir(struct file *file, struct dir_context *ctx)
+ 		fsnotify_access(file);
+ 		file_accessed(file);
+ 	}
+-	inode_unlock_shared(inode);
++	if (locked)
++		inode_unlock_shared(inode);
+ out:
+ 	return res;
+ }
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 09de7bf6f1d28..a07031fd4ae24 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -1980,6 +1980,8 @@ struct file_operations {
+ #define FOP_ASYNC_LOCK		((__force fop_flags_t)(1 << 6))
+ /* File system supports uncached read/write buffered IO */
+ #define FOP_DONTCACHE		((__force fop_flags_t)(1 << 7))
++/* Never changes and is never removed, readdir of a directory takes no lock */
++#define FOP_IMMUTABLE		((__force fop_flags_t)(1 << 8))
+ 
+ /* Wrap a directory iterator that needs exclusive inode access */
+ int wrap_directory_iterator(struct file *, struct dir_context *,
+-- 
+2.53.0
+
