@@ -1,0 +1,132 @@
+From c86b6c59158e32bba3426f5a1b7cb96a2d5ed224 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 1 May 2024 23:25:47 +0000
+Subject: gve: Account for stopped queues when reading NIC stats
+
+From: Shailend Chand <shailend@google.com>
+
+[ Upstream commit af9bcf910b1f86244f39e15e701b2dc564b469a6 ]
+
+We now account for the fact that the NIC might send us stats for a
+subset of queues. Without this change, gve_get_ethtool_stats might make
+an invalid access on the priv->stats_report->stats array.
+
+Tested-by: Mina Almasry <almasrymina@google.com>
+Reviewed-by: Praveen Kaligineedi <pkaligineedi@google.com>
+Reviewed-by: Harshitha Ramamurthy <hramamurthy@google.com>
+Signed-off-by: Shailend Chand <shailend@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/net/ethernet/google/gve/gve_ethtool.c | 38 ++++++++++++++++---
+ 1 file changed, 32 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/net/ethernet/google/gve/gve_ethtool.c b/drivers/net/ethernet/google/gve/gve_ethtool.c
+index b1c4df3bab292..bc20c13ba2870 100644
+--- a/drivers/net/ethernet/google/gve/gve_ethtool.c
++++ b/drivers/net/ethernet/google/gve/gve_ethtool.c
+@@ -166,6 +166,8 @@ gve_get_ethtool_stats(struct net_device *netdev,
+ 	struct stats *report_stats;
+ 	int *rx_qid_to_stats_idx;
+ 	int *tx_qid_to_stats_idx;
++	int num_stopped_rxqs = 0;
++	int num_stopped_txqs = 0;
+ 	struct gve_priv *priv;
+ 	bool skip_nic_stats;
+ 	unsigned int start;
+@@ -182,12 +184,23 @@ gve_get_ethtool_stats(struct net_device *netdev,
+ 					    sizeof(int), GFP_KERNEL);
+ 	if (!rx_qid_to_stats_idx)
+ 		return;
++	for (ring = 0; ring < priv->rx_cfg.num_queues; ring++) {
++		rx_qid_to_stats_idx[ring] = -1;
++		if (!priv->ntfy_blocks[gve_rx_idx_to_ntfy(priv, ring)].rx)
++			num_stopped_rxqs++;
++	}
+ 	tx_qid_to_stats_idx = kmalloc_array(num_tx_queues,
+ 					    sizeof(int), GFP_KERNEL);
+ 	if (!tx_qid_to_stats_idx) {
+ 		kfree(rx_qid_to_stats_idx);
+ 		return;
+ 	}
++	for (ring = 0; ring < num_tx_queues; ring++) {
++		tx_qid_to_stats_idx[ring] = -1;
++		if (!priv->ntfy_blocks[gve_tx_idx_to_ntfy(priv, ring)].tx)
++			num_stopped_txqs++;
++	}
++
+ 	for (rx_pkts = 0, rx_bytes = 0, rx_skb_alloc_fail = 0,
+ 	     rx_buf_alloc_fail = 0, rx_desc_err_dropped_pkt = 0,
+ 	     xdp_tx_errors = 0, xdp_redirect_errors = 0,
+@@ -272,11 +285,16 @@ gve_get_ethtool_stats(struct net_device *netdev,
+ 		 */
+ 		rx_base_stats_idx = (stats_region_len - nic_stats_len) /
+ 							sizeof(struct stats);
++		/* The boundary between driver stats and NIC stats shifts if there are
++		 * stopped queues.
++		 */
++		rx_base_stats_idx += NIC_RX_STATS_REPORT_NUM * num_stopped_rxqs +
++			NIC_TX_STATS_REPORT_NUM * num_stopped_txqs;
+ 		max_rx_stats_idx = NIC_RX_STATS_REPORT_NUM *
+-			priv->rx_cfg.num_queues +
++			(priv->rx_cfg.num_queues - num_stopped_rxqs) +
+ 			rx_base_stats_idx;
+ 		max_tx_stats_idx = NIC_TX_STATS_REPORT_NUM *
+-			num_tx_queues +
++			(num_tx_queues - num_stopped_txqs) +
+ 			max_rx_stats_idx;
+ 	}
+ 	/* Preprocess the stats report for rx, map queue id to start index */
+@@ -291,6 +309,10 @@ gve_get_ethtool_stats(struct net_device *netdev,
+ 			skip_nic_stats = true;
+ 			break;
+ 		}
++		if (queue_id < 0 || queue_id >= priv->rx_cfg.num_queues) {
++			net_err_ratelimited("Invalid rxq id in NIC stats\n");
++			continue;
++		}
+ 		rx_qid_to_stats_idx[queue_id] = stats_idx;
+ 	}
+ 	/* walk RX rings */
+@@ -327,11 +349,11 @@ gve_get_ethtool_stats(struct net_device *netdev,
+ 			data[i++] = rx->rx_copybreak_pkt;
+ 			data[i++] = rx->rx_copied_pkt;
+ 			/* stats from NIC */
+-			if (skip_nic_stats) {
++			stats_idx = rx_qid_to_stats_idx[ring];
++			if (skip_nic_stats || stats_idx < 0) {
+ 				/* skip NIC rx stats */
+ 				i += NIC_RX_STATS_REPORT_NUM;
+ 			} else {
+-				stats_idx = rx_qid_to_stats_idx[ring];
+ 				for (j = 0; j < NIC_RX_STATS_REPORT_NUM; j++) {
+ 					u64 value =
+ 						be64_to_cpu(report_stats[stats_idx + j].value);
+@@ -367,6 +389,10 @@ gve_get_ethtool_stats(struct net_device *netdev,
+ 			skip_nic_stats = true;
+ 			break;
+ 		}
++		if (queue_id < 0 || queue_id >= num_tx_queues) {
++			net_err_ratelimited("Invalid txq id in NIC stats\n");
++			continue;
++		}
+ 		tx_qid_to_stats_idx[queue_id] = stats_idx;
+ 	}
+ 	/* walk TX rings */
+@@ -400,11 +426,11 @@ gve_get_ethtool_stats(struct net_device *netdev,
+ 			data[i++] = gve_tx_load_event_counter(priv, tx);
+ 			data[i++] = tx->dma_mapping_error;
+ 			/* stats from NIC */
+-			if (skip_nic_stats) {
++			stats_idx = tx_qid_to_stats_idx[ring];
++			if (skip_nic_stats || stats_idx < 0) {
+ 				/* skip NIC tx stats */
+ 				i += NIC_TX_STATS_REPORT_NUM;
+ 			} else {
+-				stats_idx = tx_qid_to_stats_idx[ring];
+ 				for (j = 0; j < NIC_TX_STATS_REPORT_NUM; j++) {
+ 					u64 value =
+ 						be64_to_cpu(report_stats[stats_idx + j].value);
+-- 
+2.53.0
+

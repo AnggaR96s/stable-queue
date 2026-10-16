@@ -1,0 +1,152 @@
+From 3c08c3f1df64135f677bb5e444ce4a3d85d9161e Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 5 Jun 2026 13:06:10 -0500
+Subject: cxl: Fix CXL_HEADERLOG_SIZE to match RAS Capability size
+
+From: Terry Bowman <terry.bowman@amd.com>
+
+[ Upstream commit c268f949e219f9e179558e836f457f6c5fbec416 ]
+
+The CXL r4.0 8.2.4.17.7 RAS Capability Structure has total length 0x58
+bytes (CXL_RAS_CAPABILITY_LENGTH); the Header Log occupies the trailing
+64 bytes at offset 0x18.  CXL_HEADERLOG_SIZE was defined as SZ_512,
+eight times the actual on-device size.
+
+header_log_copy() reads CXL_HEADERLOG_SIZE_U32 (128) dwords from the
+RAS capability iomap, overrunning the 88-byte mapping by 448 bytes.
+The cxl_aer_uncorrectable_error trace event memcpy()s CXL_HEADERLOG_SIZE
+(512) bytes from its source.  For the CPER caller the source is
+struct cxl_ras_capability_regs::header_log[16] (64 bytes) embedded in a
+stack-local cxl_cper_prot_err_work_data, so the memcpy reads 448 bytes
+of kernel stack into the trace event ring buffer where userspace can
+read it via tracefs.
+
+Set CXL_HEADERLOG_SIZE to 64 and derive CXL_HEADERLOG_SIZE_U32 from it,
+bringing all iomap readers into agreement on 16 dwords.  Userspace tools
+such as rasdaemon have grown a dependency on the buggy 512-byte (128 u32)
+header_log layout in the cxl_aer_uncorrectable_error trace event.  Add
+CXL_HEADERLOG_TRACE_SIZE_U32 = 128 and use it for the trace event
+__array and its memcpy to preserve that ABI.  Both callers now pass a
+zero-filled u32[CXL_HEADERLOG_TRACE_SIZE_U32] staging buffer with only
+the first CXL_HEADERLOG_SIZE_U32 (16) entries populated from hardware;
+the remaining 112 u32s are zero-padded, keeping the 512-byte trace ring
+buffer layout intact.
+
+[ dj: Replaced 64 with SZ_64 per RichardC ]
+
+Fixes: 36f257e3b0ba ("acpi/ghes, cxl/pci: Process CXL CPER Protocol Errors")
+Fixes: 2905cb5236cb ("cxl/pci: Add (hopeful) error handling support")
+Cc: stable@vger.kernel.org
+Reported-by: Sashiko
+Signed-off-by: Terry Bowman <terry.bowman@amd.com>
+Reviewed-by: Alison Schofield <alison.schofield@intel.com>
+Reviewed-by: Dave Jiang <dave.jiang@intel.com>
+Reviewed-by: Ben Cheatham <benjamin.cheatham@amd.com>
+Reviewed-by: Richard Cheng <icheng@nvidia.com>
+Link: https://patch.msgid.link/20260605180610.2249458-1-terry.bowman@amd.com
+Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/cxl/core/pci.c   | 10 +++++++---
+ drivers/cxl/core/trace.h | 12 ++++++++----
+ drivers/cxl/cxl.h        | 14 ++++++++++++--
+ 3 files changed, 27 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/cxl/core/pci.c b/drivers/cxl/core/pci.c
+index 6edfd05466737..e89d4a9827155 100644
+--- a/drivers/cxl/core/pci.c
++++ b/drivers/cxl/core/pci.c
+@@ -11,6 +11,10 @@
+ #include "core.h"
+ #include "trace.h"
+ 
++/* Check that UCE header definition is maintained to keep ABI intact  */
++static_assert(CXL_HEADERLOG_TRACE_SIZE_U32 == 128,
++	      "rasdaemon ABI requires exactly 128 u32s");
++
+ /**
+  * DOC: cxl core pci
+  *
+@@ -663,12 +667,12 @@ static void header_log_copy(struct cxl_dev_state *cxlds, u32 *log)
+ {
+ 	void __iomem *addr;
+ 	u32 *log_addr;
+-	int i, log_u32_size = CXL_HEADERLOG_SIZE / sizeof(u32);
++	int i;
+ 
+ 	addr = cxlds->regs.ras + CXL_RAS_HEADER_LOG_OFFSET;
+ 	log_addr = log;
+ 
+-	for (i = 0; i < log_u32_size; i++) {
++	for (i = 0; i < CXL_HEADERLOG_SIZE_U32; i++) {
+ 		*log_addr = readl(addr);
+ 		log_addr++;
+ 		addr += sizeof(u32);
+@@ -681,7 +685,7 @@ static void header_log_copy(struct cxl_dev_state *cxlds, u32 *log)
+  */
+ static bool cxl_report_and_clear(struct cxl_dev_state *cxlds)
+ {
+-	u32 hl[CXL_HEADERLOG_SIZE_U32];
++	u32 hl[CXL_HEADERLOG_TRACE_SIZE_U32] = {};
+ 	void __iomem *addr;
+ 	u32 status;
+ 	u32 fe;
+diff --git a/drivers/cxl/core/trace.h b/drivers/cxl/core/trace.h
+index 1e1e50d39bf63..54b72f943744b 100644
+--- a/drivers/cxl/core/trace.h
++++ b/drivers/cxl/core/trace.h
+@@ -57,7 +57,7 @@ TRACE_EVENT(cxl_aer_uncorrectable_error,
+ 		__field(u64, serial)
+ 		__field(u32, status)
+ 		__field(u32, first_error)
+-		__array(u32, header_log, CXL_HEADERLOG_SIZE_U32)
++		__array(u32, header_log, CXL_HEADERLOG_TRACE_SIZE_U32)
+ 	),
+ 	TP_fast_assign(
+ 		__assign_str(memdev, dev_name(&cxlmd->dev));
+@@ -66,10 +66,14 @@ TRACE_EVENT(cxl_aer_uncorrectable_error,
+ 		__entry->status = status;
+ 		__entry->first_error = fe;
+ 		/*
+-		 * Embed the 512B headerlog data for user app retrieval and
+-		 * parsing, but no need to print this in the trace buffer.
++		 * Embed headerlog data for user app retrieval and parsing,
++		 * but no need to print in the trace buffer. Only
++		 * CXL_HEADERLOG_SIZE_U32 (16) dwords are hardware data;
++		 * the remaining entries preserve the 512-byte ABI layout
++		 * rasdaemon depends on and are zero-filled by the caller.
+ 		 */
+-		memcpy(__entry->header_log, hl, CXL_HEADERLOG_SIZE);
++		memcpy(__entry->header_log, hl,
++			CXL_HEADERLOG_TRACE_SIZE_U32 * sizeof(u32));
+ 	),
+ 	TP_printk("memdev=%s host=%s serial=%lld: status: '%s' first_error: '%s'",
+ 		  __get_str(memdev), __get_str(host), __entry->serial,
+diff --git a/drivers/cxl/cxl.h b/drivers/cxl/cxl.h
+index f3260ca17522a..9dcc8a4d5128a 100644
+--- a/drivers/cxl/cxl.h
++++ b/drivers/cxl/cxl.h
+@@ -143,8 +143,18 @@ static inline int ways_to_eiw(unsigned int ways, u8 *eiw)
+ #define CXL_RAS_CAP_CONTROL_FE_MASK GENMASK(5, 0)
+ #define CXL_RAS_HEADER_LOG_OFFSET 0x18
+ #define CXL_RAS_CAPABILITY_LENGTH 0x58
+-#define CXL_HEADERLOG_SIZE SZ_512
+-#define CXL_HEADERLOG_SIZE_U32 SZ_512 / sizeof(u32)
++#define CXL_HEADERLOG_SIZE SZ_64
++#define CXL_HEADERLOG_SIZE_U32 (CXL_HEADERLOG_SIZE / sizeof(u32))
++
++/*
++ * The RAS UCE trace event header array was originally sized at SZ_512/sizeof(u32)
++ * = 128 u32s due to a bug. Userspace tools (rasdaemon) have grown a dependency
++ * on that 512-byte layout. Keep the trace array at 128 u32s to preserve the
++ * ABI; only CXL_HEADERLOG_SIZE_U32 (16) dwords are valid hardware data, the
++ * remainder are zero-filled.
++ */
++#define CXL_HEADERLOG_TRACE_SIZE SZ_512
++#define CXL_HEADERLOG_TRACE_SIZE_U32 (CXL_HEADERLOG_TRACE_SIZE / sizeof(u32))
+ 
+ /* CXL 2.0 8.2.8.1 Device Capabilities Array Register */
+ #define CXLDEV_CAP_ARRAY_OFFSET 0x0
+-- 
+2.53.0
+

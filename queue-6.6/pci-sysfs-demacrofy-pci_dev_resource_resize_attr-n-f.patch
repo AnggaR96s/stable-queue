@@ -1,0 +1,194 @@
+From 6d2e9e715189a1eb326067101865170d56b7c7d1 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 22 Feb 2024 13:46:06 +0200
+Subject: PCI/sysfs: Demacrofy pci_dev_resource_resize_attr(n) functions
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+From: Ilpo Järvinen <ilpo.jarvinen@linux.intel.com>
+
+[ Upstream commit f6c73999837820f98519bf0146df44e58f20f89c ]
+
+pci_dev_resource_resize_attr(n) macro is invoked for six resources,
+creating a large footprint function for each resource.
+
+Rework the macro to only create a function that calls a helper function so
+the compiler can decide if it warrants to inline the function or not.
+
+With x86_64 defconfig, this saves roughly 2.5kB:
+
+  $ scripts/bloat-o-meter drivers/pci/pci-sysfs.o{.old,.new}
+  add/remove: 1/0 grow/shrink: 0/6 up/down: 512/-2934 (-2422)
+  Function                                     old     new   delta
+  __resource_resize_store                        -     512    +512
+  resource5_resize_store                       503      14    -489
+  resource4_resize_store                       503      14    -489
+  resource3_resize_store                       503      14    -489
+  resource2_resize_store                       503      14    -489
+  resource1_resize_store                       503      14    -489
+  resource0_resize_store                       500      11    -489
+  Total: Before=13399, After=10977, chg -18.08%
+
+(The compiler seemingly chose to still inline __resource_resize_show()
+which is fine, those functions are not very complex/large.)
+
+Link: https://lore.kernel.org/r/20240222114607.1837-1-ilpo.jarvinen@linux.intel.com
+Signed-off-by: Ilpo Järvinen <ilpo.jarvinen@linux.intel.com>
+Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+
+Adapt the helper to this tree's existing resize logic: keep the
+four-argument pci_resize_resource() call and omit the loop that releases
+same-flag BARs, which is not present here.
+
+Stable-dep-of: 25ec7f57dece ("PCI/sysfs: Add CAP_SYS_ADMIN check to __resource_resize_store()")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/pci/pci-sysfs.c | 122 ++++++++++++++++++++++------------------
+ 1 file changed, 66 insertions(+), 56 deletions(-)
+
+diff --git a/drivers/pci/pci-sysfs.c b/drivers/pci/pci-sysfs.c
+index 857bfe349cf5c..087fe400e6372 100644
+--- a/drivers/pci/pci-sysfs.c
++++ b/drivers/pci/pci-sysfs.c
+@@ -1409,71 +1409,81 @@ static const struct attribute_group pci_dev_reset_attr_group = {
+ 	.is_visible = pci_dev_reset_attr_is_visible,
+ };
+ 
++static ssize_t __resource_resize_show(struct device *dev, int n, char *buf)
++{
++	struct pci_dev *pdev = to_pci_dev(dev);
++	ssize_t ret;
++
++	pci_config_pm_runtime_get(pdev);
++
++	ret = sysfs_emit(buf, "%016llx\n",
++			 (u64)pci_rebar_get_possible_sizes(pdev, n));
++
++	pci_config_pm_runtime_put(pdev);
++
++	return ret;
++}
++
++static ssize_t __resource_resize_store(struct device *dev, int n,
++				       const char *buf, size_t count)
++{
++	struct pci_dev *pdev = to_pci_dev(dev);
++	unsigned long size;
++	int ret;
++	u16 cmd;
++
++	if (kstrtoul(buf, 0, &size) < 0)
++		return -EINVAL;
++
++	device_lock(dev);
++	if (dev->driver) {
++		ret = -EBUSY;
++		goto unlock;
++	}
++
++	pci_config_pm_runtime_get(pdev);
++
++	if ((pdev->class >> 8) == PCI_CLASS_DISPLAY_VGA) {
++		ret = aperture_remove_conflicting_pci_devices(pdev,
++						"resourceN_resize");
++		if (ret)
++			goto pm_put;
++	}
++
++	pci_read_config_word(pdev, PCI_COMMAND, &cmd);
++	pci_write_config_word(pdev, PCI_COMMAND,
++			      cmd & ~PCI_COMMAND_MEMORY);
++
++	pci_remove_resource_files(pdev);
++
++	ret = pci_resize_resource(pdev, n, size, 0);
++
++	pci_assign_unassigned_bus_resources(pdev->bus);
++
++	if (pci_create_resource_files(pdev))
++		pci_warn(pdev, "Failed to recreate resource files after BAR resizing\n");
++
++	pci_write_config_word(pdev, PCI_COMMAND, cmd);
++pm_put:
++	pci_config_pm_runtime_put(pdev);
++unlock:
++	device_unlock(dev);
++
++	return ret ? ret : count;
++}
++
+ #define pci_dev_resource_resize_attr(n)					\
+ static ssize_t resource##n##_resize_show(struct device *dev,		\
+ 					 struct device_attribute *attr,	\
+-					 char * buf)			\
++					 char *buf)			\
+ {									\
+-	struct pci_dev *pdev = to_pci_dev(dev);				\
+-	ssize_t ret;							\
+-									\
+-	pci_config_pm_runtime_get(pdev);				\
+-									\
+-	ret = sysfs_emit(buf, "%016llx\n",				\
+-			 (u64)pci_rebar_get_possible_sizes(pdev, n));	\
+-									\
+-	pci_config_pm_runtime_put(pdev);				\
+-									\
+-	return ret;							\
++	return __resource_resize_show(dev, n, buf);			\
+ }									\
+-									\
+ static ssize_t resource##n##_resize_store(struct device *dev,		\
+ 					  struct device_attribute *attr,\
+ 					  const char *buf, size_t count)\
+ {									\
+-	struct pci_dev *pdev = to_pci_dev(dev);				\
+-	unsigned long size;						\
+-	int ret;							\
+-	u16 cmd;							\
+-									\
+-	if (kstrtoul(buf, 0, &size) < 0)				\
+-		return -EINVAL;						\
+-									\
+-	device_lock(dev);						\
+-	if (dev->driver) {						\
+-		ret = -EBUSY;						\
+-		goto unlock;						\
+-	}								\
+-									\
+-	pci_config_pm_runtime_get(pdev);				\
+-									\
+-	if ((pdev->class >> 8) == PCI_CLASS_DISPLAY_VGA) {		\
+-		ret = aperture_remove_conflicting_pci_devices(pdev,	\
+-						"resourceN_resize");	\
+-		if (ret)						\
+-			goto pm_put;					\
+-	}								\
+-									\
+-	pci_read_config_word(pdev, PCI_COMMAND, &cmd);			\
+-	pci_write_config_word(pdev, PCI_COMMAND,			\
+-			      cmd & ~PCI_COMMAND_MEMORY);		\
+-									\
+-	pci_remove_resource_files(pdev);				\
+-									\
+-	ret = pci_resize_resource(pdev, n, size, 0);			\
+-									\
+-	pci_assign_unassigned_bus_resources(pdev->bus);			\
+-									\
+-	if (pci_create_resource_files(pdev))				\
+-		pci_warn(pdev, "Failed to recreate resource files after BAR resizing\n");\
+-									\
+-	pci_write_config_word(pdev, PCI_COMMAND, cmd);			\
+-pm_put:									\
+-	pci_config_pm_runtime_put(pdev);				\
+-unlock:									\
+-	device_unlock(dev);						\
+-									\
+-	return ret ? ret : count;					\
++	return __resource_resize_store(dev, n, buf, count);		\
+ }									\
+ static DEVICE_ATTR_RW(resource##n##_resize)
+ 
+-- 
+2.53.0
+

@@ -1,0 +1,148 @@
+From b1349c884adf6c200f8f1ec9c5a293d2fa6897e4 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 11 Apr 2025 13:52:31 -0700
+Subject: net: Add ops_undo_single for module load/unload.
+
+From: Kuniyuki Iwashima <kuniyu@amazon.com>
+
+[ Upstream commit fed176bf3143362ac9935e3964949ab6a5c3286b ]
+
+If ops_init() fails while loading a module or we unload the
+module, free_exit_list() rolls back the changes.
+
+The rollback sequence is the same as ops_undo_list().
+
+The ops is already removed from pernet_list before calling
+free_exit_list().  If we link the ops to a temporary list,
+we can reuse ops_undo_list().
+
+Let's add a wrapper of ops_undo_list() and use it instead
+of free_exit_list().
+
+Now, we have the central place to roll back ops_init().
+
+Signed-off-by: Kuniyuki Iwashima <kuniyu@amazon.com>
+Reviewed-by: Sabrina Dubroca <sd@queasysnail.net>
+Link: https://patch.msgid.link/20250411205258.63164-3-kuniyu@amazon.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Stable-dep-of: 60a25ef8dacb ("wireguard: device: use exit_rtnl callback instead of manual rtnl_lock in pre_exit")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ net/core/net_namespace.c | 54 ++++++++++++++++++----------------------
+ 1 file changed, 24 insertions(+), 30 deletions(-)
+
+diff --git a/net/core/net_namespace.c b/net/core/net_namespace.c
+index 25f84a3764f71..f2171ff0e7b09 100644
+--- a/net/core/net_namespace.c
++++ b/net/core/net_namespace.c
+@@ -236,6 +236,17 @@ static void ops_undo_list(const struct list_head *ops_list,
+ 		ops_free_list(ops, net_exit_list);
+ }
+ 
++static void ops_undo_single(struct pernet_operations *ops,
++			    struct list_head *net_exit_list)
++{
++	bool hold_rtnl = !!ops->exit_batch_rtnl;
++	LIST_HEAD(ops_list);
++
++	list_add(&ops->list, &ops_list);
++	ops_undo_list(&ops_list, NULL, net_exit_list, false, hold_rtnl);
++	list_del(&ops->list);
++}
++
+ /* should be called with nsid_lock held */
+ static int alloc_netid(struct net *net, struct net *peer, int reqid)
+ {
+@@ -1226,31 +1237,13 @@ void __init net_ns_init(void)
+ 		      RTNL_FLAG_DUMP_UNLOCKED);
+ }
+ 
+-static void free_exit_list(struct pernet_operations *ops, struct list_head *net_exit_list)
+-{
+-	ops_pre_exit_list(ops, net_exit_list);
+-	synchronize_rcu();
+-
+-	if (ops->exit_batch_rtnl) {
+-		LIST_HEAD(dev_kill_list);
+-
+-		rtnl_lock();
+-		ops->exit_batch_rtnl(net_exit_list, &dev_kill_list);
+-		unregister_netdevice_many(&dev_kill_list);
+-		rtnl_unlock();
+-	}
+-	ops_exit_list(ops, net_exit_list);
+-
+-	ops_free_list(ops, net_exit_list);
+-}
+-
+ #ifdef CONFIG_NET_NS
+ static int __register_pernet_operations(struct list_head *list,
+ 					struct pernet_operations *ops)
+ {
++	LIST_HEAD(net_exit_list);
+ 	struct net *net;
+ 	int error;
+-	LIST_HEAD(net_exit_list);
+ 
+ 	list_add_tail(&ops->list, list);
+ 	if (ops->init || ops->id) {
+@@ -1269,21 +1262,21 @@ static int __register_pernet_operations(struct list_head *list,
+ out_undo:
+ 	/* If I have an error cleanup all namespaces I initialized */
+ 	list_del(&ops->list);
+-	free_exit_list(ops, &net_exit_list);
++	ops_undo_single(ops, &net_exit_list);
+ 	return error;
+ }
+ 
+ static void __unregister_pernet_operations(struct pernet_operations *ops)
+ {
+-	struct net *net;
+ 	LIST_HEAD(net_exit_list);
++	struct net *net;
+ 
+-	list_del(&ops->list);
+ 	/* See comment in __register_pernet_operations() */
+ 	for_each_net(net)
+ 		list_add_tail(&net->exit_list, &net_exit_list);
+ 
+-	free_exit_list(ops, &net_exit_list);
++	list_del(&ops->list);
++	ops_undo_single(ops, &net_exit_list);
+ }
+ 
+ #else
+@@ -1291,22 +1284,23 @@ static void __unregister_pernet_operations(struct pernet_operations *ops)
+ static int __register_pernet_operations(struct list_head *list,
+ 					struct pernet_operations *ops)
+ {
+-	if (!init_net_initialized) {
+-		list_add_tail(&ops->list, list);
++	list_add_tail(&ops->list, list);
++
++	if (!init_net_initialized)
+ 		return 0;
+-	}
+ 
+ 	return ops_init(ops, &init_net);
+ }
+ 
+ static void __unregister_pernet_operations(struct pernet_operations *ops)
+ {
+-	if (!init_net_initialized) {
+-		list_del(&ops->list);
+-	} else {
++	list_del(&ops->list);
++
++	if (init_net_initialized) {
+ 		LIST_HEAD(net_exit_list);
++
+ 		list_add(&init_net.exit_list, &net_exit_list);
+-		free_exit_list(ops, &net_exit_list);
++		ops_undo_single(ops, &net_exit_list);
+ 	}
+ }
+ 
+-- 
+2.53.0
+

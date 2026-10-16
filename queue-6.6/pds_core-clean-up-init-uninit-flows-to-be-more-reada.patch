@@ -1,0 +1,221 @@
+From f86ba9f1c422410ccfccaa31f74ca3d97663c6f2 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 2 Feb 2024 11:59:11 -0800
+Subject: pds_core: Clean up init/uninit flows to be more readable
+
+From: Brett Creeley <brett.creeley@amd.com>
+
+[ Upstream commit 792d36ccc163ac4aa606b3f5ec31cfd2c3a365de ]
+
+The setup and teardown flows are somewhat hard to follow regarding
+pdsc_core_init()/pdsc_dev_init() and their corresponding teardown
+flows being in pdsc_teardown(). Improve the readability by adding
+new pdsc_core_uninit()/pdsc_dev_unint() functions that mirror their
+init counterparts. Also, move the notify and admin qcq allocations
+into pdsc_core_init(), so they can be freed in pdsc_core_uninit().
+
+Signed-off-by: Brett Creeley <brett.creeley@amd.com>
+Reviewed-by: Shannon Nelson <shannon.nelson@amd.com>
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Stable-dep-of: 0ad134881508 ("pds_core: fix use-after-free on workqueue during remove")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/net/ethernet/amd/pds_core/core.c | 81 ++++++++++++------------
+ drivers/net/ethernet/amd/pds_core/core.h |  1 +
+ drivers/net/ethernet/amd/pds_core/dev.c  | 16 +++++
+ 3 files changed, 58 insertions(+), 40 deletions(-)
+
+diff --git a/drivers/net/ethernet/amd/pds_core/core.c b/drivers/net/ethernet/amd/pds_core/core.c
+index 8a9519e36de14..89e27f8b90f74 100644
+--- a/drivers/net/ethernet/amd/pds_core/core.c
++++ b/drivers/net/ethernet/amd/pds_core/core.c
+@@ -305,6 +305,17 @@ int pdsc_qcq_alloc(struct pdsc *pdsc, unsigned int type, unsigned int index,
+ 	return err;
+ }
+ 
++static void pdsc_core_uninit(struct pdsc *pdsc)
++{
++	pdsc_qcq_free(pdsc, &pdsc->notifyqcq);
++	pdsc_qcq_free(pdsc, &pdsc->adminqcq);
++
++	if (pdsc->kern_dbpage) {
++		iounmap(pdsc->kern_dbpage);
++		pdsc->kern_dbpage = NULL;
++	}
++}
++
+ static int pdsc_core_init(struct pdsc *pdsc)
+ {
+ 	union pds_core_dev_comp comp = {};
+@@ -315,9 +326,29 @@ static int pdsc_core_init(struct pdsc *pdsc)
+ 	struct pds_core_dev_init_data_in cidi;
+ 	u32 dbid_count;
+ 	u32 dbpage_num;
++	int numdescs;
+ 	size_t sz;
+ 	int err;
+ 
++	numdescs = PDSC_ADMINQ_MAX_LENGTH;
++	err = pdsc_qcq_alloc(pdsc, PDS_CORE_QTYPE_ADMINQ, 0, "adminq",
++			     PDS_CORE_QCQ_F_CORE | PDS_CORE_QCQ_F_INTR,
++			     numdescs,
++			     sizeof(union pds_core_adminq_cmd),
++			     sizeof(union pds_core_adminq_comp),
++			     0, &pdsc->adminqcq);
++	if (err)
++		return err;
++
++	err = pdsc_qcq_alloc(pdsc, PDS_CORE_QTYPE_NOTIFYQ, 0, "notifyq",
++			     PDS_CORE_QCQ_F_NOTIFYQ,
++			     PDSC_NOTIFYQ_LENGTH,
++			     sizeof(struct pds_core_notifyq_cmd),
++			     sizeof(union pds_core_notifyq_comp),
++			     0, &pdsc->notifyqcq);
++	if (err)
++		goto err_out_uninit;
++
+ 	cidi.adminq_q_base = cpu_to_le64(pdsc->adminqcq.q_base_pa);
+ 	cidi.adminq_cq_base = cpu_to_le64(pdsc->adminqcq.cq_base_pa);
+ 	cidi.notifyq_cq_base = cpu_to_le64(pdsc->notifyqcq.cq.base_pa);
+@@ -341,7 +372,7 @@ static int pdsc_core_init(struct pdsc *pdsc)
+ 	if (err) {
+ 		dev_err(pdsc->dev, "Device init command failed: %pe\n",
+ 			ERR_PTR(err));
+-		return err;
++		goto err_out_uninit;
+ 	}
+ 
+ 	pdsc->hw_index = le32_to_cpu(cido.core_hw_index);
+@@ -351,7 +382,8 @@ static int pdsc_core_init(struct pdsc *pdsc)
+ 	pdsc->kern_dbpage = pdsc_map_dbpage(pdsc, dbpage_num);
+ 	if (!pdsc->kern_dbpage) {
+ 		dev_err(pdsc->dev, "Cannot map dbpage, aborting\n");
+-		return -ENOMEM;
++		err = -ENOMEM;
++		goto err_out_uninit;
+ 	}
+ 
+ 	pdsc->adminqcq.q.hw_type = cido.adminq_hw_type;
+@@ -364,6 +396,10 @@ static int pdsc_core_init(struct pdsc *pdsc)
+ 
+ 	pdsc->last_eid = 0;
+ 
++	return 0;
++
++err_out_uninit:
++	pdsc_core_uninit(pdsc);
+ 	return err;
+ }
+ 
+@@ -406,32 +442,12 @@ static int pdsc_viftypes_init(struct pdsc *pdsc)
+ 
+ int pdsc_setup(struct pdsc *pdsc, bool init)
+ {
+-	int numdescs;
+ 	int err;
+ 
+ 	err = pdsc_dev_init(pdsc);
+ 	if (err)
+ 		return err;
+ 
+-	numdescs = PDSC_ADMINQ_MAX_LENGTH;
+-	err = pdsc_qcq_alloc(pdsc, PDS_CORE_QTYPE_ADMINQ, 0, "adminq",
+-			     PDS_CORE_QCQ_F_CORE | PDS_CORE_QCQ_F_INTR,
+-			     numdescs,
+-			     sizeof(union pds_core_adminq_cmd),
+-			     sizeof(union pds_core_adminq_comp),
+-			     0, &pdsc->adminqcq);
+-	if (err)
+-		goto err_out_teardown;
+-
+-	err = pdsc_qcq_alloc(pdsc, PDS_CORE_QTYPE_NOTIFYQ, 0, "notifyq",
+-			     PDS_CORE_QCQ_F_NOTIFYQ,
+-			     PDSC_NOTIFYQ_LENGTH,
+-			     sizeof(struct pds_core_notifyq_cmd),
+-			     sizeof(union pds_core_notifyq_comp),
+-			     0, &pdsc->notifyqcq);
+-	if (err)
+-		goto err_out_teardown;
+-
+ 	/* Set up the Core with the AdminQ and NotifyQ info */
+ 	err = pdsc_core_init(pdsc);
+ 	if (err)
+@@ -456,33 +472,18 @@ int pdsc_setup(struct pdsc *pdsc, bool init)
+ 
+ void pdsc_teardown(struct pdsc *pdsc, bool removing)
+ {
+-	int i;
+-
+ 	if (!pdsc->pdev->is_virtfn)
+ 		pdsc_devcmd_reset(pdsc);
+ 	if (pdsc->adminqcq.work.func)
+ 		cancel_work_sync(&pdsc->adminqcq.work);
+-	pdsc_qcq_free(pdsc, &pdsc->notifyqcq);
+-	pdsc_qcq_free(pdsc, &pdsc->adminqcq);
++
++	pdsc_core_uninit(pdsc);
+ 
+ 	kfree(pdsc->viftype_status);
+ 	pdsc->viftype_status = NULL;
+ 
+-	if (pdsc->intr_info) {
+-		for (i = 0; i < pdsc->nintrs; i++)
+-			pdsc_intr_free(pdsc, i);
+-
+-		kfree(pdsc->intr_info);
+-		pdsc->intr_info = NULL;
+-		pdsc->nintrs = 0;
+-	}
+-
+-	if (pdsc->kern_dbpage) {
+-		iounmap(pdsc->kern_dbpage);
+-		pdsc->kern_dbpage = NULL;
+-	}
++	pdsc_dev_uninit(pdsc);
+ 
+-	pci_free_irq_vectors(pdsc->pdev);
+ 	set_bit(PDSC_S_FW_DEAD, &pdsc->state);
+ }
+ 
+diff --git a/drivers/net/ethernet/amd/pds_core/core.h b/drivers/net/ethernet/amd/pds_core/core.h
+index 4213714085031..b61d7c5afda19 100644
+--- a/drivers/net/ethernet/amd/pds_core/core.h
++++ b/drivers/net/ethernet/amd/pds_core/core.h
+@@ -282,6 +282,7 @@ int pdsc_devcmd_locked(struct pdsc *pdsc, union pds_core_dev_cmd *cmd,
+ int pdsc_devcmd_init(struct pdsc *pdsc);
+ int pdsc_devcmd_reset(struct pdsc *pdsc);
+ int pdsc_dev_init(struct pdsc *pdsc);
++void pdsc_dev_uninit(struct pdsc *pdsc);
+ 
+ int pdsc_intr_alloc(struct pdsc *pdsc, char *name,
+ 		    irq_handler_t handler, void *data);
+diff --git a/drivers/net/ethernet/amd/pds_core/dev.c b/drivers/net/ethernet/amd/pds_core/dev.c
+index 0e9398503a04d..68f44c4a4c42c 100644
+--- a/drivers/net/ethernet/amd/pds_core/dev.c
++++ b/drivers/net/ethernet/amd/pds_core/dev.c
+@@ -323,6 +323,22 @@ static int pdsc_identify(struct pdsc *pdsc)
+ 	return 0;
+ }
+ 
++void pdsc_dev_uninit(struct pdsc *pdsc)
++{
++	if (pdsc->intr_info) {
++		int i;
++
++		for (i = 0; i < pdsc->nintrs; i++)
++			pdsc_intr_free(pdsc, i);
++
++		kfree(pdsc->intr_info);
++		pdsc->intr_info = NULL;
++		pdsc->nintrs = 0;
++	}
++
++	pci_free_irq_vectors(pdsc->pdev);
++}
++
+ int pdsc_dev_init(struct pdsc *pdsc)
+ {
+ 	unsigned int nintrs;
+-- 
+2.53.0
+

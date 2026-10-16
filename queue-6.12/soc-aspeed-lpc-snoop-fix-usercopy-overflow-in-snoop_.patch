@@ -1,0 +1,122 @@
+From 5055ff5afcfaf8ac09b4536d8282a5d7a5698a28 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 12 Jun 2026 19:07:43 +0000
+Subject: soc: aspeed: lpc-snoop: Fix usercopy overflow in snoop_file_read
+
+From: Karthikeyan KS <karthiproffesional@gmail.com>
+
+[ Upstream commit 1acef6d85bfd98bd9dfe1f08bffa397a4dda8a6f ]
+
+put_fifo_with_discard() acts as both producer and consumer on the kfifo:
+it calls kfifo_skip() (advances out) and kfifo_put() (advances in) from
+the IRQ handler without synchronizing with snoop_file_read(), which also
+consumes via kfifo_to_user(). On SMP systems this concurrent access can
+leave (in - out) larger than the ring buffer, so __kfifo_to_user()'s clamp
+to (in - out) is ineffective and kfifo_copy_to_user() can attempt a
+copy_to_user() past the kmalloc-2k backing store:
+
+  usercopy: Kernel memory exposure attempt detected from SLUB object
+  'kmalloc-2k' (offset 0, size 2049)!
+  kernel BUG at mm/usercopy.c!
+  Call trace:
+   usercopy_abort
+   __check_heap_object
+   __check_object_size
+   kfifo_copy_to_user
+   __kfifo_to_user
+   snoop_file_read
+   vfs_read
+
+Serialize kfifo access with a per-channel spinlock shared between the
+IRQ handler (producer) and the file reader (consumer).  Annotate @fifo
+with __guarded_by(&lock) and opt the driver into context analysis so the
+compiler enforces that all fifo access holds the lock.
+
+Fixes: 3772e5da4454 ("drivers/misc: Aspeed LPC snoop output using misc chardev")
+Signed-off-by: Karthikeyan KS <karthiproffesional@gmail.com>
+Signed-off-by: Andrew Jeffery <andrew@codeconstruct.com.au>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/soc/aspeed/aspeed-lpc-snoop.c | 31 ++++++++++++++++++++-------
+ 1 file changed, 23 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/soc/aspeed/aspeed-lpc-snoop.c b/drivers/soc/aspeed/aspeed-lpc-snoop.c
+index fc3a2c41cc107..35f58eb0f134c 100644
+--- a/drivers/soc/aspeed/aspeed-lpc-snoop.c
++++ b/drivers/soc/aspeed/aspeed-lpc-snoop.c
+@@ -11,6 +11,7 @@
+  */
+ 
+ #include <linux/bitops.h>
++#include <linux/cleanup.h>
+ #include <linux/clk.h>
+ #include <linux/interrupt.h>
+ #include <linux/fs.h>
+@@ -59,6 +60,7 @@ struct aspeed_lpc_snoop_model_data {
+ 
+ struct aspeed_lpc_snoop_channel {
+ 	bool enabled;
++	spinlock_t		lock;
+ 	struct kfifo		fifo;
+ 	wait_queue_head_t	wq;
+ 	struct miscdevice	miscdev;
+@@ -82,6 +84,7 @@ static ssize_t snoop_file_read(struct file *file, char __user *buffer,
+ 				size_t count, loff_t *ppos)
+ {
+ 	struct aspeed_lpc_snoop_channel *chan = snoop_file_to_chan(file);
++	u8 *buf __free(kfree) = NULL;
+ 	unsigned int copied;
+ 	int ret = 0;
+ 
+@@ -93,9 +96,16 @@ static ssize_t snoop_file_read(struct file *file, char __user *buffer,
+ 		if (ret == -ERESTARTSYS)
+ 			return -EINTR;
+ 	}
+-	ret = kfifo_to_user(&chan->fifo, buffer, count, &copied);
+-	if (ret)
+-		return ret;
++
++	count = min_t(size_t, count, SNOOP_FIFO_SIZE);
++
++	buf = kmalloc(count, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++
++	copied = kfifo_out_spinlocked(&chan->fifo, buf, count, &chan->lock);
++	if (copied && copy_to_user(buffer, buf, copied))
++		return -EFAULT;
+ 
+ 	return copied;
+ }
+@@ -119,11 +129,13 @@ static const struct file_operations snoop_fops = {
+ /* Save a byte to a FIFO and discard the oldest byte if FIFO is full */
+ static void put_fifo_with_discard(struct aspeed_lpc_snoop_channel *chan, u8 val)
+ {
+-	if (!kfifo_initialized(&chan->fifo))
+-		return;
+-	if (kfifo_is_full(&chan->fifo))
+-		kfifo_skip(&chan->fifo);
+-	kfifo_put(&chan->fifo, val);
++	scoped_guard(spinlock, &chan->lock) {
++		if (!kfifo_initialized(&chan->fifo))
++			return;
++		if (kfifo_is_full(&chan->fifo))
++			kfifo_skip(&chan->fifo);
++		kfifo_put(&chan->fifo, val);
++	}
+ 	wake_up_interruptible(&chan->wq);
+ }
+ 
+@@ -292,6 +304,9 @@ static int aspeed_lpc_snoop_probe(struct platform_device *pdev)
+ 	if (!lpc_snoop)
+ 		return -ENOMEM;
+ 
++	spin_lock_init(&lpc_snoop->chan[0].lock);
++	spin_lock_init(&lpc_snoop->chan[1].lock);
++
+ 	np = pdev->dev.parent->of_node;
+ 	if (!of_device_is_compatible(np, "aspeed,ast2400-lpc-v2") &&
+ 	    !of_device_is_compatible(np, "aspeed,ast2500-lpc-v2") &&
+-- 
+2.53.0
+

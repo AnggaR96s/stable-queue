@@ -1,0 +1,163 @@
+From d25a50e7964a1688769f6e1e0e612b7cf5bbe71a Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 3 Mar 2026 00:33:57 +0000
+Subject: KVM: SVM: Add missing save/restore handling of LBR MSRs
+
+From: Yosry Ahmed <yosry@kernel.org>
+
+[ Upstream commit 3700f0788da6acf73b2df56690f4b201aa4aefd2 ]
+
+MSR_IA32_DEBUGCTLMSR and LBR MSRs are currently not enumerated by
+KVM_GET_MSR_INDEX_LIST, and LBR MSRs cannot be set with KVM_SET_MSRS. So
+save/restore is completely broken.
+
+Fix it by adding the MSRs to msrs_to_save_base, and allowing writes to
+LBR MSRs from userspace only (as they are read-only MSRs) if LBR
+virtualization is enabled.  Additionally, to correctly restore L1's LBRs
+while L2 is running, make sure the LBRs are copied from the captured
+VMCB01 save area in svm_copy_vmrun_state().
+
+Note, for VMX, this also fixes a flaw where MSR_IA32_DEBUGCTLMSR isn't
+reported as an MSR to save/restore.
+
+Note #2, over-reporting MSR_IA32_LASTxxx on Intel is ok, as KVM already
+handles unsupported reads and writes thanks to commit b5e2fec0ebc3 ("KVM:
+Ignore DEBUGCTL MSRs with no effect") (kvm_do_msr_access() will morph the
+unsupported userspace write into a nop).
+
+Fixes: 24e09cbf480a ("KVM: SVM: enable LBR virtualization")
+Cc: stable@vger.kernel.org
+Reported-by: Jim Mattson <jmattson@google.com>
+Signed-off-by: Yosry Ahmed <yosry@kernel.org>
+Link: https://patch.msgid.link/20260303003421.2185681-4-yosry@kernel.org
+[sean: guard with lbrv checks, massage changelog]
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ arch/x86/kvm/svm/nested.c |  9 +++++++++
+ arch/x86/kvm/svm/svm.c    | 42 ++++++++++++++++++++++++++++++++++-----
+ arch/x86/kvm/x86.c        | 13 ++++++++++++
+ 3 files changed, 59 insertions(+), 5 deletions(-)
+
+diff --git a/arch/x86/kvm/svm/nested.c b/arch/x86/kvm/svm/nested.c
+index 432d188b2f3c9..2e4db6602db11 100644
+--- a/arch/x86/kvm/svm/nested.c
++++ b/arch/x86/kvm/svm/nested.c
+@@ -973,6 +973,15 @@ void svm_copy_vmrun_state(struct vmcb_save_area *to_save,
+ 	to_save->rsp = from_save->rsp;
+ 	to_save->rip = from_save->rip;
+ 	to_save->cpl = 0;
++
++	if (kvm_cpu_cap_has(X86_FEATURE_LBRV)) {
++		to_save->dbgctl		= from_save->dbgctl;
++		to_save->br_from	= from_save->br_from;
++		to_save->br_to		= from_save->br_to;
++		to_save->last_excp_from	= from_save->last_excp_from;
++		to_save->last_excp_to	= from_save->last_excp_to;
++		to_save->dbgctl &= ~DEBUGCTL_RESERVED_BITS;
++	}
+ }
+ 
+ void svm_copy_vmloadsave_state(struct vmcb *to_vmcb, struct vmcb *from_vmcb)
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+index 8844f49d3e7f8..832886bec53d3 100644
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -2903,19 +2903,19 @@ static int svm_get_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ 		msr_info->data = svm->tsc_aux;
+ 		break;
+ 	case MSR_IA32_DEBUGCTLMSR:
+-		msr_info->data = svm->vmcb->save.dbgctl;
++		msr_info->data = lbrv ? svm->vmcb->save.dbgctl : 0;
+ 		break;
+ 	case MSR_IA32_LASTBRANCHFROMIP:
+-		msr_info->data = svm->vmcb->save.br_from;
++		msr_info->data = lbrv ? svm->vmcb->save.br_from : 0;
+ 		break;
+ 	case MSR_IA32_LASTBRANCHTOIP:
+-		msr_info->data = svm->vmcb->save.br_to;
++		msr_info->data = lbrv ? svm->vmcb->save.br_to : 0;
+ 		break;
+ 	case MSR_IA32_LASTINTFROMIP:
+-		msr_info->data = svm->vmcb->save.last_excp_from;
++		msr_info->data = lbrv ? svm->vmcb->save.last_excp_from : 0;
+ 		break;
+ 	case MSR_IA32_LASTINTTOIP:
+-		msr_info->data = svm->vmcb->save.last_excp_to;
++		msr_info->data = lbrv ? svm->vmcb->save.last_excp_to : 0;
+ 		break;
+ 	case MSR_VM_HSAVE_PA:
+ 		msr_info->data = svm->nested.hsave_msr;
+@@ -3191,6 +3191,38 @@ static int svm_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr)
+ 		vmcb_mark_dirty(svm->vmcb, VMCB_LBR);
+ 		svm_update_lbrv(vcpu);
+ 		break;
++	case MSR_IA32_LASTBRANCHFROMIP:
++		if (!lbrv)
++			return KVM_MSR_RET_UNSUPPORTED;
++		if (!msr->host_initiated)
++			return 1;
++		svm->vmcb->save.br_from = data;
++		vmcb_mark_dirty(svm->vmcb, VMCB_LBR);
++		break;
++	case MSR_IA32_LASTBRANCHTOIP:
++		if (!lbrv)
++			return KVM_MSR_RET_UNSUPPORTED;
++		if (!msr->host_initiated)
++			return 1;
++		svm->vmcb->save.br_to = data;
++		vmcb_mark_dirty(svm->vmcb, VMCB_LBR);
++		break;
++	case MSR_IA32_LASTINTFROMIP:
++		if (!lbrv)
++			return KVM_MSR_RET_UNSUPPORTED;
++		if (!msr->host_initiated)
++			return 1;
++		svm->vmcb->save.last_excp_from = data;
++		vmcb_mark_dirty(svm->vmcb, VMCB_LBR);
++		break;
++	case MSR_IA32_LASTINTTOIP:
++		if (!lbrv)
++			return KVM_MSR_RET_UNSUPPORTED;
++		if (!msr->host_initiated)
++			return 1;
++		svm->vmcb->save.last_excp_to = data;
++		vmcb_mark_dirty(svm->vmcb, VMCB_LBR);
++		break;
+ 	case MSR_VM_HSAVE_PA:
+ 		/*
+ 		 * Old kernels did not validate the value written to
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 313fce77e0589..cb659d04d07ee 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -1473,6 +1473,9 @@ static const u32 msrs_to_save_base[] = {
+ 	MSR_IA32_UMWAIT_CONTROL,
+ 
+ 	MSR_IA32_XFD, MSR_IA32_XFD_ERR,
++	MSR_IA32_DEBUGCTLMSR,
++	MSR_IA32_LASTBRANCHFROMIP, MSR_IA32_LASTBRANCHTOIP,
++	MSR_IA32_LASTINTFROMIP, MSR_IA32_LASTINTTOIP,
+ };
+ 
+ static const u32 msrs_to_save_pmu[] = {
+@@ -1914,6 +1917,16 @@ static int kvm_set_msr_ignored_check(struct kvm_vcpu *vcpu,
+ {
+ 	int ret = __kvm_set_msr(vcpu, index, data, host_initiated);
+ 
++	if (ret == KVM_MSR_RET_UNSUPPORTED && host_initiated && !data) {
++		switch (index) {
++		case MSR_IA32_LASTBRANCHFROMIP:
++		case MSR_IA32_LASTBRANCHTOIP:
++		case MSR_IA32_LASTINTFROMIP:
++		case MSR_IA32_LASTINTTOIP:
++			return 0;
++		}
++	}
++
+ 	if (ret == KVM_MSR_RET_UNSUPPORTED)
+ 		if (kvm_msr_ignored_check(index, data, true))
+ 			ret = 0;
+-- 
+2.53.0
+

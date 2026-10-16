@@ -1,0 +1,196 @@
+From b93ffe8be328be4abd91deb27c77366fa458eca5 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 11 Apr 2025 13:52:30 -0700
+Subject: net: Factorise setup_net() and cleanup_net().
+
+From: Kuniyuki Iwashima <kuniyu@amazon.com>
+
+[ Upstream commit e333b1c3cf25fca348422c9ad5cc8db40b4243fa ]
+
+When we roll back the changes made by struct pernet_operations.init(),
+we execute mostly identical sequences in three places.
+
+  * setup_net()
+  * cleanup_net()
+  * free_exit_list()
+
+The only difference between the first two is which list and RCU helpers
+to use.
+
+In setup_net(), an ops could fail on the way, so we need to perform a
+reverse walk from its previous ops in pernet_list.  OTOH, in cleanup_net(),
+we iterate the full list from tail to head.
+
+The former passes the failed ops to list_for_each_entry_continue_reverse().
+It's tricky, but we can reuse it for the latter if we pass list_entry() of
+the head node.
+
+Also, synchronize_rcu() and synchronize_rcu_expedited() can be easily
+switched by an argument.
+
+Let's factorise the rollback part in setup_net() and cleanup_net().
+
+In the next patch, ops_undo_list() will be reused for free_exit_list(),
+and then two arguments (ops_list and hold_rtnl) will differ.
+
+Signed-off-by: Kuniyuki Iwashima <kuniyu@amazon.com>
+Reviewed-by: Sabrina Dubroca <sd@queasysnail.net>
+Link: https://patch.msgid.link/20250411205258.63164-2-kuniyu@amazon.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Stable-dep-of: 60a25ef8dacb ("wireguard: device: use exit_rtnl callback instead of manual rtnl_lock in pre_exit")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ net/core/net_namespace.c | 106 +++++++++++++++++++--------------------
+ 1 file changed, 51 insertions(+), 55 deletions(-)
+
+diff --git a/net/core/net_namespace.c b/net/core/net_namespace.c
+index 613b2b07bad9f..25f84a3764f71 100644
+--- a/net/core/net_namespace.c
++++ b/net/core/net_namespace.c
+@@ -189,6 +189,53 @@ static void ops_free_list(const struct pernet_operations *ops,
+ 	}
+ }
+ 
++static void ops_undo_list(const struct list_head *ops_list,
++			  const struct pernet_operations *ops,
++			  struct list_head *net_exit_list,
++			  bool expedite_rcu, bool hold_rtnl)
++{
++	const struct pernet_operations *saved_ops;
++
++	if (!ops)
++		ops = list_entry(ops_list, typeof(*ops), list);
++
++	saved_ops = ops;
++
++	list_for_each_entry_continue_reverse(ops, ops_list, list)
++		ops_pre_exit_list(ops, net_exit_list);
++
++	/* Another CPU might be rcu-iterating the list, wait for it.
++	 * This needs to be before calling the exit() notifiers, so the
++	 * rcu_barrier() after ops_undo_list() isn't sufficient alone.
++	 * Also the pre_exit() and exit() methods need this barrier.
++	 */
++	if (expedite_rcu)
++		synchronize_rcu_expedited();
++	else
++		synchronize_rcu();
++
++	if (hold_rtnl) {
++		LIST_HEAD(dev_kill_list);
++
++		ops = saved_ops;
++		rtnl_lock();
++		list_for_each_entry_continue_reverse(ops, ops_list, list) {
++			if (ops->exit_batch_rtnl)
++				ops->exit_batch_rtnl(net_exit_list, &dev_kill_list);
++		}
++		unregister_netdevice_many(&dev_kill_list);
++		rtnl_unlock();
++	}
++
++	ops = saved_ops;
++	list_for_each_entry_continue_reverse(ops, ops_list, list)
++		ops_exit_list(ops, net_exit_list);
++
++	ops = saved_ops;
++	list_for_each_entry_continue_reverse(ops, ops_list, list)
++		ops_free_list(ops, net_exit_list);
++}
++
+ /* should be called with nsid_lock held */
+ static int alloc_netid(struct net *net, struct net *peer, int reqid)
+ {
+@@ -349,9 +396,8 @@ static __net_init void preinit_net(struct net *net, struct user_namespace *user_
+ static __net_init int setup_net(struct net *net)
+ {
+ 	/* Must be called with pernet_ops_rwsem held */
+-	const struct pernet_operations *ops, *saved_ops;
++	const struct pernet_operations *ops;
+ 	LIST_HEAD(net_exit_list);
+-	LIST_HEAD(dev_kill_list);
+ 	int error = 0;
+ 
+ 	preempt_disable();
+@@ -374,29 +420,7 @@ static __net_init int setup_net(struct net *net)
+ 	 * for the pernet modules whose init functions did not fail.
+ 	 */
+ 	list_add(&net->exit_list, &net_exit_list);
+-	saved_ops = ops;
+-	list_for_each_entry_continue_reverse(ops, &pernet_list, list)
+-		ops_pre_exit_list(ops, &net_exit_list);
+-
+-	synchronize_rcu();
+-
+-	ops = saved_ops;
+-	rtnl_lock();
+-	list_for_each_entry_continue_reverse(ops, &pernet_list, list) {
+-		if (ops->exit_batch_rtnl)
+-			ops->exit_batch_rtnl(&net_exit_list, &dev_kill_list);
+-	}
+-	unregister_netdevice_many(&dev_kill_list);
+-	rtnl_unlock();
+-
+-	ops = saved_ops;
+-	list_for_each_entry_continue_reverse(ops, &pernet_list, list)
+-		ops_exit_list(ops, &net_exit_list);
+-
+-	ops = saved_ops;
+-	list_for_each_entry_continue_reverse(ops, &pernet_list, list)
+-		ops_free_list(ops, &net_exit_list);
+-
++	ops_undo_list(&pernet_list, ops, &net_exit_list, false, true);
+ 	rcu_barrier();
+ 	goto out;
+ }
+@@ -594,11 +618,9 @@ static LLIST_HEAD(cleanup_list);
+ 
+ static void cleanup_net(struct work_struct *work)
+ {
+-	const struct pernet_operations *ops;
+-	struct net *net, *tmp, *last;
+ 	struct llist_node *net_kill_list;
++	struct net *net, *tmp, *last;
+ 	LIST_HEAD(net_exit_list);
+-	LIST_HEAD(dev_kill_list);
+ 
+ 	/* Atomically snapshot the list of namespaces to cleanup */
+ 	net_kill_list = llist_del_all(&cleanup_list);
+@@ -627,33 +649,7 @@ static void cleanup_net(struct work_struct *work)
+ 		list_add_tail(&net->exit_list, &net_exit_list);
+ 	}
+ 
+-	/* Run all of the network namespace pre_exit methods */
+-	list_for_each_entry_reverse(ops, &pernet_list, list)
+-		ops_pre_exit_list(ops, &net_exit_list);
+-
+-	/*
+-	 * Another CPU might be rcu-iterating the list, wait for it.
+-	 * This needs to be before calling the exit() notifiers, so
+-	 * the rcu_barrier() below isn't sufficient alone.
+-	 * Also the pre_exit() and exit() methods need this barrier.
+-	 */
+-	synchronize_rcu_expedited();
+-
+-	rtnl_lock();
+-	list_for_each_entry_reverse(ops, &pernet_list, list) {
+-		if (ops->exit_batch_rtnl)
+-			ops->exit_batch_rtnl(&net_exit_list, &dev_kill_list);
+-	}
+-	unregister_netdevice_many(&dev_kill_list);
+-	rtnl_unlock();
+-
+-	/* Run all of the network namespace exit methods */
+-	list_for_each_entry_reverse(ops, &pernet_list, list)
+-		ops_exit_list(ops, &net_exit_list);
+-
+-	/* Free the net generic variables */
+-	list_for_each_entry_reverse(ops, &pernet_list, list)
+-		ops_free_list(ops, &net_exit_list);
++	ops_undo_list(&pernet_list, NULL, &net_exit_list, true, true);
+ 
+ 	up_read(&pernet_ops_rwsem);
+ 
+-- 
+2.53.0
+
