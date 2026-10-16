@@ -1,0 +1,164 @@
+From bc925c1216f0848da96ac642fba3cb92ae1f4e06 Mon Sep 17 00:00:00 2001
+From: Paulo Alcantara <pc@manguebit.com>
+Date: Mon, 18 Nov 2024 12:35:14 -0300
+Subject: smb: client: improve compound padding in encryption
+
+From: Paulo Alcantara <pc@manguebit.com>
+
+commit bc925c1216f0848da96ac642fba3cb92ae1f4e06 upstream.
+
+After commit f7f291e14dde ("cifs: fix oops during encryption"), the
+encryption layer can handle vmalloc'd buffers as well as kmalloc'd
+buffers, so there is no need to inefficiently squash request iovs
+into a single one to handle padding in compound requests.
+
+Cc: David Howells <dhowells@redhat.com>
+Signed-off-by: Paulo Alcantara (Red Hat) <pc@manguebit.com>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/smb/client/cifsglob.h  |    4 ++--
+ fs/smb/client/smb2ops.c   |   37 +++----------------------------------
+ fs/smb/client/transport.c |   40 +++++++++++++---------------------------
+ 3 files changed, 18 insertions(+), 63 deletions(-)
+
+--- a/fs/smb/client/cifsglob.h
++++ b/fs/smb/client/cifsglob.h
+@@ -2195,7 +2195,7 @@ static inline int cifs_get_num_sgs(const
+ 			struct kvec *iov = &rqst[i].rq_iov[j];
+ 
+ 			addr = (unsigned long)iov->iov_base + skip;
+-			if (unlikely(is_vmalloc_addr((void *)addr))) {
++			if (is_vmalloc_or_module_addr((void *)addr)) {
+ 				len = iov->iov_len - skip;
+ 				nents += DIV_ROUND_UP(offset_in_page(addr) + len,
+ 						      PAGE_SIZE);
+@@ -2222,7 +2222,7 @@ static inline void cifs_sg_set_buf(struc
+ 	unsigned int off = offset_in_page(addr);
+ 
+ 	addr &= PAGE_MASK;
+-	if (unlikely(is_vmalloc_addr((void *)addr))) {
++	if (is_vmalloc_or_module_addr((void *)addr)) {
+ 		do {
+ 			unsigned int len = min_t(unsigned int, buflen, PAGE_SIZE - off);
+ 
+--- a/fs/smb/client/smb2ops.c
++++ b/fs/smb/client/smb2ops.c
+@@ -2842,7 +2842,7 @@ smb2_set_next_command(struct cifs_tcon *
+ 	struct cifs_ses *ses = tcon->ses;
+ 	struct TCP_Server_Info *server = ses->server;
+ 	unsigned long len = smb_rqst_len(server, rqst);
+-	int i, num_padding;
++	int num_padding;
+ 
+ 	shdr = (struct smb2_hdr *)(rqst->rq_iov[0].iov_base);
+ 	if (shdr == NULL) {
+@@ -2851,44 +2851,13 @@ smb2_set_next_command(struct cifs_tcon *
+ 	}
+ 
+ 	/* SMB headers in a compound are 8 byte aligned. */
+-
+-	/* No padding needed */
+-	if (!(len & 7))
+-		goto finished;
+-
+-	num_padding = 8 - (len & 7);
+-	if (!smb3_encryption_required(tcon)) {
+-		/*
+-		 * If we do not have encryption then we can just add an extra
+-		 * iov for the padding.
+-		 */
++	if (!IS_ALIGNED(len, 8)) {
++		num_padding = 8 - (len & 7);
+ 		rqst->rq_iov[rqst->rq_nvec].iov_base = smb2_padding;
+ 		rqst->rq_iov[rqst->rq_nvec].iov_len = num_padding;
+ 		rqst->rq_nvec++;
+ 		len += num_padding;
+-	} else {
+-		/*
+-		 * We can not add a small padding iov for the encryption case
+-		 * because the encryption framework can not handle the padding
+-		 * iovs.
+-		 * We have to flatten this into a single buffer and add
+-		 * the padding to it.
+-		 */
+-		for (i = 1; i < rqst->rq_nvec; i++) {
+-			memcpy(rqst->rq_iov[0].iov_base +
+-			       rqst->rq_iov[0].iov_len,
+-			       rqst->rq_iov[i].iov_base,
+-			       rqst->rq_iov[i].iov_len);
+-			rqst->rq_iov[0].iov_len += rqst->rq_iov[i].iov_len;
+-		}
+-		memset(rqst->rq_iov[0].iov_base + rqst->rq_iov[0].iov_len,
+-		       0, num_padding);
+-		rqst->rq_iov[0].iov_len += num_padding;
+-		len += num_padding;
+-		rqst->rq_nvec = 1;
+ 	}
+-
+- finished:
+ 	shdr->NextCommand = cpu_to_le32(len);
+ }
+ 
+--- a/fs/smb/client/transport.c
++++ b/fs/smb/client/transport.c
+@@ -425,19 +425,16 @@ out:
+ 	return rc;
+ }
+ 
+-struct send_req_vars {
+-	struct smb2_transform_hdr tr_hdr;
+-	struct smb_rqst rqst[MAX_COMPOUND];
+-	struct kvec iov;
+-};
+-
+ static int
+ smb_send_rqst(struct TCP_Server_Info *server, int num_rqst,
+ 	      struct smb_rqst *rqst, int flags)
+ {
+-	struct send_req_vars *vars;
+-	struct smb_rqst *cur_rqst;
+-	struct kvec *iov;
++	struct smb2_transform_hdr tr_hdr;
++	struct smb_rqst new_rqst[MAX_COMPOUND] = {};
++	struct kvec iov = {
++		.iov_base = &tr_hdr,
++		.iov_len = sizeof(tr_hdr),
++	};
+ 	int rc;
+ 
+ 	if (flags & CIFS_COMPRESS_REQ)
+@@ -454,26 +451,15 @@ smb_send_rqst(struct TCP_Server_Info *se
+ 		return -EIO;
+ 	}
+ 
+-	vars = kzalloc(sizeof(*vars), GFP_NOFS);
+-	if (!vars)
+-		return -ENOMEM;
+-	cur_rqst = vars->rqst;
+-	iov = &vars->iov;
+-
+-	iov->iov_base = &vars->tr_hdr;
+-	iov->iov_len = sizeof(vars->tr_hdr);
+-	cur_rqst[0].rq_iov = iov;
+-	cur_rqst[0].rq_nvec = 1;
++	new_rqst[0].rq_iov = &iov;
++	new_rqst[0].rq_nvec = 1;
+ 
+ 	rc = server->ops->init_transform_rq(server, num_rqst + 1,
+-					    &cur_rqst[0], rqst);
+-	if (rc)
+-		goto out;
+-
+-	rc = __smb_send_rqst(server, num_rqst + 1, &cur_rqst[0]);
+-	smb3_free_compound_rqst(num_rqst, &cur_rqst[1]);
+-out:
+-	kfree(vars);
++					    new_rqst, rqst);
++	if (!rc) {
++		rc = __smb_send_rqst(server, num_rqst + 1, new_rqst);
++		smb3_free_compound_rqst(num_rqst, &new_rqst[1]);
++	}
+ 	return rc;
+ }
+ 
