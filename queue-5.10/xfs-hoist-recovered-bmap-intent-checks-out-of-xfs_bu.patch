@@ -1,0 +1,133 @@
+From 587a5de3c870e20b1dd907a7a0eca637780b6dfa Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 13 Oct 2026 15:09:30 +0530
+Subject: xfs: hoist recovered bmap intent checks out of xfs_bui_item_recover
+
+From: Darrick J. Wong <darrick.wong@oracle.com>
+
+[ Upstream commit bc525cf455dac810d28f9edd379805dc249bc5a9 ]
+
+When we recover a bmap intent from the log, we need to validate its
+contents before we try to replay them.  Hoist the checking code into a
+separate function in preparation to refactor this code to use validation
+helpers.
+
+Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Stable-dep-of: 7b5f775be14a ("xfs: fix unmount hang with unflushable inodes stuck in the AIL")
+Signed-off-by: Siddh Raman Pant <siddh.raman.pant@oracle.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/xfs/xfs_bmap_item.c | 74 +++++++++++++++++++++++++++---------------
+ 1 file changed, 47 insertions(+), 27 deletions(-)
+
+diff --git a/fs/xfs/xfs_bmap_item.c b/fs/xfs/xfs_bmap_item.c
+index a3b350437db26..88d28a862f52c 100644
+--- a/fs/xfs/xfs_bmap_item.c
++++ b/fs/xfs/xfs_bmap_item.c
+@@ -418,6 +418,49 @@ const struct xfs_defer_op_type xfs_bmap_update_defer_type = {
+ 	.cancel_item	= xfs_bmap_update_cancel_item,
+ };
+ 
++/* Is this recovered BUI ok? */
++static inline bool
++xfs_bui_validate(
++	struct xfs_mount		*mp,
++	struct xfs_bui_log_item		*buip)
++{
++	struct xfs_map_extent		*bmap;
++	xfs_fsblock_t			startblock_fsb;
++	xfs_fsblock_t			inode_fsb;
++
++	/* Only one mapping operation per BUI... */
++	if (buip->bui_format.bui_nextents != XFS_BUI_MAX_FAST_EXTENTS)
++		return false;
++
++	bmap = &buip->bui_format.bui_extents[0];
++	startblock_fsb = XFS_BB_TO_FSB(mp,
++			XFS_FSB_TO_DADDR(mp, bmap->me_startblock));
++	inode_fsb = XFS_BB_TO_FSB(mp, XFS_FSB_TO_DADDR(mp,
++			XFS_INO_TO_FSB(mp, bmap->me_owner)));
++
++	if (bmap->me_flags & ~XFS_BMAP_EXTENT_FLAGS)
++		return false;
++
++	switch (bmap->me_flags & XFS_BMAP_EXTENT_TYPE_MASK) {
++	case XFS_BMAP_MAP:
++	case XFS_BMAP_UNMAP:
++		break;
++	default:
++		return false;
++	}
++
++	if (startblock_fsb == 0 ||
++	    bmap->me_len == 0 ||
++	    inode_fsb == 0 ||
++	    startblock_fsb >= mp->m_sb.sb_dblocks ||
++	    bmap->me_len >= mp->m_sb.sb_agblocks ||
++	    inode_fsb >= mp->m_sb.sb_dblocks ||
++	    (bmap->me_flags & ~XFS_BMAP_EXTENT_FLAGS))
++		return false;
++
++	return true;
++}
++
+ /*
+  * Process a bmap update intent item that was recovered from the log.
+  * We need to update some inode's bmbt.
+@@ -434,47 +477,24 @@ xfs_bui_item_recover(
+ 	struct xfs_mount		*mp = lip->li_mountp;
+ 	struct xfs_map_extent		*bmap;
+ 	struct xfs_bud_log_item		*budp;
+-	xfs_fsblock_t			startblock_fsb;
+-	xfs_fsblock_t			inode_fsb;
+ 	xfs_filblks_t			count;
+ 	xfs_exntst_t			state;
+ 	unsigned int			bui_type;
+ 	int				whichfork;
+ 	int				error = 0;
+ 
+-	/* Only one mapping operation per BUI... */
+-	if (buip->bui_format.bui_nextents != XFS_BUI_MAX_FAST_EXTENTS)
++	if (!xfs_bui_validate(mp, buip)) {
++		XFS_CORRUPTION_ERROR(__func__, XFS_ERRLEVEL_LOW, mp,
++				&buip->bui_format, sizeof(buip->bui_format));
+ 		return -EFSCORRUPTED;
++	}
+ 
+-	/*
+-	 * First check the validity of the extent described by the
+-	 * BUI.  If anything is bad, then toss the BUI.
+-	 */
+ 	bmap = &buip->bui_format.bui_extents[0];
+-	startblock_fsb = XFS_BB_TO_FSB(mp,
+-			   XFS_FSB_TO_DADDR(mp, bmap->me_startblock));
+-	inode_fsb = XFS_BB_TO_FSB(mp, XFS_FSB_TO_DADDR(mp,
+-			XFS_INO_TO_FSB(mp, bmap->me_owner)));
+ 	state = (bmap->me_flags & XFS_BMAP_EXTENT_UNWRITTEN) ?
+ 			XFS_EXT_UNWRITTEN : XFS_EXT_NORM;
+ 	whichfork = (bmap->me_flags & XFS_BMAP_EXTENT_ATTR_FORK) ?
+ 			XFS_ATTR_FORK : XFS_DATA_FORK;
+ 	bui_type = bmap->me_flags & XFS_BMAP_EXTENT_TYPE_MASK;
+-	switch (bui_type) {
+-	case XFS_BMAP_MAP:
+-	case XFS_BMAP_UNMAP:
+-		break;
+-	default:
+-		return -EFSCORRUPTED;
+-	}
+-	if (startblock_fsb == 0 ||
+-	    bmap->me_len == 0 ||
+-	    inode_fsb == 0 ||
+-	    startblock_fsb >= mp->m_sb.sb_dblocks ||
+-	    bmap->me_len >= mp->m_sb.sb_agblocks ||
+-	    inode_fsb >= mp->m_sb.sb_dblocks ||
+-	    (bmap->me_flags & ~XFS_BMAP_EXTENT_FLAGS))
+-		return -EFSCORRUPTED;
+ 
+ 	/* Grab the inode. */
+ 	error = xfs_iget(mp, NULL, bmap->me_owner, 0, 0, &ip);
+-- 
+2.53.0
+
