@@ -1,0 +1,89 @@
+From a589d0a9bb3e1d8a04e5a6933fbfed9819f56c36 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 6 May 2025 22:04:52 +0900
+Subject: ksmbd: Fix UAF in __close_file_table_ids
+
+From: Sean Heelan <seanheelan@gmail.com>
+
+[ Upstream commit 36991c1ccde2d5a521577c448ffe07fcccfe104d ]
+
+A use-after-free is possible if one thread destroys the file
+via __ksmbd_close_fd while another thread holds a reference to
+it. The existing checks on fp->refcount are not sufficient to
+prevent this.
+
+The fix takes ft->lock around the section which removes the
+file from the file table. This prevents two threads acquiring the
+same file pointer via __close_file_table_ids, as well as the other
+functions which retrieve a file from the IDR and which already use
+this same lock.
+
+Cc: stable@vger.kernel.org
+Signed-off-by: Sean Heelan <seanheelan@gmail.com>
+Acked-by: Namjae Jeon <linkinjeon@kernel.org>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/smb/server/vfs_cache.c | 37 +++++++++++++++++++++++++++++++------
+ 1 file changed, 31 insertions(+), 6 deletions(-)
+
+diff --git a/fs/smb/server/vfs_cache.c b/fs/smb/server/vfs_cache.c
+index 9eb9f892ac2b5..4b35e4f960694 100644
+--- a/fs/smb/server/vfs_cache.c
++++ b/fs/smb/server/vfs_cache.c
+@@ -648,21 +648,46 @@ __close_file_table_ids(struct ksmbd_file_table *ft,
+ 		       bool (*skip)(struct ksmbd_tree_connect *tcon,
+ 				    struct ksmbd_file *fp))
+ {
+-	unsigned int			id;
+-	struct ksmbd_file		*fp;
+-	int				num = 0;
++	struct ksmbd_file *fp;
++	unsigned int id = 0;
++	int num = 0;
++
++	while (1) {
++		write_lock(&ft->lock);
++		fp = idr_get_next(ft->idr, &id);
++		if (!fp) {
++			write_unlock(&ft->lock);
++			break;
++		}
+ 
+-	idr_for_each_entry(ft->idr, fp, id) {
+-		if (skip(tcon, fp))
++		if (skip(tcon, fp)) {
++			id++;
++			write_unlock(&ft->lock);
+ 			continue;
++		}
+ 
+ 		set_close_state_blocked_works(fp);
+ 
+-		if (!atomic_dec_and_test(&fp->refcount))
++		if (!atomic_dec_and_test(&fp->refcount)) {
++			id++;
++			write_unlock(&ft->lock);
+ 			continue;
++		}
++
++		idr_remove(ft->idr, fp->volatile_id);
++		fp->volatile_id = KSMBD_NO_FID;
++		write_unlock(&ft->lock);
++
++		write_lock(&fp->f_ci->m_lock);
++		list_del_init(&fp->node);
++		write_unlock(&fp->f_ci->m_lock);
++
+ 		__ksmbd_close_fd(ft, fp);
++
+ 		num++;
++		id++;
+ 	}
++
+ 	return num;
+ }
+ 
+-- 
+2.53.0
+

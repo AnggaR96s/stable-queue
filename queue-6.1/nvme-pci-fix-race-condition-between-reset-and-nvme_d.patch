@@ -1,0 +1,83 @@
+From 16461898f3ca640cdb12093165284ed56942031e Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 15 Oct 2024 13:21:00 +0200
+Subject: nvme-pci: fix race condition between reset and nvme_dev_disable()
+
+From: Maurizio Lombardi <mlombard@redhat.com>
+
+[ Upstream commit 26bc0a81f64ce00fc4342c38eeb2eddaad084dd2 ]
+
+nvme_dev_disable() modifies the dev->online_queues field, therefore
+nvme_pci_update_nr_queues() should avoid racing against it, otherwise
+we could end up passing invalid values to blk_mq_update_nr_hw_queues().
+
+ WARNING: CPU: 39 PID: 61303 at drivers/pci/msi/api.c:347
+          pci_irq_get_affinity+0x187/0x210
+ Workqueue: nvme-reset-wq nvme_reset_work [nvme]
+ RIP: 0010:pci_irq_get_affinity+0x187/0x210
+ Call Trace:
+  <TASK>
+  ? blk_mq_pci_map_queues+0x87/0x3c0
+  ? pci_irq_get_affinity+0x187/0x210
+  blk_mq_pci_map_queues+0x87/0x3c0
+  nvme_pci_map_queues+0x189/0x460 [nvme]
+  blk_mq_update_nr_hw_queues+0x2a/0x40
+  nvme_reset_work+0x1be/0x2a0 [nvme]
+
+Fix the bug by locking the shutdown_lock mutex before using
+dev->online_queues. Give up if nvme_dev_disable() is running or if
+it has been executed already.
+
+Fixes: 949928c1c731 ("NVMe: Fix possible queue use after freed")
+Tested-by: Yi Zhang <yi.zhang@redhat.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Maurizio Lombardi <mlombard@redhat.com>
+Signed-off-by: Keith Busch <kbusch@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/nvme/host/pci.c | 18 +++++++++++++++---
+ 1 file changed, 15 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index a12d3ad54a1b6..0ed96b0ecb9e3 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -2620,11 +2620,23 @@ static void nvme_pci_alloc_tag_set(struct nvme_dev *dev)
+ 	dev->ctrl.tagset = set;
+ }
+ 
+-static void nvme_pci_update_nr_queues(struct nvme_dev *dev)
++static bool nvme_pci_update_nr_queues(struct nvme_dev *dev)
+ {
++	/* Give up if we are racing with nvme_dev_disable() */
++	if (!mutex_trylock(&dev->shutdown_lock))
++		return false;
++
++	/* Check if nvme_dev_disable() has been executed already */
++	if (!dev->online_queues) {
++		mutex_unlock(&dev->shutdown_lock);
++		return false;
++	}
++
+ 	blk_mq_update_nr_hw_queues(&dev->tagset, dev->online_queues - 1);
+ 	/* free previously allocated queues that are no longer usable */
+ 	nvme_free_queues(dev, dev->online_queues);
++	mutex_unlock(&dev->shutdown_lock);
++	return true;
+ }
+ 
+ static int nvme_pci_enable(struct nvme_dev *dev)
+@@ -2986,8 +2998,8 @@ static void nvme_reset_work(struct work_struct *work)
+ 		nvme_wait_freeze(&dev->ctrl);
+ 		if (!dev->ctrl.tagset)
+ 			nvme_pci_alloc_tag_set(dev);
+-		else
+-			nvme_pci_update_nr_queues(dev);
++		else if (!nvme_pci_update_nr_queues(dev))
++			goto out;
+ 		nvme_dbbuf_set(dev);
+ 		nvme_unfreeze(&dev->ctrl);
+ 	}
+-- 
+2.53.0
+

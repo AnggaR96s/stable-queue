@@ -1,0 +1,179 @@
+From c15046f0513812560d5f2605efa64d827ad29c5c Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 17 Oct 2022 17:20:30 +0800
+Subject: scsi: hisi_sas: Add SATA_DISK_ERR bit handling for v3 hw
+
+From: Xingui Yang <yangxingui@huawei.com>
+
+[ Upstream commit 930d97dabdd56681aef752a35475f0212a171741 ]
+
+When CQ header dw3 SATA_DISK_ERR is set it means this SATA disk is in error
+state and the current IPTT is invalid. An invalid IPTT does not correspond
+to any slot.
+
+In this scenario, new I/Os that delivered to disk will be rejected by the
+controller and all I/Os remaining in the disk should be aborted, which we
+add here with the sas_ata_device_link_abort() call.
+
+In hisi_sas_abort_task() we don't want to issue a soft reset as it may
+cause info to be lost in the target disk for the ATA EH autopsy. In this
+case, just release resources - the disk won't return other I/Os normally
+after NCQ Error, so this is safe.
+
+Signed-off-by: Xingui Yang <yangxingui@huawei.com>
+Signed-off-by: John Garry <john.garry@huawei.com>
+Link: https://lore.kernel.org/r/1665998435-199946-4-git-send-email-john.garry@huawei.com
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Stable-dep-of: 9f564f15f884 ("scsi: hisi_sas: Create all dump files during debugfs initialization")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/scsi/hisi_sas/hisi_sas.h       |  1 +
+ drivers/scsi/hisi_sas/hisi_sas_main.c  | 18 +++++++++-
+ drivers/scsi/hisi_sas/hisi_sas_v3_hw.c | 48 ++++++++++++++++++++++++--
+ 3 files changed, 64 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/scsi/hisi_sas/hisi_sas.h b/drivers/scsi/hisi_sas/hisi_sas.h
+index 2ecf97f7ae525..423af1dc36487 100644
+--- a/drivers/scsi/hisi_sas/hisi_sas.h
++++ b/drivers/scsi/hisi_sas/hisi_sas.h
+@@ -104,6 +104,7 @@ enum {
+ enum dev_status {
+ 	HISI_SAS_DEV_INIT,
+ 	HISI_SAS_DEV_NORMAL,
++	HISI_SAS_DEV_NCQ_ERR,
+ };
+ 
+ enum {
+diff --git a/drivers/scsi/hisi_sas/hisi_sas_main.c b/drivers/scsi/hisi_sas/hisi_sas_main.c
+index ae7383e9e5fc1..2f13bb9771d64 100644
+--- a/drivers/scsi/hisi_sas/hisi_sas_main.c
++++ b/drivers/scsi/hisi_sas/hisi_sas_main.c
+@@ -1631,13 +1631,26 @@ static int hisi_sas_abort_task(struct sas_task *task)
+ 	} else if (task->task_proto & SAS_PROTOCOL_SATA ||
+ 		task->task_proto & SAS_PROTOCOL_STP) {
+ 		if (task->dev->dev_type == SAS_SATA_DEV) {
++			struct ata_queued_cmd *qc = task->uldd_task;
++
+ 			rc = hisi_sas_internal_task_abort_dev(sas_dev, false);
+ 			if (rc < 0) {
+ 				dev_err(dev, "abort task: internal abort failed\n");
+ 				goto out;
+ 			}
+ 			hisi_sas_dereg_device(hisi_hba, device);
+-			rc = hisi_sas_softreset_ata_disk(device);
++
++			/*
++			 * If an ATA internal command times out in ATA EH, it
++			 * need to execute soft reset, so check the scsicmd
++			 */
++			if ((sas_dev->dev_status == HISI_SAS_DEV_NCQ_ERR) &&
++			    qc && qc->scsicmd) {
++				hisi_sas_do_release_task(hisi_hba, task, slot);
++				rc = TMF_RESP_FUNC_COMPLETE;
++			} else {
++				rc = hisi_sas_softreset_ata_disk(device);
++			}
+ 		}
+ 	} else if (slot && task->task_proto & SAS_PROTOCOL_SMP) {
+ 		/* SMP */
+@@ -1756,6 +1769,9 @@ static int hisi_sas_I_T_nexus_reset(struct domain_device *device)
+ 	struct device *dev = hisi_hba->dev;
+ 	int rc;
+ 
++	if (sas_dev->dev_status == HISI_SAS_DEV_NCQ_ERR)
++		sas_dev->dev_status = HISI_SAS_DEV_NORMAL;
++
+ 	rc = hisi_sas_internal_task_abort_dev(sas_dev, false);
+ 	if (rc < 0) {
+ 		dev_err(dev, "I_T nexus reset: internal abort (%d)\n", rc);
+diff --git a/drivers/scsi/hisi_sas/hisi_sas_v3_hw.c b/drivers/scsi/hisi_sas/hisi_sas_v3_hw.c
+index 3db206c743831..2b19c515acdeb 100644
+--- a/drivers/scsi/hisi_sas/hisi_sas_v3_hw.c
++++ b/drivers/scsi/hisi_sas/hisi_sas_v3_hw.c
+@@ -408,6 +408,11 @@
+ #define CMPLT_HDR_CMPLT_MSK		(0x3 << CMPLT_HDR_CMPLT_OFF)
+ #define CMPLT_HDR_ERROR_PHASE_OFF   2
+ #define CMPLT_HDR_ERROR_PHASE_MSK   (0xff << CMPLT_HDR_ERROR_PHASE_OFF)
++/* bit[9:2] Error Phase */
++#define ERR_PHASE_RESPONSE_FRAME_REV_STAGE_OFF	\
++					8
++#define ERR_PHASE_RESPONSE_FRAME_REV_STAGE_MSK	\
++	(0x1 << ERR_PHASE_RESPONSE_FRAME_REV_STAGE_OFF)
+ #define CMPLT_HDR_RSPNS_XFRD_OFF	10
+ #define CMPLT_HDR_RSPNS_XFRD_MSK	(0x1 << CMPLT_HDR_RSPNS_XFRD_OFF)
+ #define CMPLT_HDR_RSPNS_GOOD_OFF	11
+@@ -427,8 +432,15 @@
+ #define CMPLT_HDR_DEV_ID_OFF		16
+ #define CMPLT_HDR_DEV_ID_MSK		(0xffff << CMPLT_HDR_DEV_ID_OFF)
+ /* dw3 */
++#define CMPLT_HDR_SATA_DISK_ERR_OFF	16
++#define CMPLT_HDR_SATA_DISK_ERR_MSK	(0x1 << CMPLT_HDR_SATA_DISK_ERR_OFF)
+ #define CMPLT_HDR_IO_IN_TARGET_OFF	17
+ #define CMPLT_HDR_IO_IN_TARGET_MSK	(0x1 << CMPLT_HDR_IO_IN_TARGET_OFF)
++/* bit[23:18] ERR_FIS_ATA_STATUS */
++#define FIS_ATA_STATUS_ERR_OFF		18
++#define FIS_ATA_STATUS_ERR_MSK		(0x1 << FIS_ATA_STATUS_ERR_OFF)
++#define FIS_TYPE_SDB_OFF		31
++#define FIS_TYPE_SDB_MSK		(0x1 << FIS_TYPE_SDB_OFF)
+ 
+ /* ITCT header */
+ /* qw0 */
+@@ -2160,6 +2172,18 @@ static irqreturn_t fatal_axi_int_v3_hw(int irq_no, void *p)
+ 	return IRQ_HANDLED;
+ }
+ 
++static bool is_ncq_err_v3_hw(struct hisi_sas_complete_v3_hdr *complete_hdr)
++{
++	u32 dw0, dw3;
++
++	dw0 = le32_to_cpu(complete_hdr->dw0);
++	dw3 = le32_to_cpu(complete_hdr->dw3);
++
++	return (dw0 & ERR_PHASE_RESPONSE_FRAME_REV_STAGE_MSK) &&
++	       (dw3 & FIS_TYPE_SDB_MSK) &&
++	       (dw3 & FIS_ATA_STATUS_ERR_MSK);
++}
++
+ static bool
+ slot_err_v3_hw(struct hisi_hba *hisi_hba, struct sas_task *task,
+ 	       struct hisi_sas_slot *slot)
+@@ -2400,14 +2424,34 @@ static irqreturn_t  cq_thread_v3_hw(int irq_no, void *p)
+ 	while (rd_point != wr_point) {
+ 		struct hisi_sas_complete_v3_hdr *complete_hdr;
+ 		struct device *dev = hisi_hba->dev;
+-		u32 dw1;
++		u32 dw0, dw1, dw3;
+ 		int iptt;
+ 
+ 		complete_hdr = &complete_queue[rd_point];
++		dw0 = le32_to_cpu(complete_hdr->dw0);
+ 		dw1 = le32_to_cpu(complete_hdr->dw1);
++		dw3 = le32_to_cpu(complete_hdr->dw3);
+ 
+ 		iptt = dw1 & CMPLT_HDR_IPTT_MSK;
+-		if (likely(iptt < HISI_SAS_COMMAND_ENTRIES_V3_HW)) {
++		if (unlikely((dw0 & CMPLT_HDR_CMPLT_MSK) == 0x3) &&
++			     (dw3 & CMPLT_HDR_SATA_DISK_ERR_MSK)) {
++			int device_id = (dw1 & CMPLT_HDR_DEV_ID_MSK) >>
++					CMPLT_HDR_DEV_ID_OFF;
++			struct hisi_sas_itct *itct =
++				&hisi_hba->itct[device_id];
++			struct hisi_sas_device *sas_dev =
++				&hisi_hba->devices[device_id];
++			struct domain_device *device = sas_dev->sas_device;
++
++			dev_err(dev, "erroneous completion disk err dev id=%d sas_addr=0x%llx CQ hdr: 0x%x 0x%x 0x%x 0x%x\n",
++				device_id, itct->sas_addr, dw0, dw1,
++				complete_hdr->act, dw3);
++
++			if (is_ncq_err_v3_hw(complete_hdr))
++				sas_dev->dev_status = HISI_SAS_DEV_NCQ_ERR;
++
++			sas_ata_device_link_abort(device, true);
++		} else if (likely(iptt < HISI_SAS_COMMAND_ENTRIES_V3_HW)) {
+ 			slot = &hisi_hba->slot_info[iptt];
+ 			slot->cmplt_queue_slot = rd_point;
+ 			slot->cmplt_queue = queue;
+-- 
+2.53.0
+

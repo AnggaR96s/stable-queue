@@ -1,0 +1,128 @@
+From 4c709f11b17c426a70f32d1f0de30c163d2cbe1f Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Sun, 6 Sep 2026 14:40:04 -0300
+Subject: smb: client: honor forceuid/forcegid when mapping SIDs to uid/gid
+
+From: Paulo Alcantara <pc@manguebit.org>
+
+[ Upstream commit 18a72975e9f35aadecc75b031f693f2d1f49308f ]
+
+When the administrator mounts with forceuid or forcegid (uid=/gid=
+mount options), they expect all files to appear owned by the specified
+user/group.  However, several code paths unconditionally called
+sid_to_id() to overwrite cf_uid/cf_gid with server-provided values,
+ignoring the administrator's explicit override:
+
+  - smb311_posix_info_to_fattr() (stat via POSIX extensions)
+  - cifs_posix_to_fattr() (readdir via POSIX extensions)
+  - parse_sec_desc() (CIFS ACL ownership mapping)
+
+This allowed an untrusted server to dictate local file ownership even
+when the mount was configured to force specific uid/gid values.
+
+Fix all three call sites to check CIFS_MOUNT_OVERR_UID and
+CIFS_MOUNT_OVERR_GID before calling sid_to_id(), following the
+same pattern already used by cifs_unix_basic_to_fattr() for unix
+extensions.
+
+Closes: https://sashiko.dev/#/patchset/20260906155816.603278-1-pc%40manguebit.org
+Reviewed-by: Namjae Jeon <linkinjeon@kernel.org>
+Signed-off-by: Paulo Alcantara <pc@manguebit.org>
+Cc: Ronnie Sahlberg <ronniesahlberg@gmail.com>
+Cc: Shyam Prasad N <sprasad@microsoft.com>
+Cc: Tom Talpey <tom@talpey.com>
+Cc: Bharath SM <bharathsm@microsoft.com>
+Cc: stable@vger.kernel.org
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/smb/client/cifsacl.c | 28 ++++++++++++++++++----------
+ fs/smb/client/readdir.c |  7 +++++--
+ 2 files changed, 23 insertions(+), 12 deletions(-)
+
+diff --git a/fs/smb/client/cifsacl.c b/fs/smb/client/cifsacl.c
+index ba93199ef7327..7bb35cdbc4d67 100644
+--- a/fs/smb/client/cifsacl.c
++++ b/fs/smb/client/cifsacl.c
+@@ -1300,6 +1300,7 @@ static int parse_sec_desc(struct cifs_sb_info *cifs_sb,
+ {
+ 	int rc = 0;
+ 	struct cifs_sid *owner_sid_ptr, *group_sid_ptr;
++	unsigned int sbflags = cifs_sb->mnt_cifs_flags;
+ 	struct cifs_acl *dacl_ptr; /* no need for SACL ptr */
+ 	char *end_of_acl = ((char *)pntsd) + acl_len;
+ 	__u32 dacloffset;
+@@ -1316,17 +1317,22 @@ static int parse_sec_desc(struct cifs_sb_info *cifs_sb,
+ 		 pntsd->revision, pntsd->type, le32_to_cpu(pntsd->osidoffset),
+ 		 le32_to_cpu(pntsd->gsidoffset),
+ 		 le32_to_cpu(pntsd->sacloffset), dacloffset);
++	fattr->cf_uid = cifs_sb->ctx->linux_uid;
++	fattr->cf_gid = cifs_sb->ctx->linux_gid;
++
+ /*	cifs_dump_mem("owner_sid: ", owner_sid_ptr, 64); */
+ 	rc = parse_sid(owner_sid_ptr, end_of_acl);
+ 	if (rc) {
+ 		cifs_dbg(FYI, "%s: Error %d parsing Owner SID\n", __func__, rc);
+ 		return rc;
+ 	}
+-	rc = sid_to_id(cifs_sb, owner_sid_ptr, fattr, SIDOWNER);
+-	if (rc) {
+-		cifs_dbg(FYI, "%s: Error %d mapping Owner SID to uid\n",
+-			 __func__, rc);
+-		return rc;
++	if (!(sbflags & CIFS_MOUNT_OVERR_UID)) {
++		rc = sid_to_id(cifs_sb, owner_sid_ptr, fattr, SIDOWNER);
++		if (rc) {
++			cifs_dbg(FYI, "%s: Error %d mapping Owner SID to uid\n",
++				 __func__, rc);
++			return rc;
++		}
+ 	}
+ 
+ 	rc = parse_sid(group_sid_ptr, end_of_acl);
+@@ -1335,11 +1341,13 @@ static int parse_sec_desc(struct cifs_sb_info *cifs_sb,
+ 			 __func__, rc);
+ 		return rc;
+ 	}
+-	rc = sid_to_id(cifs_sb, group_sid_ptr, fattr, SIDGROUP);
+-	if (rc) {
+-		cifs_dbg(FYI, "%s: Error %d mapping Group SID to gid\n",
+-			 __func__, rc);
+-		return rc;
++	if (!(sbflags & CIFS_MOUNT_OVERR_GID)) {
++		rc = sid_to_id(cifs_sb, group_sid_ptr, fattr, SIDGROUP);
++		if (rc) {
++			cifs_dbg(FYI, "%s: Error %d mapping Group SID to gid\n",
++				 __func__, rc);
++			return rc;
++		}
+ 	}
+ 
+ 	if (dacloffset) {
+diff --git a/fs/smb/client/readdir.c b/fs/smb/client/readdir.c
+index ded9cf784c22d..1ba176a690cc3 100644
+--- a/fs/smb/client/readdir.c
++++ b/fs/smb/client/readdir.c
+@@ -233,6 +233,7 @@ static void
+ cifs_posix_to_fattr(struct cifs_fattr *fattr, struct smb2_posix_info *info,
+ 		    struct cifs_sb_info *cifs_sb)
+ {
++	unsigned int sbflags = cifs_sb->mnt_cifs_flags;
+ 	struct smb2_posix_info_parsed parsed;
+ 	int rc;
+ 
+@@ -284,8 +285,10 @@ cifs_posix_to_fattr(struct cifs_fattr *fattr, struct smb2_posix_info *info,
+ 		cifs_dbg(VFS, "%s: failed to parse SIDs: %d\n",
+ 			 __func__, rc);
+ 	} else {
+-		sid_to_id(cifs_sb, &parsed.owner, fattr, SIDOWNER);
+-		sid_to_id(cifs_sb, &parsed.group, fattr, SIDGROUP);
++		if (!(sbflags & CIFS_MOUNT_OVERR_UID))
++			sid_to_id(cifs_sb, &parsed.owner, fattr, SIDOWNER);
++		if (!(sbflags & CIFS_MOUNT_OVERR_GID))
++			sid_to_id(cifs_sb, &parsed.group, fattr, SIDGROUP);
+ 	}
+ }
+ 
+-- 
+2.53.0
+

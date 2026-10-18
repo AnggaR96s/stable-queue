@@ -1,0 +1,101 @@
+From 306d6f862f2bd48c6c0ebfe28ea59642dcb9c607 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 6 Mar 2025 10:32:45 +0800
+Subject: net: mctp: unshare packets when reassembling
+
+From: Matt Johnston <matt@codeconstruct.com.au>
+
+[ Upstream commit f5d83cf0eeb90fade4d5c4d17d24b8bee9ceeecc ]
+
+Ensure that the frag_list used for reassembly isn't shared with other
+packets. This avoids incorrect reassembly when packets are cloned, and
+prevents a memory leak due to circular references between fragments and
+their skb_shared_info.
+
+The upcoming MCTP-over-USB driver uses skb_clone which can trigger the
+problem - other MCTP drivers don't share SKBs.
+
+A kunit test is added to reproduce the issue.
+
+Signed-off-by: Matt Johnston <matt@codeconstruct.com.au>
+Fixes: 4a992bbd3650 ("mctp: Implement message fragmentation & reassembly")
+Reviewed-by: Simon Horman <horms@kernel.org>
+Link: https://patch.msgid.link/20250306-matt-mctp-usb-v1-1-085502b3dd28@codeconstruct.com.au
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ net/mctp/route.c | 43 +++++++++++++++++++++++++++++--------------
+ 1 file changed, 29 insertions(+), 14 deletions(-)
+
+diff --git a/net/mctp/route.c b/net/mctp/route.c
+index 4d649ba66cfdc..00fc79c05b4ac 100644
+--- a/net/mctp/route.c
++++ b/net/mctp/route.c
+@@ -298,8 +298,14 @@ static int mctp_frag_queue(struct mctp_sk_key *key, struct sk_buff *skb)
+ 		& MCTP_HDR_SEQ_MASK;
+ 
+ 	if (!key->reasm_head) {
+-		key->reasm_head = skb;
+-		key->reasm_tailp = &(skb_shinfo(skb)->frag_list);
++		/* Since we're manipulating the shared frag_list, ensure it isn't
++		 * shared with any other SKBs.
++		 */
++		key->reasm_head = skb_unshare(skb, GFP_ATOMIC);
++		if (!key->reasm_head)
++			return -ENOMEM;
++
++		key->reasm_tailp = &(skb_shinfo(key->reasm_head)->frag_list);
+ 		key->last_seq = this_seq;
+ 		return 0;
+ 	}
+@@ -429,18 +435,26 @@ static int mctp_route_input(struct mctp_route *route, struct sk_buff *skb)
+ 			/* we can queue without the key lock here, as the
+ 			 * key isn't observable yet
+ 			 */
+-			mctp_frag_queue(key, skb);
+-
+-			/* if the key_add fails, we've raced with another
+-			 * SOM packet with the same src, dest and tag. There's
+-			 * no way to distinguish future packets, so all we
+-			 * can do is drop; we'll free the skb on exit from
+-			 * this function.
+-			 */
+-			rc = mctp_key_add(key, msk);
+-			if (!rc) {
+-				trace_mctp_key_acquire(key);
++			rc = mctp_frag_queue(key, skb);
++			if (rc == -ENOMEM) {
++				/* skb_unshare() has already freed the skb */
++				skb = NULL;
++			} else if (!rc) {
++				/* reasm_head owns the (possibly copied) skb */
+ 				skb = NULL;
++
++				/* if the key_add fails, we've raced with
++				 * another SOM packet with the same src, dest
++				 * and tag. There's no way to distinguish
++				 * future packets, so all we can do is drop.
++				 */
++				rc = mctp_key_add(key, msk);
++				if (!rc) {
++					trace_mctp_key_acquire(key);
++				} else {
++					kfree_skb(key->reasm_head);
++					key->reasm_head = NULL;
++				}
+ 			}
+ 
+ 			/* we don't need to release key->lock on exit, so
+@@ -459,7 +473,8 @@ static int mctp_route_input(struct mctp_route *route, struct sk_buff *skb)
+ 				key = NULL;
+ 			} else {
+ 				rc = mctp_frag_queue(key, skb);
+-				if (!rc)
++				/* -ENOMEM: skb_unshare() already freed the skb */
++				if (!rc || rc == -ENOMEM)
+ 					skb = NULL;
+ 			}
+ 		}
+-- 
+2.53.0
+

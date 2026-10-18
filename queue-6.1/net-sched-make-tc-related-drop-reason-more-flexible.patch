@@ -1,0 +1,155 @@
+From 8df207040db4749da673cf15454b15ec86fd7567 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 9 Oct 2023 11:26:54 +0200
+Subject: net, sched: Make tc-related drop reason more flexible
+
+From: Daniel Borkmann <daniel@iogearbox.net>
+
+[ Upstream commit 54a59aed395ce0f4177b5212e5746a6462de3ad9 ]
+
+Currently, the kfree_skb_reason() in sch_handle_{ingress,egress}() can only
+express a basic SKB_DROP_REASON_TC_INGRESS or SKB_DROP_REASON_TC_EGRESS reason.
+
+Victor kicked-off an initial proposal to make this more flexible by disambiguating
+verdict from return code by moving the verdict into struct tcf_result and
+letting tcf_classify() return a negative error. If hit, then two new drop
+reasons were added in the proposal, that is SKB_DROP_REASON_TC_INGRESS_ERROR
+as well as SKB_DROP_REASON_TC_EGRESS_ERROR. Further analysis of the actual
+error codes would have required to attach to tcf_classify via kprobe/kretprobe
+to more deeply debug skb and the returned error.
+
+In order to make the kfree_skb_reason() in sch_handle_{ingress,egress}() more
+extensible, it can be addressed in a more straight forward way, that is: Instead
+of placing the verdict into struct tcf_result, we can just put the drop reason
+in there, which does not require changes throughout various classful schedulers
+given the existing verdict logic can stay as is.
+
+Then, SKB_DROP_REASON_TC_ERROR{,_*} can be added to the enum skb_drop_reason
+to disambiguate between an error or an intentional drop. New drop reason error
+codes can be added successively to the tc code base.
+
+For internal error locations which have not yet been annotated with a
+SKB_DROP_REASON_TC_ERROR{,_*}, the fallback is SKB_DROP_REASON_TC_INGRESS and
+SKB_DROP_REASON_TC_EGRESS, respectively. Generic errors could be marked with a
+SKB_DROP_REASON_TC_ERROR code until they are converted to more specific ones
+if it is found that they would be useful for troubleshooting.
+
+While drop reasons have infrastructure for subsystem specific error codes which
+are currently used by mac80211 and ovs, Jakub mentioned that it is preferred
+for tc to use the enum skb_drop_reason core codes given it is a better fit and
+currently the tooling support is better, too.
+
+With regards to the latter:
+
+  [...] I think Alastair (bpftrace) is working on auto-prettifying enums when
+  bpftrace outputs maps. So we can do something like:
+
+  $ bpftrace -e 'tracepoint:skb:kfree_skb { @[args->reason] = count(); }'
+  Attaching 1 probe...
+  ^C
+
+  @[SKB_DROP_REASON_TC_INGRESS]: 2
+  @[SKB_CONSUMED]: 34
+
+  ^^^^^^^^^^^^ names!!
+
+  Auto-magically. [...]
+
+Add a small helper tcf_set_drop_reason() which can be used to set the drop reason
+into the tcf_result.
+
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Cc: Jamal Hadi Salim <jhs@mojatatu.com>
+Cc: Victor Nogueira <victor@mojatatu.com>
+Link: https://lore.kernel.org/netdev/20231006063233.74345d36@kernel.org
+Reviewed-by: Jakub Kicinski <kuba@kernel.org>
+Link: https://lore.kernel.org/r/20231009092655.22025-1-daniel@iogearbox.net
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Stable-dep-of: f60b396ee174 ("net/sched: act_api: fix TOCTOU NULL deref on a->goto_chain")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/net/pkt_cls.h     | 6 ++++++
+ include/net/sch_generic.h | 3 +--
+ net/core/dev.c            | 6 ++++--
+ 3 files changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/include/net/pkt_cls.h b/include/net/pkt_cls.h
+index 2ef3c220d52ca..5671a05b744b0 100644
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@ -181,6 +181,12 @@ __cls_set_class(unsigned long *clp, unsigned long cl)
+ 	return xchg(clp, cl);
+ }
+ 
++static inline void tcf_set_drop_reason(struct tcf_result *res,
++				       enum skb_drop_reason reason)
++{
++	res->drop_reason = reason;
++}
++
+ static inline void
+ __tcf_bind_filter(struct Qdisc *q, struct tcf_result *r, unsigned long base)
+ {
+diff --git a/include/net/sch_generic.h b/include/net/sch_generic.h
+index 9310e02d27c88..e16c97cd6ef91 100644
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@ -327,7 +327,6 @@ struct Qdisc_ops {
+ 	struct module		*owner;
+ };
+ 
+-
+ struct tcf_result {
+ 	union {
+ 		struct {
+@@ -335,8 +334,8 @@ struct tcf_result {
+ 			u32		classid;
+ 		};
+ 		const struct tcf_proto *goto_tp;
+-
+ 	};
++	enum skb_drop_reason		drop_reason;
+ };
+ 
+ struct tcf_chain;
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 06f4f0f2421b4..1bf404303565e 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -4080,6 +4080,7 @@ sch_handle_egress(struct sk_buff *skb, int *ret, struct net_device *dev)
+ 	/* qdisc_skb_cb(skb)->pkt_len was already set by the caller. */
+ 	tc_skb_cb(skb)->mru = 0;
+ 	tc_skb_cb(skb)->post_ct = false;
++	cl_res.drop_reason = SKB_DROP_REASON_TC_EGRESS;
+ 	mini_qdisc_bstats_cpu_update(miniq, skb);
+ 
+ 	switch (tcf_classify(skb, miniq->block, miniq->filter_list, &cl_res, false)) {
+@@ -4090,7 +4091,7 @@ sch_handle_egress(struct sk_buff *skb, int *ret, struct net_device *dev)
+ 	case TC_ACT_SHOT:
+ 		mini_qdisc_qstats_cpu_drop(miniq);
+ 		*ret = NET_XMIT_DROP;
+-		kfree_skb_reason(skb, SKB_DROP_REASON_TC_EGRESS);
++		kfree_skb_reason(skb, cl_res.drop_reason ?: SKB_DROP_REASON_TC_EGRESS);
+ 		return NULL;
+ 	case TC_ACT_STOLEN:
+ 	case TC_ACT_QUEUED:
+@@ -5273,6 +5274,7 @@ sch_handle_ingress(struct sk_buff *skb, struct packet_type **pt_prev, int *ret,
+ 	tc_skb_cb(skb)->mru = 0;
+ 	tc_skb_cb(skb)->post_ct = false;
+ 	skb->tc_at_ingress = 1;
++	cl_res.drop_reason = SKB_DROP_REASON_TC_INGRESS;
+ 	mini_qdisc_bstats_cpu_update(miniq, skb);
+ 
+ 	switch (tcf_classify(skb, miniq->block, miniq->filter_list, &cl_res, false)) {
+@@ -5282,7 +5284,7 @@ sch_handle_ingress(struct sk_buff *skb, struct packet_type **pt_prev, int *ret,
+ 		break;
+ 	case TC_ACT_SHOT:
+ 		mini_qdisc_qstats_cpu_drop(miniq);
+-		kfree_skb_reason(skb, SKB_DROP_REASON_TC_INGRESS);
++		kfree_skb_reason(skb, cl_res.drop_reason ?: SKB_DROP_REASON_TC_INGRESS);
+ 		*ret = NET_RX_DROP;
+ 		return NULL;
+ 	case TC_ACT_STOLEN:
+-- 
+2.53.0
+

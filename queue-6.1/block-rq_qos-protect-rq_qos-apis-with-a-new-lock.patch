@@ -1,0 +1,258 @@
+From 671981f8874c9a75192869ef4ae7e384c5badd93 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 14 Apr 2023 16:40:08 +0800
+Subject: block/rq_qos: protect rq_qos apis with a new lock
+
+From: Yu Kuai <yukuai3@huawei.com>
+
+[ Upstream commit a13bd91be22318768d55470cbc0b0f4488ef9edf ]
+
+commit 50e34d78815e ("block: disable the elevator int del_gendisk")
+move rq_qos_exit() from disk_release() to del_gendisk(), this will
+introduce some problems:
+
+1) If rq_qos_add() is triggered by enabling iocost/iolatency through
+   cgroupfs, then it can concurrent with del_gendisk(), it's not safe to
+   write 'q->rq_qos' concurrently.
+
+2) Activate cgroup policy that is relied on rq_qos will call
+   rq_qos_add() and blkcg_activate_policy(), and if rq_qos_exit() is
+   called in the middle, null-ptr-dereference will be triggered in
+   blkcg_activate_policy().
+
+3) blkg_conf_open_bdev() can call blkdev_get_no_open() first to find the
+   disk, then if rq_qos_exit() from del_gendisk() is done before
+   rq_qos_add(), then memory will be leaked.
+
+This patch add a new disk level mutex 'rq_qos_mutex':
+
+1) The lock will protect rq_qos_exit() directly.
+
+2) For wbt that doesn't relied on blk-cgroup, rq_qos_add() can only be
+   called from disk initialization for now because wbt can't be
+   destructed until rq_qos_exit(), so it's safe not to protect wbt for
+   now. Hoever, in case that rq_qos dynamically destruction is supported
+   in the furture, this patch also protect rq_qos_add() from wbt_init()
+   directly, this is enough because blk-sysfs already synchronize
+   writers with disk removal.
+
+3) For iocost and iolatency, in order to synchronize disk removal and
+   cgroup configuration, the lock is held after blkdev_get_no_open()
+   from blkg_conf_open_bdev(), and is released in blkg_conf_exit().
+   In order to fix the above memory leak, disk_live() is checked after
+   holding the new lock.
+
+Fixes: 50e34d78815e ("block: disable the elevator int del_gendisk")
+Signed-off-by: Yu Kuai <yukuai3@huawei.com>
+Acked-by: Tejun Heo <tj@kernel.org>
+Link: https://lore.kernel.org/r/20230414084008.2085155-1-yukuai1@huaweicloud.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ block/blk-cgroup.c     | 12 ++++++++++++
+ block/blk-core.c       |  1 +
+ block/blk-iocost.c     |  4 ++++
+ block/blk-rq-qos.c     |  2 ++
+ block/blk-rq-qos.h     | 18 ++++--------------
+ block/blk-wbt.c        |  2 ++
+ include/linux/blkdev.h |  1 +
+ 7 files changed, 26 insertions(+), 14 deletions(-)
+
+diff --git a/block/blk-cgroup.c b/block/blk-cgroup.c
+index 7d7c99d93bdb8..3a33ec0af8419 100644
+--- a/block/blk-cgroup.c
++++ b/block/blk-cgroup.c
+@@ -656,6 +656,13 @@ struct block_device *blkcg_conf_open_bdev(char **inputp)
+ 		return ERR_PTR(-ENODEV);
+ 	}
+ 
++	mutex_lock(&bdev->bd_queue->rq_qos_mutex);
++	if (!disk_live(bdev->bd_disk)) {
++		mutex_unlock(&bdev->bd_queue->rq_qos_mutex);
++		blkdev_put_no_open(bdev);
++		return ERR_PTR(-ENODEV);
++	}
++
+ 	*inputp = input;
+ 	return bdev;
+ }
+@@ -779,6 +786,7 @@ int blkg_conf_prep(struct blkcg *blkcg, const struct blkcg_policy *pol,
+ fail_exit_queue:
+ 	blk_queue_exit(q);
+ fail:
++	mutex_unlock(&q->rq_qos_mutex);
+ 	blkdev_put_no_open(bdev);
+ 	/*
+ 	 * If queue was bypassing, we should retry.  Do so after a
+@@ -803,9 +811,11 @@ EXPORT_SYMBOL_GPL(blkg_conf_prep);
+  */
+ void blkg_conf_finish(struct blkg_conf_ctx *ctx)
+ 	__releases(&ctx->bdev->bd_queue->queue_lock) __releases(rcu)
++	__releases(&ctx->bdev->bd_queue->rq_qos_mutex)
+ {
+ 	spin_unlock_irq(&bdev_get_queue(ctx->bdev)->queue_lock);
+ 	rcu_read_unlock();
++	mutex_unlock(&ctx->bdev->bd_queue->rq_qos_mutex);
+ 	blkdev_put_no_open(ctx->bdev);
+ }
+ EXPORT_SYMBOL_GPL(blkg_conf_finish);
+@@ -1297,7 +1307,9 @@ int blkcg_init_disk(struct gendisk *disk)
+ 	if (ret)
+ 		goto err_ioprio_exit;
+ 
++	mutex_lock(&q->rq_qos_mutex);
+ 	ret = blk_iolatency_init(disk);
++	mutex_unlock(&q->rq_qos_mutex);
+ 	if (ret)
+ 		goto err_throtl_exit;
+ 
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 1fcd80a1c54fd..641bc0fa8a4ad 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -412,6 +412,7 @@ struct request_queue *blk_alloc_queue(int node_id, bool alloc_srcu)
+ 	mutex_init(&q->debugfs_mutex);
+ 	mutex_init(&q->sysfs_lock);
+ 	mutex_init(&q->sysfs_dir_lock);
++	mutex_init(&q->rq_qos_mutex);
+ 	spin_lock_init(&q->queue_lock);
+ 
+ 	init_waitqueue_head(&q->mq_freeze_wq);
+diff --git a/block/blk-iocost.c b/block/blk-iocost.c
+index 93482cc420c97..3989d8c796b0f 100644
+--- a/block/blk-iocost.c
++++ b/block/blk-iocost.c
+@@ -3309,11 +3309,13 @@ static ssize_t ioc_qos_write(struct kernfs_open_file *of, char *input,
+ 	ioc_refresh_params(ioc, true);
+ 	spin_unlock_irq(&ioc->lock);
+ 
++	mutex_unlock(&bdev->bd_queue->rq_qos_mutex);
+ 	blkdev_put_no_open(bdev);
+ 	return nbytes;
+ einval:
+ 	ret = -EINVAL;
+ err:
++	mutex_unlock(&bdev->bd_queue->rq_qos_mutex);
+ 	blkdev_put_no_open(bdev);
+ 	return ret;
+ }
+@@ -3434,12 +3436,14 @@ static ssize_t ioc_cost_model_write(struct kernfs_open_file *of, char *input,
+ 	ioc_refresh_params(ioc, true);
+ 	spin_unlock_irq(&ioc->lock);
+ 
++	mutex_unlock(&bdev->bd_queue->rq_qos_mutex);
+ 	blkdev_put_no_open(bdev);
+ 	return nbytes;
+ 
+ einval:
+ 	ret = -EINVAL;
+ err:
++	mutex_unlock(&bdev->bd_queue->rq_qos_mutex);
+ 	blkdev_put_no_open(bdev);
+ 	return ret;
+ }
+diff --git a/block/blk-rq-qos.c b/block/blk-rq-qos.c
+index a319311d1ced1..aa45f073d51b0 100644
+--- a/block/blk-rq-qos.c
++++ b/block/blk-rq-qos.c
+@@ -288,9 +288,11 @@ void rq_qos_wait(struct rq_wait *rqw, void *private_data,
+ 
+ void rq_qos_exit(struct request_queue *q)
+ {
++	mutex_lock(&q->rq_qos_mutex);
+ 	while (q->rq_qos) {
+ 		struct rq_qos *rqos = q->rq_qos;
+ 		q->rq_qos = rqos->next;
+ 		rqos->ops->exit(rqos);
+ 	}
++	mutex_unlock(&q->rq_qos_mutex);
+ }
+diff --git a/block/blk-rq-qos.h b/block/blk-rq-qos.h
+index 1ef1f7d4bc3cb..98be0e02a86c1 100644
+--- a/block/blk-rq-qos.h
++++ b/block/blk-rq-qos.h
+@@ -87,21 +87,18 @@ static inline void rq_wait_init(struct rq_wait *rq_wait)
+ 
+ static inline int rq_qos_add(struct request_queue *q, struct rq_qos *rqos)
+ {
++	lockdep_assert_held(&q->rq_qos_mutex);
++
+ 	/*
+ 	 * No IO can be in-flight when adding rqos, so freeze queue, which
+ 	 * is fine since we only support rq_qos for blk-mq queue.
+-	 *
+-	 * Reuse ->queue_lock for protecting against other concurrent
+-	 * rq_qos adding/deleting
+ 	 */
+ 	blk_mq_freeze_queue(q);
+ 
+-	spin_lock_irq(&q->queue_lock);
+ 	if (rq_qos_id(q, rqos->id))
+ 		goto ebusy;
+ 	rqos->next = q->rq_qos;
+ 	q->rq_qos = rqos;
+-	spin_unlock_irq(&q->queue_lock);
+ 
+ 	blk_mq_unfreeze_queue(q);
+ 
+@@ -113,7 +110,6 @@ static inline int rq_qos_add(struct request_queue *q, struct rq_qos *rqos)
+ 
+ 	return 0;
+ ebusy:
+-	spin_unlock_irq(&q->queue_lock);
+ 	blk_mq_unfreeze_queue(q);
+ 	return -EBUSY;
+ 
+@@ -123,21 +119,15 @@ static inline void rq_qos_del(struct request_queue *q, struct rq_qos *rqos)
+ {
+ 	struct rq_qos **cur;
+ 
+-	/*
+-	 * See comment in rq_qos_add() about freezing queue & using
+-	 * ->queue_lock.
+-	 */
+-	blk_mq_freeze_queue(q);
++	lockdep_assert_held(&q->rq_qos_mutex);
+ 
+-	spin_lock_irq(&q->queue_lock);
++	blk_mq_freeze_queue(q);
+ 	for (cur = &q->rq_qos; *cur; cur = &(*cur)->next) {
+ 		if (*cur == rqos) {
+ 			*cur = rqos->next;
+ 			break;
+ 		}
+ 	}
+-	spin_unlock_irq(&q->queue_lock);
+-
+ 	blk_mq_unfreeze_queue(q);
+ 
+ 	mutex_lock(&q->debugfs_mutex);
+diff --git a/block/blk-wbt.c b/block/blk-wbt.c
+index c293e08b301ff..46534c877c12f 100644
+--- a/block/blk-wbt.c
++++ b/block/blk-wbt.c
+@@ -850,7 +850,9 @@ int wbt_init(struct request_queue *q)
+ 	/*
+ 	 * Assign rwb and add the stats callback.
+ 	 */
++	mutex_lock(&q->rq_qos_mutex);
+ 	ret = rq_qos_add(q, &rwb->rqos);
++	mutex_unlock(&q->rq_qos_mutex);
+ 	if (ret)
+ 		goto err_free;
+ 
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index de013fc37ef83..c5d07c7609d4b 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -397,6 +397,7 @@ struct request_queue {
+ 
+ 	struct blk_queue_stats	*stats;
+ 	struct rq_qos		*rq_qos;
++	struct mutex		rq_qos_mutex;
+ 
+ 	const struct blk_mq_ops	*mq_ops;
+ 
+-- 
+2.53.0
+
