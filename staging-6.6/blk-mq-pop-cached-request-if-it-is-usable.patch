@@ -1,0 +1,106 @@
+From 7e2d494c74613f08f010fdc10444b9e0956fd07d Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 16 Oct 2026 14:47:52 -0400
+Subject: blk-mq: pop cached request if it is usable
+
+From: Keith Busch <kbusch@kernel.org>
+
+[ Upstream commit dc278e9bf2b9513a763353e6b9cc21e0f532954e ]
+
+When submitting a bio to blk-mq, if the task should sleep after peeking
+a cached request, but before it pops it, the plug flushes and calls
+blk_mq_free_plug_rqs, freeing the cached_rqs. This creates a
+use-after-free bug. Fix this by popping the cached request before any
+possible blocking calls if it is suitable for use.
+
+Popping this request first holds a queue reference, so avoid any
+serialization races with queue freezes and can safely proceed with
+dispatching that request to the driver. This potentially increases a
+timing window from when a driver wants to freeze its queue to when
+requests stop being dispatched. That scenario is off the fast path
+though, and drivers need to appropriately handle requests during a
+freeze request anyway.
+
+The downside is the popped element needs to be individually freed when
+we performed a bio plug merge. The cached request would have had to be
+freed later anyway, but this patch does it inline with building the plug
+list instead of after flushing it.
+
+Fixes: b0077e269f6c1 ("blk-mq: make sure active queue usage is held for bio_integrity_prep()")
+Fixes: 7b4f36cd22a65 ("block: ensure we hold a queue reference when using queue limits")
+Signed-off-by: Keith Busch <kbusch@kernel.org>
+Link: https://patch.msgid.link/20260521190253.242065-1-kbusch@meta.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Assisted-by: LLM
+[ Backport to 6.6.y: Pop a suitable request from the older cached_rq list
+  before fallible preparation, then initialize it after preparation. The
+  target has three preparation or merge exits; the following correction
+  restores the request on each exit. ]
+Signed-off-by: Artem Dinaburg <artem@trailofbits.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ block/blk-mq.c | 32 ++++++++++++++++----------------
+ 1 file changed, 16 insertions(+), 16 deletions(-)
+
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 4c1c5a261d0cf..1ad77737b27d3 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -2984,17 +2984,7 @@ static bool blk_mq_can_use_cached_rq(struct request *rq, struct blk_plug *plug,
+ 	if (op_is_flush(rq->cmd_flags) != op_is_flush(bio->bi_opf))
+ 		return false;
+ 
+-	/*
+-	 * If any qos ->throttle() end up blocking, we will have flushed the
+-	 * plug and hence killed the cached_rq list as well. Pop this entry
+-	 * before we throttle.
+-	 */
+ 	plug->cached_rq = rq_list_next(rq);
+-	rq_qos_throttle(rq->q, bio);
+-
+-	blk_mq_rq_time_init(rq, 0);
+-	rq->cmd_flags = bio->bi_opf;
+-	INIT_LIST_HEAD(&rq->queuelist);
+ 	return true;
+ }
+ 
+@@ -3027,20 +3017,30 @@ void blk_mq_submit_bio(struct bio *bio)
+ 		rq = rq_list_peek(&plug->cached_rq);
+ 		if (rq && rq->q != q)
+ 			rq = NULL;
++		if (rq && !blk_mq_can_use_cached_rq(rq, plug, bio))
++			rq = NULL;
+ 	}
+ 	if (rq) {
+ 		if (unlikely(bio_may_exceed_limits(bio, &q->limits))) {
+ 			bio = __bio_split_to_limits(bio, &q->limits, &nr_segs);
+-			if (!bio)
++			if (!bio) {
++				blk_mq_free_request(rq);
+ 				return;
++			}
+ 		}
+-		if (!bio_integrity_prep(bio))
++		if (!bio_integrity_prep(bio)) {
++			blk_mq_free_request(rq);
+ 			return;
+-		if (blk_mq_attempt_bio_merge(q, bio, nr_segs))
++		}
++		if (blk_mq_attempt_bio_merge(q, bio, nr_segs)) {
++			blk_mq_free_request(rq);
+ 			return;
+-		if (blk_mq_can_use_cached_rq(rq, plug, bio))
+-			goto done;
+-		percpu_ref_get(&q->q_usage_counter);
++		}
++		rq_qos_throttle(rq->q, bio);
++		blk_mq_rq_time_init(rq, 0);
++		rq->cmd_flags = bio->bi_opf;
++		INIT_LIST_HEAD(&rq->queuelist);
++		goto done;
+ 	} else {
+ 		if (unlikely(bio_queue_enter(bio)))
+ 			return;
+-- 
+2.53.0
+
