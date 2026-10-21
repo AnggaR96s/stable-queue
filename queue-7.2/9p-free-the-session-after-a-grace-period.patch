@@ -1,0 +1,72 @@
+From bcec7fc2e224088daf94448d663b02e0d0b9c717 Mon Sep 17 00:00:00 2001
+From: Christian Brauner <brauner@kernel.org>
+Date: Fri, 9 Oct 2026 23:51:53 +0200
+Subject: 9p: free the session after a grace period
+
+From: Christian Brauner <brauner@kernel.org>
+
+commit bcec7fc2e224088daf94448d663b02e0d0b9c717 upstream.
+
+v9fs_vfs_get_link_dotl() reads ->cache from the v9fs_session_info in
+sb->s_fs_info to decide whether the symlink target sits in the page
+cache. It does that before it looks at the dentry, so it also does it in
+rcu pathwalk mode. Without loose or metadata caching the dentries have
+no ->d_revalidate() that would make the walk leave rcu mode before it
+gets there.
+
+v9fs_kill_super() frees the session and clears sb->s_fs_info without
+waiting for a grace period. Right now a pathwalk can't still be in
+v9fs_vfs_get_link_dotl() at that point, but only by accident. umount(2)
+waits for a grace period in namespace_unlock() before it drops the
+mount. And a mount whose last reference goes away elsewhere, like the
+chdir out of a lazily unmounted directory, still gets a grace period
+from bdi_unregister(). v9fs_fill_super() sets up a private bdi, so
+generic_shutdown_super() unregisters it from kill_anon_super() and
+bdi_remove_from_list() waits in synchronize_rcu_expedited() before
+v9fs_kill_super() frees the session. That grace period protects the rcu
+readers of bdi_list in the writeback code. It has nothing to do with
+pathwalk.
+
+Don't rely on it. Keep sb->s_fs_info and free the session after a grace
+period.
+
+Fixes: 712da38d134b ("9p: Enable symlink caching in page cache")
+Cc: stable@vger.kernel.org
+Link: https://patch.msgid.link/20261009-work-fixes-rcu-v1-3-7446d2d335e6@kernel.org
+Signed-off-by: Christian Brauner (Amutable) <brauner@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/9p/v9fs.h      | 1 +
+ fs/9p/vfs_super.c | 4 ++--
+ 2 files changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/fs/9p/v9fs.h b/fs/9p/v9fs.h
+index a462bcbfc7da..2ac863dc8446 100644
+--- a/fs/9p/v9fs.h
++++ b/fs/9p/v9fs.h
+@@ -137,6 +137,7 @@ struct v9fs_session_info {
+ 	struct list_head slist; /* list of sessions registered with v9fs */
+ 	struct rw_semaphore rename_sem;
+ 	long session_lock_timeout; /* retry interval for blocking locks */
++	struct rcu_head rcu;	/* v9fs_vfs_get_link_dotl() reads ->cache in rcu pathwalk */
+ };
+ 
+ #define NDENTRY_TIMEOUT_NEVER (-1U)
+diff --git a/fs/9p/vfs_super.c b/fs/9p/vfs_super.c
+index 94d6b02c221b..79526044685c 100644
+--- a/fs/9p/vfs_super.c
++++ b/fs/9p/vfs_super.c
+@@ -173,8 +173,8 @@ static void v9fs_kill_super(struct super_block *s)
+ 
+ 	v9fs_session_cancel(v9ses);
+ 	v9fs_session_close(v9ses);
+-	kfree(v9ses);
+-	s->s_fs_info = NULL;
++	/* v9fs_vfs_get_link_dotl() may still read ->cache in rcu pathwalk */
++	kfree_rcu(v9ses, rcu);
+ 	p9_debug(P9_DEBUG_VFS, "exiting kill_super\n");
+ }
+ 
+-- 
+2.56.0
+
