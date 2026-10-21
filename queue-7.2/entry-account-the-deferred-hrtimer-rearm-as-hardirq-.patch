@@ -1,0 +1,112 @@
+From 2e6233a67ec180181eed8718dee615742e0244ec Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 13 Oct 2026 12:13:18 +0500
+Subject: entry: Account the deferred hrtimer rearm as hardirq context for
+ lockdep
+
+From: Mikhail Gavrilov <mikhail.v.gavrilov@gmail.com>
+
+[ Upstream commit 7cbaa0f4579f48e92639c6abb761fdef8fbade47 ]
+
+On a desktop debug kernel (PROVE_LOCKING, KASAN, LOCKDEP_CHAINS_BITS=19)
+lockdep switches itself off after about two days of uptime with
+"BUG: MAX_LOCKDEP_CHAIN_HLOCKS too low!", and locking is not validated
+until the next reboot. In the last such boot the pool ran out after 46.6
+hours, and a fifth of it, 533509 of 2621431 chain hlocks in 63838 of
+344717 chains, had been created by the deferred hrtimer rearm on return
+from interrupt.
+
+Make lockdep account that rearm as part of the timer interrupt it
+belongs to.
+
+Commit 15dd3a948855
+("hrtimer: Push reprogramming timers into the interrupt return path")
+moved the reprogramming of the clock event device out of the timer
+interrupt into the interrupt return path. On return to kernel mode
+irqentry_exit_to_kernel_mode_after_preempt() performs it after
+irq_exit_rcu() has already left lockdep's hardirq context. lockdep
+therefore records hrtimer_bases.lock and the timekeeper sequence count
+as taken by the interrupted context, on top of the locks that context
+holds, and every distinct held-lock stack an interrupt hits adds two
+lock chains. When the rearm runs from irq_enter_rcu() or
+__irq_exit_rcu() it is still inside lockdep's hardirq context, and there
+the same acquisitions reuse one pair of chains.
+
+The dependencies recorded on the return path are "lock held with
+interrupts enabled -> hrtimer_bases.lock". Such a lock is hardirq-unsafe
+and hrtimer_bases.lock is hardirq-safe, so a path in the reverse
+direction is already reported by the irq-safety checks without these
+edges.
+
+Re-enter lockdep's hardirq context around the rearm on the kernel return
+path. The return to user mode path holds no locks and is left alone, as
+is the rearm in __schedule(), which runs under the runqueue lock.
+
+With the same kernel tree, configuration and workload, one hour of
+uptime including a full kernel build, the chains of this shape, with
+hrtimer_bases.lock and optionally the timekeeper sequence count on top
+of a held-lock stack outside the scheduler, go from 13266 (96187 chain
+hlocks, 15.9% of those in use) to 4. Those 4 come from clock_was_set(),
+which takes cpus_read_lock() and each CPU's hrtimer_bases.lock and reads
+the clock under it.
+
+Fixes: 15dd3a948855 ("hrtimer: Push reprogramming timers into the interrupt return path")
+Signed-off-by: Mikhail Gavrilov <mikhail.v.gavrilov@gmail.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://patch.msgid.link/20261013071318.33300-1-mikhail.v.gavrilov@gmail.com
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/linux/irq-entry-common.h | 23 +++++++++++++++++++++--
+ 1 file changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/include/linux/irq-entry-common.h b/include/linux/irq-entry-common.h
+index 1fabf0f5ea8e7..c03153548a2d4 100644
+--- a/include/linux/irq-entry-common.h
++++ b/include/linux/irq-entry-common.h
+@@ -468,6 +468,25 @@ static inline void irqentry_exit_to_kernel_mode_preempt(struct pt_regs *regs,
+ 		irqentry_exit_cond_resched();
+ }
+ 
++/*
++ * The deferred hrtimer rearm is the tail of the timer interrupt, moved to the
++ * interrupt return path so that it runs after a possible reschedule. By now
++ * irq_exit_rcu() has left lockdep's hardirq context. Re-enter it for the
++ * rearm, so that the hrtimer base lock and the timekeeping sequence count are
++ * not chained onto the locks held by the interrupted context, which would add
++ * new lock chains for every lock stack an interrupt hits.
++ *
++ * The rearm on return to user mode needs no such annotation: no locks are
++ * held there, so it uses the same lock chains as the rearm in hardirq
++ * context.
++ */
++static __always_inline void irqentry_hrtimer_rearm_deferred(void)
++{
++	lockdep_hardirq_enter();
++	hrtimer_rearm_deferred();
++	lockdep_hardirq_exit();
++}
++
+ /**
+  * irqentry_exit_to_kernel_mode_after_preempt - Establish trace, lockdep and RCU state
+  * @regs:	Pointer to current's pt_regs
+@@ -491,7 +510,7 @@ irqentry_exit_to_kernel_mode_after_preempt(struct pt_regs *regs, irqentry_state_
+ 		 */
+ 		if (state.exit_rcu) {
+ 			instrumentation_begin();
+-			hrtimer_rearm_deferred();
++			irqentry_hrtimer_rearm_deferred();
+ 			/* Tell the tracer that IRET will enable interrupts */
+ 			trace_hardirqs_on_prepare();
+ 			lockdep_hardirqs_on_prepare();
+@@ -502,7 +521,7 @@ irqentry_exit_to_kernel_mode_after_preempt(struct pt_regs *regs, irqentry_state_
+ 		}
+ 
+ 		instrumentation_begin();
+-		hrtimer_rearm_deferred();
++		irqentry_hrtimer_rearm_deferred();
+ 		/* Covers both tracing and lockdep */
+ 		trace_hardirqs_on();
+ 		instrumentation_end();
+-- 
+2.53.0
+

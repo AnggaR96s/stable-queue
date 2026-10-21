@@ -1,0 +1,107 @@
+From 9bd0211f8d7464760d541fc1e45dfb615935c429 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Sun, 27 Sep 2026 19:13:29 +1000
+Subject: scsi: target: Disable interrupts while holding delayed_cmd_lock
+
+From: Yu Zhang <yuz08559@gmail.com>
+
+[ Upstream commit 04a67a8b1a4460345d22fe75d93430cbf7e651d7 ]
+
+target_do_delayed_work() takes dev->delayed_cmd_lock with a plain
+spin_lock(). It runs from system_percpu_wq, so interrupts stay enabled
+while the lock is held. Every other acquisition of that lock uses
+spin_lock_irqsave(): target_handle_task_attr() and
+transport_complete_ordered_sync() in target_core_transport.c, and
+target_non_ordered_release() in target_core_device.c.
+
+That was safe while every caller of transport_complete_task_attr() ran
+in process context: target_complete_ok_work() from target_completion_wq,
+transport_complete_qf() from dev->qf_work_queue, and
+transport_generic_request_failure() from the submit and execute paths.
+
+Since commit 06933066d88a ("scsi: target: Add support for completing
+commands from backend context") that is no longer true. With
+complete_type=1 on a fabric that sets direct_compl_supp,
+target_complete() runs target_complete_ok_work() inline in the backend's
+completion context, which target_complete_cmd_with_sense() documents as
+"May be called from interrupt context". For iblock that is the bio
+end_io.
+
+target_complete_ok_work() starts with transport_complete_task_attr(),
+which takes delayed_cmd_lock in two ways:
+
+ - Every ORDERED command is put on dev->delayed_cmd_list by
+   target_handle_task_attr() and dispatched from there by
+   target_do_delayed_work(), which marks it SCF_TASK_ORDERED_SYNC.  Its
+   completion therefore goes through transport_complete_ordered_sync().
+
+ - A SIMPLE command that completes while an ORDERED command is pending
+   drops the last reference to the killed dev->non_ordered, and
+   percpu_ref_put() then runs target_non_ordered_release() in the
+   completing context.
+
+Both take the lock and, if commands are waiting, call
+schedule_work(&dev->delayed_cmd_work), which queues on system_percpu_wq,
+i.e. on the CPU that took the completion. Further completions for the
+same queue are typically delivered there too, so one arriving while the
+work holds the lock spins on it forever.
+
+Reaching this needs complete_type=1, which is not the default
+(vhost-scsi, the only fabric with direct_compl_supp, defaults to
+TARGET_QUEUE_COMPL), a backend whose I/O completes from interrupt
+context, and ORDERED commands from the initiator. Linux virtio_scsi
+guests send only VIRTIO_SCSI_S_SIMPLE and never take the ordered path;
+any guest that uses the ORDERED task attribute, which vhost-scsi
+accepts, does.
+
+target_do_delayed_work() is a work item and always runs in process
+context, so spin_lock_irq() is sufficient.
+
+Found by inspection; no runtime report. A single ORDERED command goes
+through both acquisitions, so with CONFIG_PROVE_LOCKING the first one
+completed through direct completion should produce an inconsistent lock
+state report on delayed_cmd_lock (hardirq or softirq, depending on where
+the backend completes).
+
+Fixes: 06933066d88a ("scsi: target: Add support for completing commands from backend context")
+Signed-off-by: Yu Zhang <yuz08559@gmail.com>
+Reviewed-by: Mike Christie <michael.christie@oracle.com>
+Link: https://patch.msgid.link/20260927091329.13482-1-yuz08559@gmail.com
+Signed-off-by: Martin K. Petersen (Oracle) <mkp@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/target/target_core_transport.c | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/target/target_core_transport.c b/drivers/target/target_core_transport.c
+index dcfe945949167..67c046549192e 100644
+--- a/drivers/target/target_core_transport.c
++++ b/drivers/target/target_core_transport.c
+@@ -2359,7 +2359,7 @@ void target_do_delayed_work(struct work_struct *work)
+ 	struct se_device *dev = container_of(work, struct se_device,
+ 					     delayed_cmd_work);
+ 
+-	spin_lock(&dev->delayed_cmd_lock);
++	spin_lock_irq(&dev->delayed_cmd_lock);
+ 	while (!dev->ordered_sync_in_progress) {
+ 		struct se_cmd *cmd;
+ 
+@@ -2380,12 +2380,12 @@ void target_do_delayed_work(struct work_struct *work)
+ 		dev->ordered_sync_in_progress = true;
+ 
+ 		list_del(&cmd->se_delayed_node);
+-		spin_unlock(&dev->delayed_cmd_lock);
++		spin_unlock_irq(&dev->delayed_cmd_lock);
+ 
+ 		__target_execute_cmd(cmd, true);
+-		spin_lock(&dev->delayed_cmd_lock);
++		spin_lock_irq(&dev->delayed_cmd_lock);
+ 	}
+-	spin_unlock(&dev->delayed_cmd_lock);
++	spin_unlock_irq(&dev->delayed_cmd_lock);
+ }
+ 
+ static void transport_complete_ordered_sync(struct se_cmd *cmd)
+-- 
+2.53.0
+

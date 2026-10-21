@@ -1,0 +1,117 @@
+From 084e352e6b9f798d8e70900746da1f467e0b6820 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 1 Jun 2026 15:56:53 +0200
+Subject: fs: add umh argument to struct kernel_clone_args
+
+From: Christian Brauner <brauner@kernel.org>
+
+[ Upstream commit ed4b1672529018b2013c62235c4bf1ab0ae0e3d4 ]
+
+Add a umh field to struct kernel_clone_args. When set, copy_fs() copies
+from pid 1's fs_struct instead of the kthread's fs_struct. This ensures
+usermodehelper threads always get init's filesystem state regardless of
+their parent's (kthreadd's) fs.
+
+Usermodehelper threads are not allowed to create mount namespaces
+(CLONE_NEWNS), share filesystem state (CLONE_FS), or be started from
+a non-initial mount namespace. No usermodehelper currently does this so
+we don't need to worry about this restriction.
+
+Set .umh = 1 in user_mode_thread(). At this stage pid 1's fs points to
+rootfs which is the same as kthreadd's fs, so this is functionally
+equivalent.
+
+Link: https://patch.msgid.link/20260601-work-kthread-nullfs-v4-20-77ee053060e0@kernel.org
+Signed-off-by: Christian Brauner (Amutable) <brauner@kernel.org>
+Stable-dep-of: d2bdb9b61b42 ("fs: let idle threads share init_fs")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/linux/sched/task.h |  1 +
+ kernel/fork.c              | 25 +++++++++++++++++++++----
+ kernel/umh.c               |  6 ++----
+ 3 files changed, 24 insertions(+), 8 deletions(-)
+
+diff --git a/include/linux/sched/task.h b/include/linux/sched/task.h
+index 41ed884cffc96..e0c1ca8c6a188 100644
+--- a/include/linux/sched/task.h
++++ b/include/linux/sched/task.h
+@@ -31,6 +31,7 @@ struct kernel_clone_args {
+ 	u32 io_thread:1;
+ 	u32 user_worker:1;
+ 	u32 no_files:1;
++	u32 umh:1;
+ 	unsigned long stack;
+ 	unsigned long stack_size;
+ 	unsigned long tls;
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 4441d415480c6..2f736fa44798b 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1618,11 +1618,27 @@ static int copy_exec_state(u64 clone_flags, struct task_struct *tsk)
+ 	return task_exec_state_copy(tsk);
+ }
+ 
+-static int copy_fs(u64 clone_flags, struct task_struct *tsk)
++static int copy_fs(u64 clone_flags, struct task_struct *tsk, bool umh)
+ {
+-	struct fs_struct *fs = current->fs;
++	struct fs_struct *fs;
++
++	/*
++	 * Usermodehelper may copy userspace_init_fs filesystem state but
++	 * they don't get to create mount namespaces, share the
++	 * filesystem state, or be started from a non-initial mount
++	 * namespace.
++	 */
++	if (umh) {
++		if (clone_flags & (CLONE_NEWNS | CLONE_FS))
++			return -EINVAL;
++		if (current->nsproxy->mnt_ns != &init_mnt_ns)
++			return -EINVAL;
++		fs = userspace_init_fs;
++	} else {
++		fs = current->fs;
++		VFS_WARN_ON_ONCE(current->fs != current->real_fs);
++	}
+ 
+-	VFS_WARN_ON_ONCE(current->fs != current->real_fs);
+ 	if (clone_flags & CLONE_FS) {
+ 		/* tsk->fs is already what we want */
+ 		read_seqlock_excl(&fs->seq);
+@@ -2282,7 +2298,7 @@ __latent_entropy struct task_struct *copy_process(
+ 	retval = copy_files(clone_flags, p, args->no_files);
+ 	if (retval)
+ 		goto bad_fork_cleanup_semundo;
+-	retval = copy_fs(clone_flags, p);
++	retval = copy_fs(clone_flags, p, args->umh);
+ 	if (retval)
+ 		goto bad_fork_cleanup_files;
+ 	retval = copy_sighand(clone_flags, p);
+@@ -2825,6 +2841,7 @@ pid_t user_mode_thread(int (*fn)(void *), void *arg, unsigned long flags)
+ 		.exit_signal	= (flags & CSIGNAL),
+ 		.fn		= fn,
+ 		.fn_arg		= arg,
++		.umh		= 1,
+ 	};
+ 
+ 	return kernel_clone(&args);
+diff --git a/kernel/umh.c b/kernel/umh.c
+index 48117c569e1aa..6e2c7bb315c68 100644
+--- a/kernel/umh.c
++++ b/kernel/umh.c
+@@ -71,10 +71,8 @@ static int call_usermodehelper_exec_async(void *data)
+ 	spin_unlock_irq(&current->sighand->siglock);
+ 
+ 	/*
+-	 * Initial kernel threads share ther FS with init, in order to
+-	 * get the init root directory. But we've now created a new
+-	 * thread that is going to execve a user process and has its own
+-	 * 'struct fs_struct'. Reset umask to the default.
++	 * Usermodehelper threads get a copy of userspace init's
++	 * fs_struct. Reset umask to the default.
+ 	 */
+ 	current->fs->umask = 0022;
+ 
+-- 
+2.53.0
+
