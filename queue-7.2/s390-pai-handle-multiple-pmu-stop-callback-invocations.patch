@@ -1,0 +1,117 @@
+From f3110e969ad226ffbb2d9b4bf5387e68d0d9ef40 Mon Sep 17 00:00:00 2001
+From: Thomas Richter <tmricht@linux.ibm.com>
+Date: Wed, 19 Aug 2026 07:58:55 +0200
+Subject: s390/pai: Handle multiple PMU stop callback invocations
+
+From: Thomas Richter <tmricht@linux.ibm.com>
+
+commit f3110e969ad226ffbb2d9b4bf5387e68d0d9ef40 upstream.
+
+Handle the following scenario:
+The kernel protects itself against a very high sampling load and
+throttles the sampling using:
+
+  perf_event_throttle() --> PMU->stop()
+
+Shortly later the scheduler may terminate the task and removes it from the
+CPU. It again calls
+
+  PMU->stop()
+
+which results in two invocations of PMU->stop() called back to back.
+Protect against this and check the PERF_HES_STOPPED bit on function
+entry.  If it is already set return.
+Clear bit PERF_HES_STOPPED in PMU->start().
+
+Prohibit ioctl(fd, PERF_EVENT_IOC_PERIOD, ...) call for this event.
+It sets perf_event::event_limit to a positive value and causes
+perf_event_overflow() to invoke pai_stop() call back function when
+perf_event::event_limit hits zero. This is not supported because the
+sample events CRYPTO_ALL and NNPA_ALL are only taken at schedule out
+of a task.
+
+Use list_for_each_entry_safe() for safe iteration over syswide_list
+in pai_have_samples().
+
+Fixes: 9f66572f2889 ("s390/pai_crypto: Enable per-task and system-wide sampling event")
+Fixes: 582cc1b28e8c ("s390/pai_ext: Enable per-task and system-wide sampling event")
+Cc: stable@vger.kernel.org # v6.19+
+Signed-off-by: Thomas Richter <tmricht@linux.ibm.com>
+Reviewed-by: Sumanth Korikkar <sumanthk@linux.ibm.com>
+Signed-off-by: Vasily Gorbik <gor@linux.ibm.com>
+Signed-off-by: Heiko Carstens <hca@linux.ibm.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/s390/kernel/perf_pai.c |   25 +++++++++++++++++++++++--
+ 1 file changed, 23 insertions(+), 2 deletions(-)
+
+--- a/arch/s390/kernel/perf_pai.c
++++ b/arch/s390/kernel/perf_pai.c
+@@ -502,6 +502,7 @@ static void pai_start(struct perf_event
+ 			cpump->event = event;
+ 		}
+ 	}
++	event->hw.state &= ~PERF_HES_STOPPED;
+ }
+ 
+ static void paicrypt_start(struct perf_event *event, int flags)
+@@ -548,6 +549,13 @@ static void pai_stop(struct perf_event *
+ 	struct pai_mapptr *mp = this_cpu_ptr(pai_root[idx].mapptr);
+ 	struct pai_map *cpump = mp->mapptr;
+ 
++	/* Cope with multiple invocations:
++	 *   1. perf_event_throttle() --> PMU->stop()
++	 *   2. task schedules out --> PMU->stop()
++	 * Check for event already stopped.
++	 */
++	if (event->hw.state & PERF_HES_STOPPED)
++		return;
+ 	if (!event->attr.sample_period) {	/* Counting */
+ 		pai_pmu[idx].pmu->read(event);
+ 	} else {				/* Sampling */
+@@ -710,9 +718,9 @@ static void pai_have_samples(int idx)
+ {
+ 	struct pai_mapptr *mp = this_cpu_ptr(pai_root[idx].mapptr);
+ 	struct pai_map *cpump = mp->mapptr;
+-	struct perf_event *event;
++	struct perf_event *event, *e2;
+ 
+-	list_for_each_entry(event, &cpump->syswide_list, hw.tp_list)
++	list_for_each_entry_safe(event, e2, &cpump->syswide_list, hw.tp_list)
+ 		pai_have_sample(event, cpump);
+ }
+ 
+@@ -729,6 +737,17 @@ static void paicrypt_sched_task(struct p
+ 		pai_have_samples(PAI_PMU_CRYPTO);
+ }
+ 
++/* Prevent ioctl(fd, PERF_EVENT_IOC_PERIOD, ...) call.
++ * It sets perf_event::event_limit to a positive value and causes
++ * perf_event_overflow() to invoke pai_stop() call back function when
++ * perf_event::event_limit hits zero. This is not supported because the
++ * sample events CRYPTO_ALL and NNPA_ALL are always taken at schedule out
++ * of a task.
++ */
++static int pai_check_period(struct perf_event *event, u64 value)
++{
++	return -EINVAL;
++}
+ /* ============================= paiext ====================================*/
+ 
+ static void paiext_event_destroy(struct perf_event *event)
+@@ -842,6 +861,7 @@ static struct pmu paicrypt = {
+ 	.stop	      = paicrypt_stop,
+ 	.read	      = paicrypt_read,
+ 	.sched_task   = paicrypt_sched_task,
++	.check_period = pai_check_period,
+ 	.attr_groups  = paicrypt_attr_groups
+ };
+ 
+@@ -1053,6 +1073,7 @@ static struct pmu paiext = {
+ 	.stop	      = paiext_stop,
+ 	.read	      = paiext_read,
+ 	.sched_task   = paiext_sched_task,
++	.check_period = pai_check_period,
+ 	.attr_groups  = paiext_attr_groups,
+ };
+ 
