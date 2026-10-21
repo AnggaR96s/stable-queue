@@ -1,0 +1,86 @@
+From 069403dff337feb192bfc70fb28ddc8a171e20c1 Mon Sep 17 00:00:00 2001
+From: Tejun Heo <tj@kernel.org>
+Date: Fri, 9 Oct 2026 12:01:45 -1000
+Subject: sched_ext: Fix use-after-free of a destroyed user DSQ by a deferred reenqueue
+
+From: Tejun Heo <tj@kernel.org>
+
+commit 069403dff337feb192bfc70fb28ddc8a171e20c1 upstream.
+
+A deferred reenqueue can read a freed user DSQ. The request stays on its
+CPU's deferred list until run_deferred() takes it, and the RCU callback that
+frees the DSQ assumes that the grace period has flushed it, so exit_dsq()
+checks the per-CPU node without the deferred list lock. A grace period waits
+for readers in flight, not for a pending run_deferred(). A run_deferred()
+which starts after the grace period began can detach the request right
+before the callback looks and then read the freed DSQ's id.
+
+Cancel the pending requests before the grace period instead. The irq work
+that frees the DSQ unlinks every CPU's request under the per-CPU deferred
+list lock, and schedule_dsq_reenq() ignores a new request under the same
+lock once the id is invalid. Only a run_deferred() that started before the
+grace period can hold a request, and it runs with IRQs disabled, so the
+grace period waits for it and nothing touches the DSQ after the callback.
+
+Fixes: 84b1a0ea0b7c ("sched_ext: Implement scx_bpf_dsq_reenq() for user DSQs")
+Cc: stable@vger.kernel.org # v7.1+
+Reported-and-tested-by: Hui Su <sh_def@163.com>
+Link: https://lore.kernel.org/all/20261008024753.4096008-1-sh_def@163.com/
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ kernel/sched/ext/ext.c |   28 +++++++++++++++++++++++++---
+ 1 file changed, 25 insertions(+), 3 deletions(-)
+
+--- a/kernel/sched/ext/ext.c
++++ b/kernel/sched/ext/ext.c
+@@ -1274,6 +1274,10 @@ static void schedule_dsq_reenq(struct sc
+ 
+ 			guard(raw_spinlock_irqsave)(&rq->scx.deferred_reenq_lock);
+ 
++			/* @dsq is being destroyed, see free_dsq_irq_workfn() */
++			if (unlikely(READ_ONCE(dsq->id) == SCX_DSQ_INVALID))
++				return;
++
+ 			if (list_empty(&dru->node))
+ 				list_move_tail(&dru->node, &rq->scx.deferred_reenq_users);
+ 			WRITE_ONCE(dru->flags, dru->flags | reenq_flags);
+@@ -4899,8 +4903,8 @@ static void exit_dsq(struct scx_dispatch
+ 		struct rq *rq = cpu_rq(cpu);
+ 
+ 		/*
+-		 * There must have been a RCU grace period since the last
+-		 * insertion and @dsq should be off the deferred list by now.
++		 * free_dsq_irq_workfn() cancelled the reenqs before the grace
++		 * period and schedule_dsq_reenq() queues nothing after that.
+ 		 */
+ 		if (WARN_ON_ONCE(!list_empty(&dru->node))) {
+ 			guard(raw_spinlock_irqsave)(&rq->scx.deferred_reenq_lock);
+@@ -4924,8 +4928,26 @@ static void free_dsq_irq_workfn(struct i
+ 	struct llist_node *to_free = llist_del_all(&dsqs_to_free);
+ 	struct scx_dispatch_q *dsq, *tmp_dsq;
+ 
+-	llist_for_each_entry_safe(dsq, tmp_dsq, to_free, free_node)
++	llist_for_each_entry_safe(dsq, tmp_dsq, to_free, free_node) {
++		s32 cpu;
++
++		/*
++		 * Cancel pending reenqs. Only a run_deferred() that started
++		 * before the grace period can hold one, and it keeps IRQs off,
++		 * so the grace period waits for it. After this sweep,
++		 * schedule_dsq_reenq() sees the invalid id under the same lock
++		 * and queues nothing.
++		 */
++		for_each_possible_cpu(cpu) {
++			struct scx_dsq_pcpu *pcpu = per_cpu_ptr(dsq->pcpu, cpu);
++			struct rq *rq = cpu_rq(cpu);
++
++			guard(raw_spinlock_irqsave)(&rq->scx.deferred_reenq_lock);
++			list_del_init(&pcpu->deferred_reenq_user.node);
++		}
++
+ 		call_rcu(&dsq->rcu, free_dsq_rcufn);
++	}
+ }
+ 
+ static DEFINE_IRQ_WORK(free_dsq_irq_work, free_dsq_irq_workfn);
