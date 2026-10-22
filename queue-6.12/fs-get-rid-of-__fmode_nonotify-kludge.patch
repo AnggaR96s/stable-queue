@@ -1,0 +1,190 @@
+From ebe559609d7829b52c6642b581860760984faf9d Mon Sep 17 00:00:00 2001
+From: Al Viro <viro@zeniv.linux.org.uk>
+Date: Fri, 15 Nov 2024 10:30:14 -0500
+Subject: fs: get rid of __FMODE_NONOTIFY kludge
+
+From: Al Viro <viro@zeniv.linux.org.uk>
+
+commit ebe559609d7829b52c6642b581860760984faf9d upstream.
+
+All it takes to get rid of the __FMODE_NONOTIFY kludge is switching
+fanotify from anon_inode_getfd() to anon_inode_getfile_fmode() and adding
+a dentry_open_nonotify() helper to be used by fanotify on the other path.
+That's it - no more weird shit in OPEN_FMODE(), etc.
+
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+Link: https://lore.kernel.org/linux-fsdevel/20241113043003.GH3387508@ZenIV/
+Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+Signed-off-by: Jan Kara <jack@suse.cz>
+Link: https://patch.msgid.link/d1231137e7b661a382459e79a764259509a4115d.1731684329.git.josef@toxicpanda.com
+Cc: Guenter Roeck <linux@roeck-us.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/fcntl.c                         |    4 ++--
+ fs/notify/fanotify/fanotify_user.c |   25 ++++++++++++++++---------
+ fs/open.c                          |   23 +++++++++++++++++++----
+ include/linux/fs.h                 |    6 +++---
+ include/uapi/asm-generic/fcntl.h   |    1 -
+ 5 files changed, 40 insertions(+), 19 deletions(-)
+
+--- a/fs/fcntl.c
++++ b/fs/fcntl.c
+@@ -1166,10 +1166,10 @@ static int __init fcntl_init(void)
+ 	 * Exceptions: O_NONBLOCK is a two bit define on parisc; O_NDELAY
+ 	 * is defined as O_NONBLOCK on some platforms and not on others.
+ 	 */
+-	BUILD_BUG_ON(21 - 1 /* for O_RDONLY being 0 */ !=
++	BUILD_BUG_ON(20 - 1 /* for O_RDONLY being 0 */ !=
+ 		HWEIGHT32(
+ 			(VALID_OPEN_FLAGS & ~(O_NONBLOCK | O_NDELAY)) |
+-			__FMODE_EXEC | __FMODE_NONOTIFY));
++			__FMODE_EXEC));
+ 
+ 	fasync_cache = kmem_cache_create("fasync_cache",
+ 					 sizeof(struct fasync_struct), 0,
+--- a/fs/notify/fanotify/fanotify_user.c
++++ b/fs/notify/fanotify/fanotify_user.c
+@@ -100,8 +100,7 @@ static void __init fanotify_sysctls_init
+  *
+  * Internal and external open flags are stored together in field f_flags of
+  * struct file. Only external open flags shall be allowed in event_f_flags.
+- * Internal flags like FMODE_NONOTIFY, FMODE_EXEC, FMODE_NOCMTIME shall be
+- * excluded.
++ * Internal flags like FMODE_EXEC shall be excluded.
+  */
+ #define	FANOTIFY_INIT_ALL_EVENT_F_BITS				( \
+ 		O_ACCMODE	| O_APPEND	| O_NONBLOCK	| \
+@@ -258,12 +257,11 @@ static int create_fd(struct fsnotify_gro
+ 		return client_fd;
+ 
+ 	/*
+-	 * we need a new file handle for the userspace program so it can read even if it was
+-	 * originally opened O_WRONLY.
++	 * We provide an fd for the userspace program, so it could access the
++	 * file without generating fanotify events itself.
+ 	 */
+-	new_file = dentry_open(path,
+-			       group->fanotify_data.f_flags | __FMODE_NONOTIFY,
+-			       current_cred());
++	new_file = dentry_open_nonotify(path, group->fanotify_data.f_flags,
++					current_cred());
+ 	if (IS_ERR(new_file)) {
+ 		put_unused_fd(client_fd);
+ 		client_fd = PTR_ERR(new_file);
+@@ -1400,6 +1398,7 @@ SYSCALL_DEFINE2(fanotify_init, unsigned
+ 	unsigned int fid_mode = flags & FANOTIFY_FID_BITS;
+ 	unsigned int class = flags & FANOTIFY_CLASS_BITS;
+ 	unsigned int internal_flags = 0;
++	struct file *file;
+ 
+ 	pr_debug("%s: flags=%x event_f_flags=%x\n",
+ 		 __func__, flags, event_f_flags);
+@@ -1468,7 +1467,7 @@ SYSCALL_DEFINE2(fanotify_init, unsigned
+ 	    (!(fid_mode & FAN_REPORT_NAME) || !(fid_mode & FAN_REPORT_FID)))
+ 		return -EINVAL;
+ 
+-	f_flags = O_RDWR | __FMODE_NONOTIFY;
++	f_flags = O_RDWR;
+ 	if (flags & FAN_CLOEXEC)
+ 		f_flags |= O_CLOEXEC;
+ 	if (flags & FAN_NONBLOCK)
+@@ -1546,10 +1545,18 @@ SYSCALL_DEFINE2(fanotify_init, unsigned
+ 			goto out_destroy_group;
+ 	}
+ 
+-	fd = anon_inode_getfd("[fanotify]", &fanotify_fops, group, f_flags);
++	fd = get_unused_fd_flags(f_flags);
+ 	if (fd < 0)
+ 		goto out_destroy_group;
+ 
++	file = anon_inode_getfile_fmode("[fanotify]", &fanotify_fops, group,
++					f_flags, FMODE_NONOTIFY);
++	if (IS_ERR(file)) {
++		fd = PTR_ERR(file);
++		put_unused_fd(fd);
++		goto out_destroy_group;
++	}
++	fd_install(fd, file);
+ 	return fd;
+ 
+ out_destroy_group:
+--- a/fs/open.c
++++ b/fs/open.c
+@@ -1124,6 +1124,23 @@ struct file *dentry_open(const struct pa
+ }
+ EXPORT_SYMBOL(dentry_open);
+ 
++struct file *dentry_open_nonotify(const struct path *path, int flags,
++				  const struct cred *cred)
++{
++	struct file *f = alloc_empty_file(flags, cred);
++	if (!IS_ERR(f)) {
++		int error;
++
++		f->f_mode |= FMODE_NONOTIFY;
++		error = vfs_open(path, f);
++		if (error) {
++			fput(f);
++			f = ERR_PTR(error);
++		}
++	}
++	return f;
++}
++
+ /**
+  * dentry_create - Create and open a file
+  * @path: path to create
+@@ -1221,7 +1238,7 @@ inline struct open_how build_open_how(in
+ inline int build_open_flags(const struct open_how *how, struct open_flags *op)
+ {
+ 	u64 flags = how->flags;
+-	u64 strip = __FMODE_NONOTIFY | O_CLOEXEC;
++	u64 strip = O_CLOEXEC;
+ 	int lookup_flags = 0;
+ 	int acc_mode = ACC_MODE(flags);
+ 
+@@ -1229,9 +1246,7 @@ inline int build_open_flags(const struct
+ 			 "struct open_flags doesn't yet handle flags > 32 bits");
+ 
+ 	/*
+-	 * Strip flags that either shouldn't be set by userspace like
+-	 * FMODE_NONOTIFY or that aren't relevant in determining struct
+-	 * open_flags like O_CLOEXEC.
++	 * Strip flags that aren't relevant in determining struct open_flags.
+ 	 */
+ 	flags &= ~strip;
+ 
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -2784,6 +2784,8 @@ static inline struct file *file_open_roo
+ }
+ struct file *dentry_open(const struct path *path, int flags,
+ 			 const struct cred *creds);
++struct file *dentry_open_nonotify(const struct path *path, int flags,
++				  const struct cred *cred);
+ struct file *dentry_create(const struct path *path, int flags, umode_t mode,
+ 			   const struct cred *cred);
+ struct path *backing_file_user_path(const struct file *f);
+@@ -3719,11 +3721,9 @@ struct ctl_table;
+ int __init list_bdev_fs_names(char *buf, size_t size);
+ 
+ #define __FMODE_EXEC		((__force int) FMODE_EXEC)
+-#define __FMODE_NONOTIFY	((__force int) FMODE_NONOTIFY)
+ 
+ #define ACC_MODE(x) ("\004\002\006\006"[(x)&O_ACCMODE])
+-#define OPEN_FMODE(flag) ((__force fmode_t)(((flag + 1) & O_ACCMODE) | \
+-					    (flag & __FMODE_NONOTIFY)))
++#define OPEN_FMODE(flag) ((__force fmode_t)((flag + 1) & O_ACCMODE))
+ 
+ static inline bool is_sxid(umode_t mode)
+ {
+--- a/include/uapi/asm-generic/fcntl.h
++++ b/include/uapi/asm-generic/fcntl.h
+@@ -6,7 +6,6 @@
+ 
+ /*
+  * FMODE_EXEC is 0x20
+- * FMODE_NONOTIFY is 0x4000000
+  * These cannot be used by userspace O_* until internal and external open
+  * flags are split.
+  * -Eric Paris
