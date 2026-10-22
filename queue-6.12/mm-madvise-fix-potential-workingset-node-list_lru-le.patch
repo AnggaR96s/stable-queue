@@ -1,0 +1,130 @@
+From f6a1a464c69a56207a87ef385c99ab0ea10fbc10 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Sun, 22 Dec 2024 20:29:36 +0800
+Subject: mm, madvise: fix potential workingset node list_lru leaks
+
+From: Kairui Song <kasong@tencent.com>
+
+[ Upstream commit 62e72d2cf702a5e2fb53d9c46ed900d9384e4a06 ]
+
+Since commit 5abc1e37afa0 ("mm: list_lru: allocate list_lru_one only when
+needed"), all list_lru users need to allocate the items using the new
+infrastructure that provides list_lru info for slab allocation, ensuring
+that the corresponding memcg list_lru is allocated before use.
+
+For workingset shadow nodes (which are xa_node), users are converted to
+use the new infrastructure by commit 9bbdc0f32409 ("xarray: use
+kmem_cache_alloc_lru to allocate xa_node").  The xas->xa_lru will be set
+correctly for filemap users.  However, there is a missing case: xa_node
+allocations caused by madvise(..., MADV_COLLAPSE).
+
+madvise(..., MADV_COLLAPSE) will also read in the absent parts of file
+map, and there will be xa_nodes allocated for the caller's memcg (assuming
+it's not rootcg).  However, these allocations won't trigger memcg list_lru
+allocation because the proper xas info was not set.
+
+If nothing else has allocated other xa_nodes for that memcg to trigger
+list_lru creation, and memory pressure starts to evict file pages,
+workingset_update_node will try to add these xa_nodes to their
+corresponding memcg list_lru, and it does not exist (NULL).  So they will
+be added to rootcg's list_lru instead.
+
+This shouldn't be a significant issue in practice, but it is indeed
+unexpected behavior, and these xa_nodes will not be reclaimed effectively.
+And may lead to incorrect counting of the list_lru->nr_items counter.
+
+This problem wasn't exposed until recent commit 28e98022b31ef
+("mm/list_lru: simplify reparenting and initial allocation") added a
+sanity check: only dying memcg could have a NULL list_lru when
+list_lru_{add,del} is called.  This problem triggered this WARNING.
+
+So make madvise(..., MADV_COLLAPSE) also call xas_set_lru() to pass the
+list_lru which we may want to insert xa_node into later.  And move
+mapping_set_update to mm/internal.h, and turn into a macro to avoid
+including extra headers in mm/internal.h.
+
+Link: https://lkml.kernel.org/r/20241222122936.67501-1-ryncsn@gmail.com
+Fixes: 9bbdc0f32409 ("xarray: use kmem_cache_alloc_lru to allocate xa_node")
+Reported-by: syzbot+38a0cbd267eff2d286ff@syzkaller.appspotmail.com
+Closes: https://lore.kernel.org/lkml/675d01e9.050a0220.37aaf.00be.GAE@google.com/
+Signed-off-by: Kairui Song <kasong@tencent.com>
+Cc: Chengming Zhou <chengming.zhou@linux.dev>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Qi Zheng <zhengqi.arch@bytedance.com>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: Sasha Levin <sashal@kernel.org>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Yu Zhao <yuzhao@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Stable-dep-of: aca1f2d5de17 ("mm/huge_memory: initialise workingset state before folio split")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ mm/filemap.c    | 9 ---------
+ mm/internal.h   | 6 ++++++
+ mm/khugepaged.c | 3 +++
+ 3 files changed, 9 insertions(+), 9 deletions(-)
+
+diff --git a/mm/filemap.c b/mm/filemap.c
+index c2287a1d1c6b7..64c2325b92389 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -125,15 +125,6 @@
+  *    ->private_lock		(zap_pte_range->block_dirty_folio)
+  */
+ 
+-static void mapping_set_update(struct xa_state *xas,
+-		struct address_space *mapping)
+-{
+-	if (dax_mapping(mapping) || shmem_mapping(mapping))
+-		return;
+-	xas_set_update(xas, workingset_update_node);
+-	xas_set_lru(xas, &shadow_nodes);
+-}
+-
+ static void page_cache_delete(struct address_space *mapping,
+ 				   struct folio *folio, void *shadow)
+ {
+diff --git a/mm/internal.h b/mm/internal.h
+index 9d277bc2c26e9..7aca909c54052 100644
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -1526,6 +1526,12 @@ static inline void shrinker_debugfs_remove(struct dentry *debugfs_entry,
+ /* Only track the nodes of mappings with shadow entries */
+ void workingset_update_node(struct xa_node *node);
+ extern struct list_lru shadow_nodes;
++#define mapping_set_update(xas, mapping) do {			\
++	if (!dax_mapping(mapping) && !shmem_mapping(mapping)) {	\
++		xas_set_update(xas, workingset_update_node);	\
++		xas_set_lru(xas, &shadow_nodes);		\
++	}							\
++} while (0)
+ 
+ /* mremap.c */
+ unsigned long move_page_tables(struct vm_area_struct *vma,
+diff --git a/mm/khugepaged.c b/mm/khugepaged.c
+index 84bacd7e19620..769e2f9f99920 100644
+--- a/mm/khugepaged.c
++++ b/mm/khugepaged.c
+@@ -20,6 +20,7 @@
+ #include <linux/rcupdate_wait.h>
+ #include <linux/swapops.h>
+ #include <linux/shmem_fs.h>
++#include <linux/dax.h>
+ #include <linux/ksm.h>
+ 
+ #include <asm/tlb.h>
+@@ -1823,6 +1824,8 @@ static int collapse_file(struct mm_struct *mm, unsigned long addr,
+ 	if (result != SCAN_SUCCEED)
+ 		goto out;
+ 
++	mapping_set_update(&xas, mapping);
++
+ 	__folio_set_locked(new_folio);
+ 	if (is_shmem)
+ 		__folio_set_swapbacked(new_folio);
+-- 
+2.53.0
+
