@@ -1,0 +1,104 @@
+From stable+bounces-364366-greg=kroah.com@vger.kernel.org Thu Oct 22 15:02:31 2026
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 22 Oct 2026 08:55:26 -0400
+Subject: sched_ext: Fix the bypass dispatch claim for schedulers bypassed by an ancestor
+To: stable@vger.kernel.org
+Cc: Tejun Heo <tj@kernel.org>, Andrea Righi <arighi@nvidia.com>, Sasha Levin <sashal@kernel.org>
+Message-ID: <20261022125419.1189016-1-sashal@kernel.org>
+
+From: Tejun Heo <tj@kernel.org>
+
+[ Upstream commit 5bdeca322a6f8d10acaf67cccab1f69747ee7be3 ]
+
+scx_bypass() claims bypass dispatch when the scheduler's depth goes from
+zero to one and releases it when the depth returns to zero, but propagates
+only the depth to the descendants, not the claim. A descendant that starts
+bypassing with its ancestor never claims, and one whose own bypass ends
+under the ancestor's keeps its claim, as its depth does not return to zero.
+
+A sub-scheduler enable whose bypass ends under a PM suspend thus leaks its
+claim: the parent keeps hosting bypass dispatch and the sub-scheduler's next
+bypass trips the WARN_ON_ONCE() on the claim. A sub-scheduler disable that
+starts under a PM suspend has no claim, so once the resume lifts the root's
+bypass its tasks sit on the parent's bypass DSQs with nobody consuming them.
+
+Claim for every descendant whose depth goes from zero to one in the
+propagation and release every scheduler in the subtree whose depth returned
+to zero once the tasks have moved out of the bypass DSQs. A parent that is
+bypassing itself when a descendant claims consumes only its own bypass DSQs,
+empty until it leaves bypass and becomes the host.
+
+Fixes: aa2a0a19686c ("sched_ext: Separate bypass dispatch enabling from bypass depth tracking")
+Cc: stable@vger.kernel.org # v7.1+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Reviewed-by: Andrea Righi <arighi@nvidia.com>
+[ sashal: Changed scx_disable_bypass_dsp() calls to disable_bypass_dsp(). ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ kernel/sched/ext/ext.c |   34 +++++++++++++++++++---------------
+ 1 file changed, 19 insertions(+), 15 deletions(-)
+
+--- a/kernel/sched/ext/ext.c
++++ b/kernel/sched/ext/ext.c
+@@ -5717,15 +5717,12 @@ static void enable_bypass_dsp(struct scx
+ 
+ 	/*
+ 	 * When a sub-sched bypasses, its tasks are queued on the bypass DSQs of
+-	 * the nearest non-bypassing ancestor or root. As enable_bypass_dsp() is
+-	 * called iff @sch is not already bypassed due to an ancestor bypassing,
+-	 * we can assume that the parent is not bypassing and thus will be the
+-	 * host of the bypass DSQs.
+-	 *
+-	 * While the situation may change in the future, the following
+-	 * guarantees that the nearest non-bypassing ancestor or root has bypass
+-	 * dispatch enabled while a descendant is bypassing, which is all that's
+-	 * required.
++	 * the nearest non-bypassing ancestor or root. The parent hosts them
++	 * unless it is bypassing too. Then they sit further up and the parent
++	 * consumes only its own bypass DSQs, empty until it leaves bypass and
++	 * becomes the host. Either way the nearest non-bypassing ancestor or
++	 * root has bypass dispatch enabled while a descendant is bypassing,
++	 * which is all that's required.
+ 	 *
+ 	 * bypass_dsp_enabled() test is used to determine whether to enter the
+ 	 * bypass dispatch handling path from both bypassing and hosting scheds.
+@@ -5818,16 +5815,19 @@ static void scx_bypass(struct scx_sched
+ 	 * Bypass state is propagated to all descendants - an scx_sched bypasses
+ 	 * if itself or any of its ancestors are in bypass mode. A descendant's
+ 	 * depth is the sum of its own bypasses and its ancestors', so every
+-	 * call propagates whether or not @sch changed state.
++	 * call propagates whether or not @sch changed state. The descendants'
++	 * claims are released below with @sch's, after their tasks have moved.
+ 	 */
+ 	raw_spin_lock(&scx_sched_lock);
+ 	scx_for_each_descendant_pre(pos, sch) {
+ 		if (pos == sch)
+ 			continue;
+-		if (bypass)
+-			inc_bypass_depth(pos);
+-		else
++		if (bypass) {
++			if (inc_bypass_depth(pos))
++				enable_bypass_dsp(pos);
++		} else {
+ 			dec_bypass_depth(pos);
++		}
+ 	}
+ 	raw_spin_unlock(&scx_sched_lock);
+ 
+@@ -5903,8 +5903,12 @@ static void scx_bypass(struct scx_sched
+ 	}
+ 
+ 	/* disarming must come after moving all tasks out of the bypass DSQs */
+-	if (!bypass)
+-		disable_bypass_dsp(sch);
++	if (!bypass) {
++		guard(raw_spinlock)(&scx_sched_lock);
++		scx_for_each_descendant_pre(pos, sch)
++			if (!pos->bypass_depth)
++				disable_bypass_dsp(pos);
++	}
+ unlock:
+ 	raw_spin_unlock_irqrestore(&scx_bypass_lock, flags);
+ }

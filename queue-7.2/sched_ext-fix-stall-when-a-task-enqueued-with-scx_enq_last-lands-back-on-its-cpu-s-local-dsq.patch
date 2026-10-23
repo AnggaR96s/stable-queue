@@ -1,0 +1,88 @@
+From stable+bounces-364326-greg=kroah.com@vger.kernel.org Thu Oct 22 13:44:44 2026
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 22 Oct 2026 07:44:23 -0400
+Subject: sched_ext: Fix stall when a task enqueued with SCX_ENQ_LAST lands back on its CPU's local DSQ
+To: stable@vger.kernel.org
+Cc: Tejun Heo <tj@kernel.org>, Xiangyu Bu <xbu@meta.com>, Dan Schatzberg <schatzberg.dan@gmail.com>, Sasha Levin <sashal@kernel.org>
+Message-ID: <20261022113413.922711-1-sashal@kernel.org>
+
+From: Tejun Heo <tj@kernel.org>
+
+[ Upstream commit 7a9df76679633cf26e0fea882a684012c6ec245a ]
+
+With SCX_OPS_ENQ_LAST, the last runnable task on a CPU is passed to
+ops.enqueue() instead of being kept running. Exiting tasks without
+SCX_OPS_ENQ_EXITING, migration disabled tasks without
+SCX_OPS_ENQ_MIGRATION_DISABLED and tasks on an offline rq skip ops.enqueue()
+and go straight to the local DSQ. This happens in put_prev_task_scx() after
+the pick has settled on idle, so nothing reschedules the CPU, which idles
+with the task queued until an unrelated wakeup lands on it or the watchdog
+fires.
+
+scx_mitosis, which sets SCX_OPS_ENQ_LAST without SCX_OPS_ENQ_EXITING, hit
+this during mass cgroup teardown: exiting tasks stuck in exit_mmap() for
+over 40 seconds.
+
+A task put on the local DSQ runs, as anywhere else. If the SCX_ENQ_LAST
+enqueue left the task on this CPU's local DSQ, set need_resched on the task
+being switched in, as proxy_resched_idle() does. resched_curr() would flag
+the task being put instead, and __schedule() clears that right after the
+pick.
+
+Fixes: f0e1a0643a59 ("sched_ext: Implement BPF extensible scheduler class")
+Cc: stable@vger.kernel.org # v6.12+
+Reported-by: Xiangyu Bu <xbu@meta.com>
+Link: https://github.com/sched-ext/scx/pull/3870
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Cc: Dan Schatzberg <schatzberg.dan@gmail.com>
+[ sashal: Adjusted context to use do_enqueue_task() without the upstream CPU-capability condition. ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ kernel/sched/ext/ext.c      |   13 +++++++++++--
+ kernel/sched/ext/internal.h |    5 +++--
+ 2 files changed, 14 insertions(+), 4 deletions(-)
+
+--- a/kernel/sched/ext/ext.c
++++ b/kernel/sched/ext/ext.c
+@@ -3169,8 +3169,7 @@ static void put_prev_task_scx(struct rq
+ 		/*
+ 		 * If @p is runnable but we're about to enter a lower
+ 		 * sched_class, %SCX_OPS_ENQ_LAST must be set. Tell
+-		 * ops.enqueue() that @p is the only one available for this cpu,
+-		 * which should trigger an explicit follow-up scheduling event.
++		 * ops.enqueue() that @p is the only one available for this cpu.
+ 		 *
+ 		 * Under core scheduling, a pick dispatches only when nothing is
+ 		 * locally runnable and can legitimately go idle with @p still
+@@ -3180,6 +3179,16 @@ static void put_prev_task_scx(struct rq
+ 			WARN_ON_ONCE(!sched_core_enabled(rq) &&
+ 				     !(sch->ops.flags & SCX_OPS_ENQ_LAST));
+ 			do_enqueue_task(rq, p, SCX_ENQ_LAST, -1);
++
++			/*
++			 * A task put on the local DSQ runs, as anywhere else.
++			 * Here the insert can't reschedule on its own: the pick
++			 * has settled on @next and @p is still curr, so
++			 * resched_curr() would flag @p and __schedule() clears
++			 * that right after the pick. Flag @next instead.
++			 */
++			if (p->scx.dsq == &rq->scx.local_dsq)
++				set_tsk_need_resched(next);
+ 		} else {
+ 			do_enqueue_task(rq, p, 0, -1);
+ 		}
+--- a/kernel/sched/ext/internal.h
++++ b/kernel/sched/ext/internal.h
+@@ -1291,8 +1291,9 @@ enum scx_enq_flags {
+ 	 * %SCX_OPS_ENQ_LAST is specified, they're ops.enqueue()'d with the
+ 	 * %SCX_ENQ_LAST flag set.
+ 	 *
+-	 * The BPF scheduler is responsible for triggering a follow-up
+-	 * scheduling event. Otherwise, Execution may stall.
++	 * If the task is queued on the local DSQ of the CPU it was running on,
++	 * it continues to run. Otherwise, the CPU goes idle. A scheduler that
++	 * wants a full dispatch cycle on the CPU should kick it.
+ 	 */
+ 	SCX_ENQ_LAST		= 1LLU << 41,
+ 
