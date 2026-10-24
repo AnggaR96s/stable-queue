@@ -1,0 +1,85 @@
+From b829872adf2a2fa4cd00861dc315aadbfb6d6c0a Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 22 Oct 2026 18:04:00 -0400
+Subject: net: bridge: mcast: don't truncate the port group walk on teardown
+
+From: Jun Yang <littleddfu@gmail.com>
+
+[ Upstream commit 5a3f7a683aee56e1f15c9d53041f3236767eaae7 ]
+
+__br_multicast_disable_port_ctx() and br_multicast_del_port() walk
+port->mglist with hlist_for_each_entry_safe(). However,
+br_multicast_find_del_pg() can also delete other entries from the same
+list through br_multicast_fwd_src_remove() or __fwd_del_star_excl().
+
+If such an entry is the iterator's saved next node, hlist_del_init()
+clears its ->next and terminates the walk early. The reproducer triggers
+this in both teardown walks, leaving port groups in the bridge mdb with
+a dangling ->key.port after del_nbp() frees the port:
+
+  BUG: KASAN: slab-use-after-free in __mdb_fill_info+0x1191/0x1320
+   __mdb_fill_info+0x1191/0x1320
+   br_mdb_dump+0x594/0xe40
+   rtnl_mdb_dump+0x1cf/0x5d0
+
+Use hlist_del_init_rcu() to unlink the group while preserving ->next.
+br_multicast_del_pg() and the teardown walks run under
+br->multicast_lock. The GC worker must acquire the same lock before
+detaching the group for destruction, so the node remains alive while
+the walk uses the preserved pointer.
+
+Preserving ->next means a walk can now reach a group that an earlier
+iteration already deleted as a side effect. That group is off mp->ports,
+so br_multicast_find_del_pg() would fall through its port scan and hit
+the trailing WARN_ON(1). Skip such groups at the top of that helper: a
+port group is put on port->mglist when it is created and only unlinked
+when it is deleted, so hlist_unhashed() identifies exactly this case.
+
+Fixes: b08123684bd5 ("net: bridge: mcast: install S,G entries automatically based on reports")
+Cc: stable@vger.kernel.org
+Suggested-by: Nikolay Aleksandrov <razor@blackwall.org>
+Reported-by: TencentOS Corvus AI <corvus@tencent.com>
+Signed-off-by: Jun Yang <junvyyang@tencent.com>
+Reviewed-by: Nikolay Aleksandrov <razor@blackwall.org>
+Link: https://patch.msgid.link/20260831111330.199543-1-junvyyang@tencent.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+[ sashal: Applied the br_multicast_del_pg() change to the existing __br_multicast_del_pg() helper. ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ net/bridge/br_multicast.c | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/net/bridge/br_multicast.c b/net/bridge/br_multicast.c
+index 53dd2d56c37ef..fdaf2db7173e6 100644
+--- a/net/bridge/br_multicast.c
++++ b/net/bridge/br_multicast.c
+@@ -596,7 +596,11 @@ static void __br_multicast_del_pg(struct net_bridge_mdb_entry *mp,
+ 	struct hlist_node *tmp;
+ 
+ 	rcu_assign_pointer(*pp, pg->next);
+-	hlist_del_init(&pg->mglist);
++	/* Keep ->next (held under multicast_lock, freed later by the GC work):
++	 * a port->mglist teardown walk may have latched this node as its next,
++	 * and deleting other groups of the same port must not truncate it.
++	 */
++	hlist_del_init_rcu(&pg->mglist);
+ 	hlist_for_each_entry_safe(ent, tmp, &pg->src_list, node)
+ 		br_multicast_del_group_src(ent);
+ 	br_mdb_notify(br->dev, mp, pg, RTM_DELMDB);
+@@ -629,6 +633,13 @@ static void br_multicast_find_del_pg(struct net_bridge *br,
+ 	struct net_bridge_mdb_entry *mp;
+ 	struct net_bridge_port_group *p;
+ 
++	/* A teardown walk over port->mglist can reach a group that an earlier
++	 * iteration already deleted as a side effect. It is off mp->ports by
++	 * now, so skip it instead of falling through to the WARN_ON() below.
++	 */
++	if (hlist_unhashed(&pg->mglist))
++		return;
++
+ 	mp = br_mdb_ip_get(br, &pg->key.addr);
+ 	if (WARN_ON(!mp))
+ 		return;
+-- 
+2.53.0
+
