@@ -1,0 +1,104 @@
+From 2dc73968c19673011e1e1dd2cc03900cd455ae87 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Sun, 25 Oct 2026 16:32:24 +0100
+Subject: netfilter: nf_tables: unconditionally bump set->nelems before
+ insertion
+
+From: Pablo Neira Ayuso <pablo@netfilter.org>
+
+[ Upstream commit def602e498a4f951da95c95b1b8ce8ae68aa733a ]
+
+In case that the set is full, a new element gets published then removed
+without waiting for the RCU grace period, while RCU reader can be
+walking over it already.
+
+To address this issue, add the element transaction even if set is full,
+but toggle the set_full flag to report -ENFILE so the abort path safely
+unwinds the set to its previous state.
+
+As for element updates, decrement set->nelems to restore it.
+
+A simpler fix is to call synchronize_rcu() in the error path.
+However, with a large batch adding elements to already maxed-out set,
+this could cause noticeable slowdown of such batches.
+
+Fixes: 35d0ac9070ef ("netfilter: nf_tables: fix set->nelems counting with no NLM_F_EXCL")
+Reported-by: Inseo An <y0un9sa@gmail.com>
+Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+Signed-off-by: Florian Westphal <fw@strlen.de>
+[ Backport to 5.10.y: applies on top of d4b7f29eb85c ("netfilter:
+  nf_tables: always increment set element count"), as in 6.1.y. 5.10
+  has neither the nft_set_maxsize() helper (8d738c1869f6) nor the
+  NFT_SET_ELEM_CATCHALL element class, so the ceiling is the same
+  expression the prerequisite inlines, set->size ? set->size +
+  set->ndeact : UINT_MAX, and every element is counted. On the
+  full-set path the element is left in the transaction and unwound by
+  the abort path, which removes it, decrements nelems and frees it only
+  after synchronize_rcu(), instead of the in-place set->ops->remove()
+  this replaces. The update-path hunk from the upstream commit does not
+  apply: 5.10 has no in-place element-update path here. ]
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Steffen Pfendtner <steffen.pfendtner@kernelscan.io>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ net/netfilter/nf_tables_api.c | 22 ++++++++++++----------
+ 1 file changed, 12 insertions(+), 10 deletions(-)
+
+diff --git a/net/netfilter/nf_tables_api.c b/net/netfilter/nf_tables_api.c
+index 867b5e152d677..cde499274fd37 100644
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@ -5596,6 +5596,8 @@ static int nft_add_set_elem(struct nft_ctx *ctx, struct nft_set *set,
+ 	struct nft_data_desc desc;
+ 	enum nft_registers dreg;
+ 	struct nft_trans *trans;
++	unsigned int max, nelems;
++	bool set_full = false;
+ 	u32 flags = 0;
+ 	u64 timeout;
+ 	u64 expiration;
+@@ -5806,10 +5808,15 @@ static int nft_add_set_elem(struct nft_ctx *ctx, struct nft_set *set,
+ 		goto err_elem_expr;
+ 	expr = NULL;
+ 
++	max = set->size ? set->size + set->ndeact : UINT_MAX;
++	nelems = atomic_inc_return(&set->nelems);
++	if (nelems > max)
++		set_full = true;
++
+ 	trans = nft_trans_elem_alloc(ctx, NFT_MSG_NEWSETELEM, set);
+ 	if (trans == NULL) {
+ 		err = -ENOMEM;
+-		goto err_elem_expr;
++		goto err_set_size;
+ 	}
+ 
+ 	ext->genmask = nft_genmask_cur(ctx->net);
+@@ -5841,20 +5848,15 @@ static int nft_add_set_elem(struct nft_ctx *ctx, struct nft_set *set,
+ 		goto err_element_clash;
+ 	}
+ 
+-	if (!atomic_add_unless(&set->nelems, 1,
+-			       set->size ? set->size + set->ndeact : UINT_MAX)) {
+-		err = -ENFILE;
+-		goto err_set_full;
+-	}
+-
+ 	nft_trans_elem(trans) = elem;
+ 	nft_trans_commit_list_add_tail(ctx->net, trans);
+-	return 0;
+ 
+-err_set_full:
+-	set->ops->remove(ctx->net, set, &elem);
++	return set_full ? -ENFILE : 0;
++
+ err_element_clash:
+ 	kfree(trans);
++err_set_size:
++	atomic_dec(&set->nelems);
+ err_elem_expr:
+ 	nf_tables_set_elem_destroy(ctx, set, elem.priv);
+ err_parse_data:
+-- 
+2.53.0
+
