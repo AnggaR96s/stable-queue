@@ -1,0 +1,97 @@
+From dc81e708c69e6a649d251febc019b3c9f060828a Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 26 Oct 2026 11:41:09 +0100
+Subject: sched/fair: Avoid overflow in place_entity()
+
+From: Hui Su <sh_def@163.com>
+
+[ Upstream commit 2f93bcb3f9aaf6ceee1aec0a97d4fe386d48e781 ]
+
+place_entity() inflates an entity's virtual lag with
+
+    lag * (load + weight) / load
+
+Commit 4823725d9d1d ("sched/fair: Increase weight bits for avg_vruntime")
+replaced the scaled-down weights used in this calculation with
+avg_vruntime_weight(), removing the arithmetic headroom provided by
+scale_load_down().
+
+The multiplication can overflow s64 before the division even when the
+final quotient is representable. A task's hierarchical effective weight
+can be as small as 2 after avg_vruntime_weight() scaling under group
+scheduling, while entity_lag() bounds |vlag| by
+
+    calc_delta_fair(cfs_rq_max_slice(cfs_rq) + TICK_NSEC, se)
+
+For example, with HZ=1000, NICE_0_LOAD=1048576, and the minimum scaled
+hierarchical weight scale_load(2)=2048, this bound is 891289600. With 114
+maximum-weight entities, the runqueue load is 10361604096. The
+intermediate product is:
+
+    891289600 * (10361604096 + 2)
+        = 9235189971864780800
+        > S64_MAX
+
+The signed overflow corrupts the entity's placement.
+
+Rewrite
+
+    lag * (load + weight) / load
+
+as
+
+    lag + lag * weight / load
+
+The two expressions are equivalent, but the latter avoids multiplying the
+virtual lag by the total runqueue weight. entity_lag() bounds vlag against
+the entity's effective weight, so the remaining lag * weight product stays
+bounded. rescale_entity() preserves this scale across h_load changes and
+already relies on the same product when rescaling vlag.
+
+Keep the original zero-load warning semantics by multiplying lag by weight
+after replacing the divisor with one.
+
+Fixes: 4823725d9d1d ("sched/fair: Increase weight bits for avg_vruntime")
+Signed-off-by: Hui Su <sh_def@163.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://patch.msgid.link/20260928124754.1692077-1-sh_def@163.com
+[ Backport to v7.2 which doesn't have flat hierarchy ]
+Signed-off-by: Vincent Guittot <vincent.guittot@linaro.org>
+Cc: stable@vger.kernel.org
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ kernel/sched/fair.c | 16 ++++++++++++----
+ 1 file changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index b6cace1d0e322..9e1a28a158da2 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -6250,12 +6250,20 @@ place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
+ 		load = cfs_rq->sum_weight;
+ 		if (curr && curr->on_rq)
+ 			load += avg_vruntime_weight(cfs_rq, curr->load.weight);
+-
+-		weight = avg_vruntime_weight(cfs_rq, se->load.weight);
+-		lag *= load + weight;
+ 		if (WARN_ON_ONCE(!load))
+ 			load = 1;
+-		lag = div64_long(lag, load);
++
++		weight = avg_vruntime_weight(cfs_rq, se->load.weight);
++
++		/*
++		 * Rewrite, because the product (W + w_i)*vl'_i might
++		 * overflow s64:
++		 *
++		 *   vl_i = (W + w_i)*vl'_i / W
++		 *        = (W*vl'_i + w_i*vl'_i) / W
++		 *        = vl'_i + w_i*vl'_i/W
++		 */
++		lag += div64_long(lag * weight, load);
+ 
+ 		/*
+ 		 * A heavy entity (relative to the tree) will pull the
+-- 
+2.53.0
+

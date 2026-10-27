@@ -1,0 +1,87 @@
+From fb5f4ab39767b96dbb83bc78d7a67a2d63a7388a Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 26 Oct 2026 10:55:33 +0900
+Subject: ntfs: take invalidate_lock in ntfs_filemap_page_mkwrite()
+
+From: Hongling Zeng <zenghongling@kylinos.cn>
+
+[ Upstream commit 0fecc393f2060e6bc25138df32cb923ec7071c6b ]
+
+ntfs_filemap_page_mkwrite() calls iomap_page_mkwrite() without holding
+mapping->invalidate_lock, so a concurrent truncate or fallocate can be in
+the middle of invalidating pagecache and rewriting the runlist while the write
+fault maps blocks and dirties the folio. This races with ntfs_attr_fallocate(),
+which merges clusters into the in-memory runlist, drops the runlist lock, and
+only afterwards zeroes the newly allocated clusters on disk; and with the
+punch-hole/insert/collapse paths that free clusters after truncating the cache.
+
+Per Documentation/filesystems/locking.rst, ->page_mkwrite() must ensure there
+are no truncate/invalidate races, "usually mapping->invalidate_lock is suitable
+for proper serialization". xfs takes its mmaplock (= the invalidate_lock
+rwsem) shared in exactly this path.
+
+Take invalidate_lock shared around iomap_page_mkwrite(). The read-only fault
+path is already covered because filemap_fault() itself grabs invalidate_lock
+shared on instantiation/read paths; only page_mkwrite was bypassing it in this
+driver.
+
+Fixes: 9c87959601e8 ("ntfs: update file operations")
+Cc: stable@vger.kernel.org
+Reviewed-by: Hyunchul Lee <hyc.lee@gmail.com>
+Reviewed-by: Baolin Liu <liubaolin@kylinos.cn>
+Signed-off-by: Hongling Zeng <zenghongling@kylinos.cn>
+Co-developed-by: Namjae Jeon <linkinjeon@kernel.org>
+Signed-off-by: Namjae Jeon <linkinjeon@kernel.org>
+Signed-off-by: Hyunchul Lee <hyc.lee@gmail.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/ntfs/file.c | 18 +++++++++++++-----
+ 1 file changed, 13 insertions(+), 5 deletions(-)
+
+diff --git a/fs/ntfs/file.c b/fs/ntfs/file.c
+index 317bb249150fd..8515560e2a4b2 100644
+--- a/fs/ntfs/file.c
++++ b/fs/ntfs/file.c
+@@ -620,12 +620,20 @@ static ssize_t ntfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
+ static vm_fault_t ntfs_filemap_page_mkwrite(struct vm_fault *vmf)
+ {
+ 	struct inode *inode = file_inode(vmf->vma->vm_file);
++	struct address_space *mapping = inode->i_mapping;
+ 	vm_fault_t ret;
+ 
+ 	sb_start_pagefault(inode->i_sb);
+ 	file_update_time(vmf->vma->vm_file);
+ 
++	/*
++	 * Serialize against truncate/fallocate which hold the lock
++	 * exclusively while invalidating pagecache and changing extents.
++	 */
++	filemap_invalidate_lock_shared(mapping);
+ 	ret = iomap_page_mkwrite(vmf, &ntfs_page_mkwrite_iomap_ops, NULL);
++	filemap_invalidate_unlock_shared(mapping);
++
+ 	sb_end_pagefault(inode->i_sb);
+ 	return ret;
+ }
+@@ -1119,13 +1127,13 @@ static long ntfs_fallocate(struct file *file, int mode, loff_t offset, loff_t le
+ 
+ 	err = file_modified(file);
+ out:
++	if (!err && mode == 0 && NInoNonResident(ni) &&
++	    offset > old_size) {
++		truncate_pagecache(vi, old_size);
++		pagecache_isize_extended(vi, old_size, offset);
++	}
+ 	filemap_invalidate_unlock(vi->i_mapping);
+ 	if (!err) {
+-		if (mode == 0 && NInoNonResident(ni) &&
+-		    offset > old_size) {
+-			truncate_pagecache(vi, old_size);
+-			pagecache_isize_extended(vi, old_size, offset);
+-		}
+ 		NInoSetFileNameDirty(ni);
+ 		inode_set_mtime_to_ts(vi, inode_set_ctime_current(vi));
+ 		mark_inode_dirty(vi);
+-- 
+2.53.0
+
