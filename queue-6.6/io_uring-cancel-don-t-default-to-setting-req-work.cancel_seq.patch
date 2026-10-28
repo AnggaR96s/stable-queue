@@ -1,0 +1,117 @@
+From d9355e4d39c2bded35d05ef56b7d5a79b9498c2d Mon Sep 17 00:00:00 2001
+From: Jens Axboe <axboe@kernel.dk>
+Date: Sun, 28 Jan 2024 20:11:55 -0700
+Subject: io_uring/cancel: don't default to setting req->work.cancel_seq
+
+From: Jens Axboe <axboe@kernel.dk>
+
+Commit 521223d7c229f83915619f888c99e952f24dc39f upstream.
+
+Just leave it unset by default, avoiding dipping into the last
+cacheline (which is otherwise untouched) for the fast path of using
+poll to drive networked traffic. Add a flag that tells us if the
+sequence is valid or not, and then we can defer actually assigning
+the flag and sequence until someone runs cancelations.
+
+[ 6.6: prerequisite for "io_uring/cancel: let CANCEL_ALL find parked requests". There is no free request flag bit here, so use the cancel_seq_set field that commit f4a1254f2a07 ("io_uring: fix cancellation overwriting req->flags") introduces upstream, which this also covers ]
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/linux/io_uring_types.h |    3 ++-
+ io_uring/cancel.c              |    3 +--
+ io_uring/cancel.h              |   10 ++++++++++
+ io_uring/io_uring.c            |    2 +-
+ io_uring/poll.c                |    6 +-----
+ 5 files changed, 15 insertions(+), 9 deletions(-)
+
+--- a/include/linux/io_uring_types.h
++++ b/include/linux/io_uring_types.h
+@@ -576,7 +576,7 @@ struct io_kiocb {
+ 		__poll_t apoll_events;
+ 	};
+ 	atomic_t			refs;
+-	atomic_t			poll_refs;
++	bool				cancel_seq_set;
+ 	struct io_task_work		io_task_work;
+ 	unsigned			nr_tw;
+ 	/* for polled requests, i.e. IORING_OP_POLL_ADD and async armed poll */
+@@ -586,6 +586,7 @@ struct io_kiocb {
+ 	/* opcode allocated if it needs to store data for async defer */
+ 	void				*async_data;
+ 	/* linked requests, IFF REQ_F_HARDLINK or REQ_F_LINK are set */
++	atomic_t			poll_refs;
+ 	struct io_kiocb			*link;
+ 	/* custom credentials, valid IFF REQ_F_CREDS is set */
+ 	const struct cred		*creds;
+--- a/io_uring/cancel.c
++++ b/io_uring/cancel.c
+@@ -56,9 +56,8 @@ bool io_cancel_req_match(struct io_kiocb
+ 		return false;
+ 	if (cd->flags & IORING_ASYNC_CANCEL_ALL) {
+ check_seq:
+-		if (cd->seq == req->work.cancel_seq)
++		if (io_cancel_match_sequence(req, cd->seq))
+ 			return false;
+-		req->work.cancel_seq = cd->seq;
+ 	}
+ 
+ 	return true;
+--- a/io_uring/cancel.h
++++ b/io_uring/cancel.h
+@@ -22,3 +22,13 @@ void init_hash_table(struct io_hash_tabl
+ 
+ int io_sync_cancel(struct io_ring_ctx *ctx, void __user *arg);
+ bool io_cancel_req_match(struct io_kiocb *req, struct io_cancel_data *cd);
++
++static inline bool io_cancel_match_sequence(struct io_kiocb *req, int sequence)
++{
++	if (req->cancel_seq_set && sequence == req->work.cancel_seq)
++		return true;
++
++	req->cancel_seq_set = true;
++	req->work.cancel_seq = sequence;
++	return false;
++}
+--- a/io_uring/io_uring.c
++++ b/io_uring/io_uring.c
+@@ -434,7 +434,6 @@ static void io_prep_async_work(struct io
+ 
+ 	req->work.list.next = NULL;
+ 	req->work.flags = 0;
+-	req->work.cancel_seq = atomic_read(&ctx->cancel_seq);
+ 	if (req->flags & REQ_F_FORCE_ASYNC)
+ 		req->work.flags |= IO_WQ_WORK_CONCURRENT;
+ 
+@@ -2164,6 +2163,7 @@ static int io_init_req(struct io_ring_ct
+ 	req->file = NULL;
+ 	req->rsrc_node = NULL;
+ 	req->task = current;
++	req->cancel_seq_set = false;
+ 
+ 	if (unlikely(opcode >= IORING_OP_LAST)) {
+ 		req->opcode = 0;
+--- a/io_uring/poll.c
++++ b/io_uring/poll.c
+@@ -585,10 +585,7 @@ static int __io_arm_poll_handler(struct
+ 				 struct io_poll_table *ipt, __poll_t mask,
+ 				 unsigned issue_flags)
+ {
+-	struct io_ring_ctx *ctx = req->ctx;
+-
+ 	INIT_HLIST_NODE(&req->hash_node);
+-	req->work.cancel_seq = atomic_read(&ctx->cancel_seq);
+ 	io_init_poll_iocb(poll, mask);
+ 	poll->file = req->file;
+ 	req->apoll_events = poll->events;
+@@ -826,9 +823,8 @@ static struct io_kiocb *io_poll_find(str
+ 		if (poll_only && req->opcode != IORING_OP_POLL_ADD)
+ 			continue;
+ 		if (cd->flags & IORING_ASYNC_CANCEL_ALL) {
+-			if (cd->seq == req->work.cancel_seq)
++			if (io_cancel_match_sequence(req, cd->seq))
+ 				continue;
+-			req->work.cancel_seq = cd->seq;
+ 		}
+ 		*out_bucket = hb;
+ 		return req;

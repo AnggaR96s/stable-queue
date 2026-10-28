@@ -1,0 +1,125 @@
+From d2f0f4117c1dbe18c4b6026b674360c570776872 Mon Sep 17 00:00:00 2001
+From: Josef Bacik <josef@toxicpanda.com>
+Date: Thu, 15 Oct 2026 19:31:03 +0000
+Subject: io_uring: don't pass restart error codes to userspace
+
+From: Josef Bacik <josef@toxicpanda.com>
+
+Commit e1a64bc64897f4c2fe460922c345f2ed8f889b5f upstream.
+
+-ERESTARTSYS and friends are instructions for the system call exit code,
+which either restarts the call or turns them into -EINTR. They are not
+supposed to be seen by applications. A request isn't a system call,
+nobody looks at what it returns before that is put into a CQE.
+
+The read/write and the networking opcodes convert these codes to -EINTR
+by hand. The others don't. An io-wq worker that is blocked in the open of
+a FIFO, a tty or some other device, or in a splice from an empty pipe,
+and that gets interrupted because the request is cancelled, completes it
+with -512:
+
+  IORING_OP_OPENAT, IOSQE_ASYNC       // FIFO without a writer
+  IORING_OP_ASYNC_CANCEL              // -EALREADY, worker is signalled
+  CQE of the open: res == -512
+
+There are more candidates, like whatever a file system or driver returns
+from ->flush(), ->fsync(), ->fallocate() or ->uring_cmd(), or breaking a
+lease or delegation.
+
+Take care of it in io_issue_sqe(), which all of them go through. The
+helper is moved from rw.c as is. The cost is a compare and a branch that
+is not taken per request.
+
+[ 6.6: io_issue_sqe() returns IOU_OK and an error straight away ]
+Fixes: 15b71abe7b52 ("io_uring: add support for IORING_OP_OPENAT")
+Assisted-by: LLM
+Signed-off-by: Josef Bacik <josef@toxicpanda.com>
+Link: https://patch.msgid.link/20261015-b4-io-uring-fixes-v1-39-c1556f5d7bf5@toxicpanda.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ io_uring/io_uring.c |    8 +++++++-
+ io_uring/io_uring.h |   18 ++++++++++++++++++
+ io_uring/rw.c       |   18 ------------------
+ 3 files changed, 25 insertions(+), 19 deletions(-)
+
+--- a/io_uring/io_uring.c
++++ b/io_uring/io_uring.c
+@@ -1906,6 +1906,9 @@ static int io_issue_sqe(struct io_kiocb
+ 	}
+ 
+ 	if (ret == IOU_OK) {
++		/* not all handlers take care of the internal restart codes */
++		if (unlikely(req->cqe.res <= -ERESTARTSYS))
++			req->cqe.res = io_fixup_restart_res(req->cqe.res);
+ 		if (issue_flags & IO_URING_F_COMPLETE_DEFER)
+ 			io_req_complete_defer(req);
+ 		else
+@@ -1914,8 +1917,11 @@ static int io_issue_sqe(struct io_kiocb
+ 		return 0;
+ 	}
+ 
+-	if (ret != IOU_ISSUE_SKIP_COMPLETE)
++	if (ret != IOU_ISSUE_SKIP_COMPLETE) {
++		if (unlikely(ret <= -ERESTARTSYS))
++			ret = io_fixup_restart_res(ret);
+ 		return ret;
++	}
+ 
+ 	/* If the op doesn't have a file, we're not polling for it */
+ 	if ((req->ctx->flags & IORING_SETUP_IOPOLL) && def->iopoll_queue)
+--- a/io_uring/io_uring.h
++++ b/io_uring/io_uring.h
+@@ -193,6 +193,24 @@ static __always_inline bool io_fill_cqe_
+ 	return true;
+ }
+ 
++static inline ssize_t io_fixup_restart_res(ssize_t ret)
++{
++	switch (ret) {
++	case -ERESTARTSYS:
++	case -ERESTARTNOINTR:
++	case -ERESTARTNOHAND:
++	case -ERESTART_RESTARTBLOCK:
++		/*
++		 * We can't just restart the syscall, since previously
++		 * submitted sqes may already be in progress. Just fail
++		 * this IO with EINTR.
++		 */
++		return -EINTR;
++	default:
++		return ret;
++	}
++}
++
+ static inline void req_set_fail(struct io_kiocb *req)
+ {
+ 	req->flags |= REQ_F_FAIL;
+--- a/io_uring/rw.c
++++ b/io_uring/rw.c
+@@ -140,24 +140,6 @@ void io_readv_writev_cleanup(struct io_k
+ 	kfree(io->free_iovec);
+ }
+ 
+-static inline ssize_t io_fixup_restart_res(ssize_t ret)
+-{
+-	switch (ret) {
+-	case -ERESTARTSYS:
+-	case -ERESTARTNOINTR:
+-	case -ERESTARTNOHAND:
+-	case -ERESTART_RESTARTBLOCK:
+-		/*
+-		 * We can't just restart the syscall, since previously
+-		 * submitted sqes may already be in progress. Just fail
+-		 * this IO with EINTR.
+-		 */
+-		return -EINTR;
+-	default:
+-		return ret;
+-	}
+-}
+-
+ static inline void io_rw_done(struct kiocb *kiocb, ssize_t ret)
+ {
+ 	/* IO was queued async, completion will happen later */
