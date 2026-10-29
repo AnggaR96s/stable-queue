@@ -1,0 +1,77 @@
+From 31a65a5b14a4b117dc71fc8d45d57bf9a9384f9e Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 28 Oct 2026 22:23:49 +0800
+Subject: wifi: mac80211: shut down RX BA session timer on teardown
+
+From: Zhao Li <enderaoelyther@gmail.com>
+
+commit e588e83e5c7a0f6d7a77dbbb58927c8c8cfd598e upstream.
+
+Tearing down an RX BA session while a BlockAckReq frame is being
+processed can rearm the session timer after teardown deletes it. A later
+expiry then accesses the freed tid_rx state.
+
+___ieee80211_stop_rx_ba_session() uses del_timer_sync() before RCU
+readers have finished with tid_rx. del_timer_sync() does not prevent a
+concurrent ieee80211_rx_h_ctrl() reader from calling mod_timer()
+afterward.
+
+Mark tid_rx removed under reorder_lock before deleting the timers, and
+serialize the BAR removed check and mod_timer() call with the same lock.
+
+This differs from the upstream commit, which uses timer_shutdown_sync()
+instead. Linux 5.10 does not provide that helper.
+
+LLM assistance was used to find the bug and review.
+
+Fixes: a87f736d942c ("mac80211: use RCU for RX aggregation")
+Cc: stable@vger.kernel.org # 5.10.x
+Signed-off-by: Zhao Li <enderaoelyther@gmail.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ net/mac80211/agg-rx.c | 5 ++---
+ net/mac80211/rx.c     | 5 +++--
+ 2 files changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/net/mac80211/agg-rx.c b/net/mac80211/agg-rx.c
+index 6ef8ded4ec764..b23ff9793fac7 100644
+--- a/net/mac80211/agg-rx.c
++++ b/net/mac80211/agg-rx.c
+@@ -103,12 +103,11 @@ void ___ieee80211_stop_rx_ba_session(struct sta_info *sta, u16 tid,
+ 	if (!tid_rx)
+ 		return;
+ 
+-	del_timer_sync(&tid_rx->session_timer);
+-
+-	/* make sure ieee80211_sta_reorder_release() doesn't re-arm the timer */
++	/* Prevent BAR and reorder release from rearming the timers. */
+ 	spin_lock_bh(&tid_rx->reorder_lock);
+ 	tid_rx->removed = true;
+ 	spin_unlock_bh(&tid_rx->reorder_lock);
++	del_timer_sync(&tid_rx->session_timer);
+ 	del_timer_sync(&tid_rx->reorder_timer);
+ 
+ 	call_rcu(&tid_rx->rcu_head, ieee80211_free_tid_rx);
+diff --git a/net/mac80211/rx.c b/net/mac80211/rx.c
+index 8ec630a4d069e..c7504dff7b4b3 100644
+--- a/net/mac80211/rx.c
++++ b/net/mac80211/rx.c
+@@ -3101,12 +3101,13 @@ ieee80211_rx_h_ctrl(struct ieee80211_rx_data *rx, struct sk_buff_head *frames)
+ 		event.u.ba.ssn = start_seq_num;
+ 		event.u.ba.sta = &rx->sta->sta;
+ 
++		spin_lock(&tid_agg_rx->reorder_lock);
++
+ 		/* reset session timer */
+-		if (tid_agg_rx->timeout)
++		if (tid_agg_rx->timeout && !tid_agg_rx->removed)
+ 			mod_timer(&tid_agg_rx->session_timer,
+ 				  TU_TO_EXP_TIME(tid_agg_rx->timeout));
+ 
+-		spin_lock(&tid_agg_rx->reorder_lock);
+ 		/* release stored frames up to start of BAR */
+ 		ieee80211_release_reorder_frames(rx->sdata, tid_agg_rx,
+ 						 start_seq_num, frames);
+-- 
+2.53.0
+
