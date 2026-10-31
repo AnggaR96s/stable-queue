@@ -1,0 +1,154 @@
+From 6b008640db7355d8de6ac18f74cedd7ccc92684f Mon Sep 17 00:00:00 2001
+From: Linus Torvalds <torvalds@linux-foundation.org>
+Date: Tue, 18 Apr 2023 17:40:09 -0400
+Subject: mm: move 'mmap_min_addr' logic from callers into vm_unmapped_area()
+
+From: Linus Torvalds <torvalds@linux-foundation.org>
+
+commit 6b008640db7355d8de6ac18f74cedd7ccc92684f upstream.
+
+Instead of having callers care about the mmap_min_addr logic for the
+lowest valid mapping address (and some of them getting it wrong), just
+move the logic into vm_unmapped_area() itself.  One less thing for various
+architecture cases (and generic helpers) to worry about.
+
+We should really try to make much more of this be common code, but baby
+steps..
+
+Without this, vm_unmapped_area() could return an address below
+mmap_min_addr (because some caller forgot about that).  That then causes
+the mmap machinery to think it has found a workable address, but then
+later security_mmap_addr(addr) is unhappy about it and the mmap() returns
+with a nonsensical error (EPERM).
+
+The proper action is to either return ENOMEM (if the virtual address space
+is exhausted), or try to find another address (ie do a bottom-up search
+for free addresses after the top-down one failed).
+
+See commit 2afc745f3e30 ("mm: ensure get_unmapped_area() returns higher
+address than mmap_min_addr"), which fixed this for one call site (the
+generic arch_get_unmapped_area_topdown() fallback) but left other cases
+alone.
+
+Link: https://lkml.kernel.org/r/20230418214009.1142926-1-Liam.Howlett@oracle.com
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Liam R. Howlett <Liam.Howlett@oracle.com>
+Cc: Russell King <linux@armlinux.org.uk>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+[ Adapted to the rbtree based unmapped_area() and unmapped_area_topdown()
+  used before the maple tree conversion: clamp the lower search bound to
+  mmap_min_addr there instead of in the maple tree search. ]
+Signed-off-by: Florian Fainelli <florian.fainelli@broadcom.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/s390/mm/hugetlbpage.c |    2 +-
+ arch/s390/mm/mmap.c        |    2 +-
+ fs/hugetlbfs/inode.c       |    2 +-
+ mm/mmap.c                  |   18 ++++++++++--------
+ 4 files changed, 13 insertions(+), 11 deletions(-)
+
+--- a/arch/s390/mm/hugetlbpage.c
++++ b/arch/s390/mm/hugetlbpage.c
+@@ -290,7 +290,7 @@ static unsigned long hugetlb_get_unmappe
+ 
+ 	info.flags = VM_UNMAPPED_AREA_TOPDOWN;
+ 	info.length = len;
+-	info.low_limit = max(PAGE_SIZE, mmap_min_addr);
++	info.low_limit = PAGE_SIZE;
+ 	info.high_limit = current->mm->mmap_base;
+ 	info.align_mask = PAGE_MASK & ~huge_page_mask(h);
+ 	info.align_offset = 0;
+--- a/arch/s390/mm/mmap.c
++++ b/arch/s390/mm/mmap.c
+@@ -136,7 +136,7 @@ unsigned long arch_get_unmapped_area_top
+ 
+ 	info.flags = VM_UNMAPPED_AREA_TOPDOWN;
+ 	info.length = len;
+-	info.low_limit = max(PAGE_SIZE, mmap_min_addr);
++	info.low_limit = PAGE_SIZE;
+ 	info.high_limit = mm->mmap_base;
+ 	if (filp || (flags & MAP_SHARED))
+ 		info.align_mask = MMAP_ALIGN_MASK << PAGE_SHIFT;
+--- a/fs/hugetlbfs/inode.c
++++ b/fs/hugetlbfs/inode.c
+@@ -232,7 +232,7 @@ hugetlb_get_unmapped_area_topdown(struct
+ 
+ 	info.flags = VM_UNMAPPED_AREA_TOPDOWN;
+ 	info.length = len;
+-	info.low_limit = max(PAGE_SIZE, mmap_min_addr);
++	info.low_limit = PAGE_SIZE;
+ 	info.high_limit = arch_get_mmap_base(addr, current->mm->mmap_base);
+ 	info.align_mask = PAGE_MASK & ~huge_page_mask(h);
+ 	info.align_offset = 0;
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -1944,6 +1944,7 @@ static unsigned long unmapped_area(struc
+ 	struct mm_struct *mm = current->mm;
+ 	struct vm_area_struct *vma;
+ 	unsigned long length, low_limit, high_limit, gap_start, gap_end;
++	unsigned long min_addr = max(info->low_limit, mmap_min_addr);
+ 
+ 	/* Adjust search length to account for worst case alignment overhead */
+ 	length = info->length + info->align_mask;
+@@ -1955,9 +1956,9 @@ static unsigned long unmapped_area(struc
+ 		return -ENOMEM;
+ 	high_limit = info->high_limit - length;
+ 
+-	if (info->low_limit > high_limit)
++	if (min_addr > high_limit)
+ 		return -ENOMEM;
+-	low_limit = info->low_limit + length;
++	low_limit = min_addr + length;
+ 
+ 	/* Check if rbtree root looks promising */
+ 	if (RB_EMPTY_ROOT(&mm->mm_rb))
+@@ -2023,8 +2024,8 @@ check_highest:
+ 
+ found:
+ 	/* We found a suitable gap. Clip it with the original low_limit. */
+-	if (gap_start < info->low_limit)
+-		gap_start = info->low_limit;
++	if (gap_start < min_addr)
++		gap_start = min_addr;
+ 
+ 	/* Adjust gap address to the desired alignment */
+ 	gap_start += (info->align_offset - gap_start) & info->align_mask;
+@@ -2039,6 +2040,7 @@ static unsigned long unmapped_area_topdo
+ 	struct mm_struct *mm = current->mm;
+ 	struct vm_area_struct *vma;
+ 	unsigned long length, low_limit, high_limit, gap_start, gap_end;
++	unsigned long min_addr = max(info->low_limit, mmap_min_addr);
+ 
+ 	/* Adjust search length to account for worst case alignment overhead */
+ 	length = info->length + info->align_mask;
+@@ -2054,9 +2056,9 @@ static unsigned long unmapped_area_topdo
+ 		return -ENOMEM;
+ 	high_limit = gap_end - length;
+ 
+-	if (info->low_limit > high_limit)
++	if (min_addr > high_limit)
+ 		return -ENOMEM;
+-	low_limit = info->low_limit + length;
++	low_limit = min_addr + length;
+ 
+ 	/* Check highest gap, which does not precede any rbtree node */
+ 	gap_start = mm->highest_vm_end;
+@@ -2128,7 +2130,7 @@ found_highest:
+ 	gap_end -= info->length;
+ 	gap_end -= (gap_end - info->align_offset) & info->align_mask;
+ 
+-	VM_BUG_ON(gap_end < info->low_limit);
++	VM_BUG_ON(gap_end < min_addr);
+ 	VM_BUG_ON(gap_end < gap_start);
+ 	return gap_end;
+ }
+@@ -2235,7 +2237,7 @@ arch_get_unmapped_area_topdown(struct fi
+ 
+ 	info.flags = VM_UNMAPPED_AREA_TOPDOWN;
+ 	info.length = len;
+-	info.low_limit = max(PAGE_SIZE, mmap_min_addr);
++	info.low_limit = PAGE_SIZE;
+ 	info.high_limit = arch_get_mmap_base(addr, mm->mmap_base);
+ 	info.align_mask = 0;
+ 	info.align_offset = 0;
