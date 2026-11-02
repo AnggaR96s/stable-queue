@@ -1,0 +1,181 @@
+From e080ec4172da8ca945c480a65d34e8bad90f7638 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 10 Sep 2026 15:08:14 +0200
+Subject: serial: fix ioctl hangup race
+
+From: Johan Hovold <johan@kernel.org>
+
+[ Upstream commit 8ca59f7baee7c72cf7729950b4ab2e7f910c9549 ]
+
+The tty ioctls can race with hangup and end up calling into a tty
+driver for a device that is already gone or powered down.
+
+Add the missing checks to make sure the port has not been hung up before
+accessing the hardware to avoid issues like kernel panic due to
+unclocked accesses.
+
+Note that TIOCGSERIAL, TIOCGICOUNT do not access hardware and are
+therefore not affected by the race.
+
+Also note that the initialised check in uart_set_ldisc() added by commit
+2f70e49ed860 ("serial_core: Check for port state when tty is in error
+state") should have been done under the port lock to avoid racing with
+uart_do_autoconfig().
+
+Fixes: 04f378b198da ("tty: BKL pushdown")
+Cc: stable@kernel.org	# 2.6.26
+Signed-off-by: Johan Hovold <johan@kernel.org>
+Link: https://patch.msgid.link/20260910130816.642699-3-johan@kernel.org
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+[ sashal: Replaced the upstream guard()/scoped-guard locking with explicit mutex_lock/unlock and goto out, and reordered port->mutex and port ref in two wait paths to avoid a deadlock with port removal. ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/tty/serial/serial_core.c | 52 +++++++++++++++++++++++---------
+ 1 file changed, 38 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/tty/serial/serial_core.c b/drivers/tty/serial/serial_core.c
+index 69845f9e7aea0..0efcebcd9991d 100644
+--- a/drivers/tty/serial/serial_core.c
++++ b/drivers/tty/serial/serial_core.c
+@@ -816,7 +816,7 @@ static int uart_set_info(struct tty_struct *tty, struct tty_port *port,
+ 	upf_t old_flags, new_flags;
+ 	int retval = 0;
+ 
+-	if (!uport)
++	if (!uport || tty_io_error(tty))
+ 		return -EIO;
+ 
+ 	new_port = new_info->port;
+@@ -1120,7 +1120,7 @@ static int uart_break_ctl(struct tty_struct *tty, int break_state)
+ 
+ 	mutex_lock(&port->mutex);
+ 	uport = uart_port_check(state);
+-	if (!uport)
++	if (!uport || tty_io_error(tty))
+ 		goto out;
+ 
+ 	if (uport->type != PORT_UNKNOWN && uport->ops->break_ctl)
+@@ -1149,7 +1149,7 @@ static int uart_do_autoconfig(struct tty_struct *tty, struct uart_state *state)
+ 		return -ERESTARTSYS;
+ 
+ 	uport = uart_port_check(state);
+-	if (!uport) {
++	if (!uport || tty_io_error(tty)) {
+ 		ret = -EIO;
+ 		goto out;
+ 	}
+@@ -1204,7 +1204,7 @@ static void uart_enable_ms(struct uart_port *uport)
+  * FIXME: This wants extracting into a common all driver implementation
+  * of TIOCMWAIT using tty_port.
+  */
+-static int uart_wait_modem_status(struct uart_state *state, unsigned long arg)
++static int uart_wait_modem_status(struct tty_struct *tty, struct uart_state *state, unsigned long arg)
+ {
+ 	struct uart_port *uport;
+ 	struct tty_port *port = &state->port;
+@@ -1215,14 +1215,26 @@ static int uart_wait_modem_status(struct uart_state *state, unsigned long arg)
+ 	/*
+ 	 * note the counters on entry
+ 	 */
++	mutex_lock(&port->mutex);
+ 	uport = uart_port_ref(state);
+-	if (!uport)
++	if (!uport) {
++		mutex_unlock(&port->mutex);
+ 		return -EIO;
++	}
++
++	if (tty_io_error(tty)) {
++		mutex_unlock(&port->mutex);
++		ret = -EIO;
++		goto out_deref;
++	}
++
+ 	spin_lock_irq(&uport->lock);
+ 	memcpy(&cprev, &uport->icount, sizeof(struct uart_icount));
+ 	uart_enable_ms(uport);
+ 	spin_unlock_irq(&uport->lock);
+ 
++	mutex_unlock(&port->mutex);
++
+ 	add_wait_queue(&port->delta_msr_wait, &wait);
+ 	for (;;) {
+ 		set_current_state(TASK_INTERRUPTIBLE);
+@@ -1251,6 +1263,7 @@ static int uart_wait_modem_status(struct uart_state *state, unsigned long arg)
+ 	}
+ 	__set_current_state(TASK_RUNNING);
+ 	remove_wait_queue(&port->delta_msr_wait, &wait);
++out_deref:
+ 	uart_port_deref(uport);
+ 
+ 	return ret;
+@@ -1568,7 +1581,7 @@ uart_ioctl(struct tty_struct *tty, unsigned int cmd, unsigned long arg)
+ 	 */
+ 	switch (cmd) {
+ 	case TIOCMIWAIT:
+-		ret = uart_wait_modem_status(state, arg);
++		ret = uart_wait_modem_status(tty, state, arg);
+ 		break;
+ 	}
+ 
+@@ -1629,15 +1642,15 @@ static void uart_set_ldisc(struct tty_struct *tty)
+ {
+ 	struct uart_state *state = tty->driver_data;
+ 	struct uart_port *uport;
+-	struct tty_port *port = &state->port;
+-
+-	if (!tty_port_initialized(port))
+-		return;
+ 
+ 	mutex_lock(&state->port.mutex);
+ 	uport = uart_port_check(state);
+-	if (uport && uport->ops->set_ldisc)
++	if (!uport || tty_io_error(tty))
++		goto out;
++
++	if (uport->ops->set_ldisc)
+ 		uport->ops->set_ldisc(uport, &tty->termios);
++out:
+ 	mutex_unlock(&state->port.mutex);
+ }
+ 
+@@ -1652,7 +1665,7 @@ static void uart_set_termios(struct tty_struct *tty,
+ 
+ 	mutex_lock(&state->port.mutex);
+ 	uport = uart_port_check(state);
+-	if (!uport)
++	if (!uport || tty_io_error(tty))
+ 		goto out;
+ 
+ 	/*
+@@ -1817,14 +1830,25 @@ static void uart_wait_until_sent(struct tty_struct *tty, int timeout)
+ 	 * 'timeout' / 'expire' give us the maximum amount of time
+ 	 * we wait.
+ 	 */
+-	while (!port->ops->tx_empty(port)) {
++	for (;;) {
++		bool done;
++
++		uart_port_deref(port);
++		mutex_lock(&state->port.mutex);
++		port = uart_port_ref(state);
++		done = !port || tty_io_error(tty) || port->ops->tx_empty(port);
++		mutex_unlock(&state->port.mutex);
++		if (done)
++			break;
++
+ 		msleep_interruptible(jiffies_to_msecs(char_time));
+ 		if (signal_pending(current))
+ 			break;
+ 		if (timeout && time_after(jiffies, expire))
+ 			break;
+ 	}
+-	uart_port_deref(port);
++	if (port)
++		uart_port_deref(port);
+ }
+ 
+ /*
+-- 
+2.53.0
+

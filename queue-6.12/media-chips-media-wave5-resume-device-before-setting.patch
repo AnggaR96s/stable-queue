@@ -1,0 +1,111 @@
+From 302b03409202ba20d11abb570bed06a61c476475 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 26 Jun 2026 10:22:32 +0900
+Subject: media: chips-media: wave5: Resume device before setting EOS flag
+
+From: Jackson Lee <jackson.lee@chipsnmedia.com>
+
+[ Upstream commit a52e6f7923c17a672135b485ffd96fbd72f46267 ]
+
+Setting the EOS flag talks to the firmware via send_firmware_command(),
+which accesses VPU registers. Both the STREAMOFF path
+(wave5_vpu_dec_job_abort()) and the V4L2_DEC_CMD_STOP path
+(wave5_vpu_dec_stop()) can run while the device is runtime suspended, so
+those register accesses hit powered-down hardware and the SoC raises an
+asynchronous SError, panicking the kernel:
+
+  SError Interrupt on CPU3, code 0x00000000bf000000 -- SError
+   send_firmware_command+0x2c/0x160 [wave5]
+   wave5_vpu_dec_set_bitstream_flag+0x6c/0x80 [wave5]
+   wave5_vpu_dec_update_bitstream_buffer+0x80/0xec [wave5]
+   wave5_vpu_dec_job_abort+0x44/0xa0 [wave5]
+   v4l2_m2m_cancel_job+0x110/0x19c [v4l2_mem2mem]
+   v4l2_m2m_streamoff+0x24/0x140 [v4l2_mem2mem]
+
+Resume the device with pm_runtime_resume_and_get() around the EOS
+firmware command and release it with pm_runtime_put_autosuspend(),
+matching the runtime PM handling already done in
+wave5_vpu_dec_device_run().
+
+Fixes: 9707a6254a8a ("media: chips-media: wave5: Add the v4l2 layer")
+Cc: stable@vger.kernel.org
+Signed-off-by: Jackson Lee <jackson.lee@chipsnmedia.com>
+Signed-off-by: Nas Chung <nas.chung@chipsnmedia.com>
+Reviewed-by: Nicolas Dufresne <nicolas.dufresne@collabora.com>
+Signed-off-by: Nicolas Dufresne <nicolas.dufresne@collabora.com>
+Signed-off-by: Hans Verkuil <hverkuil+cisco@kernel.org>
+[ sashal: Guarded the pm_runtime_put_autosuspend() calls on a successful pm_runtime_resume_and_get() and added the missing pm_runtime.h include, instead of putting unconditionally as upstream does. ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ .../chips-media/wave5/wave5-vpu-dec.c         | 24 +++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/drivers/media/platform/chips-media/wave5/wave5-vpu-dec.c b/drivers/media/platform/chips-media/wave5/wave5-vpu-dec.c
+index 19510a363724e..a4c859cbcafdc 100644
+--- a/drivers/media/platform/chips-media/wave5/wave5-vpu-dec.c
++++ b/drivers/media/platform/chips-media/wave5/wave5-vpu-dec.c
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include <linux/delay.h>
++#include <linux/pm_runtime.h>
+ #include "wave5-helper.h"
+ 
+ #define VPU_DEC_DEV_NAME "C&M Wave5 VPU decoder"
+@@ -853,6 +854,7 @@ static int wave5_vpu_dec_s_selection(struct file *file, void *fh, struct v4l2_se
+ static int wave5_vpu_dec_stop(struct vpu_instance *inst)
+ {
+ 	int ret = 0;
++	int pm_ret;
+ 	unsigned long flags;
+ 	struct v4l2_m2m_ctx *m2m_ctx = inst->v4l2_fh.m2m_ctx;
+ 
+@@ -869,7 +871,16 @@ static int wave5_vpu_dec_stop(struct vpu_instance *inst)
+ 		 * calls do not block on a mutex while inside this spinlock.
+ 		 */
+ 		spin_unlock_irqrestore(&inst->state_spinlock, flags);
++		/*
++		 * V4L2_DEC_CMD_STOP can arrive while the device is runtime
++		 * suspended (e.g. on pipeline teardown). Setting the EOS flag
++		 * accesses VPU registers via send_firmware_command(), so the
++		 * device must be resumed first to avoid an asynchronous SError.
++		 */
++		pm_ret = pm_runtime_resume_and_get(inst->dev->dev);
+ 		ret = wave5_vpu_dec_set_eos_on_firmware(inst);
++		if (!pm_ret)
++			pm_runtime_put_autosuspend(inst->dev->dev);
+ 		if (ret)
+ 			return ret;
+ 
+@@ -1781,15 +1792,28 @@ static void wave5_vpu_dec_job_abort(void *priv)
+ {
+ 	struct vpu_instance *inst = priv;
+ 	int ret;
++	int pm_ret;
+ 
+ 	ret = switch_state(inst, VPU_INST_STATE_STOP);
+ 	if (ret)
+ 		return;
+ 
++	/*
++	 * job_abort() runs from the STREAMOFF path and may be called while the
++	 * device is runtime suspended. Setting the EOS flag talks to the
++	 * firmware (send_firmware_command() accesses VPU registers), so the
++	 * device must be resumed first; otherwise the register access faults
++	 * with an asynchronous SError.
++	 */
++	pm_ret = pm_runtime_resume_and_get(inst->dev->dev);
++
+ 	ret = wave5_vpu_dec_set_eos_on_firmware(inst);
+ 	if (ret)
+ 		dev_warn(inst->dev->dev,
+ 			 "Setting EOS for the bitstream, fail: %d\n", ret);
++
++	if (!pm_ret)
++		pm_runtime_put_autosuspend(inst->dev->dev);
+ }
+ 
+ static int wave5_vpu_dec_job_ready(void *priv)
+-- 
+2.53.0
+
