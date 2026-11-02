@@ -1,0 +1,76 @@
+From 93eb67749240ac7110662a608d1c5ad3b1cf07d6 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 2 Nov 2026 02:21:04 -0800
+Subject: net: sched: avoid qdisc_reset_all_tx_gt() vs dequeue race for
+ lockless qdiscs
+
+From: Koichiro Den <den@valinux.co.jp>
+
+[ Upstream commit 7f083faf59d14c04e01ec05a7507f036c965acf8 ]
+
+When shrinking the number of real tx queues,
+netif_set_real_num_tx_queues() calls qdisc_reset_all_tx_gt() to flush
+qdiscs for queues which will no longer be used.
+
+qdisc_reset_all_tx_gt() currently serializes qdisc_reset() with
+qdisc_lock(). However, for lockless qdiscs, the dequeue path is
+serialized by qdisc_run_begin/end() using qdisc->seqlock instead, so
+qdisc_reset() can run concurrently with __qdisc_run() and free skbs
+while they are still being dequeued, leading to UAF.
+
+Serialize qdisc_reset_all_tx_gt() against the lockless dequeue path by
+taking qdisc->seqlock for TCQ_F_NOLOCK qdiscs, matching the
+serialization model already used by dev_reset_queue().
+
+Additionally clear QDISC_STATE_NON_EMPTY after reset so the qdisc state
+reflects an empty queue, avoiding needless re-scheduling.
+
+Fixes: 6b3ba9146fe6 ("net: sched: allow qdiscs to handle locking")
+Signed-off-by: Koichiro Den <den@valinux.co.jp>
+Link: https://patch.msgid.link/20260228145307.3955532-1-den@valinux.co.jp
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 7f083faf59d14c04e01ec05a7507f036c965acf8)
+
+Conflicts:
+ - include/net/sch_generic.h: retain the older qdisc state model. It has
+   no __QDISC_STATE_DRAINING or QDISC_STATE_NON_EMPTY, so serialize reset
+   with seqlock and clear __QDISC_STATE_MISSED, matching dev_reset_queue().
+
+Assisted-by: Codex:gpt-6
+Signed-off-by: Manjunath Patil <manjunath.b.patil@oracle.com>
+Signed-off-by: Harshit Mogalapalli <harshit.m.mogalapalli@oracle.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/net/sch_generic.h | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/include/net/sch_generic.h b/include/net/sch_generic.h
+index fa5c253770e1e..0c55a129fac92 100644
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@ -745,13 +745,22 @@ static inline bool skb_skip_tc_classify(struct sk_buff *skb)
+ static inline void qdisc_reset_all_tx_gt(struct net_device *dev, unsigned int i)
+ {
+ 	struct Qdisc *qdisc;
++	bool nolock;
+ 
+ 	for (; i < dev->num_tx_queues; i++) {
+ 		qdisc = rtnl_dereference(netdev_get_tx_queue(dev, i)->qdisc);
+ 		if (qdisc) {
++			nolock = qdisc->flags & TCQ_F_NOLOCK;
++
++			if (nolock)
++				spin_lock_bh(&qdisc->seqlock);
+ 			spin_lock_bh(qdisc_lock(qdisc));
+ 			qdisc_reset(qdisc);
+ 			spin_unlock_bh(qdisc_lock(qdisc));
++			if (nolock) {
++				clear_bit(__QDISC_STATE_MISSED, &qdisc->state);
++				spin_unlock_bh(&qdisc->seqlock);
++			}
+ 		}
+ 	}
+ }
+-- 
+2.53.0
+

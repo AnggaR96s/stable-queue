@@ -1,0 +1,201 @@
+From e6ec571f0496eba325249924b6d3c3365bc4f5e9 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 2 Nov 2026 02:20:58 -0800
+Subject: ipv4: start using dst_dev_rcu()
+
+From: Eric Dumazet <edumazet@google.com>
+
+[ Upstream commit 6ad8de3cefdb6ffa6708b21c567df0dbf82c43a8 ]
+
+Change icmpv4_xrlim_allow(), ip_defrag() to prevent possible UAF.
+
+Change ipmr_prepare_xmit(), ipmr_queue_fwd_xmit(), ip_mr_output(),
+ipv4_neigh_lookup() to use lockdep enabled dst_dev_rcu().
+
+Fixes: 4a6ce2b6f2ec ("net: introduce a new function dst_dev_put()")
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Reviewed-by: David Ahern <dsahern@kernel.org>
+Link: https://patch.msgid.link/20250828195823.3958522-9-edumazet@google.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Cc: stable@vger.kernel.org
+
+Conflicts:
+	net/ipv4/icmp.c
+	net/ipv4/ip_fragment.c
+	net/ipv4/ipmr.c
+	net/ipv4/route.c
+
+ - Supply dst_dev_rcu() and skb_dst_dev_rcu() in include/net/dst.h; this
+   baseline has neither helper. Use the checked READ_ONCE() definitions
+   present in 5.15.y, without changing struct dst_entry or importing the
+   broader dst->dev_rcu conversion. The patch is self-contained.
+ - Preserve the four-argument inet_getpeer_v4() and inet_putpeer() calls.
+   Return before taking RCU for ICMP types exempt from rate limiting;
+   release RCU on both the loopback and rate-limited paths.
+ - Keep ip_frag_queue(qp, skb) and ipq_put(qp). Add RCU protection before
+   selecting the device and release it on both queue lookup outcomes.
+ - Use dst_dev_rcu() in the older ipmr_queue_xmit() implementation. Add
+   the IPv4 cache-replay RCU wrapper from b07a9b26e2b1 ("ipmr: Always call
+   ip{,6}_mr_forward() from RCU read-side critical section"), which this
+   baseline lacks. RTNL alone does not satisfy the checked accessor.
+ - Nest ordinary RCU inside the existing RCU-BH section in neighbour
+   lookup. dst_dev_rcu() checks ordinary RCU, while the older neighbour
+   hash walkers still require BH protection via rcu_dereference_bh().
+
+Signed-off-by: Praveen Kumar Kannoju <praveen.kannoju@oracle.com>
+Signed-off-by: Harshit Mogalapalli <harshit.m.mogalapalli@oracle.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/net/dst.h      | 12 ++++++++++++
+ net/ipv4/icmp.c        | 10 +++++++---
+ net/ipv4/ip_fragment.c |  9 +++++++--
+ net/ipv4/ipmr.c        |  4 +++-
+ net/ipv4/route.c       |  5 ++++-
+ 5 files changed, 33 insertions(+), 7 deletions(-)
+
+diff --git a/include/net/dst.h b/include/net/dst.h
+index 9114272f81009..b3522d3de8c8f 100644
+--- a/include/net/dst.h
++++ b/include/net/dst.h
+@@ -547,6 +547,18 @@ static inline void skb_dst_update_pmtu_no_confirm(struct sk_buff *skb, u32 mtu)
+ 		dst->ops->update_pmtu(dst, NULL, skb, mtu, false);
+ }
+ 
++static inline struct net_device *dst_dev_rcu(const struct dst_entry *dst)
++{
++	/* In the future, use rcu_dereference(dst->dev) */
++	WARN_ON_ONCE(!rcu_read_lock_held());
++	return READ_ONCE(dst->dev);
++}
++
++static inline struct net_device *skb_dst_dev_rcu(const struct sk_buff *skb)
++{
++	return dst_dev_rcu(skb_dst(skb));
++}
++
+ struct dst_entry *dst_blackhole_check(struct dst_entry *dst, u32 cookie);
+ void dst_blackhole_update_pmtu(struct dst_entry *dst, struct sock *sk,
+ 			       struct sk_buff *skb, u32 mtu, bool confirm_neigh);
+diff --git a/net/ipv4/icmp.c b/net/ipv4/icmp.c
+index e919d2a5169e7..dab78347f7ce6 100644
+--- a/net/ipv4/icmp.c
++++ b/net/ipv4/icmp.c
+@@ -315,24 +315,28 @@ static bool icmpv4_xrlim_allow(struct net *net, struct rtable *rt,
+ 			       struct flowi4 *fl4, int type, int code)
+ {
+ 	struct dst_entry *dst = &rt->dst;
++	struct net_device *dev;
+ 	struct inet_peer *peer;
+ 	bool rc = true;
+ 	int vif;
+ 
+ 	if (icmpv4_mask_allow(net, type, code))
+-		goto out;
++		return true;
+ 
+ 	/* No rate limit on loopback */
+-	if (dst->dev && (dst->dev->flags&IFF_LOOPBACK))
++	rcu_read_lock();
++	dev = dst_dev_rcu(dst);
++	if (dev && (dev->flags & IFF_LOOPBACK))
+ 		goto out;
+ 
+-	vif = l3mdev_master_ifindex(dst->dev);
++	vif = l3mdev_master_ifindex_rcu(dev);
+ 	peer = inet_getpeer_v4(net->ipv4.peers, fl4->daddr, vif, 1);
+ 	rc = inet_peer_xrlim_allow(peer,
+ 				   READ_ONCE(net->ipv4.sysctl_icmp_ratelimit));
+ 	if (peer)
+ 		inet_putpeer(peer);
+ out:
++	rcu_read_unlock();
+ 	return rc;
+ }
+ 
+diff --git a/net/ipv4/ip_fragment.c b/net/ipv4/ip_fragment.c
+index ec2264adf2a6a..5cdc65a5c010b 100644
+--- a/net/ipv4/ip_fragment.c
++++ b/net/ipv4/ip_fragment.c
+@@ -475,13 +475,16 @@ static int ip_frag_reasm(struct ipq *qp, struct sk_buff *skb,
+ /* Process an incoming IP datagram fragment. */
+ int ip_defrag(struct net *net, struct sk_buff *skb, u32 user)
+ {
+-	struct net_device *dev = skb->dev ? : skb_dst(skb)->dev;
+-	int vif = l3mdev_master_ifindex_rcu(dev);
++	struct net_device *dev;
+ 	struct ipq *qp;
++	int vif;
+ 
+ 	__IP_INC_STATS(net, IPSTATS_MIB_REASMREQDS);
+ 
+ 	/* Lookup (or create) queue header */
++	rcu_read_lock();
++	dev = skb->dev ? : skb_dst_dev_rcu(skb);
++	vif = l3mdev_master_ifindex_rcu(dev);
+ 	qp = ip_find(net, ip_hdr(skb), user, vif);
+ 	if (qp) {
+ 		int ret;
+@@ -491,9 +494,11 @@ int ip_defrag(struct net *net, struct sk_buff *skb, u32 user)
+ 		ret = ip_frag_queue(qp, skb);
+ 
+ 		spin_unlock(&qp->q.lock);
++		rcu_read_unlock();
+ 		ipq_put(qp);
+ 		return ret;
+ 	}
++	rcu_read_unlock();
+ 
+ 	__IP_INC_STATS(net, IPSTATS_MIB_REASMFAILS);
+ 	kfree_skb(skb);
+diff --git a/net/ipv4/ipmr.c b/net/ipv4/ipmr.c
+index f17b36a978486..ee5860cf76503 100644
+--- a/net/ipv4/ipmr.c
++++ b/net/ipv4/ipmr.c
+@@ -1012,7 +1012,9 @@ static void ipmr_cache_resolve(struct net *net, struct mr_table *mrt,
+ 
+ 			rtnl_unicast(skb, net, NETLINK_CB(skb).portid);
+ 		} else {
++			rcu_read_lock();
+ 			ip_mr_forward(net, mrt, skb->dev, skb, c, 0);
++			rcu_read_unlock();
+ 		}
+ 	}
+ }
+@@ -1870,7 +1872,7 @@ static void ipmr_queue_xmit(struct net *net, struct mr_table *mrt,
+ 			goto out_free;
+ 	}
+ 
+-	dev = rt->dst.dev;
++	dev = dst_dev_rcu(&rt->dst);
+ 
+ 	if (skb->len+encap > dst_mtu(&rt->dst) && (ntohs(iph->frag_off) & IP_DF)) {
+ 		/* Do not fragment multicasts. Alas, IPv4 does not
+diff --git a/net/ipv4/route.c b/net/ipv4/route.c
+index b7db0255af6e1..088c207c10fa3 100644
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@ -446,10 +446,12 @@ static struct neighbour *ipv4_neigh_lookup(const struct dst_entry *dst,
+ 					   const void *daddr)
+ {
+ 	const struct rtable *rt = container_of(dst, struct rtable, dst);
+-	struct net_device *dev = dst->dev;
++	struct net_device *dev;
+ 	struct neighbour *n;
+ 
+ 	rcu_read_lock_bh();
++	rcu_read_lock();
++	dev = dst_dev_rcu(dst);
+ 
+ 	if (likely(rt->rt_gw_family == AF_INET)) {
+ 		n = ip_neigh_gw4(dev, rt->rt_gw4);
+@@ -465,6 +467,7 @@ static struct neighbour *ipv4_neigh_lookup(const struct dst_entry *dst,
+ 	if (!IS_ERR(n) && !refcount_inc_not_zero(&n->refcnt))
+ 		n = NULL;
+ 
++	rcu_read_unlock();
+ 	rcu_read_unlock_bh();
+ 
+ 	return n;
+-- 
+2.53.0
+
