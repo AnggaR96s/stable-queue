@@ -1,0 +1,268 @@
+From dffa38ef390dd496fe738e4a82ddefe6bbef9ffe Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 2 Nov 2026 20:14:10 +0000
+Subject: smb: client: fix busy dentry warning on unmount after DIO
+
+From: Siddharth Chintamaneni <sidchintamaneni@gmail.com>
+
+commit 75f5c412fa867efa0bf9b646bffe0d912109e84a upstream.
+
+In mainline, commit 75f5c412fa86 ("smb: client: fix busy dentry warning
+on unmount after DIO") fixes a busy-dentry warning during unmount by
+tracking in-flight netfs_io_request instances in cifs_init_request() and
+cifs_free_request(), waiting for the counter to reach zero in
+cifs_kill_sb() before kill_anon_super(), and then flushing
+serverclose_wq and fileinfo_put_wq. Because mainline routes all CIFS I/O
+(direct I/O, uncached I/O, buffered readahead, and buffered writeback)
+through netfs_io_request, that single counter covers every path that
+holds a cifsFileInfo reference across asynchronous I/O completion.
+
+Kernel 6.6 predates the netfs I/O request conversion and instead splits
+I/O across three reference-counted structures that each hold a
+cifsFileInfo reference:
+- struct cifs_aio_ctx, used by direct and uncached I/O (__cifs_readv()
+  and __cifs_writev()).
+- struct cifs_readdata, allocated for uncached reads
+  (cifs_send_async_read()) and directly without a cifs_aio_ctx for
+  buffered readahead (cifs_readahead()).
+- struct cifs_writedata, allocated for uncached writes
+  (cifs_write_from_iter(), cifs_writev_requeue()) and directly without a
+  cifs_aio_ctx for buffered writeback
+  (cifs_write_back_from_locked_folio()).
+
+In both the DIO/uncached paths (where collect_uncached_read_data() and
+collect_uncached_write_data() signal completion via complete(&ctx->done)
+or ctx->iocb->ki_complete() before the worker drops its rdata/wdata and
+ctx references) and the buffered paths (where cifs_readahead_complete()
+unlocks folios and cifs_writev_complete() ends folio writeback before
+calling kref_put() on rdata/wdata to drop their cfile reference), a
+racing close() and umount() can reach shrink_dcache_for_umount() before
+the final cifsFileInfo_put() has been queued and flushed. This triggers:
+
+  BUG: Dentry ... still in use (1) [unmount of cifs cifs]
+
+followed by a use-after-free when deferred cifsFileInfo_put_work runs
+after superblock teardown.
+
+Fix this in 6.6 by:
+1. Adding cifs_sb->outstanding_aio and incrementing it whenever
+   ctx->cfile, rdata->cfile, or wdata->cfile is assigned.
+2. Releasing wdata->cfile and rdata->cfile before dropping ctx->refcount
+   in cifs_uncached_writedata_release() and cifs_readdata_release().
+3. Decrementing cifs_sb->outstanding_aio in cifs_aio_ctx_release(),
+   cifs_readdata_release(), and cifs_writedata_release() only after
+   cifsFileInfo_put() has been called, and waiting for it to reach zero
+   in cifs_kill_sb() before flushing serverclose_wq and fileinfo_put_wq.
+
+Fixes: 340cea84f691 ("cifs: open files should not hold ref on superblock")
+Tested-by: Gillian Laming <glaming@microsoft.com>
+Signed-off-by: Siddharth Chintamaneni <sidchintamaneni@gmail.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/smb/client/cifs_fs_sb.h |  1 +
+ fs/smb/client/cifsfs.c     | 11 +++++++++++
+ fs/smb/client/connect.c    |  1 +
+ fs/smb/client/file.c       | 33 ++++++++++++++++++++++++++++-----
+ fs/smb/client/misc.c       |  4 ++++
+ 5 files changed, 45 insertions(+), 5 deletions(-)
+
+diff --git a/fs/smb/client/cifs_fs_sb.h b/fs/smb/client/cifs_fs_sb.h
+index 6517591922801..5011dd639dd9b 100644
+--- a/fs/smb/client/cifs_fs_sb.h
++++ b/fs/smb/client/cifs_fs_sb.h
+@@ -54,6 +54,7 @@ struct cifs_sb_info {
+ 	struct nls_table *local_nls;
+ 	struct smb3_fs_context *ctx;
+ 	atomic_t active;
++	atomic_t outstanding_aio;	/* nr of AIO contexts not yet fully deinitialized */
+ 	unsigned int mnt_cifs_flags;
+ 	struct delayed_work prune_tlinks;
+ 	struct rcu_head rcu;
+diff --git a/fs/smb/client/cifsfs.c b/fs/smb/client/cifsfs.c
+index 3154b21bfe8a2..700dd3005ba89 100644
+--- a/fs/smb/client/cifsfs.c
++++ b/fs/smb/client/cifsfs.c
+@@ -301,6 +301,17 @@ static void cifs_kill_sb(struct super_block *sb)
+ 		/* Wait for all opened files to release */
+ 		flush_workqueue(deferredclose_wq);
+ 
++		/*
++		 * Wait for all in-flight AIO contexts to finish cleanup so
++		 * that their cifsFileInfo final puts have been queued, then
++		 * drain the workqueues so the dentry refs are dropped before
++		 * kill_anon_super().
++		 */
++		wait_var_event(&cifs_sb->outstanding_aio,
++			       !atomic_read(&cifs_sb->outstanding_aio));
++		flush_workqueue(serverclose_wq);
++		flush_workqueue(fileinfo_put_wq);
++
+ 		/* finally release root dentry */
+ 		dput(cifs_sb->root);
+ 		cifs_sb->root = NULL;
+diff --git a/fs/smb/client/connect.c b/fs/smb/client/connect.c
+index 1c21ae3d61e24..3d0fd8bf8f352 100644
+--- a/fs/smb/client/connect.c
++++ b/fs/smb/client/connect.c
+@@ -3396,6 +3396,7 @@ int cifs_setup_cifs_sb(struct cifs_sb_info *cifs_sb)
+ 
+ 	spin_lock_init(&cifs_sb->tlink_tree_lock);
+ 	cifs_sb->tlink_tree = RB_ROOT;
++	atomic_set(&cifs_sb->outstanding_aio, 0);
+ 
+ 	cifs_dbg(FYI, "file mode: %04ho  dir mode: %04ho\n",
+ 		 ctx->file_mode, ctx->dir_mode);
+diff --git a/fs/smb/client/file.c b/fs/smb/client/file.c
+index d329b8a3b756d..0ca0381fd7bb3 100644
+--- a/fs/smb/client/file.c
++++ b/fs/smb/client/file.c
+@@ -2618,6 +2618,8 @@ cifs_writedata_release(struct kref *refcount)
+ {
+ 	struct cifs_writedata *wdata = container_of(refcount,
+ 					struct cifs_writedata, refcount);
++	struct cifs_sb_info *cifs_sb = NULL;
++
+ #ifdef CONFIG_CIFS_SMB_DIRECT
+ 	if (wdata->mr) {
+ 		smbd_deregister_mr(wdata->mr);
+@@ -2625,10 +2627,15 @@ cifs_writedata_release(struct kref *refcount)
+ 	}
+ #endif
+ 
+-	if (wdata->cfile)
++	if (wdata->cfile) {
++		cifs_sb = CIFS_SB(wdata->cfile->dentry->d_sb);
+ 		cifsFileInfo_put(wdata->cfile);
++	}
+ 
+ 	kfree(wdata);
++
++	if (cifs_sb && atomic_dec_and_test(&cifs_sb->outstanding_aio))
++		wake_up_var(&cifs_sb->outstanding_aio);
+ }
+ 
+ /*
+@@ -2690,6 +2697,7 @@ cifs_writev_requeue(struct cifs_writedata *wdata)
+ 			if (!is_retryable_error(rc))
+ 				rc = -EBADF;
+ 		} else {
++			atomic_inc(&CIFS_SB(inode->i_sb)->outstanding_aio);
+ 			wdata2->pid = wdata2->cfile->pid;
+ 			rc = server->ops->async_writev(wdata2,
+ 						       cifs_writedata_release);
+@@ -2998,6 +3006,7 @@ static ssize_t cifs_write_back_from_locked_folio(struct address_space *mapping,
+ 	wdata->pid = cfile->pid;
+ 	wdata->credits = credits_on_stack;
+ 	wdata->cfile = cfile;
++	atomic_inc(&cifs_sb->outstanding_aio);
+ 	wdata->server = server;
+ 	cfile = NULL;
+ 
+@@ -3491,9 +3500,10 @@ cifs_uncached_writedata_release(struct kref *refcount)
+ {
+ 	struct cifs_writedata *wdata = container_of(refcount,
+ 					struct cifs_writedata, refcount);
++	struct cifs_aio_ctx *ctx = wdata->ctx;
+ 
+-	kref_put(&wdata->ctx->refcount, cifs_aio_ctx_release);
+ 	cifs_writedata_release(refcount);
++	kref_put(&ctx->refcount, cifs_aio_ctx_release);
+ }
+ 
+ static void collect_uncached_write_data(struct cifs_aio_ctx *ctx);
+@@ -3704,6 +3714,7 @@ cifs_write_from_iter(loff_t fpos, size_t len, struct iov_iter *from,
+ 		wdata->sync_mode = WB_SYNC_ALL;
+ 		wdata->offset	= (__u64)fpos;
+ 		wdata->cfile	= cifsFileInfo_get(open_file);
++		atomic_inc(&cifs_sb->outstanding_aio);
+ 		wdata->server	= server;
+ 		wdata->pid	= pid;
+ 		wdata->bytes	= cur_len;
+@@ -3852,6 +3863,7 @@ static ssize_t __cifs_writev(
+ 		return -ENOMEM;
+ 
+ 	ctx->cfile = cifsFileInfo_get(cfile);
++	atomic_inc(&cifs_sb->outstanding_aio);
+ 
+ 	if (!is_sync_kiocb(iocb))
+ 		ctx->iocb = iocb;
+@@ -4067,19 +4079,27 @@ cifs_readdata_release(struct kref *refcount)
+ {
+ 	struct cifs_readdata *rdata = container_of(refcount,
+ 					struct cifs_readdata, refcount);
++	struct cifs_aio_ctx *ctx = rdata->ctx;
++	struct cifs_sb_info *cifs_sb = NULL;
+ 
+-	if (rdata->ctx)
+-		kref_put(&rdata->ctx->refcount, cifs_aio_ctx_release);
+ #ifdef CONFIG_CIFS_SMB_DIRECT
+ 	if (rdata->mr) {
+ 		smbd_deregister_mr(rdata->mr);
+ 		rdata->mr = NULL;
+ 	}
+ #endif
+-	if (rdata->cfile)
++	if (rdata->cfile) {
++		cifs_sb = CIFS_SB(rdata->cfile->dentry->d_sb);
+ 		cifsFileInfo_put(rdata->cfile);
++	}
+ 
+ 	kfree(rdata);
++
++	if (ctx)
++		kref_put(&ctx->refcount, cifs_aio_ctx_release);
++
++	if (cifs_sb && atomic_dec_and_test(&cifs_sb->outstanding_aio))
++		wake_up_var(&cifs_sb->outstanding_aio);
+ }
+ 
+ static void collect_uncached_read_data(struct cifs_aio_ctx *ctx);
+@@ -4234,6 +4254,7 @@ cifs_send_async_read(loff_t fpos, size_t len, struct cifsFileInfo *open_file,
+ 
+ 		rdata->server	= server;
+ 		rdata->cfile	= cifsFileInfo_get(open_file);
++		atomic_inc(&cifs_sb->outstanding_aio);
+ 		rdata->offset	= fpos;
+ 		rdata->bytes	= cur_len;
+ 		rdata->pid	= pid;
+@@ -4387,6 +4408,7 @@ static ssize_t __cifs_readv(
+ 	ctx->direct_io	= direct;
+ 	ctx->len	= len;
+ 	ctx->cfile	= cifsFileInfo_get(cfile);
++	atomic_inc(&cifs_sb->outstanding_aio);
+ 	ctx->nr_pinned_pages = 0;
+ 
+ 	if (!is_sync_kiocb(iocb))
+@@ -4881,6 +4903,7 @@ static void cifs_readahead(struct readahead_control *ractl)
+ 		rdata->offset	= ra_index * PAGE_SIZE;
+ 		rdata->bytes	= nr_pages * PAGE_SIZE;
+ 		rdata->cfile	= cifsFileInfo_get(open_file);
++		atomic_inc(&cifs_sb->outstanding_aio);
+ 		rdata->server	= server;
+ 		rdata->mapping	= ractl->mapping;
+ 		rdata->pid	= pid;
+diff --git a/fs/smb/client/misc.c b/fs/smb/client/misc.c
+index 8937095184ca6..48197d47ee821 100644
+--- a/fs/smb/client/misc.c
++++ b/fs/smb/client/misc.c
+@@ -1185,6 +1185,7 @@ cifs_aio_ctx_release(struct kref *refcount)
+ {
+ 	struct cifs_aio_ctx *ctx = container_of(refcount,
+ 					struct cifs_aio_ctx, refcount);
++	struct cifs_sb_info *cifs_sb = CIFS_SB(ctx->cfile->dentry->d_sb);
+ 
+ 	cifsFileInfo_put(ctx->cfile);
+ 
+@@ -1211,6 +1212,9 @@ cifs_aio_ctx_release(struct kref *refcount)
+ 	}
+ 
+ 	kfree(ctx);
++
++	if (atomic_dec_and_test(&cifs_sb->outstanding_aio))
++		wake_up_var(&cifs_sb->outstanding_aio);
+ }
+ 
+ /**
+-- 
+2.53.0
+
