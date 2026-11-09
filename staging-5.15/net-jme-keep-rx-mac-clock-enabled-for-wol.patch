@@ -1,0 +1,153 @@
+From cb659cae843ed49f99125aaa1e3291f729fc91d1 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Sat, 24 Oct 2026 14:40:44 +0200
+Subject: net: jme: keep RX MAC clock enabled for WoL
+
+From: Franck Baur <franck.baur.67@gmail.com>
+
+[ Upstream commit ed9179fc7228315fb745dc3b111bae446e6894d2 ]
+
+On the JMicron JMC250 revision 03, the MAC reset performed during
+suspend leaves GPREG1_RXCLKOFF set. Although the driver enables Magic
+Packet detection, the gated RX MAC clock prevents wake-up from ACPI S3.
+
+Keep the RX MAC clock enabled while WoL is armed. Restore the gated
+clock state immediately after disabling WoL during resume, preserving
+the RX engine initialization ordering.
+
+Prevent concurrent link-change work from gating the clock again after
+WoL has been armed. Quiesce interrupt-driven link-change scheduling,
+synchronize pending interrupts, and cancel outstanding link-change
+work before programming WoL in suspend and shutdown paths.
+
+Restore the deferred processing state before requesting link
+reinitialization on resume.
+
+Tested on an ASUS K42JE with JMC250 [197b:0250] rev 03 using a
+Debian 6.12.111 kernel and an externally built module. ACPI S3 wake
+with a Magic Packet completed in 19 seconds, while a control without
+a Magic Packet resumed through the RTC alarm after 123 seconds.
+Ethernet and SSH recovered after resume.
+
+S4 and S5 wake behaviour has not been validated with this revision.
+
+Fixes: 854a2e7c331a ("jme: Safer MAC processor reset sequence")
+Cc: stable@vger.kernel.org
+Assisted-by: LLM
+Signed-off-by: Franck Baur <franck.baur.67@gmail.com>
+Signed-off-by: Dave Miller <davem@davem-thinkpadp1gen8.ibmlond.csb>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/net/ethernet/jme.c | 37 ++++++++++++++++++++++++++++++++-----
+ drivers/net/ethernet/jme.h |  1 +
+ 2 files changed, 33 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/net/ethernet/jme.c b/drivers/net/ethernet/jme.c
+index 06890993662ad..05d2d6983a48c 100644
+--- a/drivers/net/ethernet/jme.c
++++ b/drivers/net/ethernet/jme.c
+@@ -1501,7 +1501,8 @@ jme_intr_msi(struct jme_adapter *jme, u32 intrstat)
+ 		 * all other events are ignored
+ 		 */
+ 		jwrite32(jme, JME_IEVE, intrstat);
+-		schedule_work(&jme->linkch_task);
++		if (!test_bit(JME_FLAG_WOL_QUIESCE, &jme->flags))
++			schedule_work(&jme->linkch_task);
+ 		goto out_reenable;
+ 	}
+ 
+@@ -1545,7 +1546,8 @@ jme_intr_msi(struct jme_adapter *jme, u32 intrstat)
+ 	/*
+ 	 * Re-enable interrupt
+ 	 */
+-	jwrite32f(jme, JME_IENS, INTR_ENABLE);
++	if (!test_bit(JME_FLAG_WOL_QUIESCE, &jme->flags))
++		jwrite32f(jme, JME_IENS, INTR_ENABLE);
+ }
+ 
+ static irqreturn_t
+@@ -1891,6 +1893,7 @@ jme_powersave_phy(struct jme_adapter *jme)
+ 		jme_set_100m_half(jme);
+ 		if (jme->reg_pmcs & (PMCS_LFEN | PMCS_LREN))
+ 			jme_wait_link(jme);
++		jme_mac_rxclk_on(jme);
+ 		jme_clear_pm_enable_wol(jme);
+ 	} else {
+ 		jme_phy_off(jme);
+@@ -3157,6 +3160,21 @@ jme_shutdown(struct pci_dev *pdev)
+ 	struct net_device *netdev = pci_get_drvdata(pdev);
+ 	struct jme_adapter *jme = netdev_priv(netdev);
+ 
++	if (netif_running(netdev)) {
++		set_bit(JME_FLAG_WOL_QUIESCE, &jme->flags);
++		netif_device_detach(netdev);
++		netif_stop_queue(netdev);
++		jme_stop_irq(jme);
++		synchronize_irq(pdev->irq);
++		jme_stop_irq(jme);
++		cancel_work_sync(&jme->linkch_task);
++		tasklet_disable(&jme->pcc_task);
++		napi_disable(&jme->napi);
++		tasklet_disable(&jme->txclean_task);
++		tasklet_disable(&jme->rxclean_task);
++		tasklet_disable(&jme->rxempty_task);
++	}
++
+ 	jme_powersave_phy(jme);
+ 	pci_pme_active(pdev, true);
+ }
+@@ -3171,11 +3189,16 @@ jme_suspend(struct device *dev)
+ 	if (!netif_running(netdev))
+ 		return 0;
+ 
+-	atomic_dec(&jme->link_changing);
+-
++	set_bit(JME_FLAG_WOL_QUIESCE, &jme->flags);
+ 	netif_device_detach(netdev);
+ 	netif_stop_queue(netdev);
+ 	jme_stop_irq(jme);
++	synchronize_irq(jme->pdev->irq);
++	jme_stop_irq(jme);
++	cancel_work_sync(&jme->linkch_task);
++	tasklet_disable(&jme->pcc_task);
++	napi_disable(&jme->napi);
++	atomic_dec(&jme->link_changing);
+ 
+ 	tasklet_disable(&jme->txclean_task);
+ 	tasklet_disable(&jme->rxclean_task);
+@@ -3214,6 +3237,7 @@ jme_resume(struct device *dev)
+ 		return 0;
+ 
+ 	jme_clear_pm_disable_wol(jme);
++	jme_mac_rxclk_off(jme);
+ 	jme_phy_on(jme);
+ 	if (test_bit(JME_FLAG_SSET, &jme->flags))
+ 		jme_set_link_ksettings(netdev, &jme->old_cmd);
+@@ -3225,8 +3249,11 @@ jme_resume(struct device *dev)
+ 
+ 	atomic_inc(&jme->link_changing);
+ 
+-	jme_reset_link(jme);
++	napi_enable(&jme->napi);
++	tasklet_enable(&jme->pcc_task);
++	clear_bit(JME_FLAG_WOL_QUIESCE, &jme->flags);
+ 
++	jme_reset_link(jme);
+ 	jme_start_irq(jme);
+ 
+ 	return 0;
+diff --git a/drivers/net/ethernet/jme.h b/drivers/net/ethernet/jme.h
+index 2af76329b4a27..a1c9f24cc7809 100644
+--- a/drivers/net/ethernet/jme.h
++++ b/drivers/net/ethernet/jme.h
+@@ -452,6 +452,7 @@ enum jme_flags_bits {
+ 	JME_FLAG_SSET		= 2,
+ 	JME_FLAG_POLL		= 5,
+ 	JME_FLAG_SHUTDOWN	= 6,
++	JME_FLAG_WOL_QUIESCE	= 7,
+ };
+ 
+ #define TX_TIMEOUT		(5 * HZ)
+-- 
+2.53.0
+
