@@ -1,0 +1,147 @@
+From 781ae520485957cb2003789aa4c4e317df575982 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 6 Nov 2026 08:23:44 -0500
+Subject: afs: Fix afs to abort the rxrpc call on send error
+
+From: David Howells <dhowells@redhat.com>
+
+[ Upstream commit 3e6af08a571fe2943a006acf3e890f36322602bc ]
+
+Fix afs_send_empty_reply() and afs_send_simple_reply() to always try to
+abort the rxrpc call rather than just aborting on -ENOMEM and otherwise
+abandoning it.  If the call is already complete due to network failure or a
+received abort, this will do nothing.
+
+Also make afs_make_call() always abort on send error; again, it does
+nothing if the rxrpc call is already dead.
+
+Fixes: 08e0e7c82eea ("[AF_RXRPC]: Make the in-kernel AFS filesystem use AF_RXRPC.")
+Link: https://netdev-ai.bots.linux.dev/sashiko/#/patchset/20260824091645.415423-1-dhowells%40redhat.com
+Signed-off-by: David Howells <dhowells@redhat.com>
+cc: Marc Dionne <marc.dionne@auristor.com>
+cc: Eric Dumazet <edumazet@google.com>
+cc: "David S. Miller" <davem@davemloft.net>
+cc: Jakub Kicinski <kuba@kernel.org>
+cc: Paolo Abeni <pabeni@redhat.com>
+cc: Simon Horman <horms@kernel.org>
+cc: linux-afs@lists.infradead.org
+cc: stable@vger.kernel.org
+Link: https://patch.msgid.link/20261006133011.531806-6-dhowells@redhat.com
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+[ sashal: Retained explicit length arguments in rxrpc_kernel_send_data() calls to match the older API. ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/afs/rxrpc.c               | 49 +++++++++++++-----------------------
+ include/trace/events/rxrpc.h |  2 +-
+ 2 files changed, 18 insertions(+), 33 deletions(-)
+
+diff --git a/fs/afs/rxrpc.c b/fs/afs/rxrpc.c
+index 55449c8791426..934667e547dc2 100644
+--- a/fs/afs/rxrpc.c
++++ b/fs/afs/rxrpc.c
+@@ -442,10 +442,8 @@ void afs_make_call(struct afs_call *call, gfp_t gfp)
+ 	return;
+ 
+ error_do_abort:
+-	if (ret != -ECONNABORTED)
+-		rxrpc_kernel_abort_call(call->net->socket, rxcall,
+-					RX_USER_ABORT, ret,
+-					afs_abort_send_data_error);
++	rxrpc_kernel_abort_call(call->net->socket, rxcall,
++				RX_USER_ABORT, ret, afs_abort_send_data_error);
+ 	if (call->async) {
+ 		afs_see_call(call, afs_call_trace_async_abort);
+ 		return;
+@@ -853,6 +851,7 @@ void afs_send_empty_reply(struct afs_call *call)
+ {
+ 	struct afs_net *net = call->net;
+ 	struct msghdr msg;
++	int ret;
+ 
+ 	_enter("");
+ 
+@@ -865,21 +864,13 @@ void afs_send_empty_reply(struct afs_call *call)
+ 	msg.msg_controllen	= 0;
+ 	msg.msg_flags		= 0;
+ 
+-	switch (rxrpc_kernel_send_data(net->socket, call->rxcall, &msg, 0,
+-				       afs_notify_end_reply_tx)) {
+-	case 0:
+-		_leave(" [replied]");
+-		return;
+-
+-	case -ENOMEM:
+-		_debug("oom");
++	ret = rxrpc_kernel_send_data(net->socket, call->rxcall, &msg, 0,
++				     afs_notify_end_reply_tx);
++	if (ret < 0) {
+ 		rxrpc_kernel_abort_call(net->socket, call->rxcall,
+-					RXGEN_SS_MARSHAL, -ENOMEM,
+-					afs_abort_oom);
+-		fallthrough;
+-	default:
+-		_leave(" [error]");
+-		return;
++					RXGEN_SS_MARSHAL, ret,
++					afs_abort_send_error);
++		afs_set_call_complete(call, ret, RXGEN_SS_MARSHAL);
+ 	}
+ }
+ 
+@@ -891,7 +882,7 @@ void afs_send_simple_reply(struct afs_call *call, const void *buf, size_t len)
+ 	struct afs_net *net = call->net;
+ 	struct msghdr msg;
+ 	struct kvec iov[1];
+-	int n;
++	int ret;
+ 
+ 	_enter("");
+ 
+@@ -906,21 +897,15 @@ void afs_send_simple_reply(struct afs_call *call, const void *buf, size_t len)
+ 	msg.msg_controllen	= 0;
+ 	msg.msg_flags		= 0;
+ 
+-	n = rxrpc_kernel_send_data(net->socket, call->rxcall, &msg, len,
+-				   afs_notify_end_reply_tx);
+-	if (n >= 0) {
+-		/* Success */
+-		_leave(" [replied]");
+-		return;
+-	}
+-
+-	if (n == -ENOMEM) {
+-		_debug("oom");
++	ret = rxrpc_kernel_send_data(net->socket, call->rxcall, &msg, len,
++				     afs_notify_end_reply_tx);
++	if (ret < 0) {
+ 		rxrpc_kernel_abort_call(net->socket, call->rxcall,
+-					RXGEN_SS_MARSHAL, -ENOMEM,
+-					afs_abort_oom);
++					RXGEN_SS_MARSHAL, ret,
++					afs_abort_send_error);
++		afs_set_call_complete(call, ret, RXGEN_SS_MARSHAL);
++		_leave(" [error]");
+ 	}
+-	_leave(" [error]");
+ }
+ 
+ /*
+diff --git a/include/trace/events/rxrpc.h b/include/trace/events/rxrpc.h
+index 8c4d791507f18..5e29744e45037 100644
+--- a/include/trace/events/rxrpc.h
++++ b/include/trace/events/rxrpc.h
+@@ -20,10 +20,10 @@
+ 	/* AFS errors */						\
+ 	EM(afs_abort_general_error,		"afs-error")		\
+ 	EM(afs_abort_interrupted,		"afs-intr")		\
+-	EM(afs_abort_oom,			"afs-oom")		\
+ 	EM(afs_abort_op_not_supported,		"afs-op-notsupp")	\
+ 	EM(afs_abort_probeuuid_negative,	"afs-probeuuid-neg")	\
+ 	EM(afs_abort_send_data_error,		"afs-send-data")	\
++	EM(afs_abort_send_error,		"afs-send-error")	\
+ 	EM(afs_abort_unmarshal_error,		"afs-unmarshal")	\
+ 	/* rxperf errors */						\
+ 	EM(rxperf_abort_general_error,		"rxperf-error")		\
+-- 
+2.53.0
+

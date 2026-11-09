@@ -1,0 +1,131 @@
+From 85384358b99105a7b9f24c6bc54490c3a620a593 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 5 Nov 2026 12:58:50 -0500
+Subject: xfs: improve dirent bounds checking in scrub and repair
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+From: Darrick J. Wong <djwong@kernel.org>
+
+[ Upstream commit 5d470234d04dae6fe2ca2cf4b9ef277b78c7e05a ]
+
+LOLLM complains that we don't do enough bounds checking of the directory
+entries in directory blocks when we're looking for errors or trying to
+salvage entries.  Let's improve that with more detailed checks.
+
+Cc: stable@vger.kernel.org # v4.16
+Fixes: ce92d29ddf9908 ("xfs: directory scrubber must walk through data block to offset")
+Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+Assisted-by: LOLLM # finding obvious bugs
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Carlos Maiolino <cem@kernel.org>
+[ sashal: inlined the upstream scrub helpers’ checks into the existing xchk_dir_rec() loop because those helpers are absent ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/xfs/scrub/dir.c | 59 +++++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 53 insertions(+), 6 deletions(-)
+
+diff --git a/fs/xfs/scrub/dir.c b/fs/xfs/scrub/dir.c
+index 0b491784b7594..7231a7df4aed6 100644
+--- a/fs/xfs/scrub/dir.c
++++ b/fs/xfs/scrub/dir.c
+@@ -167,6 +167,7 @@ xchk_dir_rec(
+ 	xfs_dahash_t			hash;
+ 	struct xfs_dir3_icleaf_hdr	hdr;
+ 	unsigned int			tag;
++	bool				foundit = false;
+ 	int				error;
+ 
+ 	ASSERT(blk->magic == XFS_DIR2_LEAF1_MAGIC ||
+@@ -211,28 +212,67 @@ xchk_dir_rec(
+ 	dent = bp->b_addr + off;
+ 
+ 	/* Make sure we got a real directory entry. */
+-	iter_off = geo->data_entry_offset;
+ 	end = xfs_dir3_data_end_offset(geo, bp->b_addr);
+ 	if (!end) {
+ 		xchk_fblock_set_corrupt(ds->sc, XFS_DATA_FORK, rec_bno);
+ 		goto out_relse;
+ 	}
+-	for (;;) {
++	iter_off = geo->data_entry_offset;
++	while (iter_off < end) {
+ 		struct xfs_dir2_data_entry	*dep = bp->b_addr + iter_off;
+ 		struct xfs_dir2_data_unused	*dup = bp->b_addr + iter_off;
++		unsigned int			advance;
+ 
+-		if (iter_off >= end) {
++		/* must have freetag */
++		advance = offsetof(typeof(*dup), length);
++		if (iter_off + advance >= end) {
+ 			xchk_fblock_set_corrupt(ds->sc, XFS_DATA_FORK, rec_bno);
+ 			goto out_relse;
+ 		}
+ 
+ 		if (be16_to_cpu(dup->freetag) == XFS_DIR2_DATA_FREE_TAG) {
+-			iter_off += be16_to_cpu(dup->length);
++			if (iter_off + sizeof(*dup) > end) {
++				xchk_fblock_set_corrupt(ds->sc, XFS_DATA_FORK,
++						rec_bno);
++				goto out_relse;
++			}
++
++			advance = xfs_dir2_data_unusedsize(be16_to_cpu(dup->length));
++			if (!advance || iter_off + advance > end) {
++				xchk_fblock_set_corrupt(ds->sc, XFS_DATA_FORK,
++						rec_bno);
++				goto out_relse;
++			}
++
++			iter_off += advance;
+ 			continue;
+ 		}
+-		if (dep == dent)
++
++		/* must have namelen */
++		advance = offsetof(typeof(*dep), name);
++		if (iter_off + advance >= end) {
++			xchk_fblock_set_corrupt(ds->sc, XFS_DATA_FORK, rec_bno);
++			goto out_relse;
++		}
++
++		/* Don't walk off the end of the block. */
++		advance = xfs_dir2_data_entsize(mp, dep->namelen);
++		if (!advance || iter_off + advance > end) {
++			xchk_fblock_set_corrupt(ds->sc, XFS_DATA_FORK, rec_bno);
++			goto out_relse;
++		}
++
++		if (dep == dent) {
++			foundit = true;
+ 			break;
+-		iter_off += xfs_dir2_data_entsize(mp, dep->namelen);
++		}
++		iter_off += advance;
++	}
++
++	/* Hash tree must point to the exact dirent */
++	if (!foundit) {
++		xchk_fblock_set_corrupt(ds->sc, XFS_DATA_FORK, rec_bno);
++		goto out_relse;
+ 	}
+ 
+ 	/* Retrieve the entry, sanity check it, and compare hashes. */
+@@ -246,6 +286,13 @@ xchk_dir_rec(
+ 		goto out_relse;
+ 	}
+ 
++	/* Name must not overflow end of block */
++	if ((char *)dent->name + dent->namelen >
++	    (char *)bp->b_addr + BBTOB(bp->b_length)) {
++		xchk_fblock_set_corrupt(ds->sc, XFS_DATA_FORK, rec_bno);
++		goto out_relse;
++	}
++
+ 	/* Does the directory hash match? */
+ 	dname.name = dent->name;
+ 	dname.len = dent->namelen;
+-- 
+2.53.0
+
