@@ -1,0 +1,101 @@
+From aebd3019e20d52737fda1abccf304092a7073d79 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 11 Nov 2026 12:49:46 -0500
+Subject: KVM: arm64: Turn vcpu->arch.pause into a counter
+
+From: Marc Zyngier <maz@kernel.org>
+
+[ Upstream commit e64309198eda29415a95113def92aa40196cd422 ]
+
+We have situations where we can call kvm_arm_halt_guest() without
+holding config_lock, which means that halt and resume can overlap in
+funny ways when called from separate contexts, and result in situations
+where a vcpu is resumed while other parts of KVM assume it is halted.
+Consequences are left to the imagination of the reader.
+
+Fix this sorry situation by turning kvm_vcpu_arch::pause into an
+atomic counter, which makes the races described above harmless.
+
+Fixes: 3b92830ad41b2 ("KVM: arm/arm64: implement kvm_arm_[halt,resume]_guest")
+Reviewed-by: Fuad Tabba <fuad.tabba@linux.dev>
+Tested-by: Fuad Tabba <fuad.tabba@linux.dev>
+Cc: stable@vger.kernel.org
+Link: https://patch.msgid.link/20261015100539.1011760-5-maz@kernel.org
+Signed-off-by: Marc Zyngier <maz@kernel.org>
+[ sashal: adapted pause handling to existing power_off checks and vcpu_req_sleep(), retaining direct rcuwait_wake_up() calls ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ arch/arm64/include/asm/kvm_host.h |  2 +-
+ arch/arm64/kvm/arm.c              | 13 +++++++------
+ 2 files changed, 8 insertions(+), 7 deletions(-)
+
+diff --git a/arch/arm64/include/asm/kvm_host.h b/arch/arm64/include/asm/kvm_host.h
+index 48ee1fe3aca40..16062b15131cf 100644
+--- a/arch/arm64/include/asm/kvm_host.h
++++ b/arch/arm64/include/asm/kvm_host.h
+@@ -354,7 +354,7 @@ struct kvm_vcpu_arch {
+ 	bool power_off;
+ 
+ 	/* Don't run the guest (internal implementation need) */
+-	bool pause;
++	atomic_t pause;
+ 
+ 	/* Cache some mmu pages needed inside spinlock regions */
+ 	struct kvm_mmu_memory_cache mmu_page_cache;
+diff --git a/arch/arm64/kvm/arm.c b/arch/arm64/kvm/arm.c
+index ccf31a749c827..3b3d9cfd6bbbc 100644
+--- a/arch/arm64/kvm/arm.c
++++ b/arch/arm64/kvm/arm.c
+@@ -289,6 +289,7 @@ int kvm_arch_vcpu_create(struct kvm_vcpu *vcpu)
+ 	kvm_arm_pvtime_vcpu_init(&vcpu->arch);
+ 
+ 	vcpu->arch.hw_mmu = &vcpu->kvm->arch.mmu;
++	atomic_set(&vcpu->arch.pause, 0);
+ 
+ 	err = kvm_vgic_vcpu_init(vcpu);
+ 	if (err)
+@@ -447,7 +448,7 @@ int kvm_arch_vcpu_runnable(struct kvm_vcpu *v)
+ {
+ 	bool irq_lines = *vcpu_hcr(v) & (HCR_VI | HCR_VF);
+ 	return ((irq_lines || kvm_vgic_vcpu_pending_irq(v))
+-		&& !v->arch.power_off && !v->arch.pause);
++		&& !v->arch.power_off && !atomic_read(&v->arch.pause));
+ }
+ 
+ bool kvm_arch_vcpu_in_kernel(struct kvm_vcpu *vcpu)
+@@ -589,7 +590,7 @@ void kvm_arm_halt_guest(struct kvm *kvm)
+ 	struct kvm_vcpu *vcpu;
+ 
+ 	kvm_for_each_vcpu(i, vcpu, kvm)
+-		vcpu->arch.pause = true;
++		atomic_inc(&vcpu->arch.pause);
+ 	kvm_make_all_cpus_request(kvm, KVM_REQ_SLEEP);
+ }
+ 
+@@ -599,8 +600,8 @@ void kvm_arm_resume_guest(struct kvm *kvm)
+ 	struct kvm_vcpu *vcpu;
+ 
+ 	kvm_for_each_vcpu(i, vcpu, kvm) {
+-		vcpu->arch.pause = false;
+-		rcuwait_wake_up(kvm_arch_vcpu_get_wait(vcpu));
++		if (atomic_dec_and_test(&vcpu->arch.pause))
++			rcuwait_wake_up(kvm_arch_vcpu_get_wait(vcpu));
+ 	}
+ }
+ 
+@@ -609,10 +610,10 @@ static void vcpu_req_sleep(struct kvm_vcpu *vcpu)
+ 	struct rcuwait *wait = kvm_arch_vcpu_get_wait(vcpu);
+ 
+ 	rcuwait_wait_event(wait,
+-			   (!vcpu->arch.power_off) &&(!vcpu->arch.pause),
++			   !vcpu->arch.power_off && !atomic_read(&vcpu->arch.pause),
+ 			   TASK_INTERRUPTIBLE);
+ 
+-	if (vcpu->arch.power_off || vcpu->arch.pause) {
++	if (vcpu->arch.power_off || atomic_read(&vcpu->arch.pause)) {
+ 		/* Awaken to handle a signal, request we sleep again later. */
+ 		kvm_make_request(KVM_REQ_SLEEP, vcpu);
+ 	}
+-- 
+2.53.0
+

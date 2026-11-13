@@ -1,0 +1,91 @@
+From b04463b56ee04b943b6c2277f34ee20c6e9c3976 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 10 Nov 2026 20:20:29 -0500
+Subject: drm/amdkfd: stop restore retries on device unplug
+
+From: Olivier Kaloudoff <olivier.kaloudoff@gmail.com>
+
+[ Upstream commit 3254ed0b15f2fe656c9cb36ccb59b92422440bf8 ]
+
+amdgpu_amdkfd_restore_userptr_worker() and svm_range_restore_work()
+reschedule themselves when validation fails with evicted objects
+pending. After a surprise removal the restore paths fail with -ENODEV
+permanently, so rescheduling just spins the worker uselessly until
+cancel_delayed_work_sync() in fini finally stops it - which can take
+a while, since process teardown itself is delayed by the dead device.
+
+Treat -ENODEV as terminal in both workers.
+
+Cc: Xiaogang Chen <xiaogang.chen@amd.com>
+Signed-off-by: Olivier Kaloudoff <olivier.kaloudoff@gmail.com>
+Signed-off-by: Felix Kuehling <felix.kuehling@amd.com>
+Reviewed-by: Felix Kuehling <felix.kuehling@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+(cherry picked from commit 266fab83139600e58db7e900e930c722e619b78c)
+Cc: stable@vger.kernel.org
+[ sashal: adapted restore retry handling to the existing atomic eviction counter and delayed-work scheduling ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ .../gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c    | 17 ++++++++++++-----
+ 1 file changed, 12 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+index a574c89193bc4..ca89abf0aca8d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+@@ -1952,6 +1952,7 @@ static void amdgpu_amdkfd_restore_userptr_worker(struct work_struct *work)
+ 	struct task_struct *usertask;
+ 	struct mm_struct *mm;
+ 	int evicted_bos;
++	int ret;
+ 
+ 	evicted_bos = atomic_read(&process_info->evicted_bos);
+ 	if (!evicted_bos)
+@@ -1969,7 +1970,8 @@ static void amdgpu_amdkfd_restore_userptr_worker(struct work_struct *work)
+ 
+ 	mutex_lock(&process_info->lock);
+ 
+-	if (update_invalid_user_pages(process_info, mm))
++	ret = update_invalid_user_pages(process_info, mm);
++	if (ret)
+ 		goto unlock_out;
+ 	/* userptr_inval_list can be empty if all evicted userptr BOs
+ 	 * have been freed. In that case there is nothing to validate
+@@ -1979,7 +1981,8 @@ static void amdgpu_amdkfd_restore_userptr_worker(struct work_struct *work)
+ 		if (atomic_read(&process_info->evicted_bos) != evicted_bos)
+ 			goto unlock_out; /* Concurrent eviction, try again */
+ 
+-		if (validate_invalid_user_pages(process_info))
++		ret = validate_invalid_user_pages(process_info);
++		if (ret)
+ 			goto unlock_out;
+ 	}
+ 	/* Final check for concurrent evicton and atomic update. If
+@@ -1988,8 +1991,10 @@ static void amdgpu_amdkfd_restore_userptr_worker(struct work_struct *work)
+ 	 * reference counting inside KFD will handle this case.
+ 	 */
+ 	if (atomic_cmpxchg(&process_info->evicted_bos, evicted_bos, 0) !=
+-	    evicted_bos)
++	    evicted_bos) {
++		ret = -EAGAIN;
+ 		goto unlock_out;
++	}
+ 	evicted_bos = 0;
+ 	if (kgd2kfd_resume_mm(mm)) {
+ 		pr_err("%s: Failed to resume KFD\n", __func__);
+@@ -2003,8 +2008,10 @@ static void amdgpu_amdkfd_restore_userptr_worker(struct work_struct *work)
+ 	mmput(mm);
+ 	put_task_struct(usertask);
+ 
+-	/* If validation failed, reschedule another attempt */
+-	if (evicted_bos)
++	/* If validation failed, reschedule another attempt, unless the
++	 * device is gone for good
++	 */
++	if (evicted_bos && ret != -ENODEV)
+ 		schedule_delayed_work(&process_info->restore_userptr_work,
+ 			msecs_to_jiffies(AMDGPU_USERPTR_RESTORE_DELAY_MS));
+ }
+-- 
+2.53.0
+

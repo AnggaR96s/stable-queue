@@ -1,0 +1,117 @@
+From cf99c0659493ffb966cb4da7d7fd8daf4f2e7cf7 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 10 Nov 2026 20:56:24 -0500
+Subject: ublk: mark the io command cancelable before publishing it
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+From: Ming Lei <tom.leiming@gmail.com>
+
+[ Upstream commit a261f0cacacc022e4fab5b8e38c59f74ce4942e8 ]
+
+FETCH, COMMIT_AND_FETCH and NEED_GET_DATA publish the command in io->cmd
+before marking it cancelable. A cancel from the control path (STOP_DEV,
+QUIESCE_DEV) can complete it in between:
+
+  issue path                       control-path cancel
+  io->cmd = C
+                                   take C, io_uring_cmd_done(C):
+                                     C not marked, nothing to unlink
+  ublk_prep_cancel(C)
+    the completed C is linked on the cancelable list
+  ring exit: the cancel walk hits it → GPF (KASAN, with a delay added)
+
+Mark the command before ublk_fill_io_cmd() publishes it. The handlers
+run with uring_lock held, as io_uring's cancel walk does, so marking
+takes no lock and the walk can't see a marked command before it is
+published. smp_wmb() orders the mark before the io->cmd store; the
+cancel loads cmd with READ_ONCE(io->cmd) before reading cmd->flags.
+
+A marked command has to be completed by io_uring_cmd_done(), so a failed
+FETCH and the inline UBLK_IO_RES_OK of NEED_GET_DATA now do that. The CQE
+is the same.
+
+Fixes: 216c8f5ef0f2 ("ublk: replace monitor with cancelable uring_cmd")
+Cc: stable@vger.kernel.org
+Tested-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: Ming Lei <tom.leiming@gmail.com>
+Link: https://patch.msgid.link/20261011063555.1142277-3-tom.leiming@gmail.com
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+[ sashal: Omitted out_done because FETCH validation precedes cancellation marking and NEED_GET_DATA already completes asynchronously. ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/block/ublk_drv.c | 16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/block/ublk_drv.c b/drivers/block/ublk_drv.c
+index 3e7c3b1f0b8a1..f89b36017d979 100644
+--- a/drivers/block/ublk_drv.c
++++ b/drivers/block/ublk_drv.c
+@@ -1589,8 +1589,10 @@ static void ublk_cancel_cmd(struct ublk_queue *ubq, unsigned tag,
+ 		io->flags |= UBLK_IO_FLAG_CANCELED;
+ 	spin_unlock(&ubq->cancel_lock);
+ 
++	/* dependency ordered against smp_wmb() in ublk_prep_cancel() */
+ 	if (!done)
+-		io_uring_cmd_done(io->cmd, UBLK_IO_RES_ABORT, 0, issue_flags);
++		io_uring_cmd_done(READ_ONCE(io->cmd), UBLK_IO_RES_ABORT, 0,
++				  issue_flags);
+ }
+ 
+ /*
+@@ -1807,6 +1809,12 @@ static inline void ublk_fill_io_cmd(struct ublk_io *io,
+ 	io->addr = buf_addr;
+ }
+ 
++/*
++ * Call before ublk_fill_io_cmd() publishes @cmd in io->cmd: a control-path
++ * cancel may complete any command found there, and io_uring_cmd_done() only
++ * takes it off the cancelable list if it is marked already. The handlers
++ * hold uring_lock, so marking takes no lock.
++ */
+ static inline void ublk_prep_cancel(struct io_uring_cmd *cmd,
+ 				    unsigned int issue_flags,
+ 				    struct ublk_queue *ubq, unsigned int tag)
+@@ -1820,6 +1828,8 @@ static inline void ublk_prep_cancel(struct io_uring_cmd *cmd,
+ 	pdu->ubq = ubq;
+ 	pdu->tag = tag;
+ 	io_uring_cmd_mark_cancelable(cmd, issue_flags);
++	/* pairs with the cancel loading cmd from io->cmd, then cmd->flags */
++	smp_wmb();
+ }
+ 
+ static int __ublk_ch_uring_cmd(struct io_uring_cmd *cmd,
+@@ -1899,6 +1909,7 @@ static int __ublk_ch_uring_cmd(struct io_uring_cmd *cmd,
+ 			goto out;
+ 		}
+ 
++		ublk_prep_cancel(cmd, issue_flags, ubq, tag);
+ 		ublk_fill_io_cmd(io, cmd, ub_cmd->addr);
+ 		ublk_mark_io_ready(ub, ubq);
+ 		break;
+@@ -1925,19 +1936,20 @@ static int __ublk_ch_uring_cmd(struct io_uring_cmd *cmd,
+ 			goto out;
+ 		}
+ 
++		ublk_prep_cancel(cmd, issue_flags, ubq, tag);
+ 		ublk_fill_io_cmd(io, cmd, ub_cmd->addr);
+ 		ublk_commit_completion(ub, ub_cmd);
+ 		break;
+ 	case UBLK_IO_NEED_GET_DATA:
+ 		if (!(io->flags & UBLK_IO_FLAG_OWNED_BY_SRV))
+ 			goto out;
++		ublk_prep_cancel(cmd, issue_flags, ubq, tag);
+ 		ublk_fill_io_cmd(io, cmd, ub_cmd->addr);
+ 		ublk_handle_need_get_data(ub, ub_cmd->q_id, ub_cmd->tag);
+ 		break;
+ 	default:
+ 		goto out;
+ 	}
+-	ublk_prep_cancel(cmd, issue_flags, ubq, tag);
+ 	return -EIOCBQUEUED;
+ 
+  out:
+-- 
+2.53.0
+

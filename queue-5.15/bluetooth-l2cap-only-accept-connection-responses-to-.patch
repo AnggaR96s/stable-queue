@@ -1,0 +1,124 @@
+From fa15914382d5eafa0df96517d5d5333def921089 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 11 Nov 2026 17:07:12 -0500
+Subject: Bluetooth: L2CAP: Only accept connection responses to outstanding
+ requests
+
+From: Siwei Zhang <oss@fourdim.xyz>
+
+commit a518b9a9ef6ee3b18ecdf6ba5360c608aaf969e9 upstream.
+
+Adjusted context as stable does not have the lockdep_assert_held()
+call and the __must_hold() context analysis annotations, and
+l2cap_connect_create_rsp() still holds conn->chan_lock and returns
+through the unlock label when the channel lookup fails.
+
+Stable still has AMP support, which upstream removed in
+commit e7b02296fb40 ("Bluetooth: Remove BT_HS"). The response to an
+L2CAP_CREATE_CHAN_REQ is also handled by l2cap_connect_create_rsp(),
+so set CONF_CONNECT_PEND in l2cap_send_create_chan_req() as
+l2cap_send_conn_req() does. Otherwise that response is dropped and an
+outgoing AMP channel hangs in BT_CONNECT. This also makes
+__l2cap_no_conn_pending() see the request as outstanding, so
+l2cap_do_start(), l2cap_conn_start() and l2cap_security_cfm() leave
+the channel alone until it is answered, as they already do for a
+pending connection request.
+
+An outgoing channel waits in BT_CONNECT until security
+and the feature mask exchange complete, and only then
+sends its connection request. A peer can answer it
+before that with a connection response matching our
+source CID. The channel then moves to BT_CONFIG,
+completes configuration and becomes connected before
+security has completed. If security then fails,
+l2cap_security_cfm() leaves the connected channel
+alone, so it stays up on a link that did not reach
+the required security level.
+
+A connection response with a zero source CID is
+matched by identifier. Another channel can hold the
+same identifier for a response it still has to send,
+so the lookup can pick the wrong channel.
+
+Only accept a connection response while our request
+is outstanding, and only look at such channels when
+matching by identifier.
+
+Fixes: 1da177e4c3f4 ("Linux-2.6.12-rc2")
+Cc: stable@vger.kernel.org
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Siwei Zhang <oss@fourdim.xyz>
+Signed-off-by: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ net/bluetooth/l2cap_core.c | 33 ++++++++++++++++++++++++++++++---
+ 1 file changed, 30 insertions(+), 3 deletions(-)
+
+diff --git a/net/bluetooth/l2cap_core.c b/net/bluetooth/l2cap_core.c
+index 9a883e476684b..75c2ab39be167 100644
+--- a/net/bluetooth/l2cap_core.c
++++ b/net/bluetooth/l2cap_core.c
+@@ -185,6 +185,28 @@ static struct l2cap_chan *l2cap_get_chan_by_ident(struct l2cap_conn *conn,
+ 	return c;
+ }
+ 
++/* Our connection request has been sent and is still outstanding */
++static bool l2cap_chan_connect_pending(struct l2cap_chan *chan)
++{
++	return chan->state == BT_CONNECT &&
++	       test_bit(CONF_CONNECT_PEND, &chan->conf_state);
++}
++
++/* Other channels may hold the same ident for a response they still have
++ * to send, so only look at channels waiting for a connection response.
++ */
++static struct l2cap_chan *__l2cap_get_connect_chan_by_ident(struct l2cap_conn *conn,
++							    u8 ident)
++{
++	struct l2cap_chan *c;
++
++	list_for_each_entry(c, &conn->chan_l, list) {
++		if (c->ident == ident && l2cap_chan_connect_pending(c))
++			return c;
++	}
++	return NULL;
++}
++
+ static struct l2cap_chan *__l2cap_global_chan_by_addr(__le16 psm, bdaddr_t *src,
+ 						      u8 src_type)
+ {
+@@ -1329,6 +1351,8 @@ static void l2cap_send_create_chan_req(struct l2cap_chan *chan, u8 amp_id)
+ 
+ 	chan->ident = l2cap_get_ident(chan->conn);
+ 
++	set_bit(CONF_CONNECT_PEND, &chan->conf_state);
++
+ 	l2cap_send_cmd(chan->conn, chan->ident, L2CAP_CREATE_CHAN_REQ,
+ 		       sizeof(req), &req);
+ }
+@@ -4426,7 +4450,7 @@ static int l2cap_connect_create_rsp(struct l2cap_conn *conn,
+ 			goto unlock;
+ 		}
+ 	} else {
+-		chan = __l2cap_get_chan_by_ident(conn, cmd->ident);
++		chan = __l2cap_get_connect_chan_by_ident(conn, cmd->ident);
+ 		if (!chan) {
+ 			err = -EBADSLT;
+ 			goto unlock;
+@@ -4443,8 +4467,11 @@ static int l2cap_connect_create_rsp(struct l2cap_conn *conn,
+ 
+ 	l2cap_chan_lock(chan);
+ 
+-	/* Ignore a late response after the channel has left BT_CONNECT. */
+-	if (chan->state != BT_CONNECT)
++	/* Only accept a response to a connection request we sent and that
++	 * is still outstanding. A channel waiting in BT_CONNECT for security
++	 * or the feature mask has not sent one yet.
++	 */
++	if (!l2cap_chan_connect_pending(chan))
+ 		goto done;
+ 
+ 	switch (result) {
+-- 
+2.53.0
+

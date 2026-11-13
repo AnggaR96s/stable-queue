@@ -1,0 +1,75 @@
+From 94dbbe53169e1e82069af398f9b8dc0838031c84 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 11 Nov 2026 10:08:09 -0500
+Subject: iomap: don't mark unwritten parts of a folio uptodate
+
+From: Christian Brauner <brauner@kernel.org>
+
+[ Upstream commit a4193b4af359db84b2cdf3a040752861984c636b ]
+
+For a buffered write into a hole, an unwritten or new extent, or past
+EOF __iomap_write_begin() zeroes the parts of the blocks outside of the
+write and then marks the blocks uptodate. That includes the range of the
+write itself which still holds whatever was in the folio before. It only
+becomes valid once the copy from userspace has filled it in.
+
+But the copy can come up short and __iomap_write_end() only rejects a
+short copy if the folio isn't uptodate. If the zeroed blocks were all
+that was missing the folio is uptodate by then, the short copy is
+accepted, and the rest of the range is exposed to readers and can end up
+on disk. A source buffer that ends in an unmapped page is enough:
+
+        ftruncate(fd, 4096);
+        pwrite(fd, p, 3000, 100);    /* 16 bytes at p, then PROT_NONE */
+        pread(fd, buf, 4096, 0);
+
+The write returns 16 and the read returns 2984 bytes of whatever was in
+that page before. If other blocks of the folio aren't uptodate the short
+copy is rejected but the zeroed blocks keep their uptodate bits and the
+retry with the copied length leaves the same bytes behind.
+
+Only mark blocks uptodate in __iomap_write_begin() after reading them.
+__iomap_write_end() marks the zeroed blocks uptodate once the copy has
+succeeded and rejects a short copy.
+
+Willy reported this back in 2024 (cf. [1]) and Zhang Yi posted the same
+fix (cf. [2]) but it never got merged.
+
+[1]: https://lore.kernel.org/all/ZqsN5ouQTEc1KAzV@casper.infradead.org
+[2]: https://lore.kernel.org/all/20240812121159.3775074-6-yi.zhang@huaweicloud.com
+
+Fixes: 9dc55f1389f9 ("iomap: add support for sub-pagesize buffered I/O without buffer heads")
+Reported-by: Josef Bacik <josef@toxicpanda.com>
+Cc: stable@vger.kernel.org
+Link: https://patch.msgid.link/20261029-work-iomap-ai-fixes-v1-1-7eda63bc1b13@kernel.org
+Signed-off-by: Christian Brauner (Amutable) <brauner@kernel.org>
+[ sashal: adapted iomap_set_range_uptodate() to use page instead of folio in the older __iomap_write_begin() context ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/iomap/buffered-io.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/fs/iomap/buffered-io.c b/fs/iomap/buffered-io.c
+index d0a141816f125..8756797f224d0 100644
+--- a/fs/iomap/buffered-io.c
++++ b/fs/iomap/buffered-io.c
+@@ -582,14 +582,15 @@ __iomap_write_begin(struct inode *inode, loff_t pos, unsigned len, int flags,
+ 		if (iomap_block_needs_zeroing(inode, srcmap, block_start)) {
+ 			if (WARN_ON_ONCE(flags & IOMAP_WRITE_F_UNSHARE))
+ 				return -EIO;
++			/* uptodate once copied, see __iomap_write_end() */
+ 			zero_user_segments(page, poff, from, to, poff + plen);
+ 		} else {
+ 			int status = iomap_read_page_sync(block_start, page,
+ 					poff, plen, srcmap);
+ 			if (status)
+ 				return status;
++			iomap_set_range_uptodate(page, poff, plen);
+ 		}
+-		iomap_set_range_uptodate(page, poff, plen);
+ 	} while ((block_start += plen) < block_end);
+ 
+ 	return 0;
+-- 
+2.53.0
+

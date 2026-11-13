@@ -1,0 +1,194 @@
+From a8082c3a827fadc933d08bf1d57987103ed66962 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 11 Nov 2026 09:26:08 -0500
+Subject: signal: Requeue signals in the appropriate queue
+
+From: Eric W. Biederman <ebiederm@xmission.com>
+
+[ Upstream commit 5768d8906bc23d512b1a736c1e198aa833a6daa4 ]
+
+In the event that a tracer changes which signal needs to be delivered
+and that signal is currently blocked then the signal needs to be
+requeued for later delivery.
+
+With the advent of CLONE_THREAD the kernel has 2 signal queues per
+task.  The per process queue and the per task queue.  Update the code
+so that if the signal is removed from the per process queue it is
+requeued on the per process queue.  This is necessary to make it
+appear the signal was never dequeued.
+
+The rr debugger reasonably believes that the state of the process from
+the last ptrace_stop it observed until PTRACE_EVENT_EXIT can be recreated
+by simply letting a process run.  If a SIGKILL interrupts a ptrace_stop
+this is not true today.
+
+So return signals to their original queue in ptrace_signal so that
+signals that are not delivered appear like they were never dequeued.
+
+Fixes: 794aa320b79d ("[PATCH] sigfix-2.5.40-D6")
+History Tree: https://git.kernel.org/pub/scm/linux/kernel/git/tglx/history.gi
+Reviewed-by: Kees Cook <keescook@chromium.org>
+Link: https://lkml.kernel.org/r/87zgq4d5r4.fsf_-_@email.froward.int.ebiederm.org
+Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+Stable-dep-of: d72e0fb3b00c ("signalfd: don't dequeue the forced fatal signals")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/signalfd.c                |  5 +++--
+ include/linux/sched/signal.h |  7 ++++---
+ kernel/signal.c              | 21 ++++++++++++++-------
+ 3 files changed, 21 insertions(+), 12 deletions(-)
+
+diff --git a/fs/signalfd.c b/fs/signalfd.c
+index 65ce0e72e7b95..e20d1484c6633 100644
+--- a/fs/signalfd.c
++++ b/fs/signalfd.c
+@@ -155,11 +155,12 @@ static int signalfd_copyinfo(struct signalfd_siginfo __user *uinfo,
+ static ssize_t signalfd_dequeue(struct signalfd_ctx *ctx, kernel_siginfo_t *info,
+ 				int nonblock)
+ {
++	enum pid_type type;
+ 	ssize_t ret;
+ 	DECLARE_WAITQUEUE(wait, current);
+ 
+ 	spin_lock_irq(&current->sighand->siglock);
+-	ret = dequeue_signal(current, &ctx->sigmask, info);
++	ret = dequeue_signal(current, &ctx->sigmask, info, &type);
+ 	switch (ret) {
+ 	case 0:
+ 		if (!nonblock)
+@@ -174,7 +175,7 @@ static ssize_t signalfd_dequeue(struct signalfd_ctx *ctx, kernel_siginfo_t *info
+ 	add_wait_queue(&current->sighand->signalfd_wqh, &wait);
+ 	for (;;) {
+ 		set_current_state(TASK_INTERRUPTIBLE);
+-		ret = dequeue_signal(current, &ctx->sigmask, info);
++		ret = dequeue_signal(current, &ctx->sigmask, info, &type);
+ 		if (ret != 0)
+ 			break;
+ 		if (signal_pending(current)) {
+diff --git a/include/linux/sched/signal.h b/include/linux/sched/signal.h
+index 324a3fd0f3c3e..d71dc9a933d44 100644
+--- a/include/linux/sched/signal.h
++++ b/include/linux/sched/signal.h
+@@ -274,17 +274,18 @@ static inline int signal_group_exit(const struct signal_struct *sig)
+ extern void flush_signals(struct task_struct *);
+ extern void ignore_signals(struct task_struct *);
+ extern void flush_signal_handlers(struct task_struct *, int force_default);
+-extern int dequeue_signal(struct task_struct *task,
+-			  sigset_t *mask, kernel_siginfo_t *info);
++extern int dequeue_signal(struct task_struct *task, sigset_t *mask,
++			  kernel_siginfo_t *info, enum pid_type *type);
+ 
+ static inline int kernel_dequeue_signal(void)
+ {
+ 	struct task_struct *task = current;
+ 	kernel_siginfo_t __info;
++	enum pid_type __type;
+ 	int ret;
+ 
+ 	spin_lock_irq(&task->sighand->siglock);
+-	ret = dequeue_signal(task, &task->blocked, &__info);
++	ret = dequeue_signal(task, &task->blocked, &__info, &__type);
+ 	spin_unlock_irq(&task->sighand->siglock);
+ 
+ 	return ret;
+diff --git a/kernel/signal.c b/kernel/signal.c
+index 5d110fd089d10..8d711b8a2dd84 100644
+--- a/kernel/signal.c
++++ b/kernel/signal.c
+@@ -627,7 +627,8 @@ static int __dequeue_signal(struct sigpending *pending, sigset_t *mask,
+  *
+  * All callers have to hold the siglock.
+  */
+-int dequeue_signal(struct task_struct *tsk, sigset_t *mask, kernel_siginfo_t *info)
++int dequeue_signal(struct task_struct *tsk, sigset_t *mask,
++		   kernel_siginfo_t *info, enum pid_type *type)
+ {
+ 	bool resched_timer = false;
+ 	int signr;
+@@ -635,8 +636,10 @@ int dequeue_signal(struct task_struct *tsk, sigset_t *mask, kernel_siginfo_t *in
+ 	/* We only dequeue private signals from ourselves, we don't let
+ 	 * signalfd steal them
+ 	 */
++	*type = PIDTYPE_PID;
+ 	signr = __dequeue_signal(&tsk->pending, mask, info, &resched_timer);
+ 	if (!signr) {
++		*type = PIDTYPE_TGID;
+ 		signr = __dequeue_signal(&tsk->signal->shared_pending,
+ 					 mask, info, &resched_timer);
+ #ifdef CONFIG_POSIX_TIMERS
+@@ -2610,7 +2613,7 @@ static void do_freezer_trap(void)
+ 		task_work_run();
+ }
+ 
+-static int ptrace_signal(int signr, kernel_siginfo_t *info)
++static int ptrace_signal(int signr, kernel_siginfo_t *info, enum pid_type type)
+ {
+ 	/*
+ 	 * We do not check sig_kernel_stop(signr) but set this marker
+@@ -2651,7 +2654,7 @@ static int ptrace_signal(int signr, kernel_siginfo_t *info)
+ 
+ 	/* If the (new) signal is now blocked, requeue it.  */
+ 	if (sigismember(&current->blocked, signr)) {
+-		send_signal(signr, info, current, PIDTYPE_PID);
++		send_signal(signr, info, current, type);
+ 		signr = 0;
+ 	}
+ 
+@@ -2752,6 +2755,7 @@ bool get_signal(struct ksignal *ksig)
+ 
+ 	for (;;) {
+ 		struct k_sigaction *ka;
++		enum pid_type type;
+ 
+ 		/* Has this task already been marked for death? */
+ 		if (signal_group_exit(signal)) {
+@@ -2794,16 +2798,18 @@ bool get_signal(struct ksignal *ksig)
+ 		 * so that the instruction pointer in the signal stack
+ 		 * frame points to the faulting instruction.
+ 		 */
++		type = PIDTYPE_PID;
+ 		signr = dequeue_synchronous_signal(&ksig->info);
+ 		if (!signr)
+-			signr = dequeue_signal(current, &current->blocked, &ksig->info);
++			signr = dequeue_signal(current, &current->blocked,
++					       &ksig->info, &type);
+ 
+ 		if (!signr)
+ 			break; /* will return 0 */
+ 
+ 		if (unlikely(current->ptrace) && (signr != SIGKILL) &&
+ 		    !(sighand->action[signr -1].sa.sa_flags & SA_IMMUTABLE)) {
+-			signr = ptrace_signal(signr, &ksig->info);
++			signr = ptrace_signal(signr, &ksig->info, type);
+ 			if (!signr)
+ 				continue;
+ 		}
+@@ -3634,6 +3640,7 @@ static int do_sigtimedwait(const sigset_t *which, kernel_siginfo_t *info,
+ 	ktime_t *to = NULL, timeout = KTIME_MAX;
+ 	struct task_struct *tsk = current;
+ 	sigset_t mask = *which;
++	enum pid_type type;
+ 	int sig, ret = 0;
+ 
+ 	if (ts) {
+@@ -3650,7 +3657,7 @@ static int do_sigtimedwait(const sigset_t *which, kernel_siginfo_t *info,
+ 	signotset(&mask);
+ 
+ 	spin_lock_irq(&tsk->sighand->siglock);
+-	sig = dequeue_signal(tsk, &mask, info);
++	sig = dequeue_signal(tsk, &mask, info, &type);
+ 	if (!sig && timeout) {
+ 		/*
+ 		 * None ready, temporarily unblock those we're interested
+@@ -3669,7 +3676,7 @@ static int do_sigtimedwait(const sigset_t *which, kernel_siginfo_t *info,
+ 		spin_lock_irq(&tsk->sighand->siglock);
+ 		__set_task_blocked(tsk, &tsk->real_blocked);
+ 		sigemptyset(&tsk->real_blocked);
+-		sig = dequeue_signal(tsk, &mask, info);
++		sig = dequeue_signal(tsk, &mask, info, &type);
+ 	}
+ 	spin_unlock_irq(&tsk->sighand->siglock);
+ 
+-- 
+2.53.0
+
