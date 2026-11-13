@@ -1,0 +1,166 @@
+From 64221556aa3429669bb195813cdf34a18b2b5a42 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 11 Nov 2026 17:44:09 -0500
+Subject: new helper: d_splice_alias_ops()
+
+From: Al Viro <viro@zeniv.linux.org.uk>
+
+[ Upstream commit 790fa81b8c43cda9fe25c1b564d0afe3ddeeb370 ]
+
+Uses of d_set_d_op() on live dentry can be very dangerous; it is going
+to be withdrawn and replaced with saner things.
+
+The best way for a filesystem is to have the default dentry_operations
+set at mount time and be done with that - __d_alloc() will use that.
+
+Currently there are two cases when d_set_d_op() is used on a live dentry -
+one is procfs, which has several genuinely different dentry_operations
+instances (different ->d_revalidate(), etc.) and another is
+simple_lookup(), where we would be better off without overriding ->d_op.
+
+For procfs we have d_set_d_op() calls followed by d_splice_alias();
+provide a new helper (d_splice_alias_ops(inode, dentry, d_ops)) that would
+combine those two, and do the d_set_d_op() part while under ->d_lock.
+That eliminates one of the places where ->d_flags had been modified
+without holding ->d_lock; current behaviour is not racy, but the reasons
+for that are far too brittle.  Better move to uniform locking rules and
+simpler proof of correctness...
+
+The next commit will convert procfs to use of that helper; it is not
+exported and won't be until somebody comes up with convincing modular
+user for it.
+
+Again, the best approach is to have default ->d_op and let __d_alloc()
+do the right thing; filesystem _may_ need non-uniform ->d_op (procfs
+does), but there'd better be good reasons for that.
+
+Reviewed-by: Christian Brauner <brauner@kernel.org>
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+Stable-dep-of: eeecea75ece2 ("proc: don't let an entry below /proc/<pid>/net be a mountpoint")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/dcache.c            | 63 ++++++++++++++++++++++++------------------
+ include/linux/dcache.h |  3 ++
+ 2 files changed, 39 insertions(+), 27 deletions(-)
+
+diff --git a/fs/dcache.c b/fs/dcache.c
+index 34e8a97e0323e..52b7211cba915 100644
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@ -2668,7 +2668,8 @@ EXPORT_SYMBOL(__d_lookup_done);
+ 
+ /* inode->i_lock held if inode is non-NULL */
+ 
+-static inline void __d_add(struct dentry *dentry, struct inode *inode)
++static inline void __d_add(struct dentry *dentry, struct inode *inode,
++			   const struct dentry_operations *ops)
+ {
+ 	struct inode *dir = NULL;
+ 	unsigned n;
+@@ -2678,6 +2679,8 @@ static inline void __d_add(struct dentry *dentry, struct inode *inode)
+ 		n = start_dir_add(dir);
+ 		__d_lookup_done(dentry);
+ 	}
++	if (unlikely(ops))
++		d_set_d_op(dentry, ops);
+ 	if (inode) {
+ 		unsigned add_flags = d_flags_for_inode(inode);
+ 		hlist_add_head(&dentry->d_u.d_alias, &inode->i_dentry);
+@@ -2709,7 +2712,7 @@ void d_add(struct dentry *entry, struct inode *inode)
+ 		security_d_instantiate(entry, inode);
+ 		spin_lock(&inode->i_lock);
+ 	}
+-	__d_add(entry, inode);
++	__d_add(entry, inode, NULL);
+ }
+ EXPORT_SYMBOL(d_add);
+ 
+@@ -3004,30 +3007,8 @@ static int __d_unalias(struct inode *inode,
+ 	return ret;
+ }
+ 
+-/**
+- * d_splice_alias - splice a disconnected dentry into the tree if one exists
+- * @inode:  the inode which may have a disconnected dentry
+- * @dentry: a negative dentry which we want to point to the inode.
+- *
+- * If inode is a directory and has an IS_ROOT alias, then d_move that in
+- * place of the given dentry and return it, else simply d_add the inode
+- * to the dentry and return NULL.
+- *
+- * If a non-IS_ROOT directory is found, the filesystem is corrupt, and
+- * we should error out: directories can't have multiple aliases.
+- *
+- * This is needed in the lookup routine of any filesystem that is exportable
+- * (via knfsd) so that we can build dcache paths to directories effectively.
+- *
+- * If a dentry was found and moved, then it is returned.  Otherwise NULL
+- * is returned.  This matches the expected return value of ->lookup.
+- *
+- * Cluster filesystems may call this function with a negative, hashed dentry.
+- * In that case, we know that the inode will be a regular file, and also this
+- * will only occur during atomic_open. So we need to check for the dentry
+- * being already hashed only in the final case.
+- */
+-struct dentry *d_splice_alias(struct inode *inode, struct dentry *dentry)
++struct dentry *d_splice_alias_ops(struct inode *inode, struct dentry *dentry,
++				  const struct dentry_operations *ops)
+ {
+ 	if (IS_ERR(inode))
+ 		return ERR_CAST(inode);
+@@ -3073,9 +3054,37 @@ struct dentry *d_splice_alias(struct inode *inode, struct dentry *dentry)
+ 		}
+ 	}
+ out:
+-	__d_add(dentry, inode);
++	__d_add(dentry, inode, ops);
+ 	return NULL;
+ }
++
++/**
++ * d_splice_alias - splice a disconnected dentry into the tree if one exists
++ * @inode:  the inode which may have a disconnected dentry
++ * @dentry: a negative dentry which we want to point to the inode.
++ *
++ * If inode is a directory and has an IS_ROOT alias, then d_move that in
++ * place of the given dentry and return it, else simply d_add the inode
++ * to the dentry and return NULL.
++ *
++ * If a non-IS_ROOT directory is found, the filesystem is corrupt, and
++ * we should error out: directories can't have multiple aliases.
++ *
++ * This is needed in the lookup routine of any filesystem that is exportable
++ * (via knfsd) so that we can build dcache paths to directories effectively.
++ *
++ * If a dentry was found and moved, then it is returned.  Otherwise NULL
++ * is returned.  This matches the expected return value of ->lookup.
++ *
++ * Cluster filesystems may call this function with a negative, hashed dentry.
++ * In that case, we know that the inode will be a regular file, and also this
++ * will only occur during atomic_open. So we need to check for the dentry
++ * being already hashed only in the final case.
++ */
++struct dentry *d_splice_alias(struct inode *inode, struct dentry *dentry)
++{
++	return d_splice_alias_ops(inode, dentry, NULL);
++}
+ EXPORT_SYMBOL(d_splice_alias);
+ 
+ /*
+diff --git a/include/linux/dcache.h b/include/linux/dcache.h
+index 6f95c3300cbbb..9f21ea124842c 100644
+--- a/include/linux/dcache.h
++++ b/include/linux/dcache.h
+@@ -240,6 +240,9 @@ extern struct dentry * d_alloc_anon(struct super_block *);
+ extern struct dentry * d_alloc_parallel(struct dentry *, const struct qstr *,
+ 					wait_queue_head_t *);
+ extern struct dentry * d_splice_alias(struct inode *, struct dentry *);
++/* weird procfs mess; *NOT* exported */
++extern struct dentry * d_splice_alias_ops(struct inode *, struct dentry *,
++					  const struct dentry_operations *);
+ extern struct dentry * d_add_ci(struct dentry *, struct inode *, struct qstr *);
+ extern struct dentry * d_exact_alias(struct dentry *, struct inode *);
+ extern struct dentry *d_find_any_alias(struct inode *inode);
+-- 
+2.53.0
+
