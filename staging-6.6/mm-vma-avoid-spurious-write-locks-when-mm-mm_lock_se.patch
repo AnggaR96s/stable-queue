@@ -1,0 +1,116 @@
+From e917fe0c17c1cd32fb4e21fbf4adf54ba5a16abb Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Sat, 14 Nov 2026 18:08:30 +0000
+Subject: mm/vma: avoid spurious write locks when mm->mm_lock_seq overflows
+
+From: Lorenzo Stoakes (ARM) <ljs@kernel.org>
+
+[ Upstream commit 7135a05838e85845e1bbf6caa6596a7e3b791a40 ]
+
+A VMA is considered write locked if vma->vm_lock_seq equals
+mm->mm_lock_seq. The latter is incremented each time the mmap write lock is
+released or downgraded, while the former is not updated on unlock.
+
+Both are ints, so after 2^32 such cycles mm->mm_lock_seq matches the stale
+vma->vm_lock_seq of a VMA which is not write locked. vma_start_write() then
+returns without taking the VMA lock, so readers are not excluded and a VMA
+can be modified with concurrent readers.
+
+So far the assumption has been that this overflow is benign, resulting only
+in readers spuriously falling back to the mmap lock, however it turns out
+that this was an unsafe assumption.
+
+This deviates from the upstream patch, which resets every VMA's sequence
+number on overflow. That relies upon mm->mm_lock_seq being a seqcount,
+which it is not in this tree.
+
+Instead, make both sequence numbers long. In both vm_area_struct and
+mm_struct the field is followed by a pointer-aligned field, so on 64-bit
+this fills an existing hole and neither struct grows.
+
+User facing effects are - dangerous races that could cause memory
+corruption or NULL pointer dereferences (especially on page table
+traversal) are avoided.
+
+Fixes: 5e31275cc997 ("mm: add per-VMA lock and helper functions to control it")
+Reported-by: Daehyeon Ko <4ncienth@gmail.com>
+Closes: https://lore.kernel.org/all/20261015143735.1630957-1-4ncienth@gmail.com/
+Signed-off-by: Lorenzo Stoakes (ARM) <ljs@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/linux/mm.h       |  7 +++----
+ include/linux/mm_types.h | 11 ++++++-----
+ 2 files changed, 9 insertions(+), 9 deletions(-)
+
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index c365c33b9c3a8..8bce7f49b6e99 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -670,7 +670,6 @@ static inline bool vma_start_read(struct vm_area_struct *vma)
+ 		return false;
+ 
+ 	/*
+-	 * Overflow might produce false locked result.
+ 	 * False unlocked result is impossible because we modify and check
+ 	 * vma->vm_lock_seq under vma->vm_lock protection and mm->mm_lock_seq
+ 	 * modification invalidates all existing locks.
+@@ -695,7 +694,7 @@ static inline void vma_end_read(struct vm_area_struct *vma)
+ }
+ 
+ /* WARNING! Can only be used if mmap_lock is expected to be write-locked */
+-static bool __is_vma_write_locked(struct vm_area_struct *vma, int *mm_lock_seq)
++static bool __is_vma_write_locked(struct vm_area_struct *vma, long *mm_lock_seq)
+ {
+ 	mmap_assert_write_locked(vma->vm_mm);
+ 
+@@ -714,7 +713,7 @@ static bool __is_vma_write_locked(struct vm_area_struct *vma, int *mm_lock_seq)
+  */
+ static inline void vma_start_write(struct vm_area_struct *vma)
+ {
+-	int mm_lock_seq;
++	long mm_lock_seq;
+ 
+ 	if (__is_vma_write_locked(vma, &mm_lock_seq))
+ 		return;
+@@ -732,7 +731,7 @@ static inline void vma_start_write(struct vm_area_struct *vma)
+ 
+ static inline void vma_assert_write_locked(struct vm_area_struct *vma)
+ {
+-	int mm_lock_seq;
++	long mm_lock_seq;
+ 
+ 	VM_BUG_ON_VMA(!__is_vma_write_locked(vma, &mm_lock_seq), vma);
+ }
+diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
+index 91c10d8b00c02..b6f981c8d1d23 100644
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -664,11 +664,12 @@ struct vm_area_struct {
+ 	 * Can be read unreliably (using READ_ONCE()) for pessimistic bailout
+ 	 * while holding nothing (except RCU to keep the VMA struct allocated).
+ 	 *
+-	 * This sequence counter is explicitly allowed to overflow; sequence
+-	 * counter reuse can only lead to occasional unnecessary use of the
+-	 * slowpath.
++	 * This sequence counter must not be reused while a VMA still holds an
++	 * old value, as that VMA would then be spuriously considered write
++	 * locked and readers would not be excluded. It is therefore a long,
++	 * which on 64-bit will not overflow in practice.
+ 	 */
+-	int vm_lock_seq;
++	long vm_lock_seq;
+ 	struct vma_lock *vm_lock;
+ 
+ 	/* Flag to indicate areas detached from the mm->mm_mt tree */
+@@ -847,7 +848,7 @@ struct mm_struct {
+ 		 * Can be read with ACQUIRE semantics if not holding write
+ 		 * mmap_lock.
+ 		 */
+-		int mm_lock_seq;
++		long mm_lock_seq;
+ #endif
+ #ifdef CONFIG_FUTEX
+ 		atomic64_t futex_unique_id;
+-- 
+2.53.0
+

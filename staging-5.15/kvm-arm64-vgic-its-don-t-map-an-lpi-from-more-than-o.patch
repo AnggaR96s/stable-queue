@@ -1,0 +1,163 @@
+From cf6de81af3facca06ff325f003d902eb5866355a Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 13 Nov 2026 12:41:48 -0500
+Subject: KVM: arm64: vgic-its: Don't map an LPI from more than one event
+
+From: Fuad Tabba <fuad.tabba@linux.dev>
+
+[ Upstream commit de81b28f0b83b22163d7d9a9b708d7aa912e0ef7 ]
+
+KVM keeps one vgic_irq per LPI. A MAPTI of an LPI whose vgic_irq
+already exists reuses it for the new ITE and leaves its target vCPU as
+it was. Mapping one LPI from two events is UNPREDICTABLE (IHI 0069H.b,
+5.2.10), but nothing stops a guest from doing it. If the first MAPTI
+names a collection the guest never maps and the second a mapped one,
+the LPI translates through the second event with a NULL target vCPU.
+
+When the VMM routes an assigned device's MSI to that event on a host
+with GICv4 enabled, kvm_vgic_v4_set_forwarding() takes the vPE from the
+NULL target vCPU and the host oopses:
+
+  Unable to handle kernel paging request at virtual address 0000000000001980
+  [...]
+  Call trace:
+   its_build_vmapti_cmd (drivers/irqchip/irq-gic-v3-its.c:943) (P)
+   its_irq_set_vcpu_affinity (drivers/irqchip/irq-gic-v3-its.c:1380)
+   irq_set_vcpu_affinity (kernel/irq/manage.c:670)
+   its_map_vlpi (drivers/irqchip/irq-gic-v4.c:326)
+   kvm_vgic_v4_set_forwarding (arch/arm64/kvm/vgic/vgic-v4.c:485)
+   kvm_arch_irq_bypass_add_producer (arch/arm64/kvm/arm.c:2977)
+   irq_bypass_register_consumer (virt/lib/irqbypass.c:44)
+   kvm_irqfd (arch/arm64/kvm/../../../virt/kvm/eventfd.c:496)
+   kvm_vm_ioctl (arch/arm64/kvm/../../../virt/kvm/kvm_main.c:5270)
+
+Track in each vgic_irq whether an ITE maps it. Drop a MAPTI of an LPI
+that is already mapped, as a failed MAPTI already is. Restoring the ITS
+tables keeps the first ITE it reads for each LPI and drops any later
+one, so a guest saved with a double mapping still restores. Key the
+check on the mapping, not on the vgic_irq. A vgic_irq outlives its ITE
+while anything holds a reference to it, such as the vCPU it was last
+queued on. A later MAPTI of such an LPI succeeds as before, and now
+retargets it to its collection.
+
+Fixes: 196b136498b35 ("KVM: arm/arm64: GICv4: Wire mapping/unmapping of VLPIs in VFIO irq bypass")
+Suggested-by: Marc Zyngier <maz@kernel.org>
+Cc: stable@vger.kernel.org
+Signed-off-by: Fuad Tabba <fuad.tabba@linux.dev>
+Reviewed-by: Oliver Upton <oupton@kernel.org>
+Link: https://patch.msgid.link/20261013081646.933312-2-fuad.tabba@linux.dev
+Signed-off-by: Marc Zyngier <maz@kernel.org>
+[ sashal: replaced scoped_guard() with explicit IRQ-saving spinlock calls for GNU89 compatibility ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ arch/arm64/kvm/vgic/vgic-its.c | 40 ++++++++++++++++++++++++++++++++--
+ include/kvm/arm_vgic.h         |  1 +
+ 2 files changed, 39 insertions(+), 2 deletions(-)
+
+diff --git a/arch/arm64/kvm/vgic/vgic-its.c b/arch/arm64/kvm/vgic/vgic-its.c
+index e6ed23b14623f..ae0ffb8dc667f 100644
+--- a/arch/arm64/kvm/vgic/vgic-its.c
++++ b/arch/arm64/kvm/vgic/vgic-its.c
+@@ -821,13 +821,20 @@ int vgic_its_inject_msi(struct kvm *kvm, struct kvm_msi *msi)
+ /* Requires the its_lock to be held. */
+ static void its_free_ite(struct kvm *kvm, struct its_ite *ite)
+ {
++	unsigned long flags;
++
+ 	list_del(&ite->ite_list);
+ 
+ 	/* This put matches the get in vgic_add_lpi. */
+ 	if (ite->irq) {
++		raw_spin_lock_irqsave(&ite->irq->irq_lock, flags);
+ 		if (ite->irq->hw)
+ 			WARN_ON(its_unmap_vlpi(ite->irq->host_irq));
+ 
++		ite->irq->hw = false;
++		ite->irq->mapped = false;
++		raw_spin_unlock_irqrestore(&ite->irq->irq_lock, flags);
++
+ 		vgic_put_irq(kvm, ite->irq);
+ 	}
+ 
+@@ -1074,6 +1081,7 @@ static int vgic_its_cmd_handle_mapi(struct kvm *kvm, struct vgic_its *its,
+ 	struct its_device *device;
+ 	struct its_collection *collection, *new_coll = NULL;
+ 	struct vgic_irq *irq;
++	unsigned long flags;
+ 	int lpi_nr;
+ 
+ 	device = find_its_device(its, device_id);
+@@ -1114,13 +1122,27 @@ static int vgic_its_cmd_handle_mapi(struct kvm *kvm, struct vgic_its *its,
+ 		vcpu = kvm_get_vcpu(kvm, collection->target_addr);
+ 
+ 	irq = vgic_add_lpi(kvm, lpi_nr, vcpu);
++	if (!IS_ERR(irq)) {
++		/* Mapping one LPI from two events is UNPREDICTABLE: the first ITE keeps it. */
++		raw_spin_lock_irqsave(&irq->irq_lock, flags);
++		if (!irq->mapped) {
++			irq->mapped = true;
++			irq->target_vcpu = vcpu;
++			ite->irq = irq;
++		}
++		raw_spin_unlock_irqrestore(&irq->irq_lock, flags);
++
++		if (!ite->irq) {
++			vgic_put_irq(kvm, irq);
++			irq = ERR_PTR(-EEXIST);
++		}
++	}
+ 	if (IS_ERR(irq)) {
+ 		if (new_coll)
+ 			vgic_its_free_collection(its, coll_id);
+ 		its_free_ite(kvm, ite);
+ 		return PTR_ERR(irq);
+ 	}
+-	ite->irq = irq;
+ 
+ 	return 0;
+ }
+@@ -2186,6 +2208,7 @@ static int vgic_its_restore_ite(struct vgic_its *its, u32 event_id,
+ 	struct vgic_irq *irq;
+ 	u32 coll_id, lpi_id;
+ 	struct its_ite *ite;
++	unsigned long flags;
+ 	u32 offset;
+ 
+ 	val = *p;
+@@ -2219,7 +2242,20 @@ static int vgic_its_restore_ite(struct vgic_its *its, u32 event_id,
+ 	irq = vgic_add_lpi(kvm, lpi_id, vcpu);
+ 	if (IS_ERR(irq))
+ 		return PTR_ERR(irq);
+-	ite->irq = irq;
++
++	raw_spin_lock_irqsave(&irq->irq_lock, flags);
++	if (!irq->mapped) {
++		irq->mapped = true;
++		irq->target_vcpu = vcpu;
++		ite->irq = irq;
++	}
++	raw_spin_unlock_irqrestore(&irq->irq_lock, flags);
++
++	/* Drop an ITE whose LPI another ITE maps, as MAPTI does. */
++	if (!ite->irq) {
++		vgic_put_irq(kvm, irq);
++		its_free_ite(kvm, ite);
++	}
+ 
+ 	return offset;
+ }
+diff --git a/include/kvm/arm_vgic.h b/include/kvm/arm_vgic.h
+index e9caa57cd633a..fcfa2777aaa08 100644
+--- a/include/kvm/arm_vgic.h
++++ b/include/kvm/arm_vgic.h
+@@ -136,6 +136,7 @@ struct vgic_irq {
+ 	bool active;			/* not used for LPIs */
+ 	bool enabled;
+ 	bool hw;			/* Tied to HW IRQ */
++	bool mapped;			/* LPIs: mapped by an ITE */
+ 	struct kref refcount;		/* Used for LPIs */
+ 	u32 hwintid;			/* HW INTID number */
+ 	unsigned int host_irq;		/* linux irq corresponding to hwintid */
+-- 
+2.53.0
+

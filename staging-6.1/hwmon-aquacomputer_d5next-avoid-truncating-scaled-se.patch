@@ -1,0 +1,113 @@
+From 1f2b71ea27cc76114dfd3f93da7e9ff9c86fe7da Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 13 Nov 2026 16:36:25 -0500
+Subject: hwmon: (aquacomputer_d5next) Avoid truncating scaled sensor readings
+
+From: Vas Zayarskiy <contact@vasily.cc>
+
+[ Upstream commit c221091f7e30c64280e4cbfa27dc4c05edc96d0c ]
+
+High Flow Next power is reported in watts. Multiplying the 16-bit value
+by one million can overflow both the signed intermediate and the u32
+cache. Store power in long, perform the conversion in u64, and clamp to
+LONG_MAX. The other existing power conversions fit in a signed 32-bit
+value. Return -ENODATA for unavailable power instead of exposing the
+stored error as a reading.
+
+The power cache is updated by HID reports without the hwmon read mutex.
+Read it once with READ_ONCE() and use that snapshot for both the
+availability check and the returned value. Mark the corresponding
+updates with WRITE_ONCE() so that the shared accesses are explicit.
+
+Widen the shared current cache to u32. The Aquastream XT conversion to
+milliamperes can exceed 65535 mA; clamp its negative conversion results
+to zero before assigning to the unsigned cache. This also permits devices
+with scaled aggregate currents to store milliamperes directly.
+
+Fixes: aed80bb91de8 ("hwmon: (aquacomputer_d5next) Add support for Aquacomputer High Flow Next")
+Cc: stable@vger.kernel.org
+Signed-off-by: Vas Zayarskiy <contact@vasily.cc>
+Link: https://patch.msgid.link/20260927191316.4137752-2-contact@vasily.cc
+[groeck: Dropped obsolete 'Assisted-by: tag]
+Signed-off-by: Guenter Roeck <linux@roeck-us.net>
+[ sashal: Replaced priv->fan_structure->power with the existing AQC_FAN_POWER_OFFSET constant. ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/hwmon/aquacomputer_d5next.c | 24 +++++++++++++++---------
+ 1 file changed, 15 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/hwmon/aquacomputer_d5next.c b/drivers/hwmon/aquacomputer_d5next.c
+index f192919fa3643..876900f829ec3 100644
+--- a/drivers/hwmon/aquacomputer_d5next.c
++++ b/drivers/hwmon/aquacomputer_d5next.c
+@@ -17,6 +17,7 @@
+ #include <linux/hwmon.h>
+ #include <linux/jiffies.h>
+ #include <linux/ktime.h>
++#include <linux/limits.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+ #include <linux/seq_file.h>
+@@ -312,9 +313,9 @@ struct aqc_data {
+ 	/* Sensor values */
+ 	s32 temp_input[20];	/* Max 4 physical and 16 virtual */
+ 	u16 speed_input[8];
+-	u32 power_input[8];
++	long power_input[8];
+ 	u16 voltage_input[8];
+-	u16 current_input[8];
++	u32 current_input[8];
+ 
+ 	/* Label values */
+ 	const char *const *temp_label;
+@@ -525,6 +526,7 @@ static umode_t aqc_is_visible(const void *data, enum hwmon_sensor_types type, u3
+ static int aqc_read(struct device *dev, enum hwmon_sensor_types type, u32 attr,
+ 		    int channel, long *val)
+ {
++	long power;
+ 	int ret;
+ 	struct aqc_data *priv = dev_get_drvdata(dev);
+ 
+@@ -542,7 +544,10 @@ static int aqc_read(struct device *dev, enum hwmon_sensor_types type, u32 attr,
+ 		*val = priv->speed_input[channel];
+ 		break;
+ 	case hwmon_power:
+-		*val = priv->power_input[channel];
++		power = READ_ONCE(priv->power_input[channel]);
++		if (power == -ENODATA)
++			return -ENODATA;
++		*val = power;
+ 		break;
+ 	case hwmon_pwm:
+ 		if (priv->fan_ctrl_offsets) {
+@@ -755,9 +760,9 @@ static int aqc_raw_event(struct hid_device *hdev, struct hid_report *report, u8
+ 	for (i = 0; i < priv->num_fans; i++) {
+ 		priv->speed_input[i] =
+ 		    get_unaligned_be16(data + priv->fan_sensor_offsets[i] + AQC_FAN_SPEED_OFFSET);
+-		priv->power_input[i] =
+-		    get_unaligned_be16(data + priv->fan_sensor_offsets[i] +
+-				       AQC_FAN_POWER_OFFSET) * 10000;
++		WRITE_ONCE(priv->power_input[i],
++			   get_unaligned_be16(data + priv->fan_sensor_offsets[i] +
++					      AQC_FAN_POWER_OFFSET) * 10000);
+ 		priv->voltage_input[i] =
+ 		    get_unaligned_be16(data + priv->fan_sensor_offsets[i] +
+ 				       AQC_FAN_VOLTAGE_OFFSET) * 10;
+@@ -780,10 +785,11 @@ static int aqc_raw_event(struct hid_device *hdev, struct hid_report *report, u8
+ 	case highflownext:
+ 		/* If external temp sensor is not connected, its power reading is also N/A */
+ 		if (priv->temp_input[1] == -ENODATA)
+-			priv->power_input[0] = -ENODATA;
++			WRITE_ONCE(priv->power_input[0], -ENODATA);
+ 		else
+-			priv->power_input[0] =
+-			    get_unaligned_be16(data + HIGHFLOWNEXT_POWER) * 1000000;
++			WRITE_ONCE(priv->power_input[0],
++				   min_t(u64, get_unaligned_be16(data + HIGHFLOWNEXT_POWER) *
++					 1000000ULL, LONG_MAX));
+ 
+ 		priv->voltage_input[0] = get_unaligned_be16(data + HIGHFLOWNEXT_5V_VOLTAGE) * 10;
+ 		priv->voltage_input[1] =
+-- 
+2.53.0
+

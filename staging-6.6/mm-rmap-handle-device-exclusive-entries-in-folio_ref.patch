@@ -1,0 +1,82 @@
+From d62e6710610054c2602a59421b1bfc1de3fabcf6 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 13 Nov 2026 23:43:38 -0500
+Subject: mm/rmap: handle device-exclusive entries in folio_referenced_one()
+
+From: David Hildenbrand (Arm) <david@kernel.org>
+
+[ Upstream commit f3c493d2f42b5f44a5c134d8d7ea7f960caf5e2c ]
+
+page_vma_mapped_walk() can return non-present device-exclusive entries,
+but folio_referenced_one() passes them to PTE young-bit accessors that
+require present PTEs.
+
+We must neither call clear_flush_young_ptes_notify() nor
+folio_pte_batch() with non-present entries. For example, clearing the
+young bit on non-present PTEs can corrupt the entry: on arm64
+PTE_AF overlaps the swap type, so clearing it turns a device-exclusive
+entry into an ordinary swap entry.
+
+folio_pte_batch() will VM_WARN_ON_FOLIO.
+
+Apply the same approach as the previous fixes to e.g., damon_ptep_mkold():
+treat these entries as old from the CPU's perspective and obtain their
+young state through the MMU notifier.
+
+Skip PTE batching and MGLRU look-around for non-present entries, and
+don't modify non-present PTEs.
+
+Fixes: b756a3b5e7ea ("mm: device exclusive memory access")
+Reviewed-by: Lorenzo Stoakes (ARM) <ljs@kernel.org>
+Cc: stable@vger.kernel.org
+Reported-by: Josef Bacik <josef@toxicpanda.com>
+Reviewed-by: Harry Yoo (Meta) <harry@kernel.org>
+Reviewed-by: Barry Song <baohua@kernel.org>
+Reviewed-by: Dev Jain <dev.jain@arm.com>
+Tested-by: Muhammad Usama Anjum <usama.anjum@arm.com>
+Link: https://patch.msgid.link/20261031-fixes_core-v3-9-d6437171ecc3@kernel.org
+Reviewed-by: Baolin Wang <baolin.wang@linux.alibaba.com>
+Signed-off-by: David Hildenbrand (Arm) <david@kernel.org>
+[ sashal: adapted batched PTE handling to single-PTE processing with the older MGLRU API. ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ mm/rmap.c | 19 +++++++++++++++----
+ 1 file changed, 15 insertions(+), 4 deletions(-)
+
+diff --git a/mm/rmap.c b/mm/rmap.c
+index bdd32890d5487..2ae76b671825c 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -825,14 +825,25 @@ static bool folio_referenced_one(struct folio *folio,
+ 		}
+ 
+ 		if (pvmw.pte) {
+-			if (lru_gen_enabled() &&
+-			    pte_young(ptep_get(pvmw.pte))) {
++			pte_t pteval = ptep_get(pvmw.pte);
++			bool young = false;
++
++			if (lru_gen_enabled() && pte_present(pteval) &&
++			    pte_young(pteval)) {
+ 				lru_gen_look_around(&pvmw);
+ 				referenced++;
+ 			}
+ 
+-			if (ptep_clear_flush_young_notify(vma, address,
+-						pvmw.pte))
++			/*
++			 * PFN swap PTEs, such as device-exclusive ones, that
++			 * actually map pages are "old" from a CPU perspective.
++			 * The MMU notifier takes care of any device aspects.
++			 */
++			if (pte_present(pteval))
++				young = ptep_clear_flush_young(vma, address, pvmw.pte);
++			young |= mmu_notifier_clear_flush_young(vma->vm_mm, address,
++							address + PAGE_SIZE);
++			if (young)
+ 				referenced++;
+ 		} else if (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE)) {
+ 			if (pmdp_clear_flush_young_notify(vma, address,
+-- 
+2.53.0
+
