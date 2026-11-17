@@ -1,0 +1,150 @@
+From e27b8a4d8513b3f4ddf0d764f77f07fe1229de39 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 13 Jan 2025 20:36:06 +0100
+Subject: net: sparx5: split sparx5_fdma_{start(),stop()}
+
+From: Daniel Machon <daniel.machon@microchip.com>
+
+[ Upstream commit b91dcb237c69a05b06d64e2f4ba0a74a0552b80f ]
+
+The two functions: sparx5_fdma_{start(),stop()} are responsible for a
+number of things, namely: allocation and initialization of FDMA buffers,
+activation FDMA channels in hardware and activation of the NAPI
+instance.
+
+This patch splits the buffer allocation and initialization into init and
+deinit functions, and the channel and NAPI activation into start and
+stop functions. This serves two purposes: 1) the start() and stop()
+functions can be reused for lan969x and 2) prepares for future MTU
+change support, where we must be able to stop and start the FDMA
+channels and NAPI instance, without free'ing and reallocating the FDMA
+buffers.
+
+Reviewed-by: Steen Hegelund <Steen.Hegelund@microchip.com>
+Signed-off-by: Daniel Machon <daniel.machon@microchip.com>
+Link: https://patch.msgid.link/20250113-sparx5-lan969x-switch-driver-5-v2-2-c468f02fd623@microchip.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Stable-dep-of: 1df26063ab9b ("net: sparx5: fix tx DCB index drift in fdma xmit")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ .../ethernet/microchip/sparx5/sparx5_fdma.c   | 44 ++++++++++++++-----
+ .../ethernet/microchip/sparx5/sparx5_main.c   |  7 ++-
+ .../ethernet/microchip/sparx5/sparx5_main.h   |  2 +
+ 3 files changed, 41 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/net/ethernet/microchip/sparx5/sparx5_fdma.c b/drivers/net/ethernet/microchip/sparx5/sparx5_fdma.c
+index 61df874b76235..b65074b358899 100644
+--- a/drivers/net/ethernet/microchip/sparx5/sparx5_fdma.c
++++ b/drivers/net/ethernet/microchip/sparx5/sparx5_fdma.c
+@@ -258,10 +258,6 @@ static int sparx5_fdma_rx_alloc(struct sparx5 *sparx5)
+ 	fdma_dcbs_init(fdma, FDMA_DCB_INFO_DATAL(fdma->db_size),
+ 		       FDMA_DCB_STATUS_INTR);
+ 
+-	netif_napi_add_weight(rx->ndev, &rx->napi, sparx5_fdma_napi_callback,
+-			      FDMA_WEIGHT);
+-	napi_enable(&rx->napi);
+-	sparx5_fdma_rx_activate(sparx5, rx);
+ 	return 0;
+ }
+ 
+@@ -406,7 +402,7 @@ static void sparx5_fdma_injection_mode(struct sparx5 *sparx5)
+ 	}
+ }
+ 
+-int sparx5_fdma_start(struct sparx5 *sparx5)
++int sparx5_fdma_init(struct sparx5 *sparx5)
+ {
+ 	int err;
+ 
+@@ -439,24 +435,52 @@ int sparx5_fdma_start(struct sparx5 *sparx5)
+ 	return err;
+ }
+ 
++int sparx5_fdma_deinit(struct sparx5 *sparx5)
++{
++	sparx5_fdma_stop(sparx5);
++	fdma_free_phys(&sparx5->rx.fdma);
++	fdma_free_phys(&sparx5->tx.fdma);
++
++	return 0;
++}
++
+ static u32 sparx5_fdma_port_ctrl(struct sparx5 *sparx5)
+ {
+ 	return spx5_rd(sparx5, FDMA_PORT_CTRL(0));
+ }
+ 
++int sparx5_fdma_start(struct sparx5 *sparx5)
++{
++	struct sparx5_rx *rx = &sparx5->rx;
++
++	netif_napi_add_weight(rx->ndev,
++			      &rx->napi,
++			      sparx5_fdma_napi_callback,
++			      FDMA_WEIGHT);
++
++	napi_enable(&rx->napi);
++
++	sparx5_fdma_rx_activate(sparx5, rx);
++
++	return 0;
++}
++
+ int sparx5_fdma_stop(struct sparx5 *sparx5)
+ {
++	struct sparx5_rx *rx = &sparx5->rx;
++	struct sparx5_tx *tx = &sparx5->tx;
+ 	u32 val;
+ 
+-	napi_disable(&sparx5->rx.napi);
++	napi_disable(&rx->napi);
++
+ 	/* Stop the fdma and channel interrupts */
+-	sparx5_fdma_rx_deactivate(sparx5, &sparx5->rx);
+-	sparx5_fdma_tx_deactivate(sparx5, &sparx5->tx);
++	sparx5_fdma_rx_deactivate(sparx5, rx);
++	sparx5_fdma_tx_deactivate(sparx5, tx);
++
+ 	/* Wait for the RX channel to stop */
+ 	read_poll_timeout(sparx5_fdma_port_ctrl, val,
+ 			  FDMA_PORT_CTRL_XTR_BUF_IS_EMPTY_GET(val) == 0,
+ 			  500, 10000, 0, sparx5);
+-	fdma_free_phys(&sparx5->rx.fdma);
+-	fdma_free_phys(&sparx5->tx.fdma);
++
+ 	return 0;
+ }
+diff --git a/drivers/net/ethernet/microchip/sparx5/sparx5_main.c b/drivers/net/ethernet/microchip/sparx5/sparx5_main.c
+index 5b83cd4b6270b..2c07a320cd8a2 100644
+--- a/drivers/net/ethernet/microchip/sparx5/sparx5_main.c
++++ b/drivers/net/ethernet/microchip/sparx5/sparx5_main.c
+@@ -698,8 +698,11 @@ static int sparx5_start(struct sparx5 *sparx5)
+ 					       sparx5_fdma_handler,
+ 					       0,
+ 					       "sparx5-fdma", sparx5);
+-		if (!err)
+-			err = sparx5_fdma_start(sparx5);
++		if (!err) {
++			err = sparx5_fdma_init(sparx5);
++			if (!err)
++				sparx5_fdma_start(sparx5);
++		}
+ 		if (err)
+ 			sparx5->fdma_irq = -ENXIO;
+ 	} else {
+diff --git a/drivers/net/ethernet/microchip/sparx5/sparx5_main.h b/drivers/net/ethernet/microchip/sparx5/sparx5_main.h
+index fde3e3d686d17..319cb020a9bcc 100644
+--- a/drivers/net/ethernet/microchip/sparx5/sparx5_main.h
++++ b/drivers/net/ethernet/microchip/sparx5/sparx5_main.h
+@@ -314,6 +314,8 @@ int sparx5_manual_injection_mode(struct sparx5 *sparx5);
+ void sparx5_port_inj_timer_setup(struct sparx5_port *port);
+ 
+ /* sparx5_fdma.c */
++int sparx5_fdma_init(struct sparx5 *sparx5);
++int sparx5_fdma_deinit(struct sparx5 *sparx5);
+ int sparx5_fdma_start(struct sparx5 *sparx5);
+ int sparx5_fdma_stop(struct sparx5 *sparx5);
+ int sparx5_fdma_xmit(struct sparx5 *sparx5, u32 *ifh, struct sk_buff *skb);
+-- 
+2.53.0
+

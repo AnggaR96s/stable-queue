@@ -1,0 +1,210 @@
+From 5c424a2bf000f75af4d71c8ab10168d15bd3b4a2 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Sun, 26 Jan 2025 08:46:30 +0100
+Subject: x86/efistub: Merge PE and handover entrypoints
+
+From: Ard Biesheuvel <ardb@kernel.org>
+
+[ Upstream commit dac628e9563640e2de7878decc03a508b1ba319a ]
+
+The difference between the PE and handover entrypoints in the EFI stub
+is that the former allocates a struct boot_params whereas the latter
+expects one from the caller. Currently, these are two completely
+separate entrypoints, duplicating some logic and both relying of
+efi_exit() to return straight back to the firmware on an error.
+
+Simplify this by making the PE entrypoint call the handover entrypoint
+with NULL as the argument for the struct boot_params parameter. This
+makes the code easier to follow, and removes the need to support two
+different calling conventions in the mixed mode asm code.
+
+While at it, move the assignment of boot_params_ptr into the function
+that actually calls into the legacy decompressor, which is where its
+value is required.
+
+Acked-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Ard Biesheuvel <ardb@kernel.org>
+Stable-dep-of: 8ea857a2bb54 ("efi/libstub: Free cmdline_ptr in efi_pe_entry")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ arch/x86/boot/compressed/efi_mixed.S    | 16 +-------
+ drivers/firmware/efi/libstub/x86-stub.c | 52 ++++++++++++++-----------
+ 2 files changed, 30 insertions(+), 38 deletions(-)
+
+diff --git a/arch/x86/boot/compressed/efi_mixed.S b/arch/x86/boot/compressed/efi_mixed.S
+index 876fc6d46a131..d681e30c6732c 100644
+--- a/arch/x86/boot/compressed/efi_mixed.S
++++ b/arch/x86/boot/compressed/efi_mixed.S
+@@ -56,22 +56,8 @@ SYM_FUNC_START(startup_64_mixed_mode)
+ 	movl	efi32_boot_sp(%rip), %esp
+ 	andl	$~7, %esp
+ 
+-#ifdef CONFIG_EFI_HANDOVER_PROTOCOL
+ 	mov	8(%rdx), %edx		// saved bootparams pointer
+-	test	%edx, %edx
+-	jnz	efi_stub_entry
+-#endif
+-	/*
+-	 * efi_pe_entry uses MS calling convention, which requires 32 bytes of
+-	 * shadow space on the stack even if all arguments are passed in
+-	 * registers. We also need an additional 8 bytes for the space that
+-	 * would be occupied by the return address, and this also results in
+-	 * the correct stack alignment for entry.
+-	 */
+-	sub	$40, %rsp
+-	mov	%rdi, %rcx		// MS calling convention
+-	mov	%rsi, %rdx
+-	jmp	efi_pe_entry
++	call	efi_stub_entry
+ SYM_FUNC_END(startup_64_mixed_mode)
+ 
+ SYM_FUNC_START(__efi64_thunk)
+diff --git a/drivers/firmware/efi/libstub/x86-stub.c b/drivers/firmware/efi/libstub/x86-stub.c
+index d54454cbab1c3..2d7c6817af4b7 100644
+--- a/drivers/firmware/efi/libstub/x86-stub.c
++++ b/drivers/firmware/efi/libstub/x86-stub.c
+@@ -401,17 +401,13 @@ static void __noreturn efi_exit(efi_handle_t handle, efi_status_t status)
+ 		asm("hlt");
+ }
+ 
+-void __noreturn efi_stub_entry(efi_handle_t handle,
+-			       efi_system_table_t *sys_table_arg,
+-			       struct boot_params *boot_params);
+-
+ /*
+  * Because the x86 boot code expects to be passed a boot_params we
+  * need to create one ourselves (usually the bootloader would create
+  * one for us).
+  */
+-efi_status_t __efiapi efi_pe_entry(efi_handle_t handle,
+-				   efi_system_table_t *sys_table_arg)
++static efi_status_t efi_allocate_bootparams(efi_handle_t handle,
++					    struct boot_params **bp)
+ {
+ 	efi_guid_t proto = LOADED_IMAGE_PROTOCOL_GUID;
+ 	struct boot_params *boot_params;
+@@ -421,21 +417,15 @@ efi_status_t __efiapi efi_pe_entry(efi_handle_t handle,
+ 	unsigned long alloc;
+ 	char *cmdline_ptr;
+ 
+-	efi_system_table = sys_table_arg;
+-
+-	/* Check if we were booted by the EFI firmware */
+-	if (efi_system_table->hdr.signature != EFI_SYSTEM_TABLE_SIGNATURE)
+-		efi_exit(handle, EFI_INVALID_PARAMETER);
+-
+ 	status = efi_bs_call(handle_protocol, handle, &proto, (void **)&image);
+ 	if (status != EFI_SUCCESS) {
+ 		efi_err("Failed to get handle for LOADED_IMAGE_PROTOCOL\n");
+-		efi_exit(handle, status);
++		return status;
+ 	}
+ 
+ 	status = efi_allocate_pages(PARAM_SIZE, &alloc, ULONG_MAX);
+ 	if (status != EFI_SUCCESS)
+-		efi_exit(handle, status);
++		return status;
+ 
+ 	boot_params = memset((void *)alloc, 0x0, PARAM_SIZE);
+ 	hdr	    = &boot_params->hdr;
+@@ -451,14 +441,14 @@ efi_status_t __efiapi efi_pe_entry(efi_handle_t handle,
+ 	cmdline_ptr = efi_convert_cmdline(image, &options_size);
+ 	if (!cmdline_ptr) {
+ 		efi_free(PARAM_SIZE, alloc);
+-		efi_exit(handle, EFI_OUT_OF_RESOURCES);
++		return EFI_OUT_OF_RESOURCES;
+ 	}
+ 
+ 	efi_set_u64_split((unsigned long)cmdline_ptr, &hdr->cmd_line_ptr,
+ 			  &boot_params->ext_cmd_line_ptr);
+ 
+-	efi_stub_entry(handle, sys_table_arg, boot_params);
+-	/* not reached */
++	*bp = boot_params;
++	return EFI_SUCCESS;
+ }
+ 
+ static void add_e820ext(struct boot_params *params,
+@@ -745,13 +735,16 @@ static efi_status_t parse_options(const char *cmdline)
+ 	return efi_parse_options(cmdline);
+ }
+ 
+-static efi_status_t efi_decompress_kernel(unsigned long *kernel_entry)
++static efi_status_t efi_decompress_kernel(unsigned long *kernel_entry,
++					  struct boot_params *boot_params)
+ {
+ 	unsigned long virt_addr = LOAD_PHYSICAL_ADDR;
+ 	unsigned long addr, alloc_size, entry;
+ 	efi_status_t status;
+ 	u32 seed[2] = {};
+ 
++	boot_params_ptr	= boot_params;
++
+ 	/* determine the required size of the allocation */
+ 	alloc_size = ALIGN(max_t(unsigned long, output_len, kernel_total_size),
+ 			   MIN_KERNEL_ALIGN);
+@@ -782,7 +775,7 @@ static efi_status_t efi_decompress_kernel(unsigned long *kernel_entry)
+ 			seed[0] = 0;
+ 		}
+ 
+-		boot_params_ptr->hdr.loadflags |= KASLR_FLAG;
++		boot_params->hdr.loadflags |= KASLR_FLAG;
+ 	}
+ 
+ 	status = efi_random_alloc(alloc_size, CONFIG_PHYSICAL_ALIGN, &addr,
+@@ -820,20 +813,27 @@ static void __noreturn enter_kernel(unsigned long kernel_addr,
+ void __noreturn efi_stub_entry(efi_handle_t handle,
+ 			       efi_system_table_t *sys_table_arg,
+ 			       struct boot_params *boot_params)
++
+ {
+ 	efi_guid_t guid = EFI_MEMORY_ATTRIBUTE_PROTOCOL_GUID;
+-	struct setup_header *hdr = &boot_params->hdr;
+ 	const struct linux_efi_initrd *initrd = NULL;
+ 	unsigned long kernel_entry;
++	struct setup_header *hdr;
+ 	efi_status_t status;
+ 
+-	boot_params_ptr = boot_params;
+-
+ 	efi_system_table = sys_table_arg;
+ 	/* Check if we were booted by the EFI firmware */
+ 	if (efi_system_table->hdr.signature != EFI_SYSTEM_TABLE_SIGNATURE)
+ 		efi_exit(handle, EFI_INVALID_PARAMETER);
+ 
++	if (!IS_ENABLED(CONFIG_EFI_HANDOVER_PROTOCOL) || !boot_params) {
++		status = efi_allocate_bootparams(handle, &boot_params);
++		if (status != EFI_SUCCESS)
++			efi_exit(handle, status);
++	}
++
++	hdr = &boot_params->hdr;
++
+ 	if (have_unsupported_snp_features())
+ 		efi_exit(handle, EFI_UNSUPPORTED);
+ 
+@@ -875,7 +875,7 @@ void __noreturn efi_stub_entry(efi_handle_t handle,
+ 	if (efi_mem_encrypt > 0)
+ 		hdr->xloadflags |= XLF_MEM_ENCRYPTION;
+ 
+-	status = efi_decompress_kernel(&kernel_entry);
++	status = efi_decompress_kernel(&kernel_entry, boot_params);
+ 	if (status != EFI_SUCCESS) {
+ 		efi_err("Failed to decompress kernel\n");
+ 		goto fail;
+@@ -945,6 +945,12 @@ void __noreturn efi_stub_entry(efi_handle_t handle,
+ 	efi_exit(handle, status);
+ }
+ 
++efi_status_t __efiapi efi_pe_entry(efi_handle_t handle,
++				   efi_system_table_t *sys_table_arg)
++{
++	efi_stub_entry(handle, sys_table_arg, NULL);
++}
++
+ #ifdef CONFIG_EFI_HANDOVER_PROTOCOL
+ void efi_handover_entry(efi_handle_t handle, efi_system_table_t *sys_table_arg,
+ 			struct boot_params *boot_params)
+-- 
+2.53.0
+

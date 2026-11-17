@@ -1,0 +1,191 @@
+From 628e3b4f8a71e3474bd7417cf4606582e4cefe85 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 27 Jun 2025 22:51:22 +0200
+Subject: power: supply: core: Add power_supply_get/set_property_direct()
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+From: Armin Wolf <W_Armin@gmx.de>
+
+[ Upstream commit 3ebed2fddf6fac5729ffc8c471c87d111b641678 ]
+
+Power supply extensions might want to interact with the underlying
+power supply to retrieve data like serial numbers, charging status
+and more. However doing so causes psy->extensions_sem to be locked
+twice, possibly causing a deadlock.
+
+Provide special variants of power_supply_get/set_property() that
+ignore any power supply extensions and thus do not touch the
+associated psy->extensions_sem lock.
+
+Suggested-by: Hans de Goede <hansg@kernel.org>
+Signed-off-by: Armin Wolf <W_Armin@gmx.de>
+Acked-by: Sebastian Reichel <sebastian.reichel@collabora.com>
+Reviewed-by: Hans de Goede <hansg@kernel.org>
+Link: https://lore.kernel.org/r/20250627205124.250433-1-W_Armin@gmx.de
+Reviewed-by: Ilpo Järvinen <ilpo.jarvinen@linux.intel.com>
+Signed-off-by: Ilpo Järvinen <ilpo.jarvinen@linux.intel.com>
+Stable-dep-of: 9f7f7a859451 ("power_supply: serialize property access with unregister")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/power/supply/power_supply_core.c | 82 ++++++++++++++++++++----
+ include/linux/power_supply.h             |  8 +++
+ 2 files changed, 78 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/power/supply/power_supply_core.c b/drivers/power/supply/power_supply_core.c
+index c483140574fa7..e03d187a0705d 100644
+--- a/drivers/power/supply/power_supply_core.c
++++ b/drivers/power/supply/power_supply_core.c
+@@ -1251,9 +1251,8 @@ bool power_supply_has_property(struct power_supply *psy,
+ 	return false;
+ }
+ 
+-int power_supply_get_property(struct power_supply *psy,
+-			    enum power_supply_property psp,
+-			    union power_supply_propval *val)
++static int __power_supply_get_property(struct power_supply *psy, enum power_supply_property psp,
++				       union power_supply_propval *val, bool use_extensions)
+ {
+ 	struct power_supply_ext_registration *reg;
+ 
+@@ -1263,10 +1262,14 @@ int power_supply_get_property(struct power_supply *psy,
+ 		return -ENODEV;
+ 	}
+ 
+-	scoped_guard(rwsem_read, &psy->extensions_sem) {
+-		power_supply_for_each_extension(reg, psy) {
+-			if (power_supply_ext_has_property(reg->ext, psp))
++	if (use_extensions) {
++		scoped_guard(rwsem_read, &psy->extensions_sem) {
++			power_supply_for_each_extension(reg, psy) {
++				if (!power_supply_ext_has_property(reg->ext, psp))
++					continue;
++
+ 				return reg->ext->get_property(psy, reg->ext, reg->data, psp, val);
++			}
+ 		}
+ 	}
+ 
+@@ -1277,20 +1280,49 @@ int power_supply_get_property(struct power_supply *psy,
+ 	else
+ 		return -EINVAL;
+ }
++
++int power_supply_get_property(struct power_supply *psy, enum power_supply_property psp,
++			      union power_supply_propval *val)
++{
++	return __power_supply_get_property(psy, psp, val, true);
++}
+ EXPORT_SYMBOL_GPL(power_supply_get_property);
+ 
+-int power_supply_set_property(struct power_supply *psy,
+-			    enum power_supply_property psp,
+-			    const union power_supply_propval *val)
++/**
++ * power_supply_get_property_direct - Read a power supply property without checking for extensions
++ * @psy: The power supply
++ * @psp: The power supply property to read
++ * @val: The resulting value of the power supply property
++ *
++ * Read a power supply property without taking into account any power supply extensions registered
++ * on the given power supply. This is mostly useful for power supply extensions that want to access
++ * their own power supply as using power_supply_get_property() directly will result in a potential
++ * deadlock.
++ *
++ * Return: 0 on success or negative error code on failure.
++ */
++int power_supply_get_property_direct(struct power_supply *psy, enum power_supply_property psp,
++				     union power_supply_propval *val)
++{
++        return __power_supply_get_property(psy, psp, val, false);
++}
++EXPORT_SYMBOL_GPL(power_supply_get_property_direct);
++
++
++static int __power_supply_set_property(struct power_supply *psy, enum power_supply_property psp,
++				       const union power_supply_propval *val, bool use_extensions)
+ {
+ 	struct power_supply_ext_registration *reg;
+ 
+ 	if (atomic_read(&psy->use_cnt) <= 0)
+ 		return -ENODEV;
+ 
+-	scoped_guard(rwsem_read, &psy->extensions_sem) {
+-		power_supply_for_each_extension(reg, psy) {
+-			if (power_supply_ext_has_property(reg->ext, psp)) {
++	if (use_extensions) {
++		scoped_guard(rwsem_read, &psy->extensions_sem) {
++			power_supply_for_each_extension(reg, psy) {
++				if (!power_supply_ext_has_property(reg->ext, psp))
++					continue;
++
+ 				if (reg->ext->set_property)
+ 					return reg->ext->set_property(psy, reg->ext, reg->data,
+ 								      psp, val);
+@@ -1305,8 +1337,34 @@ int power_supply_set_property(struct power_supply *psy,
+ 
+ 	return psy->desc->set_property(psy, psp, val);
+ }
++
++int power_supply_set_property(struct power_supply *psy, enum power_supply_property psp,
++			      const union power_supply_propval *val)
++{
++	return __power_supply_set_property(psy, psp, val, true);
++}
+ EXPORT_SYMBOL_GPL(power_supply_set_property);
+ 
++/**
++ * power_supply_set_property_direct - Write a power supply property without checking for extensions
++ * @psy: The power supply
++ * @psp: The power supply property to write
++ * @val: The value to write to the power supply property
++ *
++ * Write a power supply property without taking into account any power supply extensions registered
++ * on the given power supply. This is mostly useful for power supply extensions that want to access
++ * their own power supply as using power_supply_set_property() directly will result in a potential
++ * deadlock.
++ *
++ * Return: 0 on success or negative error code on failure.
++ */
++int power_supply_set_property_direct(struct power_supply *psy, enum power_supply_property psp,
++				     const union power_supply_propval *val)
++{
++	return __power_supply_set_property(psy, psp, val, false);
++}
++EXPORT_SYMBOL_GPL(power_supply_set_property_direct);
++
+ int power_supply_property_is_writeable(struct power_supply *psy,
+ 					enum power_supply_property psp)
+ {
+diff --git a/include/linux/power_supply.h b/include/linux/power_supply.h
+index 734a387f08eb0..ad395bfa26e29 100644
+--- a/include/linux/power_supply.h
++++ b/include/linux/power_supply.h
+@@ -880,15 +880,23 @@ static inline int power_supply_is_system_supplied(void) { return -ENOSYS; }
+ extern int power_supply_get_property(struct power_supply *psy,
+ 			    enum power_supply_property psp,
+ 			    union power_supply_propval *val);
++int power_supply_get_property_direct(struct power_supply *psy, enum power_supply_property psp,
++				     union power_supply_propval *val);
+ #if IS_ENABLED(CONFIG_POWER_SUPPLY)
+ extern int power_supply_set_property(struct power_supply *psy,
+ 			    enum power_supply_property psp,
+ 			    const union power_supply_propval *val);
++int power_supply_set_property_direct(struct power_supply *psy, enum power_supply_property psp,
++				     const union power_supply_propval *val);
+ #else
+ static inline int power_supply_set_property(struct power_supply *psy,
+ 			    enum power_supply_property psp,
+ 			    const union power_supply_propval *val)
+ { return 0; }
++static inline int power_supply_set_property_direct(struct power_supply *psy,
++						   enum power_supply_property psp,
++						   const union power_supply_propval *val)
++{ return 0; }
+ #endif
+ extern void power_supply_external_power_changed(struct power_supply *psy);
+ 
+-- 
+2.53.0
+

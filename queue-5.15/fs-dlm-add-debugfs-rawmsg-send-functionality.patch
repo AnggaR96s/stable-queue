@@ -1,0 +1,162 @@
+From 42e8795588a92967b3169070592e2507d022dc79 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 2 Nov 2021 15:17:20 -0400
+Subject: fs: dlm: add debugfs rawmsg send functionality
+
+From: Alexander Aring <aahringo@redhat.com>
+
+[ Upstream commit 9af5b8f0ead7cd90161b0555ed8e85ee38f79fa5 ]
+
+This patch adds a dlm functionality to send a raw dlm message to a
+specific cluster node. This raw message can be build by user space and
+send out by writing the message to "rawmsg" dlm debugfs file.
+
+There is a in progress scapy dlm module which provides a easy build of
+DLM messages in user space. For example:
+
+DLM(h_cmd=3, o_nextcmd=1, h_nodeid=1, h_lockspace=0xe4f48a18, ...)
+
+The goal is to provide an easy reproducable state to crash DLM or to
+fuzz the DLM kernel stack if there are possible ways to crash it.
+
+Note: that if the sequence number is zero and dlm version is not set to
+3.1 the kernel will automatic will set a right sequence number, otherwise
+DLM stack testing is not possible.
+
+Signed-off-by: Alexander Aring <aahringo@redhat.com>
+Signed-off-by: David Teigland <teigland@redhat.com>
+Stable-dep-of: 7bf1aca6d626 ("dlm: validate lock modes in recovery messages")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/dlm/debug_fs.c | 37 ++++++++++++++++++++++++++++++++++++
+ fs/dlm/midcomms.c | 48 +++++++++++++++++++++++++++++++++++++++++++++++
+ fs/dlm/midcomms.h |  2 ++
+ 3 files changed, 87 insertions(+)
+
+diff --git a/fs/dlm/debug_fs.c b/fs/dlm/debug_fs.c
+index 47e9d57e4cae3..555904eeea8ea 100644
+--- a/fs/dlm/debug_fs.c
++++ b/fs/dlm/debug_fs.c
+@@ -768,6 +768,42 @@ static int dlm_version_show(struct seq_file *file, void *offset)
+ }
+ DEFINE_SHOW_ATTRIBUTE(dlm_version);
+ 
++static ssize_t dlm_rawmsg_write(struct file *fp, const char __user *user_buf,
++				size_t count, loff_t *ppos)
++{
++	void *buf;
++	int ret;
++
++	if (count > PAGE_SIZE || count < sizeof(struct dlm_header))
++		return -EINVAL;
++
++	buf = kmalloc(PAGE_SIZE, GFP_NOFS);
++	if (!buf)
++		return -ENOMEM;
++
++	if (copy_from_user(buf, user_buf, count)) {
++		ret = -EFAULT;
++		goto out;
++	}
++
++	ret = dlm_midcomms_rawmsg_send(fp->private_data, buf, count);
++	if (ret)
++		goto out;
++
++	kfree(buf);
++	return count;
++
++out:
++	kfree(buf);
++	return ret;
++}
++
++static const struct file_operations dlm_rawmsg_fops = {
++	.open	= simple_open,
++	.write	= dlm_rawmsg_write,
++	.llseek	= no_llseek,
++};
++
+ void *dlm_create_debug_comms_file(int nodeid, void *data)
+ {
+ 	struct dentry *d_node;
+@@ -782,6 +818,7 @@ void *dlm_create_debug_comms_file(int nodeid, void *data)
+ 	debugfs_create_file("send_queue_count", 0444, d_node, data,
+ 			    &dlm_send_queue_cnt_fops);
+ 	debugfs_create_file("version", 0444, d_node, data, &dlm_version_fops);
++	debugfs_create_file("rawmsg", 0200, d_node, data, &dlm_rawmsg_fops);
+ 
+ 	return d_node;
+ }
+diff --git a/fs/dlm/midcomms.c b/fs/dlm/midcomms.c
+index 8e97da3555c57..ae71f13c91e4f 100644
+--- a/fs/dlm/midcomms.c
++++ b/fs/dlm/midcomms.c
+@@ -1434,3 +1434,51 @@ int dlm_midcomms_close(int nodeid)
+ 
+ 	return ret;
+ }
++
++/* debug functionality to send raw dlm msg from user space */
++struct dlm_rawmsg_data {
++	struct midcomms_node *node;
++	void *buf;
++};
++
++static void midcomms_new_rawmsg_cb(void *data)
++{
++	struct dlm_rawmsg_data *rd = data;
++	struct dlm_header *h = rd->buf;
++
++	switch (h->h_version) {
++	case cpu_to_le32(DLM_VERSION_3_1):
++		break;
++	default:
++		switch (h->h_cmd) {
++		case DLM_OPTS:
++			if (!h->u.h_seq)
++				h->u.h_seq = rd->node->seq_send++;
++			break;
++		default:
++			break;
++		}
++		break;
++	}
++}
++
++int dlm_midcomms_rawmsg_send(struct midcomms_node *node, void *buf,
++			     int buflen)
++{
++	struct dlm_rawmsg_data rd;
++	struct dlm_msg *msg;
++	char *msgbuf;
++
++	rd.node = node;
++	rd.buf = buf;
++
++	msg = dlm_lowcomms_new_msg(node->nodeid, buflen, GFP_NOFS,
++				   &msgbuf, midcomms_new_rawmsg_cb, &rd);
++	if (!msg)
++		return -ENOMEM;
++
++	memcpy(msgbuf, buf, buflen);
++	dlm_lowcomms_commit_msg(msg);
++	return 0;
++}
++
+diff --git a/fs/dlm/midcomms.h b/fs/dlm/midcomms.h
+index 1a36b7834dfc5..6bcfd84591834 100644
+--- a/fs/dlm/midcomms.h
++++ b/fs/dlm/midcomms.h
+@@ -31,6 +31,8 @@ const char *dlm_midcomms_state(struct midcomms_node *node);
+ unsigned long dlm_midcomms_flags(struct midcomms_node *node);
+ int dlm_midcomms_send_queue_cnt(struct midcomms_node *node);
+ uint32_t dlm_midcomms_version(struct midcomms_node *node);
++int dlm_midcomms_rawmsg_send(struct midcomms_node *node, void *buf,
++			     int buflen);
+ 
+ #endif				/* __MIDCOMMS_DOT_H__ */
+ 
+-- 
+2.53.0
+

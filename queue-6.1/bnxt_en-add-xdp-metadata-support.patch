@@ -1,0 +1,118 @@
+From 69798d834a53a12b84af50b974f13c2bbe84f5f2 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 2 Apr 2024 02:37:51 -0700
+Subject: bnxt_en: Add XDP Metadata support
+
+From: Somnath Kotur <somnath.kotur@broadcom.com>
+
+[ Upstream commit 0ae1fafc8be6d4271a8ad66b4695e123a4e8cef1 ]
+
+- Change the last arg to xdp_prepare_buff to true from false.
+- Ensure that when XDP_PASS is returned the xdp->data_meta area
+is copied to the skb->data area. Account for the meta data
+size on skb allocation and do a pull after to move it to the
+"reserved" zone.
+
+Signed-off-by: Somnath Kotur <somnath.kotur@broadcom.com>
+Reviewed-by: Michael Chan <michael.chan@broadcom.com>
+Reviewed-by: Pavan Chebbi <pavan.chebbi@broadcom.com>
+Cc: Alexei Starovoitov <ast@kernel.org>
+Cc: Daniel Borkmann <daniel@iogearbox.net>
+Cc: Jesper Dangaard Brouer <hawk@kernel.org>
+Cc: John Fastabend <john.fastabend@gmail.com>
+Signed-off-by: Pavan Chebbi <pavan.chebbi@broadcom.com>
+Acked-by: Paolo Abeni <pabeni@redhat.com>
+Link: https://lore.kernel.org/r/20240402093753.331120-6-pavan.chebbi@broadcom.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Stable-dep-of: 364b88b54fc2 ("eth: bnxt: hand XDP frags over to the copybreak skb")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/net/ethernet/broadcom/bnxt/bnxt.c     | 44 +++++++++++++++++--
+ drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c |  2 +-
+ 2 files changed, 41 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.c b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index 2bb1e26034048..bbb7b77a6b753 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@ -1249,9 +1249,9 @@ static int bnxt_agg_bufs_valid(struct bnxt *bp, struct bnxt_cp_ring_info *cpr,
+ 	return RX_AGG_CMP_VALID(agg, *raw_cons);
+ }
+ 
+-static inline struct sk_buff *bnxt_copy_skb(struct bnxt_napi *bnapi, u8 *data,
+-					    unsigned int len,
+-					    dma_addr_t mapping)
++static struct sk_buff *bnxt_copy_data(struct bnxt_napi *bnapi, u8 *data,
++				      unsigned int len,
++				      dma_addr_t mapping)
+ {
+ 	struct bnxt *bp = bnapi->bp;
+ 	struct pci_dev *pdev = bp->pdev;
+@@ -1271,6 +1271,39 @@ static inline struct sk_buff *bnxt_copy_skb(struct bnxt_napi *bnapi, u8 *data,
+ 				   bp->rx_dir);
+ 
+ 	skb_put(skb, len);
++
++	return skb;
++}
++
++static struct sk_buff *bnxt_copy_skb(struct bnxt_napi *bnapi, u8 *data,
++				     unsigned int len,
++				     dma_addr_t mapping)
++{
++	return bnxt_copy_data(bnapi, data, len, mapping);
++}
++
++static struct sk_buff *bnxt_copy_xdp(struct bnxt_napi *bnapi,
++				     struct xdp_buff *xdp,
++				     unsigned int len,
++				     dma_addr_t mapping)
++{
++	unsigned int metasize = 0;
++	u8 *data = xdp->data;
++	struct sk_buff *skb;
++
++	len = xdp->data_end - xdp->data_meta;
++	metasize = xdp->data - xdp->data_meta;
++	data = xdp->data_meta;
++
++	skb = bnxt_copy_data(bnapi, data, len, mapping);
++	if (!skb)
++		return skb;
++
++	if (metasize) {
++		skb_metadata_set(skb, metasize);
++		__skb_pull(skb, metasize);
++	}
++
+ 	return skb;
+ }
+ 
+@@ -1983,7 +2016,10 @@ static int bnxt_rx_pkt(struct bnxt *bp, struct bnxt_cp_ring_info *cpr,
+ 	}
+ 
+ 	if (len <= bp->rx_copy_thresh) {
+-		skb = bnxt_copy_skb(bnapi, data_ptr, len, dma_addr);
++		if (!xdp_active)
++			skb = bnxt_copy_skb(bnapi, data_ptr, len, dma_addr);
++		else
++			skb = bnxt_copy_xdp(bnapi, &xdp, len, dma_addr);
+ 		bnxt_reuse_rx_data(rxr, cons, data);
+ 		if (!skb) {
+ 			if (agg_bufs) {
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c b/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c
+index 95f620991ec78..45d55aa3c730e 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c
+@@ -194,7 +194,7 @@ void bnxt_xdp_buff_init(struct bnxt *bp, struct bnxt_rx_ring_info *rxr,
+ 	dma_sync_single_for_cpu(&pdev->dev, mapping + offset, len, bp->rx_dir);
+ 
+ 	xdp_init_buff(xdp, buflen, &rxr->xdp_rxq);
+-	xdp_prepare_buff(xdp, data_ptr - offset, offset, len, false);
++	xdp_prepare_buff(xdp, data_ptr - offset, offset, len, true);
+ }
+ 
+ void bnxt_xdp_buff_frags_free(struct bnxt_rx_ring_info *rxr,
+-- 
+2.53.0
+

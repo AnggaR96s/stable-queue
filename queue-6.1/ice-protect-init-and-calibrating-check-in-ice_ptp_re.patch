@@ -1,0 +1,142 @@
+From 2a40f6cd30909f1c09b0035d32fbb9c54ca1e961 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 5 Dec 2022 11:52:47 -0800
+Subject: ice: protect init and calibrating check in ice_ptp_request_ts
+
+From: Jacob Keller <jacob.e.keller@intel.com>
+
+[ Upstream commit 3ad5c10bf21d1d69ac1117a89b3ce2271a832b34 ]
+
+When requesting a new timestamp, the ice_ptp_request_ts function does not
+hold the Tx tracker lock while checking init and calibrating. This means
+that we might issue a new timestamp request just after the Tx timestamp
+tracker starts being deinitialized. This could lead to incorrect access of
+the timestamp structures. Correct this by moving the init and calibrating
+checks under the lock, and updating the flows which modify these fields to
+use the lock.
+
+Note that we do not need to hold the lock while checking for tx->init in
+ice_ptp_tx_tstamp. This is because the teardown function will use
+synchronize_irq after clearing the flag to ensure that the threaded
+interrupt completes. Either a) the tx->init flag will be cleared before the
+ice_ptp_tx_tstamp function starts, thus it will exit immediately, or b) the
+threaded interrupt will be executing and the synchronize_irq will wait
+until the threaded interrupt has completed at which point we know the init
+field has definitely been set and new interrupts will not execute the Tx
+timestamp thread function.
+
+Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+Tested-by: Gurucharan G <gurucharanx.g@intel.com> (A Contingent worker at Intel)
+Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+Stable-dep-of: 50870d621160 ("ice: set in_use only after preparing Tx timestamp index")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/net/ethernet/intel/ice/ice_ptp.c | 36 ++++++++++++++++++++----
+ drivers/net/ethernet/intel/ice/ice_ptp.h |  2 +-
+ 2 files changed, 32 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/net/ethernet/intel/ice/ice_ptp.c b/drivers/net/ethernet/intel/ice/ice_ptp.c
+index 82a41c5744032..364e07186c694 100644
+--- a/drivers/net/ethernet/intel/ice/ice_ptp.c
++++ b/drivers/net/ethernet/intel/ice/ice_ptp.c
+@@ -599,6 +599,23 @@ static u64 ice_ptp_extend_40b_ts(struct ice_pf *pf, u64 in_tstamp)
+ 				     (in_tstamp >> 8) & mask);
+ }
+ 
++/**
++ * ice_ptp_is_tx_tracker_up - Check if Tx tracker is ready for new timestamps
++ * @tx: the PTP Tx timestamp tracker to check
++ *
++ * Check that a given PTP Tx timestamp tracker is up, i.e. that it is ready
++ * to accept new timestamp requests.
++ *
++ * Assumes the tx->lock spinlock is already held.
++ */
++static bool
++ice_ptp_is_tx_tracker_up(struct ice_ptp_tx *tx)
++{
++	lockdep_assert_held(&tx->lock);
++
++	return tx->init && !tx->calibrating;
++}
++
+ /**
+  * ice_ptp_tx_tstamp - Process Tx timestamps for a port
+  * @tx: the PTP Tx timestamp tracker
+@@ -760,10 +777,10 @@ ice_ptp_alloc_tx_tracker(struct ice_ptp_tx *tx)
+ 		return -ENOMEM;
+ 	}
+ 
+-	spin_lock_init(&tx->lock);
+-
+ 	tx->init = 1;
+ 
++	spin_lock_init(&tx->lock);
++
+ 	return 0;
+ }
+ 
+@@ -805,7 +822,9 @@ ice_ptp_flush_tx_tracker(struct ice_pf *pf, struct ice_ptp_tx *tx)
+ static void
+ ice_ptp_release_tx_tracker(struct ice_pf *pf, struct ice_ptp_tx *tx)
+ {
++	spin_lock(&tx->lock);
+ 	tx->init = 0;
++	spin_unlock(&tx->lock);
+ 
+ 	/* wait for potentially outstanding interrupt to complete */
+ 	synchronize_irq(pf->msix_entries[pf->oicr_idx].vector);
+@@ -1306,7 +1325,9 @@ ice_ptp_port_phy_restart(struct ice_ptp_port *ptp_port)
+ 	kthread_cancel_delayed_work_sync(&ptp_port->ov_work);
+ 
+ 	/* temporarily disable Tx timestamps while calibrating PHY offset */
++	spin_lock(&ptp_port->tx.lock);
+ 	ptp_port->tx.calibrating = true;
++	spin_unlock(&ptp_port->tx.lock);
+ 	ptp_port->tx_fifo_busy_cnt = 0;
+ 
+ 	/* Start the PHY timer in bypass mode */
+@@ -1315,7 +1336,9 @@ ice_ptp_port_phy_restart(struct ice_ptp_port *ptp_port)
+ 		goto out_unlock;
+ 
+ 	/* Enable Tx timestamps right away */
++	spin_lock(&ptp_port->tx.lock);
+ 	ptp_port->tx.calibrating = false;
++	spin_unlock(&ptp_port->tx.lock);
+ 
+ 	kthread_queue_delayed_work(pf->ptp.kworker, &ptp_port->ov_work, 0);
+ 
+@@ -2363,11 +2386,14 @@ s8 ice_ptp_request_ts(struct ice_ptp_tx *tx, struct sk_buff *skb)
+ {
+ 	u8 idx;
+ 
+-	/* Check if this tracker is initialized */
+-	if (!tx->init || tx->calibrating)
++	spin_lock(&tx->lock);
++
++	/* Check that this tracker is accepting new timestamp requests */
++	if (!ice_ptp_is_tx_tracker_up(tx)) {
++		spin_unlock(&tx->lock);
+ 		return -1;
++	}
+ 
+-	spin_lock(&tx->lock);
+ 	/* Find and set the first available index */
+ 	idx = find_first_zero_bit(tx->in_use, tx->len);
+ 	if (idx < tx->len) {
+diff --git a/drivers/net/ethernet/intel/ice/ice_ptp.h b/drivers/net/ethernet/intel/ice/ice_ptp.h
+index 2d038c008a3a6..4d7f2b9c2b8ff 100644
+--- a/drivers/net/ethernet/intel/ice/ice_ptp.h
++++ b/drivers/net/ethernet/intel/ice/ice_ptp.h
+@@ -111,7 +111,7 @@ struct ice_tx_tstamp {
+ 
+ /**
+  * struct ice_ptp_tx - Tracking structure for all Tx timestamp requests on a port
+- * @lock: lock to prevent concurrent write to in_use bitmap
++ * @lock: lock to prevent concurrent access to fields of this struct
+  * @tstamps: array of len to store outstanding requests
+  * @in_use: bitmap of len to indicate which slots are in use
+  * @block: which memory block (quad or port) the timestamps are captured in
+-- 
+2.53.0
+

@@ -1,0 +1,264 @@
+From 1c0fae2113895875c0cb7764f326f5bdc3a62da5 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Sun, 23 Jul 2023 02:30:33 -0700
+Subject: apparmor: add additional flags to extended permission.
+
+From: John Johansen <john.johansen@canonical.com>
+
+[ Upstream commit 2e12c5f060176ede209673e4f63ea5d0e3c5814c ]
+
+This is a step towards merging the file and policy state machines.
+
+With the switch to extended permissions the state machine's ACCEPT2
+table became unused freeing it up to store state specific flags. The
+first flags to be stored are FLAG_OWNER and FLAG other which paves the
+way towards merging the file and policydb perms into a single
+permission table.
+
+Currently Lookups based on the objects ownership conditional will
+still need separate fns, this will be address in a following patch.
+
+Signed-off-by: John Johansen <john.johansen@canonical.com>
+Stable-dep-of: 449195a4bb7d ("apparmor: fix table_size() integer overflow on 32 bit")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ security/apparmor/apparmorfs.c     |  5 +++--
+ security/apparmor/domain.c         |  9 ++++++---
+ security/apparmor/file.c           | 23 ++++++++++++++---------
+ security/apparmor/include/file.h   |  5 +++--
+ security/apparmor/include/policy.h |  7 ++++++-
+ security/apparmor/policy_compat.c  |  6 +++---
+ security/apparmor/policy_unpack.c  | 20 +++++++++++++++++++-
+ 7 files changed, 54 insertions(+), 21 deletions(-)
+
+diff --git a/security/apparmor/apparmorfs.c b/security/apparmor/apparmorfs.c
+index eee116b42f27c..ac1507391686b 100644
+--- a/security/apparmor/apparmorfs.c
++++ b/security/apparmor/apparmorfs.c
+@@ -707,7 +707,8 @@ static void profile_query_cb(struct aa_profile *profile, struct aa_perms *perms,
+ 		if (state) {
+ 			struct path_cond cond = { };
+ 
+-			tmp = *(aa_lookup_fperms(rules->file, state, &cond));
++			tmp = *(aa_lookup_condperms(current_fsuid(),
++						    rules->file, state, &cond));
+ 		}
+ 	} else if (rules->policy->dfa) {
+ 		if (!RULE_MEDIATES(rules, *match_str))
+@@ -2478,7 +2479,7 @@ static struct aa_sfs_entry aa_sfs_entry_policy[] = {
+ 	AA_SFS_FILE_BOOLEAN("set_load",		1),
+ 	/* number of out of band transitions supported */
+ 	AA_SFS_FILE_U64("outofband",		MAX_OOB_SUPPORTED),
+-	AA_SFS_FILE_U64("permstable32_version",	1),
++	AA_SFS_FILE_U64("permstable32_version",	3),
+ 	AA_SFS_FILE_STRING("permstable32", PERMS32STR),
+ 	AA_SFS_FILE_U64("state32",	1),
+ 	AA_SFS_DIR("unconfined_restrictions",   aa_sfs_entry_unconfined),
+diff --git a/security/apparmor/domain.c b/security/apparmor/domain.c
+index 8685c10e6754c..66bea805e7f39 100644
+--- a/security/apparmor/domain.c
++++ b/security/apparmor/domain.c
+@@ -155,7 +155,8 @@ static int label_compound_match(struct aa_profile *profile,
+ 		if (!state)
+ 			goto fail;
+ 	}
+-	*perms = *(aa_lookup_fperms(rules->file, state, &cond));
++	*perms = *(aa_lookup_condperms(current_fsuid(), rules->file, state,
++				       &cond));
+ 	aa_apply_modes_to_perms(profile, perms);
+ 	if ((perms->allow & request) != request)
+ 		return -EACCES;
+@@ -210,7 +211,8 @@ static int label_components_match(struct aa_profile *profile,
+ 	return 0;
+ 
+ next:
+-	tmp = *(aa_lookup_fperms(rules->file, state, &cond));
++	tmp = *(aa_lookup_condperms(current_fsuid(), rules->file, state,
++				    &cond));
+ 	aa_apply_modes_to_perms(profile, &tmp);
+ 	aa_perms_accum(perms, &tmp);
+ 	label_for_each_cont(i, label, tp) {
+@@ -219,7 +221,8 @@ static int label_components_match(struct aa_profile *profile,
+ 		state = match_component(profile, tp, stack, start);
+ 		if (!state)
+ 			goto fail;
+-		tmp = *(aa_lookup_fperms(rules->file, state, &cond));
++		tmp = *(aa_lookup_condperms(current_fsuid(), rules->file, state,
++					    &cond));
+ 		aa_apply_modes_to_perms(profile, &tmp);
+ 		aa_perms_accum(perms, &tmp);
+ 	}
+diff --git a/security/apparmor/file.c b/security/apparmor/file.c
+index 62bc46e037588..35bd22a778baf 100644
+--- a/security/apparmor/file.c
++++ b/security/apparmor/file.c
+@@ -169,7 +169,8 @@ static int path_name(const char *op, const struct cred *subj_cred,
+ struct aa_perms default_perms = {};
+ /**
+  * aa_lookup_fperms - convert dfa compressed perms to internal perms
+- * @file_rules: the aa_policydb to lookup perms for  (NOT NULL)
++ * @subj_uid: uid to use for subject owner test
++ * @rules: the aa_policydb to lookup perms for  (NOT NULL)
+  * @state: state in dfa
+  * @cond:  conditions to consider  (NOT NULL)
+  *
+@@ -177,18 +178,21 @@ struct aa_perms default_perms = {};
+  *
+  * Returns: a pointer to a file permission set
+  */
+-struct aa_perms *aa_lookup_fperms(struct aa_policydb *file_rules,
+-				 aa_state_t state, struct path_cond *cond)
++struct aa_perms *aa_lookup_condperms(kuid_t subj_uid, struct aa_policydb *rules,
++				     aa_state_t state, struct path_cond *cond)
+ {
+-	unsigned int index = ACCEPT_TABLE(file_rules->dfa)[state];
++	unsigned int index = ACCEPT_TABLE(rules->dfa)[state];
+ 
+-	if (!(file_rules->perms))
++	if (!(rules->perms))
+ 		return &default_perms;
+ 
+-	if (uid_eq(current_fsuid(), cond->uid))
+-		return &(file_rules->perms[index]);
++	if ((ACCEPT_TABLE2(rules->dfa)[state] & ACCEPT_FLAG_OWNER)) {
++		if (uid_eq(subj_uid, cond->uid))
++			return &(rules->perms[index]);
++		return &(rules->perms[index + 1]);
++	}
+ 
+-	return &(file_rules->perms[index + 1]);
++	return &(rules->perms[index]);
+ }
+ 
+ /**
+@@ -207,7 +211,8 @@ aa_state_t aa_str_perms(struct aa_policydb *file_rules, aa_state_t start,
+ {
+ 	aa_state_t state;
+ 	state = aa_dfa_match(file_rules->dfa, start, name);
+-	*perms = *(aa_lookup_fperms(file_rules, state, cond));
++	*perms = *(aa_lookup_condperms(current_fsuid(), file_rules, state,
++				       cond));
+ 
+ 	return state;
+ }
+diff --git a/security/apparmor/include/file.h b/security/apparmor/include/file.h
+index 6e8f2aa66cd63..06d9899098a65 100644
+--- a/security/apparmor/include/file.h
++++ b/security/apparmor/include/file.h
+@@ -77,8 +77,9 @@ int aa_audit_file(const struct cred *cred,
+ 		  const char *target, struct aa_label *tlabel, kuid_t ouid,
+ 		  const char *info, int error);
+ 
+-struct aa_perms *aa_lookup_fperms(struct aa_policydb *file_rules,
+-				  aa_state_t state, struct path_cond *cond);
++struct aa_perms *aa_lookup_condperms(kuid_t subj_uid,
++				     struct aa_policydb *file_rules,
++				     aa_state_t state, struct path_cond *cond);
+ aa_state_t aa_str_perms(struct aa_policydb *file_rules, aa_state_t start,
+ 			const char *name, struct path_cond *cond,
+ 			struct aa_perms *perms);
+diff --git a/security/apparmor/include/policy.h b/security/apparmor/include/policy.h
+index 47199bead884b..552b885b64a60 100644
+--- a/security/apparmor/include/policy.h
++++ b/security/apparmor/include/policy.h
+@@ -59,6 +59,11 @@ extern const char *const aa_profile_mode_names[];
+ 
+ #define on_list_rcu(X) (!list_empty(X) && (X)->prev != LIST_POISON2)
+ 
++/* flags in the dfa accept2 table */
++enum dfa_accept_flags {
++	ACCEPT_FLAG_OWNER = 1,
++};
++
+ /*
+  * FIXME: currently need a clean way to replace and remove profiles as a
+  * set.  It should be done at the namespace level.
+@@ -124,6 +129,7 @@ static inline void aa_put_pdb(struct aa_policydb *pdb)
+ 		kref_put(&pdb->count, aa_pdb_free_kref);
+ }
+ 
++/* lookup perm that doesn't have and object conditional */
+ static inline struct aa_perms *aa_lookup_perms(struct aa_policydb *policy,
+ 					       aa_state_t state)
+ {
+@@ -135,7 +141,6 @@ static inline struct aa_perms *aa_lookup_perms(struct aa_policydb *policy,
+ 	return &(policy->perms[index]);
+ }
+ 
+-
+ /* struct aa_data - generic data structure
+  * key: name for retrieving this data
+  * size: size of data in bytes
+diff --git a/security/apparmor/policy_compat.c b/security/apparmor/policy_compat.c
+index 423227670e685..cfc2207e5a12e 100644
+--- a/security/apparmor/policy_compat.c
++++ b/security/apparmor/policy_compat.c
+@@ -286,10 +286,10 @@ static void remap_dfa_accept(struct aa_dfa *dfa, unsigned int factor)
+ 
+ 	AA_BUG(!dfa);
+ 
+-	for (state = 0; state < state_count; state++)
++	for (state = 0; state < state_count; state++) {
+ 		ACCEPT_TABLE(dfa)[state] = state * factor;
+-	kvfree(dfa->tables[YYTD_ID_ACCEPT2]);
+-	dfa->tables[YYTD_ID_ACCEPT2] = NULL;
++		ACCEPT_TABLE2(dfa)[state] = factor > 1 ? ACCEPT_FLAG_OWNER : 0;
++	}
+ }
+ 
+ /* TODO: merge different dfa mappings into single map_policy fn */
+diff --git a/security/apparmor/policy_unpack.c b/security/apparmor/policy_unpack.c
+index 0928c064ee9f9..ac03011501dc6 100644
+--- a/security/apparmor/policy_unpack.c
++++ b/security/apparmor/policy_unpack.c
+@@ -731,6 +731,7 @@ static int unpack_pdb(struct aa_ext *e, struct aa_policydb **policy,
+ 	void *pos = e->pos;
+ 	int i, flags, error = -EPROTO;
+ 	ssize_t size;
++	u32 version = 0;
+ 
+ 	pdb = aa_alloc_pdb(GFP_KERNEL);
+ 	if (!pdb)
+@@ -748,6 +749,9 @@ static int unpack_pdb(struct aa_ext *e, struct aa_policydb **policy,
+ 	if (pdb->perms) {
+ 		/* perms table present accept is index */
+ 		flags = TO_ACCEPT1_FLAG(YYTD_DATA32);
++		if (aa_unpack_u32(e, &version, "permsv") && version > 2)
++			/* accept2 used for dfa flags */
++			flags |= TO_ACCEPT2_FLAG(YYTD_DATA32);
+ 	} else {
+ 		/* packed perms in accept1 and accept2 */
+ 		flags = TO_ACCEPT1_FLAG(YYTD_DATA32) |
+@@ -795,6 +799,20 @@ static int unpack_pdb(struct aa_ext *e, struct aa_policydb **policy,
+ 		}
+ 	}
+ 
++	if (pdb->perms && version <= 2) {
++		/* add dfa flags table missing in v2 */
++		u32 noents = pdb->dfa->tables[YYTD_ID_ACCEPT]->td_lolen;
++		u16 tdflags = pdb->dfa->tables[YYTD_ID_ACCEPT]->td_flags;
++		size_t tsize = table_size(noents, tdflags);
++
++		pdb->dfa->tables[YYTD_ID_ACCEPT2] = kvzalloc(tsize, GFP_KERNEL);
++		if (!pdb->dfa->tables[YYTD_ID_ACCEPT2]) {
++			*info = "failed to alloc dfa flags table";
++			goto out;
++		}
++		pdb->dfa->tables[YYTD_ID_ACCEPT2]->td_lolen = noents;
++		pdb->dfa->tables[YYTD_ID_ACCEPT2]->td_flags = tdflags;
++	}
+ 	/*
+ 	 * Unfortunately due to a bug in earlier userspaces, a
+ 	 * transition table may be present even when the dfa is
+@@ -810,7 +828,7 @@ static int unpack_pdb(struct aa_ext *e, struct aa_policydb **policy,
+ 
+ 	/* TODO: move compat mapping here, requires dfa merging first */
+ 	/* TODO: move verify here, it has to be done after compat mappings */
+-
++out:
+ 	*policy = pdb;
+ 	return 0;
+ 
+-- 
+2.53.0
+

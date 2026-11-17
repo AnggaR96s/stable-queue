@@ -1,0 +1,244 @@
+From 5a602f36efd9c62cb1760f4ab878e0fd5bb8bb51 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 23 Aug 2024 21:40:47 -0700
+Subject: apparmor: add support for 2^24 states to the dfa state machine.
+
+From: John Johansen <john.johansen@canonical.com>
+
+[ Upstream commit 9208c05f9fdfd927ea160b97dfef3c379049fff2 ]
+
+Currently the dfa state machine is limited by its default, next, and
+check tables using u16. Allow loading of u32 tables, and if u16 tables
+are loaded map them to u32.
+
+The number of states allowed does not increase to 2^32 because the
+base table uses the top 8 bits of its u32 for flags. Moving the flags
+into a separate table allowing a full 2^32 bit range wil be done in
+a separate patch.
+
+Link: https://gitlab.com/apparmor/apparmor/-/issues/419
+Signed-off-by: John Johansen <john.johansen@canonical.com>
+Stable-dep-of: 449195a4bb7d ("apparmor: fix table_size() integer overflow on 32 bit")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ security/apparmor/apparmorfs.c    |  1 +
+ security/apparmor/include/match.h |  8 ++-
+ security/apparmor/match.c         | 99 ++++++++++++++++++++++++-------
+ 3 files changed, 83 insertions(+), 25 deletions(-)
+
+diff --git a/security/apparmor/apparmorfs.c b/security/apparmor/apparmorfs.c
+index eeed8047b12ff..eee116b42f27c 100644
+--- a/security/apparmor/apparmorfs.c
++++ b/security/apparmor/apparmorfs.c
+@@ -2480,6 +2480,7 @@ static struct aa_sfs_entry aa_sfs_entry_policy[] = {
+ 	AA_SFS_FILE_U64("outofband",		MAX_OOB_SUPPORTED),
+ 	AA_SFS_FILE_U64("permstable32_version",	1),
+ 	AA_SFS_FILE_STRING("permstable32", PERMS32STR),
++	AA_SFS_FILE_U64("state32",	1),
+ 	AA_SFS_DIR("unconfined_restrictions",   aa_sfs_entry_unconfined),
+ 	{ }
+ };
+diff --git a/security/apparmor/include/match.h b/security/apparmor/include/match.h
+index 14c0401f97c1b..da03d1404335a 100644
+--- a/security/apparmor/include/match.h
++++ b/security/apparmor/include/match.h
+@@ -87,10 +87,12 @@ struct table_header {
+ 	char td_data[];
+ };
+ 
+-#define DEFAULT_TABLE(DFA) ((u16 *)((DFA)->tables[YYTD_ID_DEF]->td_data))
++#define TABLE_DATAU16(TABLE) ((u16 *)((TABLE)->td_data))
++#define TABLE_DATAU32(TABLE) ((u32 *)((TABLE)->td_data))
++#define DEFAULT_TABLE(DFA) ((u32 *)((DFA)->tables[YYTD_ID_DEF]->td_data))
+ #define BASE_TABLE(DFA) ((u32 *)((DFA)->tables[YYTD_ID_BASE]->td_data))
+-#define NEXT_TABLE(DFA) ((u16 *)((DFA)->tables[YYTD_ID_NXT]->td_data))
+-#define CHECK_TABLE(DFA) ((u16 *)((DFA)->tables[YYTD_ID_CHK]->td_data))
++#define NEXT_TABLE(DFA) ((u32 *)((DFA)->tables[YYTD_ID_NXT]->td_data))
++#define CHECK_TABLE(DFA) ((u32 *)((DFA)->tables[YYTD_ID_CHK]->td_data))
+ #define EQUIV_TABLE(DFA) ((u8 *)((DFA)->tables[YYTD_ID_EC]->td_data))
+ #define ACCEPT_TABLE(DFA) ((u32 *)((DFA)->tables[YYTD_ID_ACCEPT]->td_data))
+ #define ACCEPT_TABLE2(DFA) ((u32 *)((DFA)->tables[YYTD_ID_ACCEPT2]->td_data))
+diff --git a/security/apparmor/match.c b/security/apparmor/match.c
+index b43aaad86b249..b2a4bee4e3939 100644
+--- a/security/apparmor/match.c
++++ b/security/apparmor/match.c
+@@ -264,6 +264,42 @@ void aa_dfa_free_kref(struct kref *kref)
+ 	dfa_free(dfa);
+ }
+ 
++
++
++/**
++ * remap_data16_to_data32 - remap u16 @old table to a u32 based table
++ * @old: table to remap
++ *
++ * Returns: new table with u32 entries instead of u16.
++ *
++ * Note: will free @old so caller does not have to
++ */
++static struct table_header *remap_data16_to_data32(struct table_header *old)
++{
++	struct table_header *new;
++	size_t tsize;
++	u32 i;
++
++	tsize = table_size(old->td_lolen, YYTD_DATA32);
++	new = kvzalloc(tsize, GFP_KERNEL);
++	if (!new) {
++		kvfree(old);
++		return NULL;
++	}
++	new->td_id = old->td_id;
++	new->td_flags = YYTD_DATA32;
++	new->td_lolen = old->td_lolen;
++
++	for (i = 0; i < old->td_lolen; i++)
++		TABLE_DATAU32(new)[i] = (u32) TABLE_DATAU16(old)[i];
++
++	kvfree(old);
++	if (is_vmalloc_addr(new))
++		vm_unmap_aliases();
++
++	return new;
++}
++
+ /**
+  * aa_dfa_unpack - unpack the binary tables of a serialized dfa
+  * @blob: aligned serialized stream of data to unpack  (NOT NULL)
+@@ -346,8 +382,10 @@ struct aa_dfa *aa_dfa_unpack(void *blob, size_t size, int flags)
+ 		case YYTD_ID_DEF:
+ 		case YYTD_ID_NXT:
+ 		case YYTD_ID_CHK:
+-			if (table->td_flags != YYTD_DATA16)
++			if (!(table->td_flags == YYTD_DATA16 ||
++			      table->td_flags == YYTD_DATA32)) {
+ 				goto fail;
++			}
+ 			break;
+ 		case YYTD_ID_EC:
+ 			if (table->td_flags != YYTD_DATA8)
+@@ -362,6 +400,23 @@ struct aa_dfa *aa_dfa_unpack(void *blob, size_t size, int flags)
+ 		dfa->tables[table->td_id] = table;
+ 		data += table_size(table->td_lolen, table->td_flags);
+ 		size -= table_size(table->td_lolen, table->td_flags);
++
++		/*
++		 * this remapping has to be done after incrementing data above
++		 * for now straight remap, later have dfa support both
++		 */
++		switch (table->td_id) {
++		case YYTD_ID_DEF:
++		case YYTD_ID_NXT:
++		case YYTD_ID_CHK:
++			if (table->td_flags == YYTD_DATA16) {
++				table = remap_data16_to_data32(table);
++				if (!table)
++					goto fail;
++			}
++			dfa->tables[table->td_id] = table;
++			break;
++		}
+ 		table = NULL;
+ 	}
+ 	error = verify_table_headers(dfa->tables, flags);
+@@ -415,10 +470,10 @@ do {							\
+ aa_state_t aa_dfa_match_len(struct aa_dfa *dfa, aa_state_t start,
+ 			    const char *str, int len)
+ {
+-	u16 *def = DEFAULT_TABLE(dfa);
++	u32 *def = DEFAULT_TABLE(dfa);
+ 	u32 *base = BASE_TABLE(dfa);
+-	u16 *next = NEXT_TABLE(dfa);
+-	u16 *check = CHECK_TABLE(dfa);
++	u32 *next = NEXT_TABLE(dfa);
++	u32 *check = CHECK_TABLE(dfa);
+ 	aa_state_t state = start;
+ 
+ 	if (state == DFA_NOMATCH)
+@@ -459,10 +514,10 @@ aa_state_t aa_dfa_match_len(struct aa_dfa *dfa, aa_state_t start,
+  */
+ aa_state_t aa_dfa_match(struct aa_dfa *dfa, aa_state_t start, const char *str)
+ {
+-	u16 *def = DEFAULT_TABLE(dfa);
++	u32 *def = DEFAULT_TABLE(dfa);
+ 	u32 *base = BASE_TABLE(dfa);
+-	u16 *next = NEXT_TABLE(dfa);
+-	u16 *check = CHECK_TABLE(dfa);
++	u32 *next = NEXT_TABLE(dfa);
++	u32 *check = CHECK_TABLE(dfa);
+ 	aa_state_t state = start;
+ 
+ 	if (state == DFA_NOMATCH)
+@@ -502,10 +557,10 @@ aa_state_t aa_dfa_match(struct aa_dfa *dfa, aa_state_t start, const char *str)
+  */
+ aa_state_t aa_dfa_next(struct aa_dfa *dfa, aa_state_t state, const char c)
+ {
+-	u16 *def = DEFAULT_TABLE(dfa);
++	u32 *def = DEFAULT_TABLE(dfa);
+ 	u32 *base = BASE_TABLE(dfa);
+-	u16 *next = NEXT_TABLE(dfa);
+-	u16 *check = CHECK_TABLE(dfa);
++	u32 *next = NEXT_TABLE(dfa);
++	u32 *check = CHECK_TABLE(dfa);
+ 
+ 	/* current state is <state>, matching character *str */
+ 	if (dfa->tables[YYTD_ID_EC]) {
+@@ -520,10 +575,10 @@ aa_state_t aa_dfa_next(struct aa_dfa *dfa, aa_state_t state, const char c)
+ 
+ aa_state_t aa_dfa_outofband_transition(struct aa_dfa *dfa, aa_state_t state)
+ {
+-	u16 *def = DEFAULT_TABLE(dfa);
++	u32 *def = DEFAULT_TABLE(dfa);
+ 	u32 *base = BASE_TABLE(dfa);
+-	u16 *next = NEXT_TABLE(dfa);
+-	u16 *check = CHECK_TABLE(dfa);
++	u32 *next = NEXT_TABLE(dfa);
++	u32 *check = CHECK_TABLE(dfa);
+ 	u32 b = (base)[(state)];
+ 
+ 	if (!(b & MATCH_FLAG_OOB_TRANSITION))
+@@ -551,10 +606,10 @@ aa_state_t aa_dfa_outofband_transition(struct aa_dfa *dfa, aa_state_t state)
+ aa_state_t aa_dfa_match_until(struct aa_dfa *dfa, aa_state_t start,
+ 				const char *str, const char **retpos)
+ {
+-	u16 *def = DEFAULT_TABLE(dfa);
++	u32 *def = DEFAULT_TABLE(dfa);
+ 	u32 *base = BASE_TABLE(dfa);
+-	u16 *next = NEXT_TABLE(dfa);
+-	u16 *check = CHECK_TABLE(dfa);
++	u32 *next = NEXT_TABLE(dfa);
++	u32 *check = CHECK_TABLE(dfa);
+ 	u32 *accept = ACCEPT_TABLE(dfa);
+ 	aa_state_t state = start, pos;
+ 
+@@ -612,10 +667,10 @@ aa_state_t aa_dfa_match_until(struct aa_dfa *dfa, aa_state_t start,
+ aa_state_t aa_dfa_matchn_until(struct aa_dfa *dfa, aa_state_t start,
+ 				 const char *str, int n, const char **retpos)
+ {
+-	u16 *def = DEFAULT_TABLE(dfa);
++	u32 *def = DEFAULT_TABLE(dfa);
+ 	u32 *base = BASE_TABLE(dfa);
+-	u16 *next = NEXT_TABLE(dfa);
+-	u16 *check = CHECK_TABLE(dfa);
++	u32 *next = NEXT_TABLE(dfa);
++	u32 *check = CHECK_TABLE(dfa);
+ 	u32 *accept = ACCEPT_TABLE(dfa);
+ 	aa_state_t state = start, pos;
+ 
+@@ -689,10 +744,10 @@ static aa_state_t leftmatch_fb(struct aa_dfa *dfa, aa_state_t start,
+ 				 const char *str, struct match_workbuf *wb,
+ 				 unsigned int *count)
+ {
+-	u16 *def = DEFAULT_TABLE(dfa);
++	u32 *def = DEFAULT_TABLE(dfa);
+ 	u32 *base = BASE_TABLE(dfa);
+-	u16 *next = NEXT_TABLE(dfa);
+-	u16 *check = CHECK_TABLE(dfa);
++	u32 *next = NEXT_TABLE(dfa);
++	u32 *check = CHECK_TABLE(dfa);
+ 	aa_state_t state = start, pos;
+ 
+ 	AA_BUG(!dfa);
+-- 
+2.53.0
+
