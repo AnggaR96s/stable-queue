@@ -1,0 +1,115 @@
+From 0e10ec74316029303cfc082925ae008bded14b7f Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 16 Nov 2026 16:28:24 +0100
+Subject: netfilter: flowtable: ensure sufficient headroom in xmit path
+
+From: Pablo Neira Ayuso <pablo@netfilter.org>
+
+commit ef4f741e8627512cb8c82f59a1fc7aacd854aadf upstream.
+
+Check for headroom and call skb_expand_head() like in the IP output
+path to ensure there is sufficient headroom for the mac header when
+forwarding this packet as suggested by sashiko.
+
+Fixes: b5964aac51e0 ("netfilter: flowtable: consolidate xmit path")
+Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+[ aq: the upstream commit does not apply to 6.6: 6.6 predates
+  b5964aac51e0, and FLOW_OFFLOAD_XMIT_NEIGH flows are still sent through
+  neigh_xmit() from nf_flow_offload_ip_hook() and
+  nf_flow_offload_ipv6_hook(). Do the same headroom check there, before
+  skb->dev is switched to the output device, and in nf_flow_queue_xmit().
+
+  Without it, a forwarded skb reaches the output device's
+  header_ops->create() with only the headroom it was received with. A
+  UDP socket behind a veth (e.g. a container) leaves 16 bytes; virtio_net
+  leaves 26 for frames larger than GOOD_COPY_LEN. GRE, ip6gre and VLAN
+  have since been hardened individually, 6LoWPAN has not:
+  lowpan_header_create() stores struct lowpan_addr_info (32 bytes) in
+  front of skb->data after a mere WARN_ON_ONCE(), i.e. an out-of-bounds
+  write before the skb head. Seen on v6.6.162 with IPv6 forwarded by a
+  flowtable from a veth to a 6LoWPAN interface:
+
+    WARNING: CPU: 1 PID: 3974 at net/ieee802154/6lowpan/tx.c:21 lowpan_header_create+0x165/0x1b0 [ieee802154_6lowpan]
+    Call Trace:
+     neigh_connected_output+0xa6/0xf0
+     neigh_xmit+0xb4/0x1e0
+     nf_flow_offload_ipv6_hook+0x544/0x7c0
+     nf_hook_slow+0x39/0xe0
+     __netif_receive_skb_core.constprop.0+0xd8a/0xf40
+     __netif_receive_skb_one_core+0x37/0xa0
+     process_backlog+0x75/0x130
+
+  Before e67c577d8989 ("ipv4: ip_gre: make ipgre_header() robust") the
+  same path panicked with multipoint GRE (DMVPN) output devices:
+  skb_under_panic in ipgre_header() via nf_flow_offload_ip_hook(). ]
+Fixes: 97add9f0d66d ("netfilter: flow table support for IPv4")
+Fixes: 0995210753a2 ("netfilter: flow table support for IPv6")
+Fixes: 7a27f6ab4135 ("netfilter: flowtable: use dev_fill_forward_path() to obtain egress device")
+Link: https://vyos.dev/T7549
+Signed-off-by: Antonio Quartulli <antonio@mandelbit.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ net/netfilter/nf_flow_table_ip.c | 26 ++++++++++++++++++++++++++
+ 1 file changed, 26 insertions(+)
+
+diff --git a/net/netfilter/nf_flow_table_ip.c b/net/netfilter/nf_flow_table_ip.c
+index 6e6d036fe1391..24f1e6917d4ac 100644
+--- a/net/netfilter/nf_flow_table_ip.c
++++ b/net/netfilter/nf_flow_table_ip.c
+@@ -330,6 +330,22 @@ static void nf_flow_encap_pop(struct sk_buff *skb,
+ 	}
+ }
+ 
++/* Make room for the link layer header of @dev, like ip_finish_output2() does.
++ * The flowtable fast path skips the IP output path, and a device with
++ * header_ops (e.g. an NBMA GRE tunnel) may need more headroom than the skb
++ * was received with. On failure the skb has been freed.
++ */
++static struct sk_buff *nf_flow_xmit_headroom(struct sk_buff *skb,
++					     struct net_device *dev)
++{
++	unsigned int hh_len = LL_RESERVED_SPACE(dev);
++
++	if (unlikely(skb_headroom(skb) < hh_len && dev->header_ops))
++		skb = skb_expand_head(skb, hh_len);
++
++	return skb;
++}
++
+ static unsigned int nf_flow_queue_xmit(struct net *net, struct sk_buff *skb,
+ 				       const struct flow_offload_tuple_rhash *tuplehash,
+ 				       unsigned short type)
+@@ -340,6 +356,10 @@ static unsigned int nf_flow_queue_xmit(struct net *net, struct sk_buff *skb,
+ 	if (!outdev)
+ 		return NF_DROP;
+ 
++	skb = nf_flow_xmit_headroom(skb, outdev);
++	if (!skb)
++		return NF_STOLEN;
++
+ 	skb->dev = outdev;
+ 	dev_hard_header(skb, skb->dev, type, tuplehash->tuple.out.h_dest,
+ 			tuplehash->tuple.out.h_source, skb->len);
+@@ -452,6 +472,9 @@ nf_flow_offload_ip_hook(void *priv, struct sk_buff *skb,
+ 	case FLOW_OFFLOAD_XMIT_NEIGH:
+ 		rt = (struct rtable *)tuplehash->tuple.dst_cache;
+ 		outdev = rt->dst.dev;
++		skb = nf_flow_xmit_headroom(skb, outdev);
++		if (!skb)
++			return NF_STOLEN;
+ 		skb->dev = outdev;
+ 		nexthop = rt_nexthop(rt, flow->tuplehash[!dir].tuple.src_v4.s_addr);
+ 		skb_dst_drop(skb);
+@@ -748,6 +771,9 @@ nf_flow_offload_ipv6_hook(void *priv, struct sk_buff *skb,
+ 	case FLOW_OFFLOAD_XMIT_NEIGH:
+ 		rt = dst_rt6_info(tuplehash->tuple.dst_cache);
+ 		outdev = rt->dst.dev;
++		skb = nf_flow_xmit_headroom(skb, outdev);
++		if (!skb)
++			return NF_STOLEN;
+ 		skb->dev = outdev;
+ 		nexthop = rt6_nexthop(rt, &flow->tuplehash[!dir].tuple.src_v6);
+ 		skb_dst_drop(skb);
+-- 
+2.53.0
+
