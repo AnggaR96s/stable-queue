@@ -1,0 +1,126 @@
+From aff426f35966e6e77ecfe065984344a7d834eaa9 Mon Sep 17 00:00:00 2001
+From: John Johansen <john.johansen@canonical.com>
+Date: Fri, 23 May 2025 21:04:51 -0700
+Subject: apparmor: mitigate parser generating large xtables
+
+From: John Johansen <john.johansen@canonical.com>
+
+commit aff426f35966e6e77ecfe065984344a7d834eaa9 upstream.
+
+Some versions of the parser are generating an xtable transition per
+state in the state machine, even when the state machine isn't using
+the transition table.
+
+The parser bug is triggered by
+commit 2e12c5f06017 ("apparmor: add additional flags to extended permission.")
+
+In addition to fixing this in userspace, mitigate this in the kernel
+as part of the policy verification checks by detecting this situation
+and adjusting to what is actually used, or if not used at all freeing
+it, so we are not wasting unneeded memory on policy.
+
+Fixes: 2e12c5f06017 ("apparmor: add additional flags to extended permission.")
+Signed-off-by: John Johansen <john.johansen@canonical.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ security/apparmor/include/lib.h   |    1 +
+ security/apparmor/lib.c           |   23 +++++++++++++++++++++++
+ security/apparmor/policy_unpack.c |   27 +++++++++++++++++++++------
+ 3 files changed, 45 insertions(+), 6 deletions(-)
+
+--- a/security/apparmor/include/lib.h
++++ b/security/apparmor/include/lib.h
+@@ -123,6 +123,7 @@ struct aa_str_table {
+ };
+ 
+ void aa_free_str_table(struct aa_str_table *table);
++bool aa_resize_str_table(struct aa_str_table *t, int newsize, gfp_t gfp);
+ 
+ struct counted_str {
+ 	struct kref count;
+--- a/security/apparmor/lib.c
++++ b/security/apparmor/lib.c
+@@ -138,6 +138,29 @@ const char *aa_splitn_fqname(const char
+ 	return name;
+ }
+ 
++bool aa_resize_str_table(struct aa_str_table *t, int newsize, gfp_t gfp)
++{
++	char **n;
++	int i;
++
++	if (t->size == newsize)
++		return true;
++	n = kcalloc(newsize, sizeof(*n), gfp);
++	if (!n)
++		return false;
++	for (i = 0; i < min(t->size, newsize); i++)
++		n[i] = t->table[i];
++	for (; i < t->size; i++)
++		kfree_sensitive(t->table[i]);
++	if (newsize > t->size)
++		memset(&n[t->size], 0, (newsize-t->size)*sizeof(*n));
++	kfree_sensitive(t->table);
++	t->table = n;
++	t->size = newsize;
++
++	return true;
++}
++
+ /**
+  * aa_info_message - log a none profile related status message
+  * @str: message to log
+--- a/security/apparmor/policy_unpack.c
++++ b/security/apparmor/policy_unpack.c
+@@ -832,8 +832,12 @@ static int unpack_pdb(struct aa_ext *e,
+ 	if (!pdb->dfa && pdb->trans.table)
+ 		aa_free_str_table(&pdb->trans);
+ 
+-	/* TODO: move compat mapping here, requires dfa merging first */
+-	/* TODO: move verify here, it has to be done after compat mappings */
++	/* TODO:
++	 * - move compat mapping here, requires dfa merging first
++	 * - move verify here, it has to be done after compat mappings
++	 * - move free of unneeded trans table here, has to be done
++	 *   after perm mapping.
++	 */
+ out:
+ 	*policy = pdb;
+ 	return 0;
+@@ -1272,21 +1276,32 @@ static bool verify_perm(struct aa_perms
+ static bool verify_perms(struct aa_policydb *pdb)
+ {
+ 	int i;
++	int xidx, xmax = -1;
+ 
+ 	for (i = 0; i < pdb->size; i++) {
+ 		if (!verify_perm(&pdb->perms[i]))
+ 			return false;
+ 		/* verify indexes into str table */
+-		if ((pdb->perms[i].xindex & AA_X_TYPE_MASK) == AA_X_TABLE &&
+-		    (pdb->perms[i].xindex & AA_X_INDEX_MASK) >= pdb->trans.size)
+-			return false;
++		if ((pdb->perms[i].xindex & AA_X_TYPE_MASK) == AA_X_TABLE) {
++			xidx = pdb->perms[i].xindex & AA_X_INDEX_MASK;
++			if (xidx >= pdb->trans.size)
++				return false;
++			if (xmax < xidx)
++				xmax = xidx;
++		}
+ 		if (pdb->perms[i].tag && pdb->perms[i].tag >= pdb->trans.size)
+ 			return false;
+ 		if (pdb->perms[i].label &&
+ 		    pdb->perms[i].label >= pdb->trans.size)
+ 			return false;
+ 	}
+-
++	/* deal with incorrectly constructed string tables */
++	if (xmax == -1) {
++		aa_free_str_table(&pdb->trans);
++	} else if (pdb->trans.size > xmax + 1) {
++		if (!aa_resize_str_table(&pdb->trans, xmax + 1, GFP_KERNEL))
++			return false;
++	}
+ 	return true;
+ }
+ 
