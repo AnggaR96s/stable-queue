@@ -1,0 +1,149 @@
+From c3d5402b2451d4bfed1dc7989c572b6e600a9369 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Sat, 21 Nov 2026 07:43:47 -0500
+Subject: Revert "SUNRPC: Convert unwrap_priv_data() to use xdr_stream"
+
+This reverts commit 82cf21374fb7ee55b37be9afb6704ba0eeffb236.
+
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/linux/sunrpc/xdr.h        |  1 +
+ net/sunrpc/auth_gss/svcauth_gss.c | 64 +++++++++++++++++++++----------
+ net/sunrpc/xdr.c                  |  7 ++++
+ 3 files changed, 51 insertions(+), 21 deletions(-)
+
+diff --git a/include/linux/sunrpc/xdr.h b/include/linux/sunrpc/xdr.h
+index f7e2850c8638f..f84e2a1358e17 100644
+--- a/include/linux/sunrpc/xdr.h
++++ b/include/linux/sunrpc/xdr.h
+@@ -188,6 +188,7 @@ xdr_adjust_iovec(struct kvec *iov, __be32 *p)
+ /*
+  * XDR buffer helper functions
+  */
++extern void xdr_shift_buf(struct xdr_buf *, size_t);
+ extern void xdr_buf_from_iov(const struct kvec *, struct xdr_buf *);
+ extern int xdr_buf_subsegment(const struct xdr_buf *, struct xdr_buf *, unsigned int, unsigned int);
+ extern void xdr_buf_trim(struct xdr_buf *, unsigned int);
+diff --git a/net/sunrpc/auth_gss/svcauth_gss.c b/net/sunrpc/auth_gss/svcauth_gss.c
+index 3d417548dc508..64fba16d8afc1 100644
+--- a/net/sunrpc/auth_gss/svcauth_gss.c
++++ b/net/sunrpc/auth_gss/svcauth_gss.c
+@@ -978,6 +978,17 @@ total_buf_len(struct xdr_buf *buf)
+ 	return buf->head[0].iov_len + buf->page_len + buf->tail[0].iov_len;
+ }
+ 
++static void
++fix_priv_head(struct xdr_buf *buf, int pad)
++{
++	if (buf->page_len == 0) {
++		/* We need to adjust head and buf->len in tandem in this
++		 * case to make svc_defer() work--it finds the original
++		 * buffer start using buf->len - buf->head[0].iov_len. */
++		buf->head[0].iov_len -= pad;
++	}
++}
++
+ /*
+  * RFC 2203, Section 5.3.2.3
+  *
+@@ -990,37 +1001,49 @@ total_buf_len(struct xdr_buf *buf)
+  *		proc_req_arg_t arg;
+  *	};
+  */
+-static noinline_for_stack int
+-svcauth_gss_unwrap_priv(struct svc_rqst *rqstp, u32 seq, struct gss_ctx *ctx)
++static int
++svcauth_gss_unwrap_priv(struct svc_rqst *rqstp, struct xdr_buf *buf, u32 seq,
++			struct gss_ctx *ctx)
+ {
+-	struct xdr_stream *xdr = &rqstp->rq_arg_stream;
+-	u32 len, maj_stat, seq_num, offset;
+-	struct xdr_buf *buf = xdr->buf;
+-	unsigned int saved_len;
++	u32 len, seq_num, maj_stat;
++	int pad, remaining_len, offset;
+ 
+ 	clear_bit(RQ_SPLICE_OK, &rqstp->rq_flags);
+ 
+-	if (xdr_stream_decode_u32(xdr, &len) < 0)
+-		goto unwrap_failed;
++	len = svc_getnl(&buf->head[0]);
+ 	if (rqstp->rq_deferred) {
+ 		/* Already decrypted last time through! The sequence number
+ 		 * check at out_seq is unnecessary but harmless: */
+ 		goto out_seq;
+ 	}
+-	if (len > xdr_stream_remaining(xdr))
++	/* buf->len is the number of bytes from the original start of the
++	 * request to the end, where head[0].iov_len is just the bytes
++	 * not yet read from the head, so these two values are different: */
++	remaining_len = total_buf_len(buf);
++	if (len > remaining_len)
+ 		goto unwrap_failed;
+-	offset = xdr_stream_pos(xdr);
+-
+-	saved_len = buf->len;
+-	maj_stat = gss_unwrap(ctx, offset, offset + len, buf);
++	pad = remaining_len - len;
++	buf->len -= pad;
++	fix_priv_head(buf, pad);
++
++	maj_stat = gss_unwrap(ctx, 0, len, buf);
++	pad = len - buf->len;
++	/* The upper layers assume the buffer is aligned on 4-byte boundaries.
++	 * In the krb5p case, at least, the data ends up offset, so we need to
++	 * move it around. */
++	/* XXX: This is very inefficient.  It would be better to either do
++	 * this while we encrypt, or maybe in the receive code, if we can peak
++	 * ahead and work out the service and mechanism there. */
++	offset = xdr_pad_size(buf->head[0].iov_len);
++	if (offset) {
++		buf->buflen = RPCSVC_MAXPAYLOAD;
++		xdr_shift_buf(buf, offset);
++		fix_priv_head(buf, pad);
++	}
+ 	if (maj_stat != GSS_S_COMPLETE)
+ 		goto bad_unwrap;
+-	xdr->nwords -= XDR_QUADLEN(saved_len - buf->len);
+-
+ out_seq:
+-	/* gss_unwrap() decrypted the sequence number. */
+-	if (xdr_stream_decode_u32(xdr, &seq_num) < 0)
+-		goto unwrap_failed;
++	seq_num = svc_getnl(&buf->head[0]);
+ 	if (seq_num != seq)
+ 		goto bad_seqno;
+ 	return 0;
+@@ -1656,9 +1679,8 @@ svcauth_gss_accept(struct svc_rqst *rqstp)
+ 			/* placeholders for length and seq. number: */
+ 			svc_putnl(resv, 0);
+ 			svc_putnl(resv, 0);
+-			svcxdr_init_decode(rqstp);
+-			if (svcauth_gss_unwrap_priv(rqstp, gc->gc_seq,
+-						    rsci->mechctx))
++			if (svcauth_gss_unwrap_priv(rqstp, &rqstp->rq_arg,
++						    gc->gc_seq, rsci->mechctx))
+ 				goto garbage_args;
+ 			rqstp->rq_auth_slack = RPC_MAX_AUTH_SIZE * 2;
+ 			break;
+diff --git a/net/sunrpc/xdr.c b/net/sunrpc/xdr.c
+index 7c4e966a6aad2..612b1a5572ebc 100644
+--- a/net/sunrpc/xdr.c
++++ b/net/sunrpc/xdr.c
+@@ -863,6 +863,13 @@ static unsigned int xdr_shrink_pagelen(struct xdr_buf *buf, unsigned int len)
+ 	return shift;
+ }
+ 
++void
++xdr_shift_buf(struct xdr_buf *buf, size_t len)
++{
++	xdr_shrink_bufhead(buf, buf->head->iov_len - len);
++}
++EXPORT_SYMBOL_GPL(xdr_shift_buf);
++
+ /**
+  * xdr_stream_pos - Return the current offset from the start of the xdr_stream
+  * @xdr: pointer to struct xdr_stream
+-- 
+2.53.0
+
