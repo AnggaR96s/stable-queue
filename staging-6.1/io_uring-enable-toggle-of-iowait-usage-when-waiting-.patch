@@ -1,0 +1,128 @@
+From dea3f061e5d81e2e2c5afa859ebf1c081948d70f Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Sat, 21 Nov 2026 21:30:03 +0000
+Subject: io_uring: enable toggle of iowait usage when waiting on CQEs
+
+From: Jens Axboe <axboe@kernel.dk>
+
+Commit 07754bfd9aee59063f8549f6e4d455eae636ecc7 upstream.
+
+By default, io_uring marks a waiting task as being in iowait, if it's
+sleeping waiting on events and there are pending requests. This isn't
+necessarily always useful, and may be confusing on non-storage setups
+where iowait isn't expected. It can also cause extra power usage, by
+preventing the CPU from entering lower sleep states.
+
+This adds a new enter flag, IORING_ENTER_NO_IOWAIT. If set, then
+io_uring will not account the sleeping task as being in iowait. If the
+kernel supports this feature, then it will be marked by having the
+IORING_FEAT_NO_IOWAIT feature flag set.
+
+As the kernel currently does not support separating the iowait
+accounting and CPU frequency boosting, the IORING_ENTER_NO_IOWAIT
+controls both of these at the same time. In the future, if those do end
+up being split, then it'd be possible to control them separately.
+However, it seems more likely that the kernel will decouple iowait and
+CPU frequency boosting anyway.
+
+[ 6.1: no struct ext_arg here. Pass the enter flags to io_cqring_wait()
+  and keep the setting in struct io_wait_queue. Flag bits match
+  upstream. ]
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/uapi/linux/io_uring.h |  2 ++
+ io_uring/io_uring.c           | 15 +++++++++------
+ 2 files changed, 11 insertions(+), 6 deletions(-)
+
+diff --git a/include/uapi/linux/io_uring.h b/include/uapi/linux/io_uring.h
+index aeed98cb5c1c8..f49ac2a5afa45 100644
+--- a/include/uapi/linux/io_uring.h
++++ b/include/uapi/linux/io_uring.h
+@@ -434,6 +434,7 @@ struct io_cqring_offsets {
+ #define IORING_ENTER_SQ_WAIT		(1U << 2)
+ #define IORING_ENTER_EXT_ARG		(1U << 3)
+ #define IORING_ENTER_REGISTERED_RING	(1U << 4)
++#define IORING_ENTER_NO_IOWAIT		(1U << 7)
+ 
+ /*
+  * Passed in for io_uring_setup(2). Copied back with updated info on success
+@@ -467,6 +468,7 @@ struct io_uring_params {
+ #define IORING_FEAT_RSRC_TAGS		(1U << 10)
+ #define IORING_FEAT_CQE_SKIP		(1U << 11)
+ #define IORING_FEAT_LINKED_FILE		(1U << 12)
++#define IORING_FEAT_NO_IOWAIT		(1U << 17)
+ 
+ /*
+  * io_uring_register(2) opcodes and arguments
+diff --git a/io_uring/io_uring.c b/io_uring/io_uring.c
+index 866c6ad29e4c9..c59fbe6905de9 100644
+--- a/io_uring/io_uring.c
++++ b/io_uring/io_uring.c
+@@ -2354,6 +2354,7 @@ struct io_wait_queue {
+ 	struct io_ring_ctx *ctx;
+ 	unsigned cq_tail;
+ 	unsigned nr_timeouts;
++	bool iowait;
+ };
+ 
+ static inline bool io_has_work(struct io_ring_ctx *ctx)
+@@ -2439,7 +2440,7 @@ static inline int io_cqring_wait_schedule(struct io_ring_ctx *ctx,
+ 	 * to be important for low QD IO.
+ 	 */
+ 	io_wait = current->in_iowait;
+-	if (current_pending_io())
++	if (iowq->iowait && current_pending_io())
+ 		current->in_iowait = 1;
+ 	ret = 1;
+ 	if (!schedule_hrtimeout(timeout, HRTIMER_MODE_ABS))
+@@ -2452,7 +2453,7 @@ static inline int io_cqring_wait_schedule(struct io_ring_ctx *ctx,
+  * Wait until events become available, if we don't already have some. The
+  * application must reap them itself, as they reside on the shared cq ring.
+  */
+-static int io_cqring_wait(struct io_ring_ctx *ctx, int min_events,
++static int io_cqring_wait(struct io_ring_ctx *ctx, int min_events, u32 flags,
+ 			  const sigset_t __user *sig, size_t sigsz,
+ 			  struct __kernel_timespec __user *uts)
+ {
+@@ -2501,6 +2502,7 @@ static int io_cqring_wait(struct io_ring_ctx *ctx, int min_events,
+ 	iowq.wq.private = current;
+ 	INIT_LIST_HEAD(&iowq.wq.entry);
+ 	iowq.ctx = ctx;
++	iowq.iowait = !(flags & IORING_ENTER_NO_IOWAIT);
+ 	iowq.nr_timeouts = atomic_read(&ctx->cq_timeouts);
+ 	iowq.cq_tail = READ_ONCE(ctx->rings->cq.head) + min_events;
+ 
+@@ -3427,7 +3429,8 @@ SYSCALL_DEFINE6(io_uring_enter, unsigned int, fd, u32, to_submit,
+ 
+ 	if (unlikely(flags & ~(IORING_ENTER_GETEVENTS | IORING_ENTER_SQ_WAKEUP |
+ 			       IORING_ENTER_SQ_WAIT | IORING_ENTER_EXT_ARG |
+-			       IORING_ENTER_REGISTERED_RING)))
++			       IORING_ENTER_REGISTERED_RING |
++			       IORING_ENTER_NO_IOWAIT)))
+ 		return -EINVAL;
+ 
+ 	/*
+@@ -3530,8 +3533,8 @@ SYSCALL_DEFINE6(io_uring_enter, unsigned int, fd, u32, to_submit,
+ 			if (likely(!ret2)) {
+ 				min_complete = min(min_complete,
+ 						   ctx->cq_entries);
+-				ret2 = io_cqring_wait(ctx, min_complete, sig,
+-						      argsz, ts);
++				ret2 = io_cqring_wait(ctx, min_complete, flags,
++						      sig, argsz, ts);
+ 			}
+ 		}
+ 
+@@ -3785,7 +3788,7 @@ static __cold int io_uring_create(unsigned entries, struct io_uring_params *p,
+ 			IORING_FEAT_POLL_32BITS | IORING_FEAT_SQPOLL_NONFIXED |
+ 			IORING_FEAT_EXT_ARG | IORING_FEAT_NATIVE_WORKERS |
+ 			IORING_FEAT_RSRC_TAGS | IORING_FEAT_CQE_SKIP |
+-			IORING_FEAT_LINKED_FILE;
++			IORING_FEAT_LINKED_FILE | IORING_FEAT_NO_IOWAIT;
+ 
+ 	if (copy_to_user(params, p, sizeof(*p))) {
+ 		ret = -EFAULT;
+-- 
+2.53.0
+

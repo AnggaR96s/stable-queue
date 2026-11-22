@@ -1,0 +1,155 @@
+From c77da4bc18149e6aeb2dfa3041138314fad93c45 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Sat, 21 Nov 2026 21:31:13 +0000
+Subject: io_uring: enable toggle of iowait usage when waiting on CQEs
+
+From: Jens Axboe <axboe@kernel.dk>
+
+Commit 07754bfd9aee59063f8549f6e4d455eae636ecc7 upstream.
+
+By default, io_uring marks a waiting task as being in iowait, if it's
+sleeping waiting on events and there are pending requests. This isn't
+necessarily always useful, and may be confusing on non-storage setups
+where iowait isn't expected. It can also cause extra power usage, by
+preventing the CPU from entering lower sleep states.
+
+This adds a new enter flag, IORING_ENTER_NO_IOWAIT. If set, then
+io_uring will not account the sleeping task as being in iowait. If the
+kernel supports this feature, then it will be marked by having the
+IORING_FEAT_NO_IOWAIT feature flag set.
+
+As the kernel currently does not support separating the iowait
+accounting and CPU frequency boosting, the IORING_ENTER_NO_IOWAIT
+controls both of these at the same time. In the future, if those do end
+up being split, then it'd be possible to control them separately.
+However, it seems more likely that the kernel will decouple iowait and
+CPU frequency boosting anyway.
+
+[ 6.12: only the NO_IOWAIT flag bits are added, the EXT_ARG_REG and
+  RW_ATTR bits before them don't exist here. io_get_ext_arg() has no
+  ctx argument. ]
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/uapi/linux/io_uring.h |  2 ++
+ io_uring/io_uring.c           | 31 +++++++++++++++++++------------
+ 2 files changed, 21 insertions(+), 12 deletions(-)
+
+diff --git a/include/uapi/linux/io_uring.h b/include/uapi/linux/io_uring.h
+index fdd7b931ea1d4..e777e6b128e85 100644
+--- a/include/uapi/linux/io_uring.h
++++ b/include/uapi/linux/io_uring.h
+@@ -518,6 +518,7 @@ struct io_cqring_offsets {
+ #define IORING_ENTER_EXT_ARG		(1U << 3)
+ #define IORING_ENTER_REGISTERED_RING	(1U << 4)
+ #define IORING_ENTER_ABS_TIMER		(1U << 5)
++#define IORING_ENTER_NO_IOWAIT		(1U << 7)
+ 
+ /*
+  * Passed in for io_uring_setup(2). Copied back with updated info on success
+@@ -554,6 +555,7 @@ struct io_uring_params {
+ #define IORING_FEAT_REG_REG_RING	(1U << 13)
+ #define IORING_FEAT_RECVSEND_BUNDLE	(1U << 14)
+ #define IORING_FEAT_MIN_TIMEOUT		(1U << 15)
++#define IORING_FEAT_NO_IOWAIT		(1U << 17)
+ 
+ /*
+  * io_uring_register(2) opcodes and arguments
+diff --git a/io_uring/io_uring.c b/io_uring/io_uring.c
+index 09551e3907f91..630b306a849f0 100644
+--- a/io_uring/io_uring.c
++++ b/io_uring/io_uring.c
+@@ -2532,8 +2532,17 @@ static int io_cqring_schedule_timeout(struct io_wait_queue *iowq,
+ 	return READ_ONCE(iowq->hit_timeout) ? -ETIME : 0;
+ }
+ 
++struct ext_arg {
++	size_t argsz;
++	struct __kernel_timespec __user *ts;
++	const sigset_t __user *sig;
++	ktime_t min_time;
++	bool iowait;
++};
++
+ static int __io_cqring_wait_schedule(struct io_ring_ctx *ctx,
+ 				     struct io_wait_queue *iowq,
++				     struct ext_arg *ext_arg,
+ 				     ktime_t start_time)
+ {
+ 	int ret = 0;
+@@ -2543,7 +2552,7 @@ static int __io_cqring_wait_schedule(struct io_ring_ctx *ctx,
+ 	 * can take into account that the task is waiting for IO - turns out
+ 	 * to be important for low QD IO.
+ 	 */
+-	if (current_pending_io())
++	if (ext_arg->iowait && current_pending_io())
+ 		current->in_iowait = 1;
+ 	if (iowq->timeout != KTIME_MAX || iowq->min_timeout)
+ 		ret = io_cqring_schedule_timeout(iowq, ctx->clockid, start_time);
+@@ -2556,6 +2565,7 @@ static int __io_cqring_wait_schedule(struct io_ring_ctx *ctx,
+ /* If this returns > 0, the caller should retry */
+ static inline int io_cqring_wait_schedule(struct io_ring_ctx *ctx,
+ 					  struct io_wait_queue *iowq,
++					  struct ext_arg *ext_arg,
+ 					  ktime_t start_time)
+ {
+ 	if (unlikely(READ_ONCE(ctx->check_cq)))
+@@ -2569,16 +2579,9 @@ static inline int io_cqring_wait_schedule(struct io_ring_ctx *ctx,
+ 	if (unlikely(io_should_wake(iowq)))
+ 		return 0;
+ 
+-	return __io_cqring_wait_schedule(ctx, iowq, start_time);
++	return __io_cqring_wait_schedule(ctx, iowq, ext_arg, start_time);
+ }
+ 
+-struct ext_arg {
+-	size_t argsz;
+-	struct __kernel_timespec __user *ts;
+-	const sigset_t __user *sig;
+-	ktime_t min_time;
+-};
+-
+ /*
+  * Wait until events become available, if we don't already have some. The
+  * application must reap them itself, as they reside on the shared cq ring.
+@@ -2660,7 +2663,7 @@ static int io_cqring_wait(struct io_ring_ctx *ctx, int min_events, u32 flags,
+ 							TASK_INTERRUPTIBLE);
+ 		}
+ 
+-		ret = io_cqring_wait_schedule(ctx, &iowq, start_time);
++		ret = io_cqring_wait_schedule(ctx, &iowq, ext_arg, start_time);
+ 		__set_current_state(TASK_RUNNING);
+ 		atomic_set(&ctx->cq_wait_nr, IO_CQ_WAKE_INIT);
+ 
+@@ -3363,6 +3366,8 @@ static int io_get_ext_arg(unsigned flags, const void __user *argp,
+ {
+ 	struct io_uring_getevents_arg arg;
+ 
++	ext_arg->iowait = !(flags & IORING_ENTER_NO_IOWAIT);
++
+ 	/*
+ 	 * If EXT_ARG isn't set, then we have no timespec and the argp pointer
+ 	 * is just a pointer to the sigset_t.
+@@ -3399,7 +3404,8 @@ SYSCALL_DEFINE6(io_uring_enter, unsigned int, fd, u32, to_submit,
+ 	if (unlikely(flags & ~(IORING_ENTER_GETEVENTS | IORING_ENTER_SQ_WAKEUP |
+ 			       IORING_ENTER_SQ_WAIT | IORING_ENTER_EXT_ARG |
+ 			       IORING_ENTER_REGISTERED_RING |
+-			       IORING_ENTER_ABS_TIMER)))
++			       IORING_ENTER_ABS_TIMER |
++			       IORING_ENTER_NO_IOWAIT)))
+ 		return -EINVAL;
+ 
+ 	/*
+@@ -3786,7 +3792,8 @@ static __cold int io_uring_create(unsigned entries, struct io_uring_params *p,
+ 			IORING_FEAT_EXT_ARG | IORING_FEAT_NATIVE_WORKERS |
+ 			IORING_FEAT_RSRC_TAGS | IORING_FEAT_CQE_SKIP |
+ 			IORING_FEAT_LINKED_FILE | IORING_FEAT_REG_REG_RING |
+-			IORING_FEAT_RECVSEND_BUNDLE | IORING_FEAT_MIN_TIMEOUT;
++			IORING_FEAT_RECVSEND_BUNDLE | IORING_FEAT_MIN_TIMEOUT |
++			IORING_FEAT_NO_IOWAIT;
+ 
+ 	if (copy_to_user(params, p, sizeof(*p))) {
+ 		ret = -EFAULT;
+-- 
+2.53.0
+

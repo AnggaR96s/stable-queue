@@ -1,0 +1,142 @@
+From be0cd83fcc0e980484bf76bbc90e86a03f1e50a8 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Sat, 21 Nov 2026 21:31:30 +0000
+Subject: io_uring/napi: don't end the single NAPI busy poll early on
+ need_resched()
+
+From: Cinq Prairie <notprairie@gmail.com>
+
+Commit 39c7210e970200f8b17de3767c73efe64173a95f upstream.
+
+With a single registered NAPI, io_napi_blocking_busy_loop() hands
+io_napi_busy_loop_should_end() to napi_busy_loop_rcu() as loop_end and
+runs its own loop once, relying on __napi_busy_loop() to spin until
+that predicate fires. napi_busy_loop_rcu() sets NAPI_F_END_ON_RESCHED,
+so __napi_busy_loop() also returns on the first need_resched(). io_uring
+treats the return as the end of the busy poll period and sleeps in
+schedule_hrtimeout() for the rest of the wait timeout.
+
+With two or more NAPIs the inner loop is single-shot and io_uring's own
+loop runs until its predicate is met, so busy_poll_to is honoured. The
+same registration therefore behaves differently for one NAPI than for
+several.
+
+Make the busy poll deadline absolute, stored in io_wait_queue, so that
+io_napi_busy_loop_should_end() no longer depends on the start_time the
+napi loop snapshots on every entry. The single NAPI loop can then be
+re-entered after an early need_resched() exit if there is budget left,
+and the loop condition drops the "run once" special case. The fast path
+that holds the NAPI across polls is kept.
+
+Measured on io_uring-7.4 at 9c207aa58e54, x86-64, HZ=1000,
+PREEMPT_DYNAMIC (lazy), no CPU isolation, low RX traffic, r8169 with one
+RX queue, prefer_busy_poll, busy_poll_to = wait timeout = 10 ms.
+"waker" is a SCHED_FIFO task pinned to the polling CPU waking every 1 ms:
+
+  1 NAPI, waker, before:  busy 0.5-1.5 ms per 10 ms wait, ~0.8M polls/s
+  1 NAPI, waker, after:   busy 10 ms per 10 ms wait,      ~16.2M polls/s
+  1 NAPI, idle, before:   busy 10 ms per 10 ms wait,      ~15.3M polls/s
+  1 NAPI, idle, after:    busy 10 ms per 10 ms wait,      ~16.2M polls/s
+  2 NAPIs, waker, before: busy 10 ms per 10 ms wait,      ~7.2M polls/s
+  2 NAPIs, waker, after:  busy 10 ms per 10 ms wait,      ~7.1M polls/s
+
+The held-NAPI fast path polls about twice as often as the single-shot
+path used for several NAPIs, which is why it is kept.
+
+Fixes: 8d0c12a80cde ("io-uring: add napi busy poll support")
+Cc: stable@vger.kernel.org
+Signed-off-by: Cinq Prairie <notprairie@gmail.com>
+Link: https://patch.msgid.link/20261027204840.7823-1-notprairie@gmail.com
+[axboe: trim comments, drop __always_unused]
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ io_uring/io_uring.h |  1 +
+ io_uring/napi.c     | 31 ++++++++++++++-----------------
+ 2 files changed, 15 insertions(+), 17 deletions(-)
+
+diff --git a/io_uring/io_uring.h b/io_uring/io_uring.h
+index 922bdf68aec8c..4f1d20d28f727 100644
+--- a/io_uring/io_uring.h
++++ b/io_uring/io_uring.h
+@@ -113,6 +113,7 @@ struct io_wait_queue {
+ 
+ #ifdef CONFIG_NET_RX_BUSY_POLL
+ 	ktime_t napi_busy_poll_dt;
++	ktime_t napi_busy_poll_end;
+ 	bool napi_prefer_busy_poll;
+ #endif
+ };
+diff --git a/io_uring/napi.c b/io_uring/napi.c
+index 45180b172bec7..46f5854f05efa 100644
+--- a/io_uring/napi.c
++++ b/io_uring/napi.c
+@@ -128,19 +128,15 @@ static inline void io_napi_remove_stale(struct io_ring_ctx *ctx, bool is_stale)
+ 		__io_napi_remove_stale(ctx);
+ }
+ 
+-static inline bool io_napi_busy_loop_timeout(ktime_t start_time,
+-					     ktime_t bp)
++static inline bool io_napi_busy_loop_timeout(struct io_wait_queue *iowq)
+ {
+-	if (bp) {
+-		ktime_t end_time = ktime_add(start_time, bp);
+-		ktime_t now = net_to_ktime(busy_loop_current_time());
+-
+-		return ktime_after(now, end_time);
+-	}
+-
+-	return true;
++	if (!iowq->napi_busy_poll_dt)
++		return true;
++	return ktime_after(net_to_ktime(busy_loop_current_time()),
++			   iowq->napi_busy_poll_end);
+ }
+ 
++/* Uses an absolute deadline, so the napi loop can be re-entered */
+ static bool io_napi_busy_loop_should_end(void *data,
+ 					 unsigned long start_time)
+ {
+@@ -150,8 +146,7 @@ static bool io_napi_busy_loop_should_end(void *data,
+ 		return true;
+ 	if (io_should_wake(iowq) || io_has_work(iowq->ctx))
+ 		return true;
+-	if (io_napi_busy_loop_timeout(net_to_ktime(start_time),
+-				      iowq->napi_busy_poll_dt))
++	if (io_napi_busy_loop_timeout(iowq))
+ 		return true;
+ 
+ 	return false;
+@@ -204,13 +199,16 @@ __io_napi_do_busy_loop(struct io_ring_ctx *ctx,
+ static void io_napi_blocking_busy_loop(struct io_ring_ctx *ctx,
+ 				       struct io_wait_queue *iowq)
+ {
+-	unsigned long start_time = busy_loop_current_time();
++	ktime_t now = net_to_ktime(busy_loop_current_time());
+ 	bool (*loop_end)(void *, unsigned long) = NULL;
+ 	void *loop_end_arg = NULL;
+ 	bool is_stale = false;
+ 
+-	/* Singular lists use a different napi loop end check function and are
+-	 * only executed once.
++	iowq->napi_busy_poll_end = ktime_add(now, iowq->napi_busy_poll_dt);
++
++	/*
++	 * A single NAPI is held by __napi_busy_loop() for the whole spin. It
++	 * may return early on need_resched(), loop until our own deadline.
+ 	 */
+ 	if (list_is_singular(&ctx->napi_list)) {
+ 		loop_end = io_napi_busy_loop_should_end;
+@@ -221,8 +219,7 @@ static void io_napi_blocking_busy_loop(struct io_ring_ctx *ctx,
+ 		do {
+ 			is_stale = __io_napi_do_busy_loop(ctx, loop_end,
+ 							  loop_end_arg);
+-		} while (!io_napi_busy_loop_should_end(iowq, start_time) &&
+-			 !loop_end_arg);
++		} while (!io_napi_busy_loop_should_end(iowq, 0));
+ 	}
+ 
+ 	io_napi_remove_stale(ctx, is_stale);
+-- 
+2.53.0
+

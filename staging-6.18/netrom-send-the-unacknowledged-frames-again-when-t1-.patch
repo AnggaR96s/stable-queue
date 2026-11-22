@@ -1,0 +1,95 @@
+From ee9fee64817ebad8c690d5246a2edeea8a9c513c Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 16 Nov 2026 12:56:00 +0100
+Subject: netrom: send the unacknowledged frames again when T1 or T4 expires
+
+From: Bernard Pidoux <bernard.f6bvp@gmail.com>
+
+When T1 expires in state 3, nr_t1timer_expiry() moves the frames of the
+ack queue back to the write queue with nr_requeue_frames(), but does not
+call nr_kick(). nr_kick() only runs when a frame comes in from the peer
+or when the application writes, so if the peer stays silent (one way
+transfer, last frame or its acknowledgment lost) nothing is sent
+again: after N2 expiries the circuit is cleared with ETIMEDOUT without
+a single retransmission. The comment above nr_requeue_frames() says the
+frames are "picked up by nr_kick called from the timer", but no timer
+calls it.
+
+T4 has the same gap: when the peer's busy condition times out, the
+frames held back while it was choked stay queued until something else
+calls nr_kick().
+
+Call nr_kick() after nr_requeue_frames() in the T1 expiry, and after
+clearing NR_COND_PEER_RX_BUSY in the T4 expiry. nr_kick() already does
+nothing outside state 3 or while the peer is busy, and sends from V(A)
+once the ack queue is empty, so the T1 retransmission resends the
+window from the first unacknowledged frame. The N2 count and the time
+at which the circuit is cleared are unchanged.
+
+Tested in two QEMU guests (6.12.94, KASAN and lockdep) linked over a
+serial mkiss port: the guest under test runs netrom with T1 = 5 s,
+N2 = 3 and T4 = 3 s; the other guest plays a NET/ROM node from user
+space with an AX.25 socket and acknowledges nothing.
+
+ - three frames written on a circuit: before, each was sent once and
+   the circuit was cleared 20.7 s later; after, the three are sent
+   again at 5.4, 10.5 and 15.6 s and the circuit is still cleared
+   20.7 s later;
+ - the peer acknowledges the first frame with CHOKE, then a second
+   frame is written: before, it was never sent; after, it goes out when
+   T4 expires (3.1 s after the CHOKE), then again on T1.
+
+No kernel report in either run.
+
+Fixes: 1da177e4c3f4 ("Linux-2.6.12-rc2")
+Signed-off-by: Bernard Pidoux <bernard.f6bvp@gmail.com>
+Assisted-by: Claude:claude-opus-5-5
+(cherry picked from commit d07ed33f39eca24db1f1b15e00ef7c4447408a0d)
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ net/netrom/nr_subr.c  | 6 +++---
+ net/netrom/nr_timer.c | 4 ++++
+ 2 files changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/net/netrom/nr_subr.c b/net/netrom/nr_subr.c
+index c3bbd5880850b..144d9c5ea5b17 100644
+--- a/net/netrom/nr_subr.c
++++ b/net/netrom/nr_subr.c
+@@ -61,9 +61,9 @@ void nr_frames_acked(struct sock *sk, unsigned short nr)
+ }
+ 
+ /*
+- * Requeue all the un-ack-ed frames on the output queue to be picked
+- * up by nr_kick called from the timer. This arrangement handles the
+- * possibility of an empty output queue.
++ * Requeue all the un-ack-ed frames on the output queue to be sent
++ * again by nr_kick(), which the T1 timer calls next. This arrangement
++ * handles the possibility of an empty output queue.
+  */
+ void nr_requeue_frames(struct sock *sk)
+ {
+diff --git a/net/netrom/nr_timer.c b/net/netrom/nr_timer.c
+index b3a62b1f3a09e..0be44b88f8948 100644
+--- a/net/netrom/nr_timer.c
++++ b/net/netrom/nr_timer.c
+@@ -171,6 +171,8 @@ static void nr_t4timer_expiry(struct timer_list *t)
+ 
+ 	bh_lock_sock(sk);
+ 	nr_sk(sk)->condition &= ~NR_COND_PEER_RX_BUSY;
++	/* the peer is assumed ready again: send what was held back */
++	nr_kick(sk);
+ 	bh_unlock_sock(sk);
+ 	sock_put(sk);
+ }
+@@ -238,6 +240,8 @@ static void nr_t1timer_expiry(struct timer_list *t)
+ 		} else {
+ 			nr->n2count++;
+ 			nr_requeue_frames(sk);
++			/* nothing else sends them if the peer stays silent */
++			nr_kick(sk);
+ 		}
+ 		break;
+ 	}
+-- 
+2.53.0
+
