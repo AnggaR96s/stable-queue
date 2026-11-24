@@ -1,0 +1,100 @@
+From e35e360bd66898a977c296ab71fe4bae17ddceb7 Mon Sep 17 00:00:00 2001
+From: Anfernee Cao <anferneemelokc5@gmail.com>
+Date: Tue, 20 Oct 2026 23:36:47 +0800
+Subject: mmc: sunxi: fix clock and runtime PM leaks on probe failure
+
+From: Anfernee Cao <anferneemelokc5@gmail.com>
+
+commit e35e360bd66898a977c296ab71fe4bae17ddceb7 upstream.
+
+sunxi_mmc_resource_request() enables the bus, card, output and sample
+clocks before returning. Several failure paths later in
+sunxi_mmc_probe() leave them running:
+
+ - If devm_request_threaded_irq() fails, the clocks enabled by
+   sunxi_mmc_enable() are never disabled.
+ - If dma_alloc_coherent(), mmc_of_parse() or sunxi_mmc_init_host()
+   fails, probe only frees the DMA buffer and the mmc_host.
+ - If mmc_add_host() fails, runtime PM has already been enabled, but
+   pm_runtime_disable() is never called.
+
+Besides leaking the clocks, this leaves the clock enable counts
+unbalanced, so a reprobe (for example after -EPROBE_DEFER) calls
+clk_prepare_enable() on the same clocks again.
+
+Disable the IRQ and the clocks in the probe error path, and disable
+runtime PM on the mmc_add_host() failure path. Also handle a failure of
+devm_request_threaded_irq() in sunxi_mmc_resource_request().
+
+Tested with QEMU's orangepi-pc machine: with forced sunxi_mmc_init_host()
+and mmc_add_host() failures the MMC clocks stay disabled in clk_summary,
+and a normal probe with an emulated SD card still works.
+
+This issue was found by manual code inspection.
+
+Fixes: 3cbcb16095f9 ("mmc: sunxi: Add driver for SD/MMC hosts found on Allwinner sunxi SoCs")
+Fixes: 9a8e1e8cc2c0 ("mmc: sunxi: Add runtime_pm support")
+Cc: stable@vger.kernel.org # v4.18+
+Signed-off-by: Anfernee Cao <anferneemelokc5@gmail.com>
+Signed-off-by: Ulf Hansson <ulfh@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/mmc/host/sunxi-mmc.c |   24 ++++++++++++++++++------
+ 1 file changed, 18 insertions(+), 6 deletions(-)
+
+--- a/drivers/mmc/host/sunxi-mmc.c
++++ b/drivers/mmc/host/sunxi-mmc.c
+@@ -1355,8 +1355,13 @@ static int sunxi_mmc_resource_request(st
+ 		goto error_disable_mmc;
+ 	}
+ 
+-	return devm_request_threaded_irq(&pdev->dev, host->irq, sunxi_mmc_irq,
+-			sunxi_mmc_handle_manual_stop, 0, "sunxi-mmc", host);
++	ret = devm_request_threaded_irq(&pdev->dev, host->irq, sunxi_mmc_irq,
++					sunxi_mmc_handle_manual_stop, 0,
++					"sunxi-mmc", host);
++	if (ret)
++		goto error_disable_mmc;
++
++	return 0;
+ 
+ error_disable_mmc:
+ 	sunxi_mmc_disable(host);
+@@ -1386,9 +1391,11 @@ static int sunxi_mmc_probe(struct platfo
+ 
+ 	host->sg_cpu = dma_alloc_coherent(&pdev->dev, PAGE_SIZE,
+ 					  &host->sg_dma, GFP_KERNEL);
+-	if (!host->sg_cpu)
+-		return dev_err_probe(&pdev->dev, -ENOMEM,
+-				     "Failed to allocate DMA descriptor mem\n");
++	if (!host->sg_cpu) {
++		ret = dev_err_probe(&pdev->dev, -ENOMEM,
++				    "Failed to allocate DMA descriptor mem\n");
++		goto error_disable_mmc;
++	}
+ 
+ 	if (host->cfg->ccu_has_timings_switch) {
+ 		/*
+@@ -1468,7 +1475,7 @@ static int sunxi_mmc_probe(struct platfo
+ 
+ 	ret = mmc_add_host(mmc);
+ 	if (ret)
+-		goto error_free_dma;
++		goto error_disable_rpm;
+ 
+ 	dev_info(&pdev->dev, "initialized, max. request size: %u KB%s\n",
+ 		 mmc->max_req_size >> 10,
+@@ -1476,8 +1483,13 @@ static int sunxi_mmc_probe(struct platfo
+ 
+ 	return 0;
+ 
++error_disable_rpm:
++	pm_runtime_disable(&pdev->dev);
+ error_free_dma:
+ 	dma_free_coherent(&pdev->dev, PAGE_SIZE, host->sg_cpu, host->sg_dma);
++error_disable_mmc:
++	disable_irq(host->irq);
++	sunxi_mmc_disable(host);
+ 	return ret;
+ }
+ 

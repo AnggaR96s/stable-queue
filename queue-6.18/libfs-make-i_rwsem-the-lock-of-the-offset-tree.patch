@@ -1,0 +1,178 @@
+From e7d73cef9726bea49de97ae1fd76405df4050a75 Mon Sep 17 00:00:00 2001
+From: Christian Brauner <brauner@kernel.org>
+Date: Sun, 1 Nov 2026 11:57:20 +0100
+Subject: libfs: make i_rwsem the lock of the offset tree
+
+From: Christian Brauner <brauner@kernel.org>
+
+commit e7d73cef9726bea49de97ae1fd76405df4050a75 upstream.
+
+The offset tree of a directory is only changed with the directory's
+i_rwsem held exclusive and offset_readdir() walks it with i_rwsem held
+shared. But the maple tree doesn't know that. It is set up with its
+internal spinlock, which every mtree_*() helper takes, and readdir takes
+rcu_read_lock() around each lookup.
+
+The next patch makes readdir keep one ma_state across dir_emit(), which
+can sleep. That is safe because no writer can run while readdir holds
+i_rwsem. But the maple tree only allows keeping a ma_state across a
+sleep if it is protected by the tree's lock. A reader that relies on
+rcu_read_lock() has to mas_pause() before it drops it, and that means a
+walk from the root for every entry again.
+
+So tell the tree what protects it. Initialize it with
+MT_FLAGS_LOCK_EXTERN and the directory's i_rwsem as its lock and switch
+the writers from the mtree_*() helpers to the mas_*() api. They all run
+with i_rwsem held exclusive already. With lockdep enabled the maple tree
+now also checks that every writer holds i_rwsem exclusive.
+
+Nothing can reach the offset tree anymore when the directory inode is
+destroyed. So clear the external lock with mt_on_stack() and destroy the
+tree with __mt_destroy() instead of taking i_rwsem in ->destroy_inode().
+
+Cc: stable@vger.kernel.org # v6.14+
+Link: https://patch.msgid.link/20261101-work-libfs-offset_readdir-v2-1-c621125b56d1@kernel.org
+Reviewed-by: Chuck Lever <cel@kernel.org>
+Signed-off-by: Christian Brauner (Amutable) <brauner@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/libfs.c         |   46 +++++++++++++++++++++++++++++-----------------
+ include/linux/fs.h |    2 +-
+ mm/shmem.c         |    2 +-
+ 3 files changed, 31 insertions(+), 19 deletions(-)
+
+--- a/fs/libfs.c
++++ b/fs/libfs.c
+@@ -264,17 +264,18 @@ static long dentry2offset(struct dentry
+ 	return (long)dentry->d_fsdata;
+ }
+ 
+-static struct lock_class_key simple_offset_lock_class;
+-
+ /**
+  * simple_offset_init - initialize an offset_ctx
+  * @octx: directory offset map to be initialized
++ * @dir: the directory @octx belongs to
+  *
++ * The directory's i_rwsem is the lock of the offset map. Writers hold it
++ * exclusive, offset_readdir() holds it shared.
+  */
+-void simple_offset_init(struct offset_ctx *octx)
++void simple_offset_init(struct offset_ctx *octx, struct inode *dir)
+ {
+-	mt_init_flags(&octx->mt, MT_FLAGS_ALLOC_RANGE);
+-	lockdep_set_class(&octx->mt.ma_lock, &simple_offset_lock_class);
++	mt_init_flags(&octx->mt, MT_FLAGS_ALLOC_RANGE | MT_FLAGS_LOCK_EXTERN);
++	mt_set_external_lock(&octx->mt, &dir->i_rwsem);
+ 	octx->next_offset = DIR_OFFSET_MIN;
+ }
+ 
+@@ -297,12 +298,13 @@ int simple_offset_add(struct offset_ctx
+ 	unsigned long offset;
+ 	int ret;
+ 
++	MA_STATE(mas, &octx->mt, 0, 0);
++
+ 	if (dentry2offset(dentry) != 0)
+ 		return -EBUSY;
+ 
+-	ret = mtree_alloc_cyclic(&octx->mt, &offset, dentry, DIR_OFFSET_MIN,
+-				 DIR_OFFSET_MAX, &octx->next_offset,
+-				 GFP_KERNEL);
++	ret = mas_alloc_cyclic(&mas, &offset, dentry, DIR_OFFSET_MIN,
++			       DIR_OFFSET_MAX, &octx->next_offset, GFP_KERNEL);
+ 	if (unlikely(ret < 0))
+ 		return ret == -EBUSY ? -ENOSPC : ret;
+ 
+@@ -315,7 +317,9 @@ static int simple_offset_replace(struct
+ {
+ 	int ret;
+ 
+-	ret = mtree_store(&octx->mt, offset, dentry, GFP_KERNEL);
++	MA_STATE(mas, &octx->mt, offset, offset);
++
++	ret = mas_store_gfp(&mas, dentry, GFP_KERNEL);
+ 	if (ret)
+ 		return ret;
+ 	offset_set(dentry, offset);
+@@ -330,13 +334,14 @@ static int simple_offset_replace(struct
+  */
+ void simple_offset_remove(struct offset_ctx *octx, struct dentry *dentry)
+ {
+-	long offset;
++	long offset = dentry2offset(dentry);
++
++	MA_STATE(mas, &octx->mt, offset, offset);
+ 
+-	offset = dentry2offset(dentry);
+ 	if (offset == 0)
+ 		return;
+ 
+-	mtree_erase(&octx->mt, offset);
++	mas_erase(&mas);
+ 	offset_set(dentry, 0);
+ }
+ 
+@@ -394,16 +399,20 @@ int simple_offset_rename_exchange(struct
+ 	long new_index = dentry2offset(new_dentry);
+ 	int ret;
+ 
++	MA_STATE(old_mas, &old_ctx->mt, old_index, old_index);
++	MA_STATE(new_mas, &new_ctx->mt, new_index, new_index);
++
+ 	if (WARN_ON(!old_index || !new_index))
+ 		return -EINVAL;
+ 
+-	ret = mtree_store(&new_ctx->mt, new_index, old_dentry, GFP_KERNEL);
++	ret = mas_store_gfp(&new_mas, old_dentry, GFP_KERNEL);
+ 	if (WARN_ON(ret))
+ 		return ret;
+ 
+-	ret = mtree_store(&old_ctx->mt, old_index, new_dentry, GFP_KERNEL);
++	ret = mas_store_gfp(&old_mas, new_dentry, GFP_KERNEL);
+ 	if (WARN_ON(ret)) {
+-		mtree_store(&new_ctx->mt, new_index, new_dentry, GFP_KERNEL);
++		mas_set(&new_mas, new_index);
++		mas_store_gfp(&new_mas, new_dentry, GFP_KERNEL);
+ 		return ret;
+ 	}
+ 
+@@ -418,11 +427,14 @@ int simple_offset_rename_exchange(struct
+  * @octx: directory offset ctx that is about to be destroyed
+  *
+  * During fs teardown (eg. umount), a directory's offset map might still
+- * contain entries. xa_destroy() cleans out anything that remains.
++ * contain entries. __mt_destroy() cleans out anything that remains.
++ * Nothing can reach the map of a directory that is being destroyed, so
++ * this runs without the directory's i_rwsem.
+  */
+ void simple_offset_destroy(struct offset_ctx *octx)
+ {
+-	mtree_destroy(&octx->mt);
++	mt_on_stack(octx->mt);
++	__mt_destroy(&octx->mt);
+ }
+ 
+ /**
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -3781,7 +3781,7 @@ struct offset_ctx {
+ 	unsigned long		next_offset;
+ };
+ 
+-void simple_offset_init(struct offset_ctx *octx);
++void simple_offset_init(struct offset_ctx *octx, struct inode *dir);
+ int simple_offset_add(struct offset_ctx *octx, struct dentry *dentry);
+ void simple_offset_remove(struct offset_ctx *octx, struct dentry *dentry);
+ void simple_offset_rename(struct inode *old_dir, struct dentry *old_dentry,
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@ -3183,7 +3183,7 @@ static struct inode *__shmem_get_inode(s
+ 		inode->i_size = 2 * BOGO_DIRENT_SIZE;
+ 		inode->i_op = &shmem_dir_inode_operations;
+ 		inode->i_fop = &simple_offset_dir_operations;
+-		simple_offset_init(shmem_get_offset_ctx(inode));
++		simple_offset_init(shmem_get_offset_ctx(inode), inode);
+ 		break;
+ 	case S_IFLNK:
+ 		/*

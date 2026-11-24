@@ -1,0 +1,73 @@
+From d27d0039bc1334be8a72c769e14c0b0c3efc317d Mon Sep 17 00:00:00 2001
+From: Mani Tofigh <mt4022@columbia.edu>
+Date: Tue, 3 Nov 2026 15:03:21 -0500
+Subject: btrfs: fix bio counter and bioc leak when async checksumming fails
+
+From: Mani Tofigh <mt4022@columbia.edu>
+
+commit d27d0039bc1334be8a72c769e14c0b0c3efc317d upstream.
+
+A single failed checksum allocation can make a later device replace
+hang forever.  btrfs_submit_chunk() takes a dev-replace bio counter
+reference and a bioc before it hands a write to the checksum worker.
+If the checksum fails there (e.g., its allocation fails),
+run_one_async_done() ends the bio but drops neither.  The counter then
+never gets back to zero and the next replace waits for it:
+
+  [ 8.369] BTRFS info (device ram0): dev_replace from /dev/ram0 (devid 1) to /dev/ram1 finished
+  [41.534] INFO: task btrfscsum:80 blocked for more than 20 seconds.
+  [41.534]  btrfs_rm_dev_replace_blocked+0x135/0x180
+  [41.534]  btrfs_dev_replace_finishing+0xefe/0x13b0
+
+The worker is only used when CONFIG_BTRFS_EXPERIMENTAL is off and the
+checksum isn't a fast one, e.g., sha256.  We hit it on a sha256
+filesystem.
+
+We put the bioc and drop the counter in that error branch.  We also
+put the bioc on the synchronous error path and on the btrfs_split_bio()
+error path, which both only drop the counter.  With the fix, the
+replace doesn't hang anymore.
+
+This bug was identified and confirmed with the help of fault-injection
+testing on a deterministic hypervisor currently under development.  Our
+C reproducer however hits it within about 35s.
+
+Fixes: f8a53bb58ec7 ("btrfs: handle checksum generation in the storage layer")
+Fixes: c7c97ceff98c ("btrfs: handle bio_split() errors")
+CC: stable@vger.kernel.org # 6.6+
+Reviewed-by: Qu Wenruo <wqu@suse.com>
+Signed-off-by: Mani Tofigh <mt4022@columbia.edu>
+Reviewed-by: David Sterba <dsterba@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/btrfs/bio.c |    4 ++++
+ 1 file changed, 4 insertions(+)
+
+--- a/fs/btrfs/bio.c
++++ b/fs/btrfs/bio.c
+@@ -624,6 +624,8 @@ static void run_one_async_done(struct bt
+ 
+ 	/* If an error occurred we just want to clean up the bio and move on. */
+ 	if (bio->bi_status) {
++		btrfs_put_bioc(async->bioc);
++		btrfs_bio_counter_dec(async->bbio->inode->root->fs_info);
+ 		btrfs_bio_end_io(async->bbio, bio->bi_status);
+ 		return;
+ 	}
+@@ -759,6 +761,7 @@ static bool btrfs_submit_chunk(struct bt
+ 		split = btrfs_split_bio(fs_info, bbio, map_length);
+ 		if (IS_ERR(split)) {
+ 			status = errno_to_blk_status(PTR_ERR(split));
++			btrfs_put_bioc(bioc);
+ 			btrfs_bio_counter_dec(fs_info);
+ 			goto end_bbio;
+ 		}
+@@ -820,6 +823,7 @@ done:
+ 	return map_length == length;
+ 
+ fail:
++	btrfs_put_bioc(bioc);
+ 	btrfs_bio_counter_dec(fs_info);
+ 	/*
+ 	 * We have split the original bbio, now we have to end both the current

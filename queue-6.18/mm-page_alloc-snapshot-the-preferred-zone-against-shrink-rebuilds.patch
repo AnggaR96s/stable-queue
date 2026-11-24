@@ -1,0 +1,153 @@
+From b3e3a760eb68449e2794ef68ab212173d9c3e8c7 Mon Sep 17 00:00:00 2001
+From: "Gregory Price (Meta)" <gourry@gourry.net>
+Date: Sat, 31 Oct 2026 22:13:34 -0400
+Subject: mm/page_alloc: snapshot the preferred zone against shrink rebuilds
+
+From: Gregory Price (Meta) <gourry@gourry.net>
+
+commit b3e3a760eb68449e2794ef68ab212173d9c3e8c7 upstream.
+
+get_page_from_freelist() and alloc_pages_bulk_noprof() reread
+ac->preferred_zoneref->zone at every use. Offlining a zone's last block
+rebuilds the zonelists in place, and the shrunk list's NULL terminator
+can land on the preferred slot mid-walk:
+
+  CPU 0                             CPU 1
+  get_page_from_freelist(GFP_KERNEL | __GFP_THISNODE)
+    zone = NORMAL (slot 1)
+                                    offline_pages()
+                                      build_all_zonelists()
+                                        [MOVABLE, NORMAL, NULL]
+                                        -> [NORMAL, NULL]
+    rmqueue(zonelist_zone(slot 1), zone)
+      zone_statistics(NULL, zone)
+
+  BUG: kernel NULL pointer dereference, address: 0000000000000060
+  RIP: 0010:get_page_from_freelist+0x6a5/0x15f0
+  Call Trace:
+   __alloc_frozen_pages_noprof+0x125/0x330
+
+Read the slot once. Zones are never freed, so a stale zone is safe, and
+a NULL slot fails the same way as walking off the end.
+
+Fixes: 11cd8638c37f ("mm, page_alloc: remove stop_machine from build_all_zonelists")
+Cc: stable@vger.kernel.org
+Signed-off-by: Gregory Price (Meta) <gourry@gourry.net>
+Reviewed-by: Vlastimil Babka (SUSE) <vbabka@kernel.org>
+Link: https://patch.msgid.link/20261101021340.2251928-7-gourry@gourry.net
+Acked-by: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Vlastimil Babka (SUSE) <vbabka@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ mm/page_alloc.c |   31 +++++++++++++++++++++++--------
+ 1 file changed, 23 insertions(+), 8 deletions(-)
+
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -3793,12 +3793,21 @@ get_page_from_freelist(gfp_t gfp_mask, u
+ {
+ 	struct zoneref *z;
+ 	struct zone *zone;
++	struct zone *preferred_zone;
+ 	struct pglist_data *last_pgdat = NULL;
+ 	bool last_pgdat_dirty_ok = false;
+ 	bool no_fallback;
+ 	bool skip_kswapd_nodes = nr_online_nodes > 1;
+ 	bool skipped_kswapd_nodes = false;
+ 
++	/*
++	 * A concurrent zonelist rebuild can NULL or replace this slot. Zones
++	 * are never freed, so reading it once keeps a usable zone.
++	 */
++	preferred_zone = zonelist_zone(ac->preferred_zoneref);
++	if (!preferred_zone)
++		return NULL;
++
+ retry:
+ 	/*
+ 	 * Scan zonelist, looking for a zone with enough free.
+@@ -3845,7 +3854,7 @@ retry:
+ 		}
+ 
+ 		if (no_fallback && !defrag_mode && nr_online_nodes > 1 &&
+-		    zone != zonelist_zone(ac->preferred_zoneref)) {
++		    zone != preferred_zone) {
+ 			int local_nid;
+ 
+ 			/*
+@@ -3853,7 +3862,7 @@ retry:
+ 			 * fragmenting fallbacks. Locality is more important
+ 			 * than fragmentation avoidance.
+ 			 */
+-			local_nid = zonelist_node_idx(ac->preferred_zoneref);
++			local_nid = zone_to_nid(preferred_zone);
+ 			if (zone_to_nid(zone) != local_nid) {
+ 				alloc_flags &= ~ALLOC_NOFRAGMENT;
+ 				goto retry;
+@@ -3917,7 +3926,7 @@ check_alloc_wmark:
+ 				goto try_this_zone;
+ 
+ 			if (!node_reclaim_enabled() ||
+-			    !zone_allows_reclaim(zonelist_zone(ac->preferred_zoneref), zone))
++			    !zone_allows_reclaim(preferred_zone, zone))
+ 				continue;
+ 
+ 			ret = node_reclaim(zone->zone_pgdat, gfp_mask, order);
+@@ -3939,7 +3948,7 @@ check_alloc_wmark:
+ 		}
+ 
+ try_this_zone:
+-		page = rmqueue(zonelist_zone(ac->preferred_zoneref), zone, order,
++		page = rmqueue(preferred_zone, zone, order,
+ 				gfp_mask, alloc_flags, ac->migratetype);
+ 		if (page) {
+ 			prep_new_page(page, order, gfp_mask, alloc_flags);
+@@ -5156,6 +5165,7 @@ unsigned long alloc_pages_bulk_noprof(gf
+ 	struct page *page;
+ 	unsigned long __maybe_unused UP_flags;
+ 	struct zone *zone;
++	struct zone *preferred_zone;
+ 	struct zoneref *z;
+ 	struct per_cpu_pages *pcp;
+ 	struct list_head *pcp_list;
+@@ -5206,6 +5216,11 @@ unsigned long alloc_pages_bulk_noprof(gf
+ 		goto out;
+ 	gfp = alloc_gfp;
+ 
++	/* Read once; see get_page_from_freelist(). */
++	preferred_zone = zonelist_zone(ac.preferred_zoneref);
++	if (!preferred_zone)
++		goto failed;
++
+ 	/* Find an allowed local zone that meets the low watermark. */
+ 	z = ac.preferred_zoneref;
+ 	for_next_zone_zonelist_nodemask(zone, z, ac.highest_zoneidx, ac.nodemask) {
+@@ -5216,8 +5231,8 @@ unsigned long alloc_pages_bulk_noprof(gf
+ 			continue;
+ 		}
+ 
+-		if (nr_online_nodes > 1 && zone != zonelist_zone(ac.preferred_zoneref) &&
+-		    zone_to_nid(zone) != zonelist_node_idx(ac.preferred_zoneref)) {
++		if (nr_online_nodes > 1 && zone != preferred_zone &&
++		    zone_to_nid(zone) != zone_to_nid(preferred_zone)) {
+ 			goto failed;
+ 		}
+ 
+@@ -5225,7 +5240,7 @@ unsigned long alloc_pages_bulk_noprof(gf
+ retry_this_zone:
+ 		mark = wmark_pages(zone, alloc_flags & ALLOC_WMARK_MASK) + nr_pages;
+ 		if (zone_watermark_fast(zone, 0,  mark,
+-				zonelist_zone_idx(ac.preferred_zoneref),
++				zone_idx(preferred_zone),
+ 				alloc_flags, gfp)) {
+ 			break;
+ 		}
+@@ -5284,7 +5299,7 @@ retry_this_zone:
+ 	pcp_trylock_finish(UP_flags);
+ 
+ 	__count_zid_vm_events(PGALLOC, zone_idx(zone), nr_account);
+-	zone_statistics(zonelist_zone(ac.preferred_zoneref), zone, nr_account);
++	zone_statistics(preferred_zone, zone, nr_account);
+ 
+ out:
+ 	return nr_populated;
