@@ -1,0 +1,112 @@
+From 70beb8160cb9f62acc4c41df1df985a5c67e1356 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 10 Sep 2026 14:19:39 +0200
+Subject: btrfs: zoned: requeue block group if zone reset bails out
+
+From: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+[ Upstream commit c5f878eefdd4f559422a68bf49b6f59e7c10e70e ]
+
+btrfs_reset_unused_block_groups() drops the block-group from
+fs_info->unused_bgs before performing the work that can actually fail,
+the actual submission of a REQ_OP_ZONE_RESET.
+
+Every failed operation after this leaves the block-group dangling,
+physically reset, but the in-memory structures aren't and it is not
+requeued to be reset on fs_info->unused_bgs.
+
+Instead of bailing out, re-add this block-group to fs_info->unused_bgs
+list.
+
+Fixes: 453a73c3069a ("btrfs: zoned: reclaim unused zone by zone resetting")
+Reviewed-by: Daniel Vacek <neelx@suse.com>
+Signed-off-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/btrfs/zoned.c | 28 ++++++++++++++++++++++------
+ 1 file changed, 22 insertions(+), 6 deletions(-)
+
+diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+index fe35bd531f70f..f25cd3ddbd630 100644
+--- a/fs/btrfs/zoned.c
++++ b/fs/btrfs/zoned.c
+@@ -3107,6 +3107,8 @@ int btrfs_reset_unused_block_groups(struct btrfs_space_info *space_info, u64 num
+ {
+ 	struct btrfs_fs_info *fs_info = space_info->fs_info;
+ 	const sector_t zone_size_sectors = fs_info->zone_size >> SECTOR_SHIFT;
++	LIST_HEAD(retry_list);
++	int ret = 0;
+ 
+ 	if (!btrfs_is_zoned(fs_info))
+ 		return 0;
+@@ -3148,11 +3150,10 @@ int btrfs_reset_unused_block_groups(struct btrfs_space_info *space_info, u64 num
+ 		}
+ 		if (!found) {
+ 			spin_unlock(&fs_info->unused_bgs_lock);
+-			return 0;
++			goto out;
+ 		}
+ 
+ 		list_del_init(&bg->bg_list);
+-		btrfs_put_block_group(bg);
+ 		spin_unlock(&fs_info->unused_bgs_lock);
+ 
+ 		/*
+@@ -3166,7 +3167,6 @@ int btrfs_reset_unused_block_groups(struct btrfs_space_info *space_info, u64 num
+ 		for (int i = 0; i < map->num_stripes; i++) {
+ 			struct btrfs_io_stripe *stripe = &map->stripes[i];
+ 			unsigned int nofs_flags;
+-			int ret;
+ 
+ 			nofs_flags = memalloc_nofs_save();
+ 			ret = blkdev_zone_mgmt(stripe->dev->bdev, REQ_OP_ZONE_RESET,
+@@ -3176,7 +3176,7 @@ int btrfs_reset_unused_block_groups(struct btrfs_space_info *space_info, u64 num
+ 
+ 			if (ret) {
+ 				up_read(&fs_info->dev_replace.rwsem);
+-				return ret;
++				goto requeue;
+ 			}
+ 		}
+ 		up_read(&fs_info->dev_replace.rwsem);
+@@ -3187,7 +3187,7 @@ int btrfs_reset_unused_block_groups(struct btrfs_space_info *space_info, u64 num
+ 		if (bg->ro) {
+ 			spin_unlock(&bg->lock);
+ 			spin_unlock(&space_info->lock);
+-			continue;
++			goto requeue;
+ 		}
+ 
+ 		reclaimed = bg->alloc_offset;
+@@ -3215,10 +3215,26 @@ int btrfs_reset_unused_block_groups(struct btrfs_space_info *space_info, u64 num
+ 		btrfs_return_free_space(space_info, reclaimed);
+ 		spin_unlock(&space_info->lock);
+ 
++		btrfs_put_block_group(bg);
++
+ 		if (num_bytes <= reclaimed)
+ 			break;
+ 		num_bytes -= reclaimed;
++		continue;
++
++requeue:
++		list_add_tail(&bg->bg_list, &retry_list);
++
++		if (ret)
++			goto out;
+ 	}
+ 
+-	return 0;
++out:
++	if (!list_empty(&retry_list)) {
++		spin_lock(&fs_info->unused_bgs_lock);
++		list_splice_tail(&retry_list, &fs_info->unused_bgs);
++		spin_unlock(&fs_info->unused_bgs_lock);
++	}
++
++	return ret;
+ }
+-- 
+2.53.0
+

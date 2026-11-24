@@ -1,0 +1,77 @@
+From 05b911d4231b45a559aca0b96daef041e1c63b82 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 3 Nov 2026 09:09:36 -0800
+Subject: net: Segment CHECKSUM_UNNECESSARY GSO skbs other than fraglist
+
+From: Alexander Duyck <alexanderduyck@fb.com>
+
+[ Upstream commit fdca4b030c78fa2773a94fda3a6dc3ce5558a727 ]
+
+The netif_needs_gso function lets a GSO skb reach the device unsegmented
+when it is CHECKSUM_PARTIAL or CHECKSUM_UNNECESSARY. The second case was
+added for FCoE, whose transmit path marked CRC offload that way at the
+time. Commit 253aab0597d9 ("fcoe: Use CHECKSUM_PARTIAL to indicate CRC
+offload") moved FCoE back to CHECKSUM_PARTIAL but left the exemption in
+place, with nothing left that needed it. Fraglist GSO, added later, is
+its only user today, as its segments already carry valid checksums.
+
+A TCP GSO skb can still arrive as CHECKSUM_UNNECESSARY without being
+fraglist. Hardware LRO builds its aggregates that way, for example mlx5
+sets SKB_GSO_TCPV4 or SKB_GSO_TCPV6 and CHECKSUM_UNNECESSARY, without
+SKB_GSO_DODGY. IP forwarding and bridging turn LRO off, but a tc mirred
+redirect does not, so such an skb can be sent out another device. It
+has no csum_start and its TCP checksum field is whatever the aggregate
+left there. Drivers that only set up TSO for CHECKSUM_PARTIAL, such as
+fbnic, i40e and ice, then send the whole skb as one oversized frame
+with a bad checksum.
+
+Have the validate_xmit_skb function mark any CHECKSUM_UNNECESSARY GSO
+skb other than fraglist as CHECKSUM_NONE, which means the same on
+transmit but is not exempt in the netif_needs_gso function. The
+__skb_gso_segment function then unshares the header and the TCP GSO
+code sets the skb up as CHECKSUM_PARTIAL, so a device with TSO segments
+it in hardware. Without TSO, and for UDP, it is segmented in software.
+The callers of the netif_needs_gso function that decide on segmentation
+for themselves, such as tap, are left as they are.
+
+Found by code inspection. In QEMU with an emulated fbnic, TCPv4 and
+TCPv6 GSO skbs built this way each went out as a single 11 KB frame
+with a bad TCP checksum. With this change they are segmented into
+MSS-sized frames with valid checksums.
+
+Fixes: 253aab0597d9 ("fcoe: Use CHECKSUM_PARTIAL to indicate CRC offload")
+Signed-off-by: Alexander Duyck <alexanderduyck@fb.com>
+Reviewed-by: Willem de Bruijn <willemb@google.com>
+Link: https://patch.msgid.link/179372577673.49909.11253315483074546903.stgit@ahduyck-xeon-server.home.arpa
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ net/core/dev.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/net/core/dev.c b/net/core/dev.c
+index e4216b78a1a49..91da33c29aa18 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -4045,6 +4045,18 @@ static struct sk_buff *validate_xmit_skb(struct sk_buff *skb, struct net_device
+ 	if (unlikely(!skb))
+ 		goto out_null;
+ 
++	/* Only fraglist GSO, whose segments already carry valid checksums,
++	 * can be handed to a device as CHECKSUM_UNNECESSARY. Any other GSO
++	 * skb has no csum_start for the device to segment from. NONE means
++	 * the same on transmit, but makes netif_needs_gso() send it to the
++	 * GSO code, which turns TCP into CHECKSUM_PARTIAL for TSO and
++	 * segments anything the device cannot offload in software.
++	 */
++	if (unlikely(skb->ip_summed == CHECKSUM_UNNECESSARY &&
++		     skb_is_gso(skb) &&
++		     !(skb_shinfo(skb)->gso_type & SKB_GSO_FRAGLIST)))
++		skb->ip_summed = CHECKSUM_NONE;
++
+ 	features = netif_skb_features(skb);
+ 	skb = validate_xmit_vlan(skb, features);
+ 	if (unlikely(!skb))
+-- 
+2.53.0
+

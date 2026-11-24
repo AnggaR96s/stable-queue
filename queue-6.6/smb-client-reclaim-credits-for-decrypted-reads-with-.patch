@@ -1,0 +1,99 @@
+From 5da231784875cb4b0535677f64dcab908e6ade8e Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 15 Oct 2026 15:53:32 -0300
+Subject: smb: client: reclaim credits for decrypted reads with no matching mid
+
+From: Paulo Alcantara <pc@manguebit.org>
+
+[ Upstream commit 78f73985846465a25a7bd1d89904053661f3ca92 ]
+
+When a decrypted SMB2 READ response carries a MessageId that matches no
+outstanding request, both the inline receive_encrypted_read() and the
+offloaded smb2_decrypt_offload() paths drop the frame without accounting
+the credits the server granted in it.  The plaintext unknown-frame path in
+cifs_demultiplex_thread() already reclaims them with
+smb2_add_credits_from_hdr(), so encrypted reads leak credits that the
+plaintext path would not.
+
+This also happens for legitimate frames - e.g. a reply that arrives after
+the client has timed out and dropped the mid - so over a long-lived
+connection the client's credit count drifts down and can eventually starve
+it of the ability to issue requests.  The frame is AEAD-authenticated, so
+the granted credits in the decrypted header come from the real server and
+are safe to apply.
+
+Reclaim the credits from the decrypted header before dropping the frame,
+and export smb2_add_credits_from_hdr() so the SMB2 receive paths can use it.
+
+Fixes: c42a6abe3012 ("CIFS: Add capability to decrypt big read responses")
+Fixes: 35cf94a39728 ("smb3: allow parallelizing decryption of reads")
+Signed-off-by: Paulo Alcantara <pc@manguebit.org>
+Reviewed-by: David Howells <dhowells@redhat.com>
+Cc: Namjae Jeon <linkinjeon@kernel.org>
+Cc: Ronnie Sahlberg <ronniesahlberg@gmail.com>
+Cc: Shyam Prasad N <sprasad@microsoft.com>
+Cc: Tom Talpey <tom@talpey.com>
+Cc: Bharath SM <bharathsm@microsoft.com>
+Cc: stable@vger.kernel.org
+[ sashal: Adjusted the cifsproto.h context: the prototype for smb2_add_credits_from_hdr() is added in the older extern-style header, without extern as upstream has it. ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/smb/client/cifsproto.h | 1 +
+ fs/smb/client/connect.c   | 3 +--
+ fs/smb/client/smb2ops.c   | 6 ++++--
+ 3 files changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/fs/smb/client/cifsproto.h b/fs/smb/client/cifsproto.h
+index 1f37bc2923fb8..f7b282b9e4be4 100644
+--- a/fs/smb/client/cifsproto.h
++++ b/fs/smb/client/cifsproto.h
+@@ -145,6 +145,7 @@ cifs_mark_tcp_ses_conns_for_reconnect(struct TCP_Server_Info *server,
+ 				      bool mark_smb_session);
+ extern int cifs_reconnect(struct TCP_Server_Info *server,
+ 			  bool mark_smb_session);
++void smb2_add_credits_from_hdr(char *buffer, struct TCP_Server_Info *server);
+ extern int checkSMB(char *buf, unsigned int len, struct TCP_Server_Info *srvr);
+ extern bool is_valid_oplock_break(char *, struct TCP_Server_Info *);
+ extern bool backup_cred(struct cifs_sb_info *);
+diff --git a/fs/smb/client/connect.c b/fs/smb/client/connect.c
+index dd76198a4a45d..3d922f5c1c0b6 100644
+--- a/fs/smb/client/connect.c
++++ b/fs/smb/client/connect.c
+@@ -1170,8 +1170,7 @@ cifs_handle_standard(struct TCP_Server_Info *server, struct mid_q_entry *mid)
+ 	return 0;
+ }
+ 
+-static void
+-smb2_add_credits_from_hdr(char *buffer, struct TCP_Server_Info *server)
++void smb2_add_credits_from_hdr(char *buffer, struct TCP_Server_Info *server)
+ {
+ 	struct smb2_hdr *shdr = (struct smb2_hdr *)buffer;
+ 	int scredits, in_flight;
+diff --git a/fs/smb/client/smb2ops.c b/fs/smb/client/smb2ops.c
+index 84acf669f88a2..186c7035f2349 100644
+--- a/fs/smb/client/smb2ops.c
++++ b/fs/smb/client/smb2ops.c
+@@ -4914,9 +4914,10 @@ static void smb2_decrypt_offload(struct work_struct *work)
+ 
+ 	dw->server->lstrp = jiffies;
+ 	mid = smb2_find_dequeue_mid(dw->server, dw->buf);
+-	if (mid == NULL)
++	if (mid == NULL) {
+ 		cifs_dbg(FYI, "mid not found\n");
+-	else {
++		smb2_add_credits_from_hdr(dw->buf, dw->server);
++	} else {
+ 		mid->decrypted = true;
+ 		rc = handle_read_data(dw->server, mid, dw->buf,
+ 				      dw->server->vals->read_rsp_size,
+@@ -5051,6 +5052,7 @@ receive_encrypted_read(struct TCP_Server_Info *server, struct mid_q_entry **mid,
+ 	*mid = smb2_find_mid(server, buf);
+ 	if (*mid == NULL) {
+ 		cifs_dbg(FYI, "mid not found\n");
++		smb2_add_credits_from_hdr(buf, server);
+ 		rc = -1;
+ 	} else {
+ 		cifs_dbg(FYI, "mid found\n");
+-- 
+2.53.0
+

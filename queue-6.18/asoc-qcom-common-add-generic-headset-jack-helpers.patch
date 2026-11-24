@@ -1,0 +1,141 @@
+From e222e62f816c771945bd0d08b112a7749dd98b89 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 4 Sep 2026 18:02:27 +0800
+Subject: ASoC: qcom: common: Add generic headset jack helpers
+
+From: Hongyang Zhao <hongyang.zhao@thundersoft.com>
+
+[ Upstream commit 7f8dd07370f8c17f8f98f0fa98691635828b0dac ]
+
+qcom_snd_wcd_jack_setup() combines creation of the card-level headset
+jack with the WCD-specific operation of attaching jack detection to
+codecs on the TX codec DMA links. External codecs connected over MI2S
+also provide component jack detection, but cannot use the WCD-specific
+DAI filtering.
+
+Factor the common jack allocation, DAPM pin registration and headset
+button mappings into a private initializer. Reuse it from the existing
+WCD path and add a generic setup helper which attaches the jack to every
+codec component in a runtime.
+
+Treat -ENOTSUPP as a no-op because snd_soc_component_set_jack() uses it
+for components which do not provide a set_jack callback.
+
+Add a matching cleanup helper so machine drivers can detach component
+jack detection when the DAI link exits. The WCD setup behavior remains
+unchanged.
+
+Signed-off-by: Hongyang Zhao <hongyang.zhao@thundersoft.com>
+Link: https://patch.msgid.link/20260904-rubikpi-next-20260605-v3-3-f49146d85af3@thundersoft.com
+Signed-off-by: Mark Brown <broonie@kernel.org>
+Stable-dep-of: 704251f9dad3 ("ASoC: qcom: x1e80100: recreate the headset jack on card rebind")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ sound/soc/qcom/common.c | 61 +++++++++++++++++++++++++++++++++++------
+ sound/soc/qcom/common.h |  3 ++
+ 2 files changed, 56 insertions(+), 8 deletions(-)
+
+diff --git a/sound/soc/qcom/common.c b/sound/soc/qcom/common.c
+index b021537f27ff1..71cbdd1a44ca2 100644
+--- a/sound/soc/qcom/common.c
++++ b/sound/soc/qcom/common.c
+@@ -356,13 +356,11 @@ static struct snd_soc_jack_pin qcom_headset_jack_pins[] = {
+ 	},
+ };
+ 
+-int qcom_snd_wcd_jack_setup(struct snd_soc_pcm_runtime *rtd,
+-			    struct snd_soc_jack *jack, bool *jack_setup)
++static int qcom_snd_headset_jack_init(struct snd_soc_card *card,
++				      struct snd_soc_jack *jack,
++				      bool *jack_setup)
+ {
+-	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
+-	struct snd_soc_dai *codec_dai = snd_soc_rtd_to_codec(rtd, 0);
+-	struct snd_soc_card *card = rtd->card;
+-	int rval, i;
++	int rval;
+ 
+ 	if (!*jack_setup) {
+ 		rval = snd_soc_card_jack_new_pins(card, "Headset Jack",
+@@ -386,6 +384,55 @@ int qcom_snd_wcd_jack_setup(struct snd_soc_pcm_runtime *rtd,
+ 		*jack_setup = true;
+ 	}
+ 
++	return 0;
++}
++
++int qcom_snd_headset_jack_setup(struct snd_soc_pcm_runtime *rtd,
++				struct snd_soc_jack *jack, bool *jack_setup)
++{
++	struct snd_soc_dai *codec_dai;
++	struct snd_soc_card *card = rtd->card;
++	int rval, i;
++
++	rval = qcom_snd_headset_jack_init(card, jack, jack_setup);
++	if (rval)
++		return rval;
++
++	for_each_rtd_codec_dais(rtd, i, codec_dai) {
++		rval = snd_soc_component_set_jack(codec_dai->component, jack, NULL);
++		if (rval != 0 && rval != -ENOTSUPP) {
++			dev_warn(card->dev, "Failed to set jack: %d\n", rval);
++			qcom_snd_headset_jack_cleanup(rtd);
++			return rval;
++		}
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(qcom_snd_headset_jack_setup);
++
++void qcom_snd_headset_jack_cleanup(struct snd_soc_pcm_runtime *rtd)
++{
++	struct snd_soc_dai *codec_dai;
++	int i;
++
++	for_each_rtd_codec_dais(rtd, i, codec_dai)
++		snd_soc_component_set_jack(codec_dai->component, NULL, NULL);
++}
++EXPORT_SYMBOL_GPL(qcom_snd_headset_jack_cleanup);
++
++int qcom_snd_wcd_jack_setup(struct snd_soc_pcm_runtime *rtd,
++			    struct snd_soc_jack *jack, bool *jack_setup)
++{
++	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
++	struct snd_soc_dai *codec_dai = snd_soc_rtd_to_codec(rtd, 0);
++	struct snd_soc_card *card = rtd->card;
++	int rval, i;
++
++	rval = qcom_snd_headset_jack_init(card, jack, jack_setup);
++	if (rval)
++		return rval;
++
+ 	switch (cpu_dai->id) {
+ 	case TX_CODEC_DMA_TX_0:
+ 	case TX_CODEC_DMA_TX_1:
+@@ -404,8 +451,6 @@ int qcom_snd_wcd_jack_setup(struct snd_soc_pcm_runtime *rtd,
+ 	default:
+ 		break;
+ 	}
+-
+-
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(qcom_snd_wcd_jack_setup);
+diff --git a/sound/soc/qcom/common.h b/sound/soc/qcom/common.h
+index 02b24caec485e..6705e135ccd77 100644
+--- a/sound/soc/qcom/common.h
++++ b/sound/soc/qcom/common.h
+@@ -24,6 +24,9 @@ int qcom_snd_apply_dai_tdm_slots_cfg(struct snd_soc_pcm_runtime *rtd,
+ 				     const struct qcom_snd_tdm_slot_cfg *cpu_cfg,
+ 				     const struct qcom_snd_tdm_slot_cfg *codec_cfg);
+ int qcom_snd_apply_dai_tdm_slots(struct snd_soc_pcm_runtime *rtd);
++int qcom_snd_headset_jack_setup(struct snd_soc_pcm_runtime *rtd,
++				struct snd_soc_jack *jack, bool *jack_setup);
++void qcom_snd_headset_jack_cleanup(struct snd_soc_pcm_runtime *rtd);
+ int qcom_snd_wcd_jack_setup(struct snd_soc_pcm_runtime *rtd,
+ 			    struct snd_soc_jack *jack, bool *jack_setup);
+ int qcom_snd_dp_jack_setup(struct snd_soc_pcm_runtime *rtd,
+-- 
+2.53.0
+

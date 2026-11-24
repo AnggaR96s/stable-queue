@@ -1,0 +1,227 @@
+From f20b7920a6cd97b7915c63516a1f0553d726834e Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 16 Sep 2026 00:14:50 +0800
+Subject: bpftool: Compute map size of light skeletons at runtime
+
+From: Leon Hwang <leon.hwang@linux.dev>
+
+[ Upstream commit a885470df10b1c0dbc011177c19d3fd3bb8af2e9 ]
+
+bpftool rounds memory-mapped data map sizes to the host page size when
+generating a light skeleton. The generated code therefore uses a 64K
+mapping size when bpftool runs on a 64K-page host, even if the skeleton
+runs on a 4K-page target. The target rejects the oversized map mmap(),
+causing failure of loading the light skeleton.
+
+When try to run 64K-page selftests on 4K-page VM, the error message does
+not provide the reason about page size.
+
+ test_atomics:PASS:atomics skeleton open 0 nsec
+ test_atomics:FAIL:atomics skeleton load unexpected error: -12 (errno 22)
+ #15      atomics:FAIL
+
+Pass the original map value size and max entries to the generated code and
+round mmap size to the runtime page size in the user-space light
+skeleton helpers. This keeps generated light skeletons independent of the
+build host page size.
+
+Fixes: d510296d331a ("bpftool: Use syscall/loader program in "prog load" and "gen skeleton" command.")
+Signed-off-by: Leon Hwang <leon.hwang@linux.dev>
+Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+Acked-by: Quentin Monnet <qmo@kernel.org>
+Link: https://lore.kernel.org/bpf/20260915161450.96249-1-leon.hwang@linux.dev
+[ sashal: Codegen now passes raw value_size and max_entries to the skeleton helpers, and the in-tree preload skeleton header's call sites are updated to match, since this tree lacks the protect-map and percpu-array code. ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ .../bpf/preload/iterators/iterators.lskel.h   |  6 +--
+ tools/bpf/bpftool/gen.c                       | 26 ++++---------
+ tools/lib/bpf/skel_internal.h                 | 37 ++++++++++++++-----
+ 3 files changed, 38 insertions(+), 31 deletions(-)
+
+diff --git a/kernel/bpf/preload/iterators/iterators.lskel.h b/kernel/bpf/preload/iterators/iterators.lskel.h
+index 70f236a82fe19..e932ceed3741a 100644
+--- a/kernel/bpf/preload/iterators/iterators.lskel.h
++++ b/kernel/bpf/preload/iterators/iterators.lskel.h
+@@ -68,7 +68,7 @@ iterators_bpf__destroy(struct iterators_bpf *skel)
+ 	iterators_bpf__detach(skel);
+ 	skel_closenz(skel->progs.dump_bpf_map.prog_fd);
+ 	skel_closenz(skel->progs.dump_bpf_prog.prog_fd);
+-	skel_free_map_data(skel->rodata, skel->maps.rodata.initial_value, 4096);
++	skel_free_map_data(skel->rodata, skel->maps.rodata.initial_value, 98, 1);
+ 	skel_closenz(skel->maps.rodata.map_fd);
+ 	skel_free(skel);
+ }
+@@ -86,7 +86,7 @@ iterators_bpf__open(void)
+ \x20\x20\x20\x6d\x61\x78\x5f\x65\x6e\x74\x72\x69\x65\x73\x0a\0\x25\x34\x75\x20\
+ \x25\x2d\x31\x36\x73\x25\x36\x64\x0a\0\x20\x20\x69\x64\x20\x6e\x61\x6d\x65\x20\
+ \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x61\x74\x74\x61\x63\x68\x65\
+-\x64\x0a\0\x25\x34\x75\x20\x25\x2d\x31\x36\x73\x20\x25\x73\x20\x25\x73\x0a\0", 4096, 98);
++\x64\x0a\0\x25\x34\x75\x20\x25\x2d\x31\x36\x73\x20\x25\x73\x20\x25\x73\x0a\0", 98, 1, 98);
+ 	if (!skel->rodata)
+ 		goto cleanup;
+ 	skel->maps.rodata.initial_value = (__u64) (long) skel->rodata;
+@@ -401,7 +401,7 @@ iterators_bpf__load(struct iterators_bpf *skel)
+ 	if (err < 0)
+ 		return err;
+ 	skel->rodata = skel_finalize_map_data(&skel->maps.rodata.initial_value,
+-					4096, PROT_READ, skel->maps.rodata.map_fd);
++					98, 1, PROT_READ, skel->maps.rodata.map_fd);
+ 	if (!skel->rodata)
+ 		return -ENOMEM;
+ 	return 0;
+diff --git a/tools/bpf/bpftool/gen.c b/tools/bpf/bpftool/gen.c
+index ac9886c80e046..35da2a8ce6612 100644
+--- a/tools/bpf/bpftool/gen.c
++++ b/tools/bpf/bpftool/gen.c
+@@ -453,16 +453,6 @@ static void print_hex(const char *data, int data_sz)
+ 	}
+ }
+ 
+-static size_t bpf_map_mmap_sz(const struct bpf_map *map)
+-{
+-	long page_sz = sysconf(_SC_PAGE_SIZE);
+-	size_t map_sz;
+-
+-	map_sz = (size_t)roundup(bpf_map__value_size(map), 8) * bpf_map__max_entries(map);
+-	map_sz = roundup(map_sz, page_sz);
+-	return map_sz;
+-}
+-
+ /* Emit type size asserts for all top-level fields in memory-mapped internal maps. */
+ static void codegen_asserts(struct bpf_object *obj, const char *obj_name)
+ {
+@@ -640,8 +630,8 @@ static void codegen_destroy(struct bpf_object *obj, const char *obj_name)
+ 			continue;
+ 		if (bpf_map__is_internal(map) &&
+ 		    (bpf_map__map_flags(map) & BPF_F_MMAPABLE))
+-			printf("\tskel_free_map_data(skel->%1$s, skel->maps.%1$s.initial_value, %2$zd);\n",
+-			       ident, bpf_map_mmap_sz(map));
++			printf("\tskel_free_map_data(skel->%1$s, skel->maps.%1$s.initial_value, %2$u, %3$u);\n",
++			       ident, bpf_map__value_size(map), bpf_map__max_entries(map));
+ 		codegen("\
+ 			\n\
+ 				skel_closenz(skel->maps.%1$s.map_fd);	    \n\
+@@ -714,11 +704,11 @@ static int gen_trace(struct bpf_object *obj, const char *obj_name, const char *h
+ 		print_hex(mmap_data, mmap_size);
+ 		codegen("\
+ 		\n\
+-		\", %1$zd, %2$zd);					    \n\
+-			if (!skel->%3$s)				    \n\
++		\", %1$u, %2$u, %3$zd);					    \n\
++			if (!skel->%4$s)				    \n\
+ 				goto cleanup;				    \n\
+-			skel->maps.%3$s.initial_value = (__u64) (long) skel->%3$s;\n\
+-		", bpf_map_mmap_sz(map), mmap_size, ident);
++			skel->maps.%4$s.initial_value = (__u64) (long) skel->%4$s;\n\
++		", bpf_map__value_size(map), bpf_map__max_entries(map), mmap_size, ident);
+ 	}
+ 	codegen("\
+ 		\n\
+@@ -773,11 +763,11 @@ static int gen_trace(struct bpf_object *obj, const char *obj_name, const char *h
+ 		codegen("\
+ 		\n\
+ 			skel->%1$s = skel_finalize_map_data(&skel->maps.%1$s.initial_value,  \n\
+-							%2$zd, %3$s, skel->maps.%1$s.map_fd);\n\
++							%2$u, %3$u, %4$s, skel->maps.%1$s.map_fd);\n\
+ 			if (!skel->%1$s)				    \n\
+ 				return -ENOMEM;				    \n\
+ 			",
+-		       ident, bpf_map_mmap_sz(map), mmap_flags);
++		       ident, bpf_map__value_size(map), bpf_map__max_entries(map), mmap_flags);
+ 	}
+ 	codegen("\
+ 		\n\
+diff --git a/tools/lib/bpf/skel_internal.h b/tools/lib/bpf/skel_internal.h
+index 1e82ab06c3ebf..5aa1549257197 100644
+--- a/tools/lib/bpf/skel_internal.h
++++ b/tools/lib/bpf/skel_internal.h
+@@ -11,6 +11,7 @@
+ #include <linux/bpf.h>
+ #else
+ #include <unistd.h>
++#include <sys/param.h>
+ #include <sys/syscall.h>
+ #include <sys/mman.h>
+ #include <stdlib.h>
+@@ -121,7 +122,7 @@ static inline void skel_free(const void *p)
+  * either bpf_probe_read_kernel() or bpf_copy_from_user() from initial_value
+  * depending on bpf_loader_ctx->flags.
+  */
+-static inline void skel_free_map_data(void *p, __u64 addr, size_t sz)
++static inline void skel_free_map_data(void *p, __u64 addr, size_t val_sz, __u32 max_entries)
+ {
+ 	if (addr != ~0ULL)
+ 		kvfree(p);
+@@ -130,18 +131,20 @@ static inline void skel_free_map_data(void *p, __u64 addr, size_t sz)
+ 	 */
+ }
+ 
+-static inline void *skel_prep_map_data(const void *val, size_t mmap_sz, size_t val_sz)
++static inline void *skel_prep_map_data(const void *val, size_t val_sz, __u32 max_entries,
++				       size_t data_sz)
+ {
+ 	void *addr;
+ 
+-	addr = kvmalloc(val_sz, GFP_KERNEL);
++	addr = kvmalloc(data_sz, GFP_KERNEL);
+ 	if (!addr)
+ 		return NULL;
+-	memcpy(addr, val, val_sz);
++	memcpy(addr, val, data_sz);
+ 	return addr;
+ }
+ 
+-static inline void *skel_finalize_map_data(__u64 *init_val, size_t mmap_sz, int flags, int fd)
++static inline void *skel_finalize_map_data(__u64 *init_val, size_t val_sz, __u32 max_entries,
++					   int flags, int fd)
+ {
+ 	struct bpf_map *map;
+ 	void *addr = NULL;
+@@ -176,25 +179,39 @@ static inline void skel_free(void *p)
+ 	free(p);
+ }
+ 
+-static inline void skel_free_map_data(void *p, __u64 addr, size_t sz)
++static inline size_t skel_map_mmap_sz(size_t val_sz, __u32 max_entries)
+ {
+-	munmap(p, sz);
++	const long page_sz = sysconf(_SC_PAGE_SIZE);
++	size_t mmap_sz;
++
++	mmap_sz = roundup(val_sz, 8) * max_entries;
++	mmap_sz = roundup(mmap_sz, page_sz);
++	return mmap_sz;
++}
++
++static inline void skel_free_map_data(void *p, __u64 addr, size_t val_sz, __u32 max_entries)
++{
++	munmap(p, skel_map_mmap_sz(val_sz, max_entries));
+ }
+ 
+-static inline void *skel_prep_map_data(const void *val, size_t mmap_sz, size_t val_sz)
++static inline void *skel_prep_map_data(const void *val, size_t val_sz, __u32 max_entries,
++				       size_t data_sz)
+ {
++	size_t mmap_sz = skel_map_mmap_sz(val_sz, max_entries);
+ 	void *addr;
+ 
+ 	addr = mmap(NULL, mmap_sz, PROT_READ | PROT_WRITE,
+ 		    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+ 	if (addr == (void *) -1)
+ 		return NULL;
+-	memcpy(addr, val, val_sz);
++	memcpy(addr, val, data_sz);
+ 	return addr;
+ }
+ 
+-static inline void *skel_finalize_map_data(__u64 *init_val, size_t mmap_sz, int flags, int fd)
++static inline void *skel_finalize_map_data(__u64 *init_val, size_t val_sz, __u32 max_entries,
++					   int flags, int fd)
+ {
++	size_t mmap_sz = skel_map_mmap_sz(val_sz, max_entries);
+ 	void *addr;
+ 
+ 	addr = mmap((void *) (long) *init_val, mmap_sz, flags, MAP_SHARED | MAP_FIXED, fd, 0);
+-- 
+2.53.0
+

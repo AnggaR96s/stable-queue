@@ -1,0 +1,115 @@
+From bcfd5fc45f4a91b8fdf9392e9bd3925b23e523b5 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 11 Nov 2026 10:21:42 +0200
+Subject: net/mlx5e: Fix false WARN_ON_ONCE in flow steering cleanup on RX init
+ failure
+
+From: Alexei Lazar <alazar@nvidia.com>
+
+[ Upstream commit 3962ded998c1df8a449fdf986f44f478e9c09675 ]
+
+mlx5e_attach_netdev() sets rx_mode_active before calling init_rx(), so
+any init_rx() failure after mlx5e_create_flow_steering() has succeeded
+makes mlx5e_destroy_flow_steering() trip
+WARN_ON_ONCE(fs->rx_mode_active) in mlx5e_del_vlan_rules().
+
+Hit in internal regression testing, so kthread creation failed
+with -EINTR:
+
+  WARNING: CPU: 3 PID: 170 at drivers/net/ethernet/mellanox/mlx5/core/en_fs.c:564 mlx5e_del_vlan_rules+0x295/0x2b0 [mlx5_core]
+  mlx5e_destroy_flow_steering+0x34/0xc0 [mlx5_core]
+  mlx5e_init_nic_rx+0x137/0x200 [mlx5_core]
+  mlx5e_attach_netdev+0x105/0x360 [mlx5_core]
+
+Fix it by creating NIC flow steering with rx_mode_active cleared and
+setting it only after profile->init_rx() succeeds. This also lets the
+internal error paths of mlx5e_create_flow_steering() destroy partially
+created steering without warning. The flag is set in
+mlx5e_attach_netdev() rather than mlx5e_init_nic_rx() so that non-NIC
+profiles, such as representors, also get it set after a detach/attach
+cycle.
+
+Fixes: 8c7353b6f716 ("net/mlx5e: Fix VLAN cleanup flow")
+Signed-off-by: Alexei Lazar <alazar@nvidia.com>
+Signed-off-by: Gal Pressman <gal@nvidia.com>
+Reviewed-by: Shahar Shitrit <shshitrit@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Link: https://patch.msgid.link/20261111082142.3131746-1-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ .../net/ethernet/mellanox/mlx5/core/en_main.c | 23 ++++++++-----------
+ 1 file changed, 9 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index bda57b117250f..964d976c5c890 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -6039,9 +6039,7 @@ static int mlx5e_nic_init(struct mlx5_core_dev *mdev,
+ 	priv->dfs_root = debugfs_create_dir("nic",
+ 					    mlx5_debugfs_get_dev_root(mdev));
+ 
+-	fs = mlx5e_fs_init(priv->profile, mdev,
+-			   !test_bit(MLX5E_STATE_DESTROYING, &priv->state),
+-			   priv->dfs_root);
++	fs = mlx5e_fs_init(priv->profile, mdev, false, priv->dfs_root);
+ 	if (!fs) {
+ 		err = -ENOMEM;
+ 		mlx5_core_err(mdev, "FS initialization failed, %d\n", err);
+@@ -6558,10 +6556,6 @@ int mlx5e_attach_netdev(struct mlx5e_priv *priv)
+ 	int err;
+ 
+ 	clear_bit(MLX5E_STATE_DESTROYING, &priv->state);
+-	if (priv->fs)
+-		mlx5e_fs_set_rx_mode_active(priv->fs,
+-					    !test_bit(MLX5E_STATE_DESTROYING,
+-						      &priv->state));
+ 
+ 	/* Validate the max_wqe_size_sq capability. */
+ 	if (WARN_ON_ONCE(mlx5e_get_max_sq_wqebbs(priv->mdev) < MLX5E_MAX_TX_WQEBBS)) {
+@@ -6622,6 +6616,9 @@ int mlx5e_attach_netdev(struct mlx5e_priv *priv)
+ 	if (err)
+ 		goto err_cleanup_tx;
+ 
++	if (priv->fs)
++		mlx5e_fs_set_rx_mode_active(priv->fs, true);
++
+ 	if (profile->enable) {
+ 		err = profile->enable(priv);
+ 		if (err)
+@@ -6633,6 +6630,10 @@ int mlx5e_attach_netdev(struct mlx5e_priv *priv)
+ 	return 0;
+ 
+ err_cleanup_rx:
++	if (priv->fs) {
++		mlx5e_fs_set_rx_mode_active(priv->fs, false);
++		cancel_work_sync(&priv->set_rx_mode_work);
++	}
+ 	profile->cleanup_rx(priv);
+ err_cleanup_tx:
+ 	profile->cleanup_tx(priv);
+@@ -6640,10 +6641,6 @@ int mlx5e_attach_netdev(struct mlx5e_priv *priv)
+ out:
+ 	mlx5e_reset_channels(priv->netdev);
+ 	set_bit(MLX5E_STATE_DESTROYING, &priv->state);
+-	if (priv->fs)
+-		mlx5e_fs_set_rx_mode_active(priv->fs,
+-					    !test_bit(MLX5E_STATE_DESTROYING,
+-						      &priv->state));
+ 	cancel_work_sync(&priv->update_stats_work);
+ 	return err;
+ }
+@@ -6654,9 +6651,7 @@ void mlx5e_detach_netdev(struct mlx5e_priv *priv)
+ 
+ 	set_bit(MLX5E_STATE_DESTROYING, &priv->state);
+ 	if (priv->fs)
+-		mlx5e_fs_set_rx_mode_active(priv->fs,
+-					    !test_bit(MLX5E_STATE_DESTROYING,
+-						      &priv->state));
++		mlx5e_fs_set_rx_mode_active(priv->fs, false);
+ 
+ 	if (profile->disable)
+ 		profile->disable(priv);
+-- 
+2.53.0
+

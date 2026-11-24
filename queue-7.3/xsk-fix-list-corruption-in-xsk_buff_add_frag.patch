@@ -1,0 +1,81 @@
+From ff72638b58a08e7d27fba6714d6b3c0a4a7490d1 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 2 Nov 2026 13:49:42 +0100
+Subject: xsk: fix list corruption in xsk_buff_add_frag()
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+From: Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+
+[ Upstream commit 94ae1259175f566ed5a33f37b09b6f32a1b2d8af ]
+
+In aligned mode, a fill ring address maps straight to its pool->heads[]
+entry. If user space posts the same address twice, a driver can pass
+xsk_buff_add_frag() a buffer that is the head of the frame or is
+already on pool->xskb_list or pool->free_list.
+
+Re-adding a linked node corrupts the list. With buffers A, B, C, B,
+xsk_rcv_zc() emits two descriptors instead of four and leaves the list
+head pointing at a self-linked B. When the Rx ring later has no room
+for a frame, the xsk_buff_free() cleanup follows B into pool->free_list
+and passes the list head to xp_free():
+
+  BUG: kernel NULL pointer dereference, address: 00000000000000c0
+  RIP: 0010:xp_free+0x1a/0x50
+  Call Trace:
+   xsk_rcv_zc+0xca/0x200
+
+The head is not on any list and needs a separate check. Adding it as
+its own frag lets bpf_xdp_adjust_tail() free the in-use head and wrap
+sinfo->nr_frags to 255.
+
+Reject such buffers before adding them to the frags array, as commit
+e37b2abca804 ("xsk: fix NULL pointer dereference in __xsk_rcv()") does
+in the copy path. Callers already drop the frame on failure.
+
+Unaligned mode is not affected, as each fill ring entry gets its own
+xskb from pool->free_heads[].
+
+Reproduced with a KUnit test feeding synthetic buffers to xsk_rcv_zc(),
+by Nagato Shiratana.
+
+Fixes: 24ea50127ecf ("xsk: support mbuf on ZC RX")
+Reported-by: Nagato Shiratana <zuomao338@gmail.com>
+Signed-off-by: Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+Reviewed-by: Björn Töpel <bjorn@kernel.org>
+Link: https://patch.msgid.link/20261102124950.958345-2-maciej.fijalkowski@intel.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/net/xdp_sock_drv.h | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/include/net/xdp_sock_drv.h b/include/net/xdp_sock_drv.h
+index d94aeb506379c..29965e3695983 100644
+--- a/include/net/xdp_sock_drv.h
++++ b/include/net/xdp_sock_drv.h
+@@ -160,15 +160,18 @@ static inline void xsk_buff_free(struct xdp_buff *xdp)
+ static inline bool xsk_buff_add_frag(struct xdp_buff *head,
+ 				     struct xdp_buff *xdp)
+ {
++	struct xdp_buff_xsk *frag = container_of(xdp, struct xdp_buff_xsk, xdp);
+ 	const void *data = xdp->data;
+-	struct xdp_buff_xsk *frag;
++
++	/* Duplicate fill ring entries map to the same xskb in aligned mode */
++	if (unlikely(xdp == head || !list_empty(&frag->list_node)))
++		return false;
+ 
+ 	if (!__xdp_buff_add_frag(head, virt_to_netmem(data),
+ 				 offset_in_page(data), xdp->data_end - data,
+ 				 xdp->frame_sz, false))
+ 		return false;
+ 
+-	frag = container_of(xdp, struct xdp_buff_xsk, xdp);
+ 	list_add_tail(&frag->list_node, &frag->pool->xskb_list);
+ 
+ 	return true;
+-- 
+2.53.0
+

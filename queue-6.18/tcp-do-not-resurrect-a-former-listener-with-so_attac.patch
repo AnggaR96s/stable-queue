@@ -1,0 +1,77 @@
+From 160dfb24ede1ffe4b2f6a275645622ff9959d04e Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 6 Nov 2026 09:42:59 +0100
+Subject: tcp: do not resurrect a former listener with
+ SO_ATTACH_REUSEPORT_[CE]BPF
+
+From: Eric Dumazet <edumazet@kernel.org>
+
+[ Upstream commit 8c011697f76abf3b2302718a7a1c50e36d849f28 ]
+
+After listen() + shutdown(), a TCP socket is moved to the closed
+section of its reuseport group, while TCP_NEW_SYN_RECV requests
+can still reference it as rsk_listener.
+
+If SO_ATTACH_REUSEPORT_[CE]BPF is then used on this socket,
+reuseport_attach_prog() calls reuseport_alloc(), which resurrects
+it into the listening section of a new group, even though the
+socket is still in TCP_CLOSE.
+
+After close(), the socket stays in that group and the pending
+requests keep it allocated. When the final ACK arrives,
+reuseport_migrate_sock() can select this dead socket and
+inet_csk_clone_lock() clones it. With a ULP like espintcp installed
+while in TCP_CLOSE, the child inherits icsk_ulp_data and sk_destruct
+after tcp_cleanup_ulp() cleared icsk_ulp_ops, leading to a
+use-after-free in espintcp_destruct().
+
+As done in commit 8cc3aef0cb19 ("tcp: Do not allow buggy transitions
+between ehash and lhash2."), deny this transition instead of adding
+checks to the fast path.
+
+Only an unhashed former listener is affected. Applications can still
+attach a reuseport prog to a socket that never listened, or to a
+listener (including one that called listen() again after shutdown()).
+
+Fixes: 333bb73f620e ("tcp: Keep TCP_CLOSE sockets in the reuseport group.")
+Reported-by: Kyle Zeng <kylebot@openai.com>
+Signed-off-by: Eric Dumazet <edumazet@kernel.org>
+Reviewed-by: Jiayuan Chen <jiayuan.chen@linux.dev>
+Reviewed-by: Kuniyuki Iwashima <kuniyu@google.com>
+Link: https://patch.msgid.link/20261106084300.2029567-1-edumazet@kernel.org
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ net/core/sock_reuseport.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/net/core/sock_reuseport.c b/net/core/sock_reuseport.c
+index d4b7caf86eee3..eb8d24964e2f6 100644
+--- a/net/core/sock_reuseport.c
++++ b/net/core/sock_reuseport.c
+@@ -6,6 +6,7 @@
+  * selecting the socket index from the array of available sockets.
+  */
+ 
++#include <net/inet_connection_sock.h>
+ #include <net/ip.h>
+ #include <net/sock_reuseport.h>
+ #include <linux/bpf.h>
+@@ -692,6 +693,14 @@ int reuseport_attach_prog(struct sock *sk, struct bpf_prog *prog)
+ 		if (!sk->sk_reuseport)
+ 			return -EINVAL;
+ 
++		/* Do not put a shutdown()ed TCP listener back into the
++		 * listening section of a reuseport group while it is in
++		 * TCP_CLOSE: requests can still migrate to it.
++		 */
++		if (sk_is_tcp(sk) &&
++		    inet_csk(sk)->unhashed_state == TCP_LISTEN)
++			return -EINVAL;
++
+ 		err = reuseport_alloc(sk, false);
+ 		if (err)
+ 			return err;
+-- 
+2.53.0
+

@@ -1,0 +1,105 @@
+From 606ea9f5f0f896b6ece41317545d6d4a4bec5ad4 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 2 Nov 2026 05:59:10 +0000
+Subject: bpf: Fix the join of fp+0 with a value that is not a pointer to stack
+
+From: Alexei Starovoitov <ast@kernel.org>
+
+[ Upstream commit 6185d4fc6e64439cad415d9bf527f8ffb3fa3db4 ]
+
+arg_track follows pointers to the stack through registers and spills.
+Scalar evolution and the removal of dead slots rely on it to know which
+slots an insn reads and writes.
+
+Where two paths meet, a register can be fp-N on one path and not a pointer
+to the stack on the other path. There is no value for that. The join adds
+a fake second offset, fp+0: with two offsets no store through the register
+is a certain write. But for fp+0 the fake offset is the offset itself:
+
+  join(fp-8, none) = {fp-8, fp+0}    two offsets
+  join(fp+0, none) = {fp+0}          one offset: "exactly fp+0"
+
+Then a store counts as a certain write to the stack, but at run time it can
+go to other memory:
+
+  r7 = r10, or r7 = map_value + 8 ; arg_track: exactly fp+0
+  *(u64 *)(r10 - 8) = fp-24
+  *(u64 *)(r7 - 8) = map_value    ; arg_track: fp-8 is overwritten
+  r8 = *(u64 *)(r10 - 8)          ; fp-24 or map_value. arg_track: none
+  loop:
+    r1 = *(u64 *)(r10 - 24)       ; the counter of the loop
+    ...
+    *(u64 *)(r8 + 0) = 4096       ; arg_track: not a write to fp-24
+
+Scalar evolution does not see the last store. It gives the counter the
+range of a loop that only increments it. The prog loads, and it accesses
+a map value out of bounds.
+
+Valid progs are rejected as well. The store through r7 makes fp-8 dead, and
+a later read of fp-8 fails with "slot poisoned by dead code elimination".
+
+When the single offset is 0, drop the offsets. The result is a pointer to
+an unknown slot of the frame, and all updates through it are weak.
+
+Veristat sees no difference in selftests, Cilium and sched_ext.
+
+Fixes: bf0c571f7feb ("bpf: introduce forward arg-tracking dataflow analysis")
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://patch.msgid.link/20261102055913.3598414-2-alexei.starovoitov@gmail.com
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ kernel/bpf/liveness.c | 31 +++++++++++++++++--------------
+ 1 file changed, 17 insertions(+), 14 deletions(-)
+
+diff --git a/kernel/bpf/liveness.c b/kernel/bpf/liveness.c
+index acee6f86f8474..e1340e73cbeda 100644
+--- a/kernel/bpf/liveness.c
++++ b/kernel/bpf/liveness.c
+@@ -872,6 +872,19 @@ static struct arg_track arg_join_imprecise(struct arg_track a, struct arg_track
+ 	return (struct arg_track){ .mask = m, .frame = ARG_IMPRECISE };
+ }
+ 
++/*
++ * 'a' or a value that is not a pointer to stack. A single fp-N gets a fake fp+0,
++ * to keep stack_use and prevent stack_def. fp+0 itself would stay a single offset.
++ */
++static struct arg_track arg_or_none(struct arg_track a)
++{
++	if (a.off_cnt != 1)
++		return a;
++	if (!a.off[0])
++		return (struct arg_track){ .frame = a.frame };
++	return arg_merge_offsets(a, arg_single(a.frame, 0));
++}
++
+ /* Join two arg_track values at merge points */
+ static struct arg_track __arg_track_join(struct arg_track a, struct arg_track b)
+ {
+@@ -896,20 +909,10 @@ static struct arg_track __arg_track_join(struct arg_track a, struct arg_track b)
+ 	 */
+ 	if (a.frame == ARG_NONE && b.frame == ARG_NONE)
+ 		return a;
+-	if (a.frame >= 0 && b.frame == ARG_NONE) {
+-		/*
+-		 * When joining single fp-N add fake fp+0 to
+-		 * keep stack_use and prevent stack_def
+-		 */
+-		if (a.off_cnt == 1)
+-			return arg_merge_offsets(a, arg_single(a.frame, 0));
+-		return a;
+-	}
+-	if (b.frame >= 0 && a.frame == ARG_NONE) {
+-		if (b.off_cnt == 1)
+-			return arg_merge_offsets(b, arg_single(b.frame, 0));
+-		return b;
+-	}
++	if (a.frame >= 0 && b.frame == ARG_NONE)
++		return arg_or_none(a);
++	if (b.frame >= 0 && a.frame == ARG_NONE)
++		return arg_or_none(b);
+ 
+ 	return arg_join_imprecise(a, b);
+ }
+-- 
+2.53.0
+

@@ -1,0 +1,167 @@
+From 6ae8e7d3adde37296007e7d53268e9e3ec2be76e Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 28 Oct 2026 21:32:35 +0100
+Subject: tcp: Fix dup-ack detection on non-SACK bidirectional data transfer.
+
+From: Guillaume Nault <gnault@redhat.com>
+
+[ Upstream commit 11140c51df12e594d6bf2c8d2af5dec63b0219ac ]
+
+When receiving a pure ack from a peer that also sends data, we can
+have SEG.SEQ > SND.WL1, even though the segment contains no data. This
+makes tcp_may_update_window() return true (because of the
+"after(ack_seq, tp->snd_wl1)" condition), and tcp_ack_update_window()
+then adds FLAG_WIN_UPDATE to the segment set of flags, even when
+there's no window update.
+
+Since FLAG_WIN_UPDATE prevents the segment from being considered as
+dup-ack (as it's part of FLAG_NOT_DUP), this can inhibit fast
+retransmit on non-SACK connections, making recovery very slow as it
+now entirely relies on RTO.
+
+The "DUPLICATE ACKNOWLEDGMENT" definition of RFC 5681, section 2,
+says that lack of window update is a necessary condition for a dup ack:
+"(e) the advertised window in the incoming acknowledgment equals the
+advertised window in the last incoming acknowledgment.". Spurious
+window updates can thus prevent dup ack detection and, in the end, fast
+retransmit.
+
+Avoid this scenario by setting FLAG_WIN_UPDATE only when a window
+update actually occurs. Pure acks with SEG.SEQ > SND.WL1 can now
+be detected as dup-ack and trigger fast retransmission.
+
+Also, stop setting FLAG_WIN_UPDATE in tcp_ack()'s header prediction
+path. One of the conditions for header prediction to happen is that
+received segments don't trigger a window update. This flag update was
+thus wrong to begin with. Now that tcp_ack_update_window() sets
+FLAG_WIN_UPDATE only if a window update actually occurred, we need the
+header prediction path to stop reporting spurious window updates too.
+Otherwise BPF programs would get inconsistent window update information
+(CA_ACK_WIN_UPDATE) between fast an slow paths.
+
+Finally, add FLAG_SND_UNA_ADVANCED to the definition of FLAG_NOT_DUP.
+This is necessary for the case where an incoming segment acknowledges
+less than a full segment of the retransmit queue. Such segments were
+not considered dubious by tcp_ack_is_dubious() because of the spurious
+FLAG_WIN_UPDATE flag, which prevented the segment from being seen as a
+duplicate ack. Now that FLAG_WIN_UPDATE doesn't cover this scenario
+anymore, we need another way to mark these acks as non-duplicate.
+Adding FLAG_SND_UNA_ADVANCED to FLAG_NOT_DUP is the natural way of
+doing this, since, by definition, a segment advancing SND.UNA, even by
+a small amount, cannot be a duplicate ack.
+
+A side effect of this patch is that repeated zero window acks received
+from peer can now be considered duplicate acks (because of the the
+"|| !win" condition in tcp_may_update_window()). Therefore, they can
+now trigger fast retransmission and fast recovery, including congestion
+window reduction, when the peer is stalled. This is RFC compliant and
+shouldn't have any negative effect.
+
+Add packetdrill selftest. Before this patch, the 1001:2001 segment was
+retransmitted upon RTO, now it's sent right after reception of the
+third duplicate ack.
+
+Thanks to Tom Williams for the investigation help and initial
+reproducer.
+
+Reported-by: Tom Williams <Tom.D.Williams@MorganStanley.com>
+Fixes: 1da177e4c3f4 ("Linux-2.6.12-rc2")
+Signed-off-by: Guillaume Nault <gnault@redhat.com>
+Reviewed-by: Kuniyuki Iwashima <kuniyu@google.com>
+Reviewed-by: Neal Cardwell <ncardwell@google.com>
+Reviewed-by: Eric Dumazet <edumazet@kernel.org>
+Link: https://patch.msgid.link/6426d558e45fc6ab724c40af62e4a8793215dd8a.1793219189.git.gnault@redhat.com
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ net/ipv4/tcp_input.c                          |  6 +--
+ .../tcp_bidir_fast_retransmit_nosack.pkt      | 42 +++++++++++++++++++
+ 2 files changed, 45 insertions(+), 3 deletions(-)
+ create mode 100644 tools/testing/selftests/net/packetdrill/tcp_bidir_fast_retransmit_nosack.pkt
+
+diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
+index 8b8c892810ee1..54e30bc368ca5 100644
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -103,7 +103,8 @@ int sysctl_tcp_max_orphans __read_mostly = NR_FILE;
+ #define FLAG_DSACK_TLP		0x20000 /* DSACK for tail loss probe */
+ 
+ #define FLAG_ACKED		(FLAG_DATA_ACKED|FLAG_SYN_ACKED)
+-#define FLAG_NOT_DUP		(FLAG_DATA|FLAG_WIN_UPDATE|FLAG_ACKED)
++#define FLAG_NOT_DUP		(FLAG_DATA|FLAG_WIN_UPDATE|FLAG_ACKED|	\
++				 FLAG_SND_UNA_ADVANCED)
+ #define FLAG_CA_ALERT		(FLAG_DATA_SACKED|FLAG_ECE|FLAG_DSACKING_ACK)
+ #define FLAG_FORWARD_PROGRESS	(FLAG_ACKED|FLAG_DATA_SACKED)
+ 
+@@ -3632,11 +3633,11 @@ static int tcp_ack_update_window(struct sock *sk, const struct sk_buff *skb, u32
+ 		nwin <<= tp->rx_opt.snd_wscale;
+ 
+ 	if (tcp_may_update_window(tp, ack, ack_seq, nwin)) {
+-		flag |= FLAG_WIN_UPDATE;
+ 		tcp_update_wl(tp, ack_seq);
+ 
+ 		if (tp->snd_wnd != nwin) {
+ 			tp->snd_wnd = nwin;
++			flag |= FLAG_WIN_UPDATE;
+ 
+ 			/* Note, it is the only place, where
+ 			 * fast path is recovered for sending TCP.
+@@ -3919,7 +3920,6 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
+ 		 */
+ 		tcp_update_wl(tp, ack_seq);
+ 		tcp_snd_una_update(tp, ack);
+-		flag |= FLAG_WIN_UPDATE;
+ 
+ 		NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPHPACKS);
+ 	} else {
+diff --git a/tools/testing/selftests/net/packetdrill/tcp_bidir_fast_retransmit_nosack.pkt b/tools/testing/selftests/net/packetdrill/tcp_bidir_fast_retransmit_nosack.pkt
+new file mode 100644
+index 0000000000000..5c66b7171d229
+--- /dev/null
++++ b/tools/testing/selftests/net/packetdrill/tcp_bidir_fast_retransmit_nosack.pkt
+@@ -0,0 +1,42 @@
++// SPDX-License-Identifier: GPL-2.0
++//
++// Verify that non-SACK connections properly detect duplicate acks when mixed
++// with other data segments from peer.
++
++`./defaults.sh`
++
++    0     socket(..., SOCK_STREAM, IPPROTO_TCP) = 4
++   +0...0 connect(4, ..., ...) = 0
++
++   // Three-way handshake, SACK not supported by peer
++   +0 > S  0:0(0) <mss 1460,sackOK,TS val 0 ecr 0,nop,wscale 8>
++   +0 < S. 0:0(0) ack 1 win 65535 <mss 1000>
++   +0 > .  1:1(0) ack 1
++
++   // Send 1000 bytes, peer acks everything
++   +0 send(4, ..., 1000, 0) = 1000
++   +0 > P. 1:1001(1000) ack 1
++   +0 < .  1:1(0) ack 1001 win 65535
++
++   // Send 4000 more bytes
++   +0 send(4, ..., 4000, 0) = 4000
++   +0 > P. 1001:5001(4000) ack 1
++
++   // Receive first dup-ack (considering segment 1001-2001 was lost)
++   +0 < .  1:1(0) ack 1001 win 65535
++
++   // Receive unrelated data segment from peer and ack it
++   +0 < P. 1:11(10) ack 1001 win 65535
++   +0 > .  5001:5001(0) ack 11
++
++   // Receive second dup-ack
++   +0 < .  11:11(0) ack 1001 win 65535
++
++   // Receive another data segment from peer and ack it
++   +0 < P. 11:21(10) ack 1001 win 65535
++   +0 > .  5001:5001(0) ack 21
++
++   // Receive third dup-ack, which should trigger fast retransmit (without
++   // waiting for RTO)
++   +0 < .  21:21(0) ack 1001 win 65535
++   +0 > .  1001:2001(1000) ack 21
+-- 
+2.53.0
+

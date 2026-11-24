@@ -1,0 +1,384 @@
+From 1761f489088b841ad43aab2968567df1d1e2a749 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 16 May 2025 16:07:29 -0700
+Subject: irqbypass: Take ownership of producer/consumer token tracking
+
+From: Sean Christopherson <seanjc@google.com>
+
+[ Upstream commit 2b521d86ee80a436a92445b8206d38d75aeb39ea ]
+
+Move ownership of IRQ bypass token tracking into irqbypass.ko, and
+explicitly require callers to pass an eventfd_ctx structure instead of a
+completely opaque token.  Relying on producers and consumers to set the
+token appropriately is error prone, and hiding the fact that the token must
+be an eventfd_ctx pointer (for all intents and purposes) unnecessarily
+obfuscates the code and makes it more brittle.
+
+Reviewed-by: Kevin Tian <kevin.tian@intel.com>
+Acked-by: Michael S. Tsirkin <mst@redhat.com>
+Reviewed-by: Alex Williamson <alex.williamson@redhat.com>
+Link: https://lore.kernel.org/r/20250516230734.2564775-4-seanjc@google.com
+Signed-off-by: Sean Christopherson <seanjc@google.com>
+Stable-dep-of: c9c1c1b7b31f ("vhost-vdpa: drop the parent's vq callback before the call fd is released")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ arch/x86/kvm/x86.c                |  4 +--
+ drivers/vfio/pci/vfio_pci_intrs.c |  9 +++----
+ drivers/vhost/vdpa.c              |  8 +++---
+ include/linux/irqbypass.h         | 35 +++++++++++++-----------
+ virt/kvm/eventfd.c                |  7 +++--
+ virt/lib/irqbypass.c              | 44 ++++++++++++++++++++-----------
+ 6 files changed, 58 insertions(+), 49 deletions(-)
+
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index ee3b528ec1e27..5068282e20705 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -12850,8 +12850,8 @@ void kvm_arch_irq_bypass_del_producer(struct irq_bypass_consumer *cons,
+ 	ret = kvm_x86_call(pi_update_irte)(irqfd->kvm,
+ 					   prod->irq, irqfd->gsi, 0);
+ 	if (ret)
+-		printk(KERN_INFO "irq bypass consumer (token %p) unregistration"
+-		       " fails: %d\n", irqfd->consumer.token, ret);
++		printk(KERN_INFO "irq bypass consumer (eventfd %p) unregistration"
++		       " fails: %d\n", irqfd->consumer.eventfd, ret);
+ 
+ 	spin_unlock_irq(&kvm->irqfds.lock);
+ 
+diff --git a/drivers/vfio/pci/vfio_pci_intrs.c b/drivers/vfio/pci/vfio_pci_intrs.c
+index ed86747749e53..d867bced40bb7 100644
+--- a/drivers/vfio/pci/vfio_pci_intrs.c
++++ b/drivers/vfio/pci/vfio_pci_intrs.c
+@@ -512,15 +512,12 @@ static int vfio_msi_set_vector_signal(struct vfio_pci_core_device *vdev,
+ 	if (ret)
+ 		goto out_put_eventfd_ctx;
+ 
+-	ctx->producer.token = trigger;
+ 	ctx->producer.irq = irq;
+-	ret = irq_bypass_register_producer(&ctx->producer);
++	ret = irq_bypass_register_producer(&ctx->producer, trigger);
+ 	if (unlikely(ret)) {
+ 		dev_info(&pdev->dev,
+-		"irq bypass producer (token %p) registration fails: %d\n",
+-		ctx->producer.token, ret);
+-
+-		ctx->producer.token = NULL;
++		"irq bypass producer (eventfd %p) registration fails: %d\n",
++		trigger, ret);
+ 	}
+ 	ctx->trigger = trigger;
+ 
+diff --git a/drivers/vhost/vdpa.c b/drivers/vhost/vdpa.c
+index d467422559cdc..2e0dbfa0a141f 100644
+--- a/drivers/vhost/vdpa.c
++++ b/drivers/vhost/vdpa.c
+@@ -225,10 +225,10 @@ static void vhost_vdpa_setup_vq_irq(struct vhost_vdpa *v, u16 qid)
+ 		return;
+ 
+ 	vq->call_ctx.producer.irq = irq;
+-	ret = irq_bypass_register_producer(&vq->call_ctx.producer);
++	ret = irq_bypass_register_producer(&vq->call_ctx.producer, vq->call_ctx.ctx);
+ 	if (unlikely(ret))
+-		dev_info(&v->dev, "vq %u, irq bypass producer (token %p) registration fails, ret =  %d\n",
+-			 qid, vq->call_ctx.producer.token, ret);
++		dev_info(&v->dev, "vq %u, irq bypass producer (eventfd %p) registration fails, ret =  %d\n",
++			 qid, vq->call_ctx.ctx, ret);
+ }
+ 
+ static void vhost_vdpa_unsetup_vq_irq(struct vhost_vdpa *v, u16 qid)
+@@ -765,7 +765,6 @@ static long vhost_vdpa_vring_ioctl(struct vhost_vdpa *v, unsigned int cmd,
+ 			if (ops->get_status(vdpa) &
+ 			    VIRTIO_CONFIG_S_DRIVER_OK)
+ 				vhost_vdpa_unsetup_vq_irq(v, idx);
+-			vq->call_ctx.producer.token = NULL;
+ 		}
+ 		break;
+ 	}
+@@ -806,7 +805,6 @@ static long vhost_vdpa_vring_ioctl(struct vhost_vdpa *v, unsigned int cmd,
+ 			cb.callback = vhost_vdpa_virtqueue_cb;
+ 			cb.private = vq;
+ 			cb.trigger = vq->call_ctx.ctx;
+-			vq->call_ctx.producer.token = vq->call_ctx.ctx;
+ 			if (ops->get_status(vdpa) &
+ 			    VIRTIO_CONFIG_S_DRIVER_OK)
+ 				vhost_vdpa_setup_vq_irq(v, idx);
+diff --git a/include/linux/irqbypass.h b/include/linux/irqbypass.h
+index 9bdb2a7818418..1b57d15ac4cf2 100644
+--- a/include/linux/irqbypass.h
++++ b/include/linux/irqbypass.h
+@@ -10,6 +10,7 @@
+ 
+ #include <linux/list.h>
+ 
++struct eventfd_ctx;
+ struct irq_bypass_consumer;
+ 
+ /*
+@@ -18,20 +19,20 @@ struct irq_bypass_consumer;
+  * The IRQ bypass manager is a simple set of lists and callbacks that allows
+  * IRQ producers (ex. physical interrupt sources) to be matched to IRQ
+  * consumers (ex. virtualization hardware that allows IRQ bypass or offload)
+- * via a shared token (ex. eventfd_ctx).  Producers and consumers register
+- * independently.  When a token match is found, the optional @stop callback
+- * will be called for each participant.  The pair will then be connected via
+- * the @add_* callbacks, and finally the optional @start callback will allow
+- * any final coordination.  When either participant is unregistered, the
+- * process is repeated using the @del_* callbacks in place of the @add_*
+- * callbacks.  Match tokens must be unique per producer/consumer, 1:N pairings
+- * are not supported.
++ * via a shared eventfd_ctx.  Producers and consumers register independently.
++ * When a producer and consumer are paired, i.e. an eventfd match is found, the
++ * optional @stop callback will be called for each participant.  The pair will
++ * then be connected via the @add_* callbacks, and finally the optional @start
++ * callback will allow any final coordination.  When either participant is
++ * unregistered, the process is repeated using the @del_* callbacks in place of
++ * the @add_* callbacks.  eventfds must be unique per producer/consumer, 1:N
++ * pairings are not supported.
+  */
+ 
+ /**
+  * struct irq_bypass_producer - IRQ bypass producer definition
+  * @node: IRQ bypass manager private list management
+- * @token: opaque token to match between producer and consumer (non-NULL)
++ * @eventfd: eventfd context used to match producers and consumers
+  * @irq: Linux IRQ number for the producer device
+  * @add_consumer: Connect the IRQ producer to an IRQ consumer (optional)
+  * @del_consumer: Disconnect the IRQ producer from an IRQ consumer (optional)
+@@ -44,7 +45,7 @@ struct irq_bypass_consumer;
+  */
+ struct irq_bypass_producer {
+ 	struct list_head node;
+-	void *token;
++	struct eventfd_ctx *eventfd;
+ 	int irq;
+ 	int (*add_consumer)(struct irq_bypass_producer *,
+ 			    struct irq_bypass_consumer *);
+@@ -57,7 +58,7 @@ struct irq_bypass_producer {
+ /**
+  * struct irq_bypass_consumer - IRQ bypass consumer definition
+  * @node: IRQ bypass manager private list management
+- * @token: opaque token to match between producer and consumer (non-NULL)
++ * @eventfd: eventfd context used to match producers and consumers
+  * @add_producer: Connect the IRQ consumer to an IRQ producer
+  * @del_producer: Disconnect the IRQ consumer from an IRQ producer
+  * @stop: Perform any quiesce operations necessary prior to add/del (optional)
+@@ -70,7 +71,7 @@ struct irq_bypass_producer {
+  */
+ struct irq_bypass_consumer {
+ 	struct list_head node;
+-	void *token;
++	struct eventfd_ctx *eventfd;
+ 	int (*add_producer)(struct irq_bypass_consumer *,
+ 			    struct irq_bypass_producer *);
+ 	void (*del_producer)(struct irq_bypass_consumer *,
+@@ -79,9 +80,11 @@ struct irq_bypass_consumer {
+ 	void (*start)(struct irq_bypass_consumer *);
+ };
+ 
+-int irq_bypass_register_producer(struct irq_bypass_producer *);
+-void irq_bypass_unregister_producer(struct irq_bypass_producer *);
+-int irq_bypass_register_consumer(struct irq_bypass_consumer *);
+-void irq_bypass_unregister_consumer(struct irq_bypass_consumer *);
++int irq_bypass_register_producer(struct irq_bypass_producer *producer,
++				 struct eventfd_ctx *eventfd);
++void irq_bypass_unregister_producer(struct irq_bypass_producer *producer);
++int irq_bypass_register_consumer(struct irq_bypass_consumer *consumer,
++				 struct eventfd_ctx *eventfd);
++void irq_bypass_unregister_consumer(struct irq_bypass_consumer *consumer);
+ 
+ #endif /* IRQBYPASS_H */
+diff --git a/virt/kvm/eventfd.c b/virt/kvm/eventfd.c
+index c9c9ccdb0e7ec..43ecb8293e9b9 100644
+--- a/virt/kvm/eventfd.c
++++ b/virt/kvm/eventfd.c
+@@ -442,15 +442,14 @@ kvm_irqfd_assign(struct kvm *kvm, struct kvm_irqfd *args)
+ 
+ #if IS_ENABLED(CONFIG_HAVE_KVM_IRQ_BYPASS)
+ 	if (kvm_arch_has_irq_bypass()) {
+-		irqfd->consumer.token = (void *)irqfd->eventfd;
+ 		irqfd->consumer.add_producer = kvm_arch_irq_bypass_add_producer;
+ 		irqfd->consumer.del_producer = kvm_arch_irq_bypass_del_producer;
+ 		irqfd->consumer.stop = kvm_arch_irq_bypass_stop;
+ 		irqfd->consumer.start = kvm_arch_irq_bypass_start;
+-		ret = irq_bypass_register_consumer(&irqfd->consumer);
++		ret = irq_bypass_register_consumer(&irqfd->consumer, irqfd->eventfd);
+ 		if (ret)
+-			pr_info("irq bypass consumer (token %p) registration fails: %d\n",
+-				irqfd->consumer.token, ret);
++			pr_info("irq bypass consumer (eventfd %p) registration fails: %d\n",
++				irqfd->eventfd, ret);
+ 	}
+ #endif
+ 
+diff --git a/virt/lib/irqbypass.c b/virt/lib/irqbypass.c
+index 28fda42e471bb..cce0111b1fd4e 100644
+--- a/virt/lib/irqbypass.c
++++ b/virt/lib/irqbypass.c
+@@ -77,17 +77,19 @@ static void __disconnect(struct irq_bypass_producer *prod,
+ /**
+  * irq_bypass_register_producer - register IRQ bypass producer
+  * @producer: pointer to producer structure
++ * @eventfd: pointer to the eventfd context associated with the producer
+  *
+  * Add the provided IRQ producer to the list of producers and connect
+- * with any matching token found on the IRQ consumers list.
++ * with any matching eventfd found on the IRQ consumers list.
+  */
+-int irq_bypass_register_producer(struct irq_bypass_producer *producer)
++int irq_bypass_register_producer(struct irq_bypass_producer *producer,
++				 struct eventfd_ctx *eventfd)
+ {
+ 	struct irq_bypass_producer *tmp;
+ 	struct irq_bypass_consumer *consumer;
+ 	int ret;
+ 
+-	if (!producer->token)
++	if (WARN_ON_ONCE(producer->eventfd))
+ 		return -EINVAL;
+ 
+ 	might_sleep();
+@@ -98,14 +100,14 @@ int irq_bypass_register_producer(struct irq_bypass_producer *producer)
+ 	mutex_lock(&lock);
+ 
+ 	list_for_each_entry(tmp, &producers, node) {
+-		if (tmp->token == producer->token) {
++		if (tmp->eventfd == eventfd) {
+ 			ret = -EBUSY;
+ 			goto out_err;
+ 		}
+ 	}
+ 
+ 	list_for_each_entry(consumer, &consumers, node) {
+-		if (consumer->token == producer->token) {
++		if (consumer->eventfd == eventfd) {
+ 			ret = __connect(producer, consumer);
+ 			if (ret)
+ 				goto out_err;
+@@ -113,6 +115,7 @@ int irq_bypass_register_producer(struct irq_bypass_producer *producer)
+ 		}
+ 	}
+ 
++	producer->eventfd = eventfd;
+ 	list_add(&producer->node, &producers);
+ 
+ 	mutex_unlock(&lock);
+@@ -137,7 +140,7 @@ void irq_bypass_unregister_producer(struct irq_bypass_producer *producer)
+ 	struct irq_bypass_producer *tmp;
+ 	struct irq_bypass_consumer *consumer;
+ 
+-	if (!producer->token)
++	if (!producer->eventfd)
+ 		return;
+ 
+ 	might_sleep();
+@@ -148,21 +151,23 @@ void irq_bypass_unregister_producer(struct irq_bypass_producer *producer)
+ 	mutex_lock(&lock);
+ 
+ 	list_for_each_entry(tmp, &producers, node) {
+-		if (tmp->token != producer->token)
++		if (tmp->eventfd != producer->eventfd)
+ 			continue;
+ 
+ 		list_for_each_entry(consumer, &consumers, node) {
+-			if (consumer->token == producer->token) {
++			if (consumer->eventfd == producer->eventfd) {
+ 				__disconnect(producer, consumer);
+ 				break;
+ 			}
+ 		}
+ 
++		producer->eventfd = NULL;
+ 		list_del(&producer->node);
+ 		module_put(THIS_MODULE);
+ 		break;
+ 	}
+ 
++	WARN_ON_ONCE(producer->eventfd);
+ 	mutex_unlock(&lock);
+ 
+ 	module_put(THIS_MODULE);
+@@ -172,18 +177,22 @@ EXPORT_SYMBOL_GPL(irq_bypass_unregister_producer);
+ /**
+  * irq_bypass_register_consumer - register IRQ bypass consumer
+  * @consumer: pointer to consumer structure
++ * @eventfd: pointer to the eventfd context associated with the consumer
+  *
+  * Add the provided IRQ consumer to the list of consumers and connect
+- * with any matching token found on the IRQ producer list.
++ * with any matching eventfd found on the IRQ producer list.
+  */
+-int irq_bypass_register_consumer(struct irq_bypass_consumer *consumer)
++int irq_bypass_register_consumer(struct irq_bypass_consumer *consumer,
++				 struct eventfd_ctx *eventfd)
+ {
+ 	struct irq_bypass_consumer *tmp;
+ 	struct irq_bypass_producer *producer;
+ 	int ret;
+ 
+-	if (!consumer->token ||
+-	    !consumer->add_producer || !consumer->del_producer)
++	if (WARN_ON_ONCE(consumer->eventfd))
++		return -EINVAL;
++
++	if (!consumer->add_producer || !consumer->del_producer)
+ 		return -EINVAL;
+ 
+ 	might_sleep();
+@@ -194,14 +203,14 @@ int irq_bypass_register_consumer(struct irq_bypass_consumer *consumer)
+ 	mutex_lock(&lock);
+ 
+ 	list_for_each_entry(tmp, &consumers, node) {
+-		if (tmp->token == consumer->token || tmp == consumer) {
++		if (tmp->eventfd == eventfd) {
+ 			ret = -EBUSY;
+ 			goto out_err;
+ 		}
+ 	}
+ 
+ 	list_for_each_entry(producer, &producers, node) {
+-		if (producer->token == consumer->token) {
++		if (producer->eventfd == eventfd) {
+ 			ret = __connect(producer, consumer);
+ 			if (ret)
+ 				goto out_err;
+@@ -209,6 +218,7 @@ int irq_bypass_register_consumer(struct irq_bypass_consumer *consumer)
+ 		}
+ 	}
+ 
++	consumer->eventfd = eventfd;
+ 	list_add(&consumer->node, &consumers);
+ 
+ 	mutex_unlock(&lock);
+@@ -233,7 +243,7 @@ void irq_bypass_unregister_consumer(struct irq_bypass_consumer *consumer)
+ 	struct irq_bypass_consumer *tmp;
+ 	struct irq_bypass_producer *producer;
+ 
+-	if (!consumer->token)
++	if (!consumer->eventfd)
+ 		return;
+ 
+ 	might_sleep();
+@@ -248,17 +258,19 @@ void irq_bypass_unregister_consumer(struct irq_bypass_consumer *consumer)
+ 			continue;
+ 
+ 		list_for_each_entry(producer, &producers, node) {
+-			if (producer->token == consumer->token) {
++			if (producer->eventfd == consumer->eventfd) {
+ 				__disconnect(producer, consumer);
+ 				break;
+ 			}
+ 		}
+ 
++		consumer->eventfd = NULL;
+ 		list_del(&consumer->node);
+ 		module_put(THIS_MODULE);
+ 		break;
+ 	}
+ 
++	WARN_ON_ONCE(consumer->eventfd);
+ 	mutex_unlock(&lock);
+ 
+ 	module_put(THIS_MODULE);
+-- 
+2.53.0
+

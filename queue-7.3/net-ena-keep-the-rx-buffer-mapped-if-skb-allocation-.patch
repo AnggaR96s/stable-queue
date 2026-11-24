@@ -1,0 +1,78 @@
+From 988ae491871cf725e8e82103bbd433219d3fa6ea Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 9 Nov 2026 09:14:29 -0800
+Subject: net: ena: Keep the RX buffer mapped if skb allocation fails
+
+From: Breno Leitao <leitao@debian.org>
+
+[ Upstream commit 3e8e22a1007a6337ba2400b3ea87077947005c20 ]
+
+We are seeing the following issue in production on arm64 EC2 hosts
+(m8g.metal-24xl, 64K pages, SMMUv3 in strict mode, 6.18 based kernel).
+Right after a global OOM, the SMMU reports F_TRANSLATION write faults
+from the ENA device, followed by a burst of:
+
+  WARNING: CPU: 48 PID: 1656834 at drivers/iommu/dma-iommu.c:1242 iommu_dma_unmap_phys+0xf4/0x108
+  Call trace:
+   iommu_dma_unmap_phys+0xf4/0x108 (P)
+   dma_unmap_phys+0x194/0x2a8
+   dma_unmap_page_attrs+0x1c/0x38
+   ena_io_poll+0x7bc/0x1790 [ena]
+   __napi_poll+0x54/0x220
+   net_rx_action+0x250/0x520
+
+ena_rx_skb() unmaps the RX buffer, or takes an extra page reference to
+reuse it, before napi_build_skb() allocates the skb. If the allocation
+fails, it returns NULL with rx_info->page still set. ena_clean_rx_irq()
+then puts the req_id back on the free list, and ena_alloc_rx_buffer()
+treats the buffer as still mapped and posts its old DMA address to the
+device again.
+
+With the IOMMU in strict mode, the device then writes to an unmapped
+IOVA, and the next completion of that buffer unmaps it a second time.
+If the IOVA was handed to a new mapping in between, the device can
+write into that buffer instead. On the reuse path, the extra page
+reference is never dropped.
+
+Allocate the skb before touching rx_info, so that a failed allocation
+leaves the buffer mapped and unchanged for the refill.
+
+Fixes: 9e5269a915a8 ("net: ena: use build_skb() in RX path")
+Fixes: f7d625adeb7b ("net: ena: Add dynamic recycling mechanism for rx buffers")
+Signed-off-by: Breno Leitao <leitao@debian.org>
+Link: https://patch.msgid.link/20261109-ena-rx-skb-alloc-fail-v1-1-aee2927cb51f@debian.org
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/net/ethernet/amazon/ena/ena_netdev.c | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/ethernet/amazon/ena/ena_netdev.c b/drivers/net/ethernet/amazon/ena/ena_netdev.c
+index 7eb6456ed0d55..15e5cfeb0abe7 100644
+--- a/drivers/net/ethernet/amazon/ena/ena_netdev.c
++++ b/drivers/net/ethernet/amazon/ena/ena_netdev.c
+@@ -1009,6 +1009,10 @@ static struct sk_buff *ena_rx_skb(struct ena_ring *rx_ring,
+ 
+ 	buf_len = SKB_DATA_ALIGN(len + buf_offset + tailroom);
+ 
++	skb = ena_alloc_skb(rx_ring, buf_addr, buf_len);
++	if (unlikely(!skb))
++		return NULL;
++
+ 	/* If XDP isn't loaded try to reuse part of the RX buffer */
+ 	reuse_rx_buf_page = !is_xdp_loaded &&
+ 			    ena_try_rx_buf_page_reuse(rx_info, buf_len, len, pkt_offset);
+@@ -1016,10 +1020,6 @@ static struct sk_buff *ena_rx_skb(struct ena_ring *rx_ring,
+ 	if (!reuse_rx_buf_page)
+ 		ena_unmap_rx_buff_attrs(rx_ring, rx_info, DMA_ATTR_SKIP_CPU_SYNC);
+ 
+-	skb = ena_alloc_skb(rx_ring, buf_addr, buf_len);
+-	if (unlikely(!skb))
+-		return NULL;
+-
+ 	/* Populate skb's linear part */
+ 	skb_reserve(skb, buf_offset);
+ 	skb_put(skb, len);
+-- 
+2.53.0
+

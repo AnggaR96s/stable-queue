@@ -1,0 +1,198 @@
+From 23769623c9759ab5b9e7e1f735dab3d9a0b3d682 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 21 Oct 2026 11:51:16 -0700
+Subject: bpf: Drop percpu_counter from the htab element count
+
+From: Puranjay Mohan <puranjay@kernel.org>
+
+[ Upstream commit 1cd28b5354ab77c727ed87255bf289a87178b415 ]
+
+The element count of a large non-preallocated hash map is a
+percpu_counter, whose slow path takes fbc->lock with
+raw_spin_lock_irqsave(). That is not safe against BPF programs that run
+while the lock is held or contended: NMI programs and, as
+queued_spin_lock_slowpath() calls trace_contention_end() with the lock
+already held, programs attached to the contention_end tracepoint. If such
+a program updates the same map it spins on the lock its own CPU holds:
+
+  WARNING: possible recursive locking detected
+  cend/250 is trying to acquire lock:
+  (key#5){....}-{2:2}, at: _raw_spin_lock_irqsave+0x18/0x30
+  but task is already holding lock:
+  (key#5){....}-{2:2}, at: _raw_spin_lock_irqsave+0x18/0x30
+    percpu_counter_add_batch+0xd8/0x160
+    alloc_htab_elem+0x408/0x480
+    htab_map_update_elem+0x1e8/0x6a0
+    bpf_prog_7a29a1ae68aedf07_cend+0x14c/0x1f8
+    __bpf_trace_contention_end+0x14/0x20
+    queued_spin_lock_slowpath+0x2e8/0x468
+    percpu_counter_add_batch+0xd8/0x160
+    alloc_htab_elem+0x408/0x480
+    htab_map_update_elem+0x1e8/0x6a0
+
+is_map_full() is affected too, as __percpu_counter_compare() falls back
+to percpu_counter_sum(), which takes the same lock.
+
+map.elem_count already is a lockless per-cpu count of the same elements.
+Make htab->count follow it in steps of PERCPU_COUNTER_BATCH and let
+is_map_full() sum elem_count once count is within nr_cpu_ids * batch of
+max_entries. Each cpu's elem_count is ahead of count by less than the
+batch, so that is exact, in NMI as well.
+
+Fixes: 86fe28f7692d ("bpf: Optimize element count in non-preallocated hash map.")
+Suggested-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Puranjay Mohan <puranjay@kernel.org>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://patch.msgid.link/20261021185117.650403-1-puranjay@kernel.org
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/linux/bpf.h  |  2 ++
+ kernel/bpf/hashtab.c | 64 ++++++++++++++++++--------------------------
+ 2 files changed, 28 insertions(+), 38 deletions(-)
+
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index a628f182bb64c..c4d1053bfe2bf 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -2916,6 +2916,8 @@ static inline void bpf_map_dec_elem_count(struct bpf_map *map)
+ 	this_cpu_dec(*map->elem_count);
+ }
+ 
++s64 bpf_map_sum_elem_count(const struct bpf_map *map);
++
+ extern int sysctl_unprivileged_bpf_disabled;
+ 
+ bool bpf_token_capable(const struct bpf_token *token, int cap);
+diff --git a/kernel/bpf/hashtab.c b/kernel/bpf/hashtab.c
+index b2b27f87d8f55..d41fe658ae847 100644
+--- a/kernel/bpf/hashtab.c
++++ b/kernel/bpf/hashtab.c
+@@ -94,10 +94,10 @@ struct bpf_htab {
+ 		struct bpf_lru lru;
+ 	};
+ 	struct htab_elem *__percpu *extra_elems;
+-	/* number of elements in non-preallocated hashtable are kept
+-	 * in either pcount or count
++	/* number of elements in non-preallocated hashtable. With
++	 * use_percpu_counter it only follows map.elem_count in steps of
++	 * PERCPU_COUNTER_BATCH, see is_map_full()
+ 	 */
+-	struct percpu_counter pcount;
+ 	atomic_t count;
+ 	bool use_percpu_counter;
+ 	u32 n_buckets;	/* number of hash buckets */
+@@ -630,29 +630,20 @@ static struct bpf_map *htab_map_alloc(union bpf_attr *attr)
+ 
+ 	htab_init_buckets(htab);
+ 
+-/* compute_batch_value() computes batch value as num_online_cpus() * 2
+- * and __percpu_counter_compare() needs
+- * htab->max_entries - cur_number_of_elems to be more than batch * num_online_cpus()
+- * for percpu_counter to be faster than atomic_t. In practice the average bpf
+- * hash map size is 10k, which means that a system with 64 cpus will fill
+- * hashmap to 20% of 10k before percpu_counter becomes ineffective. Therefore
+- * define our own batch count as 32 then 10k hash map can be filled up to 80%:
++/* is_map_full() needs htab->max_entries - cur_number_of_elems to be more than
++ * batch * nr_cpu_ids for the percpu counter to be faster than atomic_t. In
++ * practice the average bpf hash map size is 10k. With batch count of 32 a 10k
++ * hash map on a system with 64 cpus can be filled up to 80%:
+  * 10k - 8k > 32 _batch_ * 64 _cpus_
+- * and __percpu_counter_compare() will still be fast. At that point hash map
++ * and is_map_full() will still be fast. At that point hash map
+  * collisions will dominate its performance anyway. Assume that hash map filled
+  * to 50+% isn't going to be O(1) and use the following formula to choose
+- * between percpu_counter and atomic_t.
++ * between the percpu counter and atomic_t. The batch has to be a power of 2.
+  */
+ #define PERCPU_COUNTER_BATCH 32
+-	if (attr->max_entries / 2 > num_online_cpus() * PERCPU_COUNTER_BATCH)
++	if (attr->max_entries / 2 > nr_cpu_ids * PERCPU_COUNTER_BATCH)
+ 		htab->use_percpu_counter = true;
+ 
+-	if (htab->use_percpu_counter) {
+-		err = percpu_counter_init(&htab->pcount, 0, GFP_KERNEL);
+-		if (err)
+-			goto free_map_locked;
+-	}
+-
+ 	if (prealloc) {
+ 		err = prealloc_init(htab);
+ 		if (err)
+@@ -680,8 +671,6 @@ static struct bpf_map *htab_map_alloc(union bpf_attr *attr)
+ free_prealloc:
+ 	prealloc_destroy(htab);
+ free_map_locked:
+-	if (htab->use_percpu_counter)
+-		percpu_counter_destroy(&htab->pcount);
+ 	bpf_map_area_free(htab->buckets);
+ 	bpf_mem_alloc_destroy(&htab->pcpu_ma);
+ 	bpf_mem_alloc_destroy(&htab->ma);
+@@ -990,30 +979,33 @@ static void htab_put_fd_value(struct bpf_htab *htab, struct htab_elem *l)
+ 
+ static bool is_map_full(struct bpf_htab *htab)
+ {
+-	if (htab->use_percpu_counter)
+-		return __percpu_counter_compare(&htab->pcount, htab->map.max_entries,
+-						PERCPU_COUNTER_BATCH) >= 0;
+-	return atomic_read(&htab->count) >= htab->map.max_entries;
++	s64 count = atomic_read(&htab->count);
++
++	/* each cpu's elem_count is ahead of count by less than the batch */
++	if (htab->use_percpu_counter &&
++	    count + nr_cpu_ids * PERCPU_COUNTER_BATCH >= htab->map.max_entries)
++		count = bpf_map_sum_elem_count(&htab->map);
++	return count >= htab->map.max_entries;
+ }
+ 
+ static void inc_elem_count(struct bpf_htab *htab)
+ {
+-	bpf_map_inc_elem_count(&htab->map);
++	s64 cnt = this_cpu_inc_return(*htab->map.elem_count);
+ 
+-	if (htab->use_percpu_counter)
+-		percpu_counter_add_batch(&htab->pcount, 1, PERCPU_COUNTER_BATCH);
+-	else
++	if (!htab->use_percpu_counter)
+ 		atomic_inc(&htab->count);
++	else if (!(cnt & (PERCPU_COUNTER_BATCH - 1)))
++		atomic_add(PERCPU_COUNTER_BATCH, &htab->count);
+ }
+ 
+ static void dec_elem_count(struct bpf_htab *htab)
+ {
+-	bpf_map_dec_elem_count(&htab->map);
++	s64 cnt = this_cpu_dec_return(*htab->map.elem_count);
+ 
+-	if (htab->use_percpu_counter)
+-		percpu_counter_add_batch(&htab->pcount, -1, PERCPU_COUNTER_BATCH);
+-	else
++	if (!htab->use_percpu_counter)
+ 		atomic_dec(&htab->count);
++	else if (!((cnt + 1) & (PERCPU_COUNTER_BATCH - 1)))
++		atomic_sub(PERCPU_COUNTER_BATCH, &htab->count);
+ }
+ 
+ static void free_htab_elem(struct bpf_htab *htab, struct htab_elem *l)
+@@ -1682,8 +1674,6 @@ static void htab_map_free(struct bpf_map *map)
+ 	bpf_map_area_free(htab->buckets);
+ 	bpf_mem_alloc_destroy(&htab->pcpu_ma);
+ 	bpf_mem_alloc_destroy(&htab->ma);
+-	if (htab->use_percpu_counter)
+-		percpu_counter_destroy(&htab->pcount);
+ 	bpf_map_area_free(htab);
+ }
+ 
+@@ -2393,9 +2383,7 @@ static u64 htab_map_mem_usage(const struct bpf_map *map)
+ 	} else {
+ #define LLIST_NODE_SZ sizeof(struct llist_node)
+ 
+-		num_entries = htab->use_percpu_counter ?
+-					  percpu_counter_sum(&htab->pcount) :
+-					  atomic_read(&htab->count);
++		num_entries = bpf_map_sum_elem_count(map);
+ 		usage += (htab->elem_size + LLIST_NODE_SZ) * num_entries;
+ 		if (percpu) {
+ 			usage += (LLIST_NODE_SZ + sizeof(void *)) * num_entries;
+-- 
+2.53.0
+

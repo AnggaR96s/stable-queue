@@ -1,0 +1,112 @@
+From d524df844f70d92093ac138e1f95ba6b1c38cc83 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 4 Sep 2026 03:35:28 +0000
+Subject: tcp: Do not allow buggy transitions between ehash and lhash2.
+
+From: Kuniyuki Iwashima <kuniyu@google.com>
+
+[ Upstream commit 8cc3aef0cb198049805ecc061a2cc7b79b0ae43e ]
+
+The following state transitions have long been a playground for
+syzbot, and recently AI joined in, reporting a lot more bugs.
+
+  * listen() + shutdown() + connect()
+  * connect() + connect(AF_UNSPEC) + listen()
+
+All the fix attempts would add more code to the fast path, which
+is not worth it.
+
+Instead of playing whack-a-mole with these edge-case bugs,
+let's disallow these transitions.
+
+Note that unhashed_state is placed in the 4-byte hole after
+icsk_pmtu_cookie.
+
+  $ pahole -C inet_connection_sock vmlinux
+  struct inet_connection_sock {
+  ...
+	__u32                      icsk_pmtu_cookie;     /*  1208     4 */
+	unsigned char              unhashed_state;       /*  1212     1 */
+
+	/* XXX 3 bytes hole, try to pack */
+
+Reported-by: Kyle Zeng <kylebot@openai.com>
+Closes: https://lore.kernel.org/netdev/20260731140512.566464-1-david.lee@trailofbits.com/
+Reported-by: Michal Luczaj <mhal@rbox.co>
+Closes: https://lore.kernel.org/netdev/20260803-sockmap-lookup-tcp-leak-v2-0-306e025bfe66@rbox.co/
+Reported-by: Hyunwoo Kim <imv4bel@gmail.com>
+Closes: https://lore.kernel.org/netdev/20260824033331.1084971-1-imv4bel@gmail.com/
+Signed-off-by: Kuniyuki Iwashima <kuniyu@google.com>
+Link: https://patch.msgid.link/20260904033543.2635540-2-kuniyu@google.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Stable-dep-of: 8c011697f76a ("tcp: do not resurrect a former listener with SO_ATTACH_REUSEPORT_[CE]BPF")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/net/inet_connection_sock.h |  1 +
+ net/ipv4/inet_connection_sock.c    |  1 +
+ net/ipv4/inet_hashtables.c         | 11 +++++++++++
+ 3 files changed, 13 insertions(+)
+
+diff --git a/include/net/inet_connection_sock.h b/include/net/inet_connection_sock.h
+index e8ee9164ec5ac..2ff01a8fbef2b 100644
+--- a/include/net/inet_connection_sock.h
++++ b/include/net/inet_connection_sock.h
+@@ -101,6 +101,7 @@ struct inet_connection_sock {
+ 	__u32                     icsk_rto_min;
+ 	__u32                     icsk_delack_max;
+ 	__u32			  icsk_pmtu_cookie;
++	unsigned char		  unhashed_state;
+ 	const struct tcp_congestion_ops *icsk_ca_ops;
+ 	const struct inet_connection_sock_af_ops *icsk_af_ops;
+ 	const struct tcp_ulp_ops  *icsk_ulp_ops;
+diff --git a/net/ipv4/inet_connection_sock.c b/net/ipv4/inet_connection_sock.c
+index 64093410f6d52..5b6436e6f242c 100644
+--- a/net/ipv4/inet_connection_sock.c
++++ b/net/ipv4/inet_connection_sock.c
+@@ -1304,6 +1304,7 @@ struct sock *inet_csk_clone_lock(const struct sock *sk,
+ 	memset(&newicsk->icsk_accept_queue, 0,
+ 	       sizeof(newicsk->icsk_accept_queue));
+ 
++	newicsk->unhashed_state = 0;
+ 	inet_sk_set_state(newsk, TCP_SYN_RECV);
+ 
+ 	inet_clone_ulp(req, newsk, priority);
+diff --git a/net/ipv4/inet_hashtables.c b/net/ipv4/inet_hashtables.c
+index 7035e35bea5e1..a597c176a5e45 100644
+--- a/net/ipv4/inet_hashtables.c
++++ b/net/ipv4/inet_hashtables.c
+@@ -744,6 +744,11 @@ int __inet_hash(struct sock *sk, struct sock *osk)
+ 		return 0;
+ 	}
+ 	WARN_ON(!sk_unhashed(sk));
++
++	if (unlikely(inet_csk(sk)->unhashed_state &&
++		     inet_csk(sk)->unhashed_state != TCP_LISTEN))
++		return -EINVAL;
++
+ 	ilb2 = inet_lhash2_bucket_sk(hashinfo, sk);
+ 
+ 	spin_lock(&ilb2->lock);
+@@ -785,6 +790,9 @@ void inet_unhash(struct sock *sk)
+ 		return;
+ 
+ 	sock_rps_delete_flow(sk);
++
++	inet_csk(sk)->unhashed_state = sk->sk_state;
++
+ 	if (sk->sk_state == TCP_LISTEN) {
+ 		struct inet_listen_hashbucket *ilb2;
+ 
+@@ -1017,6 +1025,9 @@ int __inet_hash_connect(struct inet_timewait_death_row *death_row,
+ 	int step, l3mdev;
+ 	u32 index;
+ 
++	if (unlikely(inet_csk(sk)->unhashed_state == TCP_LISTEN))
++		return -EINVAL;
++
+ 	if (port) {
+ 		local_bh_disable();
+ 		ret = check_established(death_row, sk, port, NULL);
+-- 
+2.53.0
+

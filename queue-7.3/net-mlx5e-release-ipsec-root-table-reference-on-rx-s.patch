@@ -1,0 +1,140 @@
+From 22aa4c70af5e4ff8395f7ac66589be3920046491 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 5 Nov 2026 23:16:29 +0200
+Subject: net/mlx5e: Release IPsec root table reference on RX setup failure
+
+From: Cosmin Ratiu <cratiu@nvidia.com>
+
+[ Upstream commit e8303b58108519ff103241442c0a7602fa106af5 ]
+
+Switchdev RX setup takes a root-chain table reference before creating
+its flow tables. If creation fails, rx_get() returns without
+incrementing the RX reference count, so rx_destroy() never releases the
+chain reference.
+
+Extract the cleanup logic in a counter-partner to the function acquiring
+the root table ref, and call it on error to properly release everything.
+Also call it from the normal destroy path to reduce code duplication.
+
+mlx5_esw_ipsec_rx_status_pass_dest_get() ignored chain table acquisition
+errors, returning success with an error pointer as the destination. The
+new unwind could then release a reference that was never taken.
+Propagate the error so cleanup only runs after a successful get.
+
+Discovered by Sashiko. Not triggered as it's an unlikely error path.
+
+Fixes: 1762f132d542 ("net/mlx5e: Support IPsec packet offload for RX in switchdev mode")
+Signed-off-by: Cosmin Ratiu <cratiu@nvidia.com>
+Reviewed-by: Jianbo Liu <jianbol@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Link: https://patch.msgid.link/20261105211637.1083978-2-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ .../mellanox/mlx5/core/en_accel/ipsec_fs.c    | 20 +++++++++++--------
+ .../mellanox/mlx5/core/esw/ipsec_fs.c         | 15 ++++++++++++--
+ .../mellanox/mlx5/core/esw/ipsec_fs.h         |  6 ++++++
+ 3 files changed, 31 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec_fs.c b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec_fs.c
+index 8ffa8068e90ac..fd9fbf3593330 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec_fs.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec_fs.c
+@@ -720,6 +720,16 @@ static void ipsec_rx_sa_selector_destroy(struct mlx5_core_dev *mdev,
+ 	mlx5_destroy_flow_table(rx->ft.sa_sel);
+ }
+ 
++static void
++ipsec_rx_status_pass_dest_put(struct mlx5e_ipsec *ipsec,
++			      struct mlx5e_ipsec_rx *rx,
++			      u32 family)
++{
++	mlx5_ipsec_fs_roce_rx_destroy(ipsec->roce, family, ipsec->mdev);
++	if (rx == ipsec->rx_esw)
++		mlx5_esw_ipsec_rx_status_pass_dest_put(ipsec);
++}
++
+ static void rx_destroy(struct mlx5_core_dev *mdev, struct mlx5e_ipsec *ipsec,
+ 		       struct mlx5e_ipsec_rx *rx, u32 family)
+ {
+@@ -739,13 +749,7 @@ static void rx_destroy(struct mlx5_core_dev *mdev, struct mlx5e_ipsec *ipsec,
+ 
+ 	ipsec_rx_policy_destroy(rx);
+ 
+-	mlx5_ipsec_fs_roce_rx_destroy(ipsec->roce, family, mdev);
+-
+-#ifdef CONFIG_MLX5_ESWITCH
+-	if (rx == ipsec->rx_esw)
+-		mlx5_chains_put_table(esw_chains(ipsec->mdev->priv.eswitch),
+-				      0, 1, 0);
+-#endif
++	ipsec_rx_status_pass_dest_put(ipsec, rx, family);
+ }
+ 
+ static void ipsec_rx_create_attr_set(struct mlx5e_ipsec *ipsec,
+@@ -1115,7 +1119,7 @@ static int rx_create(struct mlx5_core_dev *mdev, struct mlx5e_ipsec *ipsec,
+ err_fs_ft_sa_sel:
+ 	mlx5_destroy_flow_table(rx->ft.status);
+ err_fs_ft_status:
+-	mlx5_ipsec_fs_roce_rx_destroy(ipsec->roce, family, mdev);
++	ipsec_rx_status_pass_dest_put(ipsec, rx, family);
+ 	return err;
+ }
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/esw/ipsec_fs.c b/drivers/net/ethernet/mellanox/mlx5/core/esw/ipsec_fs.c
+index ab50d2c734ede..f8c97954b6eaf 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/esw/ipsec_fs.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/esw/ipsec_fs.c
+@@ -34,12 +34,23 @@ void mlx5_esw_ipsec_rx_create_attr_set(struct mlx5e_ipsec *ipsec,
+ int mlx5_esw_ipsec_rx_status_pass_dest_get(struct mlx5e_ipsec *ipsec,
+ 					   struct mlx5_flow_destination *dest)
+ {
+-	dest->type = MLX5_FLOW_DESTINATION_TYPE_FLOW_TABLE;
+-	dest->ft = mlx5_chains_get_table(esw_chains(ipsec->mdev->priv.eswitch), 0, 1, 0);
++	struct mlx5_flow_table *ft;
++
++	ft = mlx5_chains_get_table(esw_chains(ipsec->mdev->priv.eswitch),
++				   0, 1, 0);
++	if (IS_ERR(ft))
++		return PTR_ERR(ft);
+ 
++	dest->type = MLX5_FLOW_DESTINATION_TYPE_FLOW_TABLE;
++	dest->ft = ft;
+ 	return 0;
+ }
+ 
++void mlx5_esw_ipsec_rx_status_pass_dest_put(struct mlx5e_ipsec *ipsec)
++{
++	mlx5_chains_put_table(esw_chains(ipsec->mdev->priv.eswitch), 0, 1, 0);
++}
++
+ int mlx5_esw_ipsec_rx_setup_modify_header(struct mlx5e_ipsec_sa_entry *sa_entry,
+ 					  struct mlx5_flow_act *flow_act)
+ {
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/esw/ipsec_fs.h b/drivers/net/ethernet/mellanox/mlx5/core/esw/ipsec_fs.h
+index 514c15258b1d1..bb6f2423078bd 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/esw/ipsec_fs.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/esw/ipsec_fs.h
+@@ -12,6 +12,7 @@ void mlx5_esw_ipsec_rx_create_attr_set(struct mlx5e_ipsec *ipsec,
+ 				       struct mlx5e_ipsec_rx_create_attr *attr);
+ int mlx5_esw_ipsec_rx_status_pass_dest_get(struct mlx5e_ipsec *ipsec,
+ 					   struct mlx5_flow_destination *dest);
++void mlx5_esw_ipsec_rx_status_pass_dest_put(struct mlx5e_ipsec *ipsec);
+ int mlx5_esw_ipsec_rx_setup_modify_header(struct mlx5e_ipsec_sa_entry *sa_entry,
+ 					  struct mlx5_flow_act *flow_act);
+ void mlx5_esw_ipsec_rx_id_mapping_remove(struct mlx5e_ipsec_sa_entry *sa_entry);
+@@ -32,6 +33,11 @@ static inline int mlx5_esw_ipsec_rx_status_pass_dest_get(struct mlx5e_ipsec *ips
+ 	return -EINVAL;
+ }
+ 
++static inline
++void mlx5_esw_ipsec_rx_status_pass_dest_put(struct mlx5e_ipsec *ipsec)
++{
++}
++
+ static inline int mlx5_esw_ipsec_rx_setup_modify_header(struct mlx5e_ipsec_sa_entry *sa_entry,
+ 							struct mlx5_flow_act *flow_act)
+ {
+-- 
+2.53.0
+

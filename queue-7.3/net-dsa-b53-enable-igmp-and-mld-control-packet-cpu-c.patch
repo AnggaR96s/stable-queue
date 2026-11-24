@@ -1,0 +1,184 @@
+From 735a94b3d749c56a4e49c19b0a96de2cc4c8b2fe Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 28 Oct 2026 16:50:59 -0700
+Subject: net: dsa: b53: Enable IGMP and MLD control packet CPU copies
+
+From: Florian Fainelli <florian.fainelli@broadcom.com>
+
+[ Upstream commit 3362cb822ea750399a15b741713181fd8560bd17 ]
+
+IGMPv2 reports and MLDv1 reports are addressed to the multicast group
+itself. Once the first listener is installed in the ARL table, subsequent
+reports can follow that entry without reaching the CPU. The bridge then
+fails to learn additional listeners, although static MDB forwarding works.
+
+Enable the high-level protocol classifiers so that IGMP and MLD control
+packets are copied to the CPU independently of the multicast ARL lookup.
+Retain normal L2 forwarding by clearing the CPU-only forwarding modes,
+and preserve unrelated protocol-control fields.
+
+Handle the BCM5395's 16-bit register and different classifier fields
+separately from the 32-bit layout on the BCM531xx, BCM5301x and newer
+integrated RoboSwitch families, including BCM7445, BCM7278 and BCM4908.
+Export the helper and call it from bcm_sf2_sw_setup() as well, since SF2
+uses its own setup operation instead of b53_setup(). This also restores
+the classifiers after the switch reset on resume. Leave older devices
+with different IGMP controls untouched, and propagate register access
+failures during setup.
+
+The SF2 setup integration and BCM4908 chip gate were updated with
+assistance from OpenAI Codex in response to review feedback.
+
+Fixes: 5d65b64a3d97 ("net: dsa: b53: Add support for MDB")
+Signed-off-by: Florian Fainelli <florian.fainelli@broadcom.com>
+Link: https://patch.msgid.link/20261028235100.3892374-2-florian.fainelli@broadcom.com
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/net/dsa/b53/b53_common.c | 57 ++++++++++++++++++++++++++++++++
+ drivers/net/dsa/b53/b53_priv.h   |  1 +
+ drivers/net/dsa/b53/b53_regs.h   | 17 ++++++++++
+ drivers/net/dsa/bcm_sf2.c        |  5 +++
+ 4 files changed, 80 insertions(+)
+
+diff --git a/drivers/net/dsa/b53/b53_common.c b/drivers/net/dsa/b53/b53_common.c
+index 0880310c9ce3f..e54f6d4d1f7bb 100644
+--- a/drivers/net/dsa/b53/b53_common.c
++++ b/drivers/net/dsa/b53/b53_common.c
+@@ -836,6 +836,59 @@ void b53_brcm_hdr_setup(struct dsa_switch *ds, int port)
+ }
+ EXPORT_SYMBOL(b53_brcm_hdr_setup);
+ 
++int b53_enable_mcast_snooping(struct b53_device *dev)
++{
++	u16 val16;
++	u32 val;
++	int ret;
++
++	/* Older switches use different IGMP controls, not HL_PRTC_CTRL. */
++	if (is5325(dev) || is5365(dev) || dev->chip_id == BCM5389_DEVICE_ID ||
++	    is5397_98(dev) || is63xx(dev))
++		return 0;
++
++	/* IGMPv2 and MLDv1 reports use the group's destination MAC. Once
++	 * the first listener is offloaded, ordinary multicast forwarding
++	 * can keep subsequent reports from reaching the bridge CPU.
++	 */
++
++	/* BCM5395 has a narrower register and a single IGMP classifier.
++	 * Its ICMPv6 classifier also covers MLD.
++	 */
++	if (dev->chip_id == BCM5395_DEVICE_ID) {
++		ret = b53_read16(dev, B53_MGMT_PAGE, B53_HL_PRTC_CTRL, &val16);
++		if (ret)
++			return ret;
++
++		val16 |= HL_PRTC_IGMP_IP_EN_5395 | HL_PRTC_ICMPV6_EN;
++		/* Zero forwarding modes copy control traffic to the CPU
++		 * independently of the ARL lookup, retaining L2 forwarding.
++		 */
++		val16 &= ~(HL_PRTC_IGMP_FWD_MODE_5395 |
++			   HL_PRTC_ICMPV6_FWD_MODE);
++
++		return b53_write16(dev, B53_MGMT_PAGE, B53_HL_PRTC_CTRL,
++				   val16);
++	}
++
++	ret = b53_read32(dev, B53_MGMT_PAGE, B53_HL_PRTC_CTRL, &val);
++	if (ret)
++		return ret;
++
++	val |= HL_PRTC_IGMP_RPTLVE_EN | HL_PRTC_IGMP_QRY_EN |
++	       HL_PRTC_IGMP_UKN_EN | HL_PRTC_MLD_RPTDONE_EN |
++	       HL_PRTC_MLD_QRY_EN;
++	/* Zero forwarding modes copy control traffic to the CPU
++	 * independently of the ARL lookup, retaining L2 forwarding.
++	 */
++	val &= ~(HL_PRTC_IGMP_RPTLVE_FWD_MODE | HL_PRTC_IGMP_QRY_FWD_MODE |
++		 HL_PRTC_IGMP_UKN_FWD_MODE | HL_PRTC_MLD_RPTDONE_FWD_MODE |
++		 HL_PRTC_MLD_QRY_FWD_MODE);
++
++	return b53_write32(dev, B53_MGMT_PAGE, B53_HL_PRTC_CTRL, val);
++}
++EXPORT_SYMBOL(b53_enable_mcast_snooping);
++
+ static void b53_enable_cpu_port(struct b53_device *dev, int port)
+ {
+ 	u8 port_ctrl;
+@@ -1334,6 +1387,10 @@ static int b53_setup(struct dsa_switch *ds)
+ 			b53_disable_port(ds, port);
+ 	}
+ 
++	ret = b53_enable_mcast_snooping(dev);
++	if (ret)
++		return ret;
++
+ 	return b53_setup_devlink_resources(ds);
+ }
+ 
+diff --git a/drivers/net/dsa/b53/b53_priv.h b/drivers/net/dsa/b53/b53_priv.h
+index 29cca7945df71..c4d2a41c714f6 100644
+--- a/drivers/net/dsa/b53/b53_priv.h
++++ b/drivers/net/dsa/b53/b53_priv.h
+@@ -504,6 +504,7 @@ static inline struct gpio_desc *b53_switch_get_reset_gpio(struct b53_device *dev
+ /* Exported functions towards other drivers */
+ void b53_imp_vlan_setup(struct dsa_switch *ds, int cpu_port);
+ int b53_configure_vlan(struct dsa_switch *ds);
++int b53_enable_mcast_snooping(struct b53_device *dev);
+ void b53_get_strings(struct dsa_switch *ds, int port, u32 stringset,
+ 		     uint8_t *data);
+ void b53_get_ethtool_stats(struct dsa_switch *ds, int port, uint64_t *data);
+diff --git a/drivers/net/dsa/b53/b53_regs.h b/drivers/net/dsa/b53/b53_regs.h
+index 54a278db67c9f..cfdb5ed383260 100644
+--- a/drivers/net/dsa/b53/b53_regs.h
++++ b/drivers/net/dsa/b53/b53_regs.h
+@@ -274,6 +274,23 @@
+ /* Revision ID register (8 bit) */
+ #define B53_REV_ID			0x40
+ 
++/* High-level protocol control (16 bit on BCM5395, otherwise 32 bit) */
++#define B53_HL_PRTC_CTRL			0x50
++#define   HL_PRTC_ICMPV6_EN		BIT(4)
++#define   HL_PRTC_ICMPV6_FWD_MODE		BIT(5)
++#define   HL_PRTC_IGMP_IP_EN_5395		BIT(6)
++#define   HL_PRTC_IGMP_FWD_MODE_5395	BIT(8)
++#define   HL_PRTC_IGMP_RPTLVE_EN		BIT(9)
++#define   HL_PRTC_IGMP_RPTLVE_FWD_MODE	BIT(10)
++#define   HL_PRTC_IGMP_QRY_EN		BIT(11)
++#define   HL_PRTC_IGMP_QRY_FWD_MODE	BIT(12)
++#define   HL_PRTC_IGMP_UKN_EN		BIT(13)
++#define   HL_PRTC_IGMP_UKN_FWD_MODE	BIT(14)
++#define   HL_PRTC_MLD_RPTDONE_EN		BIT(15)
++#define   HL_PRTC_MLD_RPTDONE_FWD_MODE	BIT(16)
++#define   HL_PRTC_MLD_QRY_EN		BIT(17)
++#define   HL_PRTC_MLD_QRY_FWD_MODE		BIT(18)
++
+ /* Broadcom header RX control (16 bit) */
+ #define B53_BRCM_HDR_RX_DIS		0x60
+ 
+diff --git a/drivers/net/dsa/bcm_sf2.c b/drivers/net/dsa/bcm_sf2.c
+index de3efa3ce9a75..f3b56ea87b07b 100644
+--- a/drivers/net/dsa/bcm_sf2.c
++++ b/drivers/net/dsa/bcm_sf2.c
+@@ -1059,6 +1059,7 @@ static int bcm_sf2_sw_setup(struct dsa_switch *ds)
+ {
+ 	struct bcm_sf2_priv *priv = bcm_sf2_to_priv(ds);
+ 	unsigned int port;
++	int ret;
+ 
+ 	/* Enable all valid ports and disable those unused */
+ 	for (port = 0; port < priv->hw_params.num_ports; port++) {
+@@ -1074,6 +1075,10 @@ static int bcm_sf2_sw_setup(struct dsa_switch *ds)
+ 	b53_configure_vlan(ds);
+ 	bcm_sf2_enable_acb(ds);
+ 
++	ret = b53_enable_mcast_snooping(priv->dev);
++	if (ret)
++		return ret;
++
+ 	return b53_setup_devlink_resources(ds);
+ }
+ 
+-- 
+2.53.0
+

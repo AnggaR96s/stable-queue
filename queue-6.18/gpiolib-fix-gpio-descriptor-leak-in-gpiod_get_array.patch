@@ -1,0 +1,125 @@
+From de1c1a18ea65d3fa3ad69fae21c38a1a6ad6a94c Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 5 Nov 2026 22:30:15 -0800
+Subject: gpiolib: fix GPIO descriptor leak in gpiod_get_array()
+
+From: Dmitry Torokhov <dmitry.torokhov@gmail.com>
+
+[ Upstream commit b2a161687acdc297aa91fec7fa0966b5aecf0d16 ]
+
+In gpiod_get_array(), descs->ndescs is used as the loop induction
+variable and is only incremented at the end of each iteration. When
+krealloc() fails on the first iteration (when index is 0),
+descs->desc[0] has already been acquired via gpiod_get_index(), but
+descs->ndescs is still 0. Consequently, gpiod_put_array() frees descs
+without releasing descs->desc[0], leaking the descriptor.
+
+Fix this by using a dedicated loop induction variable and incrementing
+descs->ndescs immediately upon storing the retrieved descriptor.
+Additionally, since the fast-path array_info setup only executes for the
+first element (index 0), simplify the bitmap_set() calls to start at bit
+0 for count bits instead of calculating offsets from the loop index.
+
+Fixes: bf9346f5d47b ("gpiolib: Identify arrays matching GPIO hardware")
+Reviewed-by: Andy Shevchenko <andriy.shevchenko@intel.com>
+Signed-off-by: Dmitry Torokhov <dmitry.torokhov@gmail.com>
+Link: https://patch.msgid.link/20261105-b4-gpiolib-free-v3-1-bb47ad58642d@gmail.com
+Signed-off-by: Bartosz Golaszewski <bartosz.golaszewski@oss.qualcomm.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/gpio/gpiolib.c | 34 ++++++++++++++--------------------
+ 1 file changed, 14 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/gpio/gpiolib.c b/drivers/gpio/gpiolib.c
+index fa2ab0f90dbda..af33ff0778cb9 100644
+--- a/drivers/gpio/gpiolib.c
++++ b/drivers/gpio/gpiolib.c
+@@ -5042,21 +5042,21 @@ struct gpio_descs *__must_check gpiod_get_array(struct device *dev,
+ 	if (!descs)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-	for (descs->ndescs = 0; descs->ndescs < count; descs->ndescs++) {
+-		desc = gpiod_get_index(dev, con_id, descs->ndescs, flags);
++	for (int i = 0; i < count; i++) {
++		desc = gpiod_get_index(dev, con_id, i, flags);
+ 		if (IS_ERR(desc)) {
+ 			gpiod_put_array(descs);
+ 			return ERR_CAST(desc);
+ 		}
+ 
+-		descs->desc[descs->ndescs] = desc;
++		descs->desc[descs->ndescs++] = desc;
+ 
+ 		gdev = gpiod_to_gpio_device(desc);
+ 		/*
+ 		 * If pin hardware number of array member 0 is also 0, select
+ 		 * its chip as a candidate for fast bitmap processing path.
+ 		 */
+-		if (descs->ndescs == 0 && gpiod_hwgpio(desc) == 0) {
++		if (i == 0 && gpiod_hwgpio(desc) == 0) {
+ 			struct gpio_descs *array;
+ 
+ 			bitmap_size = BITS_TO_LONGS(gdev->ngpio > count ?
+@@ -5081,10 +5081,8 @@ struct gpio_descs *__must_check gpiod_get_array(struct device *dev,
+ 			array_info->desc = descs->desc;
+ 			array_info->size = count;
+ 			array_info->gdev = gdev;
+-			bitmap_set(array_info->get_mask, descs->ndescs,
+-				   count - descs->ndescs);
+-			bitmap_set(array_info->set_mask, descs->ndescs,
+-				   count - descs->ndescs);
++			bitmap_set(array_info->get_mask, 0, count);
++			bitmap_set(array_info->set_mask, 0, count);
+ 			descs->info = array_info;
+ 		}
+ 
+@@ -5094,38 +5092,34 @@ struct gpio_descs *__must_check gpiod_get_array(struct device *dev,
+ 
+ 		/* Unmark array members which don't belong to the 'fast' chip */
+ 		if (array_info->gdev != gdev) {
+-			__clear_bit(descs->ndescs, array_info->get_mask);
+-			__clear_bit(descs->ndescs, array_info->set_mask);
++			__clear_bit(i, array_info->get_mask);
++			__clear_bit(i, array_info->set_mask);
+ 		}
+ 		/*
+ 		 * Detect array members which belong to the 'fast' chip
+ 		 * but their pins are not in hardware order.
+ 		 */
+-		else if (gpiod_hwgpio(desc) != descs->ndescs) {
++		else if (gpiod_hwgpio(desc) != i) {
+ 			/*
+ 			 * Don't use fast path if all array members processed so
+ 			 * far belong to the same chip as this one but its pin
+ 			 * hardware number is different from its array index.
+ 			 */
+-			if (bitmap_full(array_info->get_mask, descs->ndescs)) {
++			if (bitmap_full(array_info->get_mask, i)) {
+ 				array_info = NULL;
+ 			} else {
+-				__clear_bit(descs->ndescs,
+-					    array_info->get_mask);
+-				__clear_bit(descs->ndescs,
+-					    array_info->set_mask);
++				__clear_bit(i, array_info->get_mask);
++				__clear_bit(i, array_info->set_mask);
+ 			}
+ 		} else {
+ 			dflags = READ_ONCE(desc->flags);
+ 			/* Exclude open drain or open source from fast output */
+ 			if (test_bit(GPIOD_FLAG_OPEN_DRAIN, &dflags) ||
+ 			    test_bit(GPIOD_FLAG_OPEN_SOURCE, &dflags))
+-				__clear_bit(descs->ndescs,
+-					    array_info->set_mask);
++				__clear_bit(i, array_info->set_mask);
+ 			/* Identify 'fast' pins which require invertion */
+ 			if (gpiod_is_active_low(desc))
+-				__set_bit(descs->ndescs,
+-					  array_info->invert_mask);
++				__set_bit(i, array_info->invert_mask);
+ 		}
+ 	}
+ 	if (array_info)
+-- 
+2.53.0
+

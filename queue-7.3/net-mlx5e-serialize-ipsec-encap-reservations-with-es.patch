@@ -1,0 +1,217 @@
+From d6e6f8e5a21c1c7722c7e80ca7b325f2186941c1 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 5 Nov 2026 23:16:30 +0200
+Subject: net/mlx5e: Serialize ipsec encap reservations with eswitch operations
+
+From: Cosmin Ratiu <cratiu@nvidia.com>
+
+[ Upstream commit b102f927c69e2d7cf849bcfb7f7b0cd6e52fc1b0 ]
+
+mlx5_eswitch_block_encap() takes mode_lock but ignores
+eswitch_operation_in_progress. mlx5_devlink_eswitch_encap_mode_set()
+claims the operation and drops mode_lock while rebuilding the FDB and
+updating offloads.encap, so a reservation can read a stale or
+rolled-back encap value. In diagram form:
+
+T1: first IPsec SA (NIC table)   T2: encap none -> basic
+                                 mlx5_devlink_eswitch_encap_mode_set()
+                                   down_write(&esw->mode_lock)
+                                   sees num_block_encap == 0
+                                   eswitch_operation_in_progress = true
+                                   up_write(&esw->mode_lock)
+                                   esw_destroy_offloads_fdb_tables()
+mlx5e_xfrm_add_state()
+  mlx5e_ipsec_fs_tunnel_allowed()
+    mlx5_eswitch_block_encap()
+      down_write(&esw->mode_lock)
+      reads encap == NONE
+      num_block_encap++
+      up_write(&esw->mode_lock)
+                                   esw->offloads.encap = BASIC
+                                   esw_create_offloads_fdb_tables()
+
+The race happens therefore because offloads.encap is not consistently
+accessed under mode_lock. There are other variations of the above race
+(e.g. in rollback, or in tx_create()).
+
+Use mlx5_esw_lock() to reject a reservation while an operation is in
+progress. This implies changing mlx5e_ipsec_fs_tunnel_allowed() to
+propagate the error. Note that these are not new failure modes as it
+seems on first glance, because if the eswitch_operation_in_progress flag
+is set, rx_get()/tx_get()->mlx5_eswitch_block_mode() already fails with
+-EBUSY. The new code simply protects against an operation initiated in
+the short window after mlx5_eswitch_block_mode().
+
+This race was found by Sashiko during inspection of another patch of
+this series. No attempt has been made to trigger it, as it requires very
+precise timing.
+
+Fixes: baac8351f74c ("net/mlx5e: Reduce eswitch mode_lock protection context")
+Signed-off-by: Cosmin Ratiu <cratiu@nvidia.com>
+Reviewed-by: Jianbo Liu <jianbol@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Link: https://patch.msgid.link/20261105211637.1083978-3-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ .../mellanox/mlx5/core/en_accel/ipsec.c       |  5 ++++-
+ .../mellanox/mlx5/core/en_accel/ipsec.h       |  2 +-
+ .../mellanox/mlx5/core/en_accel/ipsec_fs.c    | 21 ++++++++++++-------
+ .../net/ethernet/mellanox/mlx5/core/eswitch.h |  6 +++---
+ .../mellanox/mlx5/core/eswitch_offloads.c     | 20 +++++++++++-------
+ 5 files changed, 35 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.c b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.c
+index e6dd911475e31..a8c7f09f903fc 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.c
+@@ -812,7 +812,10 @@ static int mlx5e_xfrm_add_state(struct net_device *dev,
+ 
+ 	if (x->props.mode == XFRM_MODE_TUNNEL &&
+ 	    x->xso.type == XFRM_DEV_OFFLOAD_PACKET) {
+-		allow_tunnel_mode = mlx5e_ipsec_fs_tunnel_allowed(sa_entry);
++		err = mlx5e_ipsec_fs_tunnel_allowed(sa_entry);
++		if (err < 0)
++			goto unblock_mode;
++		allow_tunnel_mode = err;
+ 		if (!allow_tunnel_mode) {
+ 			NL_SET_ERR_MSG_MOD(extack,
+ 					   "Packet offload tunnel mode is disabled due to encap settings");
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.h b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.h
+index abcbd38db9dbb..f4b2d7b950c00 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.h
+@@ -320,7 +320,7 @@ void mlx5e_accel_ipsec_fs_del_rule(struct mlx5e_ipsec_sa_entry *sa_entry);
+ int mlx5e_accel_ipsec_fs_add_pol(struct mlx5e_ipsec_pol_entry *pol_entry);
+ void mlx5e_accel_ipsec_fs_del_pol(struct mlx5e_ipsec_pol_entry *pol_entry);
+ void mlx5e_accel_ipsec_fs_modify(struct mlx5e_ipsec_sa_entry *sa_entry);
+-bool mlx5e_ipsec_fs_tunnel_allowed(struct mlx5e_ipsec_sa_entry *sa_entry);
++int mlx5e_ipsec_fs_tunnel_allowed(struct mlx5e_ipsec_sa_entry *sa_entry);
+ 
+ int mlx5_ipsec_create_sa_ctx(struct mlx5e_ipsec_sa_entry *sa_entry);
+ void mlx5_ipsec_free_sa_ctx(struct mlx5e_ipsec_sa_entry *sa_entry);
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec_fs.c b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec_fs.c
+index fd9fbf3593330..1529d47303234 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec_fs.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec_fs.c
+@@ -1072,9 +1072,12 @@ static int rx_create(struct mlx5_core_dev *mdev, struct mlx5e_ipsec *ipsec,
+ 		goto err_fs_ft_sa_sel;
+ 
+ 	/* Create FT */
+-	if (mlx5_ipsec_device_caps(mdev) & MLX5_IPSEC_CAP_TUNNEL)
+-		rx->allow_tunnel_mode =
+-			mlx5_eswitch_block_encap(mdev, rx == ipsec->rx_esw);
++	if (mlx5_ipsec_device_caps(mdev) & MLX5_IPSEC_CAP_TUNNEL) {
++		err = mlx5_eswitch_block_encap(mdev, rx == ipsec->rx_esw);
++		if (err < 0)
++			goto err_fs_ft;
++		rx->allow_tunnel_mode = err;
++	}
+ 
+ 	if (rx->allow_tunnel_mode)
+ 		flags = MLX5_FLOW_TABLE_TUNNEL_EN_REFORMAT;
+@@ -1315,9 +1318,12 @@ static int tx_create(struct mlx5e_ipsec *ipsec, struct mlx5e_ipsec_tx *tx,
+ 	if (err)
+ 		goto err_status_rule;
+ 
+-	if (mlx5_ipsec_device_caps(mdev) & MLX5_IPSEC_CAP_TUNNEL)
+-		tx->allow_tunnel_mode =
+-			mlx5_eswitch_block_encap(mdev, tx == ipsec->tx_esw);
++	if (mlx5_ipsec_device_caps(mdev) & MLX5_IPSEC_CAP_TUNNEL) {
++		err = mlx5_eswitch_block_encap(mdev, tx == ipsec->tx_esw);
++		if (err < 0)
++			goto err_encap;
++		tx->allow_tunnel_mode = err;
++	}
+ 
+ 	if (tx->allow_tunnel_mode)
+ 		flags = MLX5_FLOW_TABLE_TUNNEL_EN_REFORMAT;
+@@ -1387,6 +1393,7 @@ static int tx_create(struct mlx5e_ipsec *ipsec, struct mlx5e_ipsec_tx *tx,
+ err_sa_ft:
+ 	if (tx->allow_tunnel_mode)
+ 		mlx5_eswitch_unblock_encap(mdev);
++err_encap:
+ 	mlx5_del_flow_rules(tx->status.rule);
+ err_status_rule:
+ 	mlx5_destroy_flow_table(tx->ft.status);
+@@ -2854,7 +2861,7 @@ void mlx5e_accel_ipsec_fs_modify(struct mlx5e_ipsec_sa_entry *sa_entry)
+ 	memcpy(sa_entry, &sa_entry_shadow, sizeof(*sa_entry));
+ }
+ 
+-bool mlx5e_ipsec_fs_tunnel_allowed(struct mlx5e_ipsec_sa_entry *sa_entry)
++int mlx5e_ipsec_fs_tunnel_allowed(struct mlx5e_ipsec_sa_entry *sa_entry)
+ {
+ 	struct mlx5e_ipsec *ipsec = sa_entry->ipsec;
+ 	struct xfrm_state *x = sa_entry->x;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+index 8b1f93b13ea9c..c904860df7b3e 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@ -967,7 +967,7 @@ void mlx5_eswitch_unload_reps(struct mlx5_eswitch *esw);
+ bool mlx5_eswitch_is_peer(struct mlx5_eswitch *esw,
+ 			  struct mlx5_eswitch *peer_esw);
+ 
+-bool mlx5_eswitch_block_encap(struct mlx5_core_dev *dev, bool from_fdb);
++int mlx5_eswitch_block_encap(struct mlx5_core_dev *dev, bool from_fdb);
+ void mlx5_eswitch_unblock_encap(struct mlx5_core_dev *dev);
+ 
+ int mlx5_eswitch_block_mode(struct mlx5_core_dev *dev);
+@@ -1071,10 +1071,10 @@ mlx5_eswitch_reload_ib_reps(struct mlx5_eswitch *esw)
+ static inline void
+ mlx5_eswitch_unload_reps(struct mlx5_eswitch *esw) {}
+ 
+-static inline bool
++static inline int
+ mlx5_eswitch_block_encap(struct mlx5_core_dev *dev, bool from_fdb)
+ {
+-	return true;
++	return 1;
+ }
+ 
+ static inline void mlx5_eswitch_unblock_encap(struct mlx5_core_dev *dev)
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+index eb74b62601682..f298e72eeec53 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@ -4689,25 +4689,31 @@ int mlx5_devlink_eswitch_inline_mode_get(struct devlink *devlink, u8 *mode)
+ 	return esw_inline_mode_to_devlink(esw->offloads.inline_mode, mode);
+ }
+ 
+-bool mlx5_eswitch_block_encap(struct mlx5_core_dev *dev, bool from_fdb)
++/* Return 1 if allowed, 0 if disallowed by the configuration, or -EBUSY
++ * if an eswitch operation is in progress.
++ */
++int mlx5_eswitch_block_encap(struct mlx5_core_dev *dev, bool from_fdb)
+ {
+ 	struct mlx5_eswitch *esw = dev->priv.eswitch;
+ 	enum devlink_eswitch_encap_mode encap;
+-	bool allow_tunnel = false;
++	int ret;
+ 
+ 	if (!mlx5_esw_allowed(esw))
+-		return true;
++		return 1;
++
++	ret = mlx5_esw_lock(esw);
++	if (ret)
++		return ret;
+ 
+-	down_write(&esw->mode_lock);
+ 	encap = esw->offloads.encap;
+ 	if (esw->mode == MLX5_ESWITCH_LEGACY ||
+ 	    (encap == DEVLINK_ESWITCH_ENCAP_MODE_NONE && !from_fdb)) {
+-		allow_tunnel = true;
++		ret = 1;
+ 		esw->offloads.num_block_encap++;
+ 	}
+-	up_write(&esw->mode_lock);
++	mlx5_esw_unlock(esw);
+ 
+-	return allow_tunnel;
++	return ret;
+ }
+ 
+ void mlx5_eswitch_unblock_encap(struct mlx5_core_dev *dev)
+-- 
+2.53.0
+

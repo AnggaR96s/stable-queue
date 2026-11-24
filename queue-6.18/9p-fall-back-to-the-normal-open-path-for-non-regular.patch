@@ -1,0 +1,113 @@
+From 41a61fe017dfeee90946f875f5b0ddefa48b960c Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 22 Sep 2026 21:15:36 +0800
+Subject: 9p: fall back to the normal open path for non-regular files
+
+From: Yuanfu Xie <yuanfuxie@stu.pku.edu.cn>
+
+[ Upstream commit ff1baa01a6e1f24741f7428119e6f3a61b995604 ]
+
+v9fs_vfs_atomic_open() and v9fs_vfs_atomic_open_dotl() call
+finish_open(file, dentry, generic_file_open) regardless of the file
+type the server reported for the created dentry.  The supplied
+callback replaces f_op->open in do_dentry_open(), so blkdev_open()
+never runs for a server-reported device node: an open() with O_CREAT
+succeeds with f_op = def_blk_fops while f_mapping still points at the
+9p inode, because the bdev mapping swap only happens inside
+blkdev_open().  The block file methods then derive their block_device
+from that inode with I_BDEV(); the loads land at the tail of a
+656-byte v9fs_inode_cache object (offsets +624 and +632), which KASAN
+reports as slab-out-of-bounds, and the garbage they read is then
+dereferenced, so the first read(), write(), ioctl() or close() ends
+in a NULL pointer write and a panic.  In the ioctl(BLKGETSIZE64)
+variant the value read this way is returned to userspace.
+
+The server controls the file type reported for the create, so a
+malicious server can crash the client this way.  KASAN report of the
+read() variant, on a build of linux-stable 2709dd5ae32f:
+
+BUG: KASAN: slab-out-of-bounds in blkdev_read_iter+0x3cd/0x440
+Read of size 8 at addr ffff88800828ceb0 by task repro/1
+
+Call Trace:
+ <TASK>
+ dump_stack_lvl+0x7b/0xa0
+ print_report+0xd0/0x630
+ kasan_report+0xe5/0x120
+ blkdev_read_iter+0x3cd/0x440
+ vfs_read+0x718/0xa50
+ ksys_read+0x10f/0x200
+ do_syscall_64+0xdd/0x4a0
+ entry_SYSCALL_64_after_hwframe+0x77/0x7f
+ </TASK>
+
+The buggy address belongs to the object at ffff88800828cc40
+ which belongs to the cache v9fs_inode_cache of size 656
+The buggy address is located 624 bytes inside of
+ allocated 656-byte region [ffff88800828cc40, ffff88800828ced0)
+
+A plain open() without O_CREAT is not affected: it runs blkdev_open()
+and either maps the device correctly or fails with -ENXIO for an rdev
+with no registered device.  When the created inode is not a regular
+file, clunk the fid the create opened.  The unopened fid is already
+on the dentry.  Set FMODE_CREATED and return finish_no_open(file, NULL)
+so the VFS keeps its dentry reference and calls the inode's ->open.
+Regular files still use finish_open() with generic_file_open.
+
+Fixes: be12af3ef5e6 ("getting rid of 'opened' argument of ->atomic_open() - part 1")
+Signed-off-by: Yuanfu Xie <yuanfuxie@stu.pku.edu.cn>
+Message-ID: <908FC420-EC1F-46FC-8526-698F646961A8@stu.pku.edu.cn>
+Signed-off-by: Dominique Martinet <asmadeus@codewreck.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/9p/vfs_inode.c      | 10 ++++++++++
+ fs/9p/vfs_inode_dotl.c | 12 ++++++++++++
+ 2 files changed, 22 insertions(+)
+
+diff --git a/fs/9p/vfs_inode.c b/fs/9p/vfs_inode.c
+index 11fbb8686b87d..32a2b45743f03 100644
+--- a/fs/9p/vfs_inode.c
++++ b/fs/9p/vfs_inode.c
+@@ -811,6 +811,16 @@ v9fs_vfs_atomic_open(struct inode *dir, struct dentry *dentry,
+ 	v9fs_invalidate_inode_attr(dir);
+ 	inode = d_inode(dentry);
+ 	v9inode = V9FS_I(inode);
++	if (!S_ISREG(inode->i_mode)) {
++		/*
++		 * Not a regular file.  v9fs_create() already stored the
++		 * unopened fid on the dentry.  Clunk the opened fid from
++		 * the create and let the VFS call ->open.
++		 */
++		p9_fid_put(fid);
++		file->f_mode |= FMODE_CREATED;
++		return finish_no_open(file, NULL);
++	}
+ 	err = finish_open(file, dentry, generic_file_open);
+ 	if (unlikely(err)) {
+ 		p9_fid_put(fid);
+diff --git a/fs/9p/vfs_inode_dotl.c b/fs/9p/vfs_inode_dotl.c
+index 72aca3106d76f..f154b7a45d4f9 100644
+--- a/fs/9p/vfs_inode_dotl.c
++++ b/fs/9p/vfs_inode_dotl.c
+@@ -313,6 +313,18 @@ v9fs_vfs_atomic_open_dotl(struct inode *dir, struct dentry *dentry,
+ 	v9fs_fid_add(dentry, &fid);
+ 	d_instantiate(dentry, inode);
+ 
++	if (!S_ISREG(inode->i_mode)) {
++		/*
++		 * Not a regular file.  The unopened fid is already on the
++		 * dentry.  Clunk the opened create fid and let the VFS call
++		 * ->open.
++		 */
++		p9_fid_put(ofid);
++		ofid = NULL;
++		file->f_mode |= FMODE_CREATED;
++		err = finish_no_open(file, NULL);
++		goto out;
++	}
+ 	/* Since we are opening a file, assign the open fid to the file */
+ 	err = finish_open(file, dentry, generic_file_open);
+ 	if (err)
+-- 
+2.53.0
+

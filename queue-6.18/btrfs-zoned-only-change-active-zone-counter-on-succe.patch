@@ -1,0 +1,130 @@
+From ceda65674505bc759f585559af2df0f25fdd3b19 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 9 Sep 2026 08:47:25 +0200
+Subject: btrfs: zoned: only change active zone counter on successful
+ (de)activation
+
+From: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+[ Upstream commit 5e79f39fbeea78703ac389c67a810406fa09bc94 ]
+
+btrfs_zone_activate() unconditionally decrements the reserved_active_zones
+counter regardless if btrfs_dev_set_active_zone() fails to set the zone
+active, i.e. because it raced with another call that already set the bit
+in the bitmask, or not.
+
+This can lead to a double decrement of the counter in case the bit has
+already been set.
+
+Only decrement the counter *iff* btrfs_dev_set_active_zone() successfully
+marked the zone in the bitmap.
+
+Mirror this behaviour when clearing the bit again.
+
+Fixes: a7e1ac7bdc5a ("btrfs: zoned: reserve zones for an active metadata/system block group")
+Reviewed-by: Daniel Vacek <neelx@suse.com>
+Signed-off-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/btrfs/zoned.c | 26 ++++++++++++++++++--------
+ 1 file changed, 18 insertions(+), 8 deletions(-)
+
+diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+index 69ede4e4d0c20..0ff693fea47c3 100644
+--- a/fs/btrfs/zoned.c
++++ b/fs/btrfs/zoned.c
+@@ -1126,11 +1126,13 @@ u64 btrfs_find_allocatable_zones(struct btrfs_device *device, u64 hole_start,
+ 	return pos;
+ }
+ 
+-static bool btrfs_dev_set_active_zone(struct btrfs_device *device, u64 pos)
++static bool btrfs_dev_set_active_zone(struct btrfs_device *device, u64 pos, bool *new)
+ {
+ 	struct btrfs_zoned_device_info *zone_info = device->zone_info;
+ 	unsigned int zno = (pos >> zone_info->zone_size_shift);
+ 
++	*new = false;
++
+ 	/* We can use any number of zones */
+ 	if (zone_info->max_active_zones == 0)
+ 		return true;
+@@ -1142,23 +1144,29 @@ static bool btrfs_dev_set_active_zone(struct btrfs_device *device, u64 pos)
+ 		if (test_and_set_bit(zno, zone_info->active_zones)) {
+ 			/* Someone already set the bit */
+ 			atomic_inc(&zone_info->active_zones_left);
++		} else {
++			*new = true;
+ 		}
+ 	}
+ 
+ 	return true;
+ }
+ 
+-static void btrfs_dev_clear_active_zone(struct btrfs_device *device, u64 pos)
++static bool btrfs_dev_clear_active_zone(struct btrfs_device *device, u64 pos)
+ {
+ 	struct btrfs_zoned_device_info *zone_info = device->zone_info;
+ 	unsigned int zno = (pos >> zone_info->zone_size_shift);
+ 
+ 	/* We can use any number of zones */
+ 	if (zone_info->max_active_zones == 0)
+-		return;
++		return false;
+ 
+-	if (test_and_clear_bit(zno, zone_info->active_zones))
++	if (test_and_clear_bit(zno, zone_info->active_zones)) {
+ 		atomic_inc(&zone_info->active_zones_left);
++		return true;
++	}
++
++	return false;
+ }
+ 
+ int btrfs_reset_device_zone(struct btrfs_device *device, u64 physical,
+@@ -2384,6 +2392,7 @@ bool btrfs_zone_activate(struct btrfs_block_group *block_group)
+ 	u64 physical;
+ 	const bool is_data = (block_group->flags & BTRFS_BLOCK_GROUP_DATA);
+ 	bool ret;
++	bool new;
+ 	int i;
+ 
+ 	if (!btrfs_is_zoned(block_group->fs_info))
+@@ -2434,12 +2443,12 @@ bool btrfs_zone_activate(struct btrfs_block_group *block_group)
+ 			goto out_unlock;
+ 		}
+ 
+-		if (!btrfs_dev_set_active_zone(device, physical)) {
++		if (!btrfs_dev_set_active_zone(device, physical, &new)) {
+ 			/* Cannot activate the zone */
+ 			ret = false;
+ 			goto out_unlock;
+ 		}
+-		if (!is_data)
++		if (!is_data && new)
+ 			zinfo->reserved_active_zones--;
+ 	}
+ 
+@@ -2486,6 +2495,7 @@ static int call_zone_finish(struct btrfs_block_group *block_group,
+ 	struct btrfs_device *device = stripe->dev;
+ 	const u64 physical = stripe->physical;
+ 	struct btrfs_zoned_device_info *zinfo = device->zone_info;
++	bool cleared;
+ 	int ret;
+ 
+ 	if (!device->bdev)
+@@ -2507,9 +2517,9 @@ static int call_zone_finish(struct btrfs_block_group *block_group,
+ 			return ret;
+ 	}
+ 
+-	if (!(block_group->flags & BTRFS_BLOCK_GROUP_DATA))
++	cleared = btrfs_dev_clear_active_zone(device, physical);
++	if (!(block_group->flags & BTRFS_BLOCK_GROUP_DATA) && cleared)
+ 		zinfo->reserved_active_zones++;
+-	btrfs_dev_clear_active_zone(device, physical);
+ 
+ 	return 0;
+ }
+-- 
+2.53.0
+

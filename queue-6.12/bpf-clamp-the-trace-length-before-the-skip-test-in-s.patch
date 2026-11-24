@@ -1,0 +1,65 @@
+From a0480cebc729e31b7bb8ba13d4f82493b02cd381 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Sun, 1 Nov 2026 19:05:10 +0000
+Subject: bpf: Clamp the trace length before the skip test in stackid_init()
+
+From: Alexei Starovoitov <ast@kernel.org>
+
+[ Upstream commit a08ba2ab79dffd92c32d3f2dadfc7eba03625a2b ]
+
+stackid_init() gives a bucket of the stack map
+min(trace_nr - skip, max_depth - skip) trace entries. Here max_depth is the
+size of a bucket plus skip, but at most perf_event_max_stack. Context
+markers can make trace_nr larger than that, so the skip test can pass when
+max_depth < skip. Then 'max_depth - skip' wraps, and the kernel can write
+after the bucket.
+
+Clamp trace_nr to max_depth before the skip test, as __bpf_get_stack_pe()
+does. The result changes only when skip >= max_depth. Then it is -EFAULT.
+Until now skip == max_depth could give the id of an empty trace.
+
+get_perf_callchain() releases the trace, so an NMI can change trace->nr.
+Use READ_ONCE() in bpf_get_stackid(), so the compiler reads it one time.
+
+Fixes: 23f852daa4ba ("bpf: Fix stackmap overflow check in __bpf_get_stackid()")
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://patch.msgid.link/20261101190535.1454146-3-alexei.starovoitov@gmail.com
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ kernel/bpf/stackmap.c | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/kernel/bpf/stackmap.c b/kernel/bpf/stackmap.c
+index 43e27cd278c4a..5baf657ccb785 100644
+--- a/kernel/bpf/stackmap.c
++++ b/kernel/bpf/stackmap.c
+@@ -268,12 +268,14 @@ static int stackid_init(struct stackid *stackid, struct bpf_map *map,
+ 	u32 skip = flags & BPF_F_SKIP_FIELD_MASK;
+ 	u32 max_depth;
+ 
++	max_depth = stack_map_calculate_max_depth(map->value_size, stack_map_data_size(map), flags);
++	/* trace_nr can be above max_depth and max_depth below skip: clamp first */
++	trace_nr = min_t(u32, trace_nr, max_depth);
+ 	if (trace_nr <= skip)
+ 		/* skipping more than usable stack trace */
+ 		return -EFAULT;
+ 
+-	max_depth = stack_map_calculate_max_depth(map->value_size, stack_map_data_size(map), flags);
+-	stackid->nr = min_t(u32, trace_nr - skip, max_depth - skip);
++	stackid->nr = trace_nr - skip;
+ 	stackid->len = stackid->nr * sizeof(u64);
+ 	stackid->ips = trace->ip + skip;
+ 	stackid->hash = jhash2((const u32 *)stackid->ips, stackid->len / sizeof(u32), 0);
+@@ -388,7 +390,8 @@ BPF_CALL_3(bpf_get_stackid, struct pt_regs *, regs, struct bpf_map *, map,
+ 			/* couldn't fetch the stack trace */
+ 			return -EFAULT;
+ 
+-		err = stackid_fastpath(&stackid, map, trace, trace->nr, flags);
++		/* the entry is released already, an NMI can change trace->nr */
++		err = stackid_fastpath(&stackid, map, trace, READ_ONCE(trace->nr), flags);
+ 		if (err != -ENOENT)
+ 			return err;
+ 
+-- 
+2.53.0
+

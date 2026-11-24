@@ -1,0 +1,87 @@
+From 4b8ff91372ab336dff959b828f93d4daa6cffcd2 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 4 Nov 2026 10:28:51 +0100
+Subject: bonding: fix slave_cnt leak on XDP enslave failure
+
+From: Eric Dumazet <edumazet@kernel.org>
+
+[ Upstream commit a978095699641d4f83a32b499a981c419c94abca ]
+
+bond_enslave() increments bond->slave_cnt before setting up XDP on the
+new slave. If that setup fails (slave has no XDP support, already has
+an XDP program, or dev_xdp_propagate() fails), the error path jumps to
+err_sysfs_del, which never decrements slave_cnt.
+
+Each failed enslave therefore leaves slave_cnt one too high:
+- SIOCBONDINFOQUERY reports a wrong num_slaves,
+- balance-rr picks slave ids beyond the end of the slave list, so
+  bond_get_slave_by_id() falls back to the first usable slave and
+  transmit is skewed toward it.
+
+Reproducer:
+
+  ip link add bond0 type bond mode balance-rr
+  ip link set bond0 xdpdrv obj xdp_dummy.bpf.o sec xdp
+  for i in 0 1 2; do
+    ip link add d$i type dummy
+    ip link set d$i master bond0   # fails: Slave does not support XDP
+  done
+
+num_slaves read via SIOCBONDINFOQUERY is 3 before this patch, 0 after.
+
+Add an err_dec_slave_cnt label ahead of err_sysfs_del and use it from
+the three XDP failure paths, which are the only failures after the
+increment.
+
+Fixes: 9e2ee5c7e7c3 ("net, bonding: Add XDP support to the bonding driver")
+Signed-off-by: Eric Dumazet <edumazet@kernel.org>
+Link: https://patch.msgid.link/20261104092851.688361-1-edumazet@kernel.org
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/net/bonding/bond_main.c | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/bonding/bond_main.c b/drivers/net/bonding/bond_main.c
+index a1c156c145b2d..e9f5e753f6770 100644
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@ -2305,7 +2305,7 @@ int bond_enslave(struct net_device *bond_dev, struct net_device *slave_dev,
+ 			SLAVE_NL_ERR(bond_dev, slave_dev, extack,
+ 				     "Slave does not support XDP");
+ 			res = -EOPNOTSUPP;
+-			goto err_sysfs_del;
++			goto err_dec_slave_cnt;
+ 		}
+ 	} else if (bond->xdp_prog) {
+ 		struct netdev_bpf xdp = {
+@@ -2319,14 +2319,14 @@ int bond_enslave(struct net_device *bond_dev, struct net_device *slave_dev,
+ 			SLAVE_NL_ERR(bond_dev, slave_dev, extack,
+ 				     "Slave has XDP program loaded, please unload before enslaving");
+ 			res = -EOPNOTSUPP;
+-			goto err_sysfs_del;
++			goto err_dec_slave_cnt;
+ 		}
+ 
+ 		res = dev_xdp_propagate(slave_dev, &xdp);
+ 		if (res < 0) {
+ 			/* ndo_bpf() sets extack error message */
+ 			slave_dbg(bond_dev, slave_dev, "Error %d calling ndo_bpf\n", res);
+-			goto err_sysfs_del;
++			goto err_dec_slave_cnt;
+ 		}
+ 		if (bond->xdp_prog)
+ 			bpf_prog_inc(bond->xdp_prog);
+@@ -2348,6 +2348,9 @@ int bond_enslave(struct net_device *bond_dev, struct net_device *slave_dev,
+ 	return 0;
+ 
+ /* Undo stages on error */
++err_dec_slave_cnt:
++	WRITE_ONCE(bond->slave_cnt, bond->slave_cnt - 1);
++
+ err_sysfs_del:
+ 	bond_sysfs_slave_del(new_slave);
+ 
+-- 
+2.53.0
+

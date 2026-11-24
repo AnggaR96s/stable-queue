@@ -1,0 +1,97 @@
+From 8145293a56766d36fac5723349d97aba385d8ae8 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 9 Nov 2026 15:44:47 -0500
+Subject: NFS: don't let delegated c/mtime stamps go backward
+
+From: Jeff Layton <jlayton@kernel.org>
+
+[ Upstream commit 427d4cd8048c8e18e7d0c7d0637e7fbec9fba078 ]
+
+With a timestamp delegation the client stamps c/mtime from its own
+coarse clock. That can land before the server's fine-grained ctime the
+client cached from the OPEN or SETATTR reply, e.g. on a WRITE right
+after an exclusive create. The server then either rejects the times
+(they don't pass dl_ctime) or can't apply the ctime, since
+inode_set_ctime_deleg() never moves ctime backward. Either way the
+c/mtime the client reported while holding the delegation changes
+after DELEGRETURN; git t1092 over NFSv4.2 sees a stat-dirty file.
+
+When a delegated stamp isn't after the cached ctime, use the cached
+ctime + 1ns instead. Compute the stamp before storing it, so lockless
+readers (getattr, CB_GETATTR) never see the trailing coarse time.
+
+Fixes: e12912d94137 ("NFSv4: Add support for delegated atime and mtime attributes")
+Signed-off-by: Jeff Layton <jlayton@kernel.org>
+Signed-off-by: Anna Schumaker <anna.schumaker@hammerspace.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/nfs/inode.c | 40 ++++++++++++++++++++++++++--------------
+ 1 file changed, 26 insertions(+), 14 deletions(-)
+
+diff --git a/fs/nfs/inode.c b/fs/nfs/inode.c
+index cb414396063d4..c07e56c313903 100644
+--- a/fs/nfs/inode.c
++++ b/fs/nfs/inode.c
+@@ -623,25 +623,33 @@ nfs_fattr_fixup_delegated(struct inode *inode, struct nfs_fattr *fattr)
+ 	}
+ }
+ 
++/*
++ * With delegated timestamps, the client's coarse clock can trail the
++ * server's fine-grained ctime cached from an OPEN or SETATTR reply. The
++ * server won't move ctime backward when the times are returned, so a
++ * new stamp must land after the cached ctime.
++ */
++static struct timespec64 nfs_delegated_stamp(struct inode *inode)
++{
++	struct timespec64 ctime = inode_get_ctime(inode);
++	struct timespec64 now = current_time(inode);
++
++	if (timespec64_compare(&now, &ctime) <= 0) {
++		now = ctime;
++		timespec64_add_ns(&now, 1);
++	}
++	return now;
++}
++
+ static void nfs_set_timestamps_to_ts(struct inode *inode, struct iattr *attr)
+ {
+ 	unsigned int cache_flags = 0;
+ 
+ 	if (attr->ia_valid & ATTR_MTIME_SET) {
+-		struct timespec64 ctime = inode_get_ctime(inode);
+-		struct timespec64 mtime = inode_get_mtime(inode);
+-		struct timespec64 now;
+-		bool updated = false;
+-
+-		now = inode_set_ctime_current(inode);
+-		if (!timespec64_equal(&now, &ctime))
+-			updated = true;
+-
++		/* The stamp is always after the old ctime */
++		inode_set_ctime_to_ts(inode, nfs_delegated_stamp(inode));
+ 		inode_set_mtime_to_ts(inode, attr->ia_mtime);
+-		if (!timespec64_equal(&now, &mtime))
+-			updated = true;
+-
+-		inode_maybe_inc_iversion(inode, updated);
++		inode_maybe_inc_iversion(inode, true);
+ 		cache_flags |= NFS_INO_INVALID_CTIME | NFS_INO_INVALID_MTIME;
+ 	}
+ 	if (attr->ia_valid & ATTR_ATIME) {
+@@ -659,7 +667,11 @@ static void nfs_update_atime(struct inode *inode)
+ 
+ static void nfs_update_mtime(struct inode *inode)
+ {
+-	inode_update_time(inode, FS_UPD_CMTIME, 0);
++	struct timespec64 now = nfs_delegated_stamp(inode);
++
++	/* Not inode_update_time(): lockless readers would see its stamp */
++	inode_set_ctime_to_ts(inode, now);
++	inode_set_mtime_to_ts(inode, now);
+ 	NFS_I(inode)->cache_validity &=
+ 		~(NFS_INO_INVALID_CTIME | NFS_INO_INVALID_MTIME);
+ }
+-- 
+2.53.0
+

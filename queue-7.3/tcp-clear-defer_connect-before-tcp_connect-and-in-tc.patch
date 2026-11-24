@@ -1,0 +1,172 @@
+From bd65d323c88f1e152bcaf633ff7cb0db80e84e0a Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Sat, 7 Nov 2026 23:56:08 +0000
+Subject: tcp: Clear DEFER_CONNECT before tcp_connect() and in tcp_abort().
+
+From: Kuniyuki Iwashima <kuniyu@google.com>
+
+[ Upstream commit 93723db43e5185404e7d637357d07ffbb38e8b65 ]
+
+When TFO is enabled, tcp_v[46]_connect() sets sk->sk_state to
+TCP_SYN_SENT and puts the socket into ehash without calling
+tcp_connect().
+
+Then, tcp_fastopen_defer_connect() sets DEFER_CONNECT, and
+the first write()/sendmsg() will call tcp_connect() and send
+SYN with data if possible.
+
+If tcp_abort() kills a socket before the first write()/sendmsg(),
+the unhashed socket can still call it and send SYN in TCP_CLOSE.
+
+Also, DEFER_CONNECT is cleared after __inet_stream_connect().
+
+So, blocking write()/sendmsg() can release lock_sock() in
+inet_wait_for_connect() while DEFER_CONNECT is set, and
+tcp_poll() could set EPOLLOUT even after SYN is sent.
+
+Let's clear DEFER_CONNECT in tcp_abort() and right before
+tcp_connect() in tcp_sendmsg_fastopen().
+
+Note that the last argument of __inet_stream_connect() is
+changed from is_sendmsg to defer_connect as DEFER_CONNECT
+is already cleared when __inet_stream_connect() is called.
+
+This change is also needed for the next patch.
+
+Fixes: 19f6d3f3c842 ("net/tcp-fastopen: Add new API support")
+Signed-off-by: Kuniyuki Iwashima <kuniyu@google.com>
+Acked-by: Matthieu Baerts (NGI0) <matttbe@kernel.org>
+Link: https://patch.msgid.link/20261107235720.3129212-2-kuniyu@google.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/net/inet_common.h |  2 +-
+ net/ipv4/af_inet.c        | 10 ++++++----
+ net/ipv4/tcp.c            |  9 +++++++--
+ net/mptcp/protocol.c      |  5 +++--
+ 4 files changed, 17 insertions(+), 9 deletions(-)
+
+diff --git a/include/net/inet_common.h b/include/net/inet_common.h
+index 3d747896be300..0f088a213c381 100644
+--- a/include/net/inet_common.h
++++ b/include/net/inet_common.h
+@@ -25,7 +25,7 @@ int inet_release(struct socket *sock);
+ int inet_stream_connect(struct socket *sock, struct sockaddr_unsized *uaddr,
+ 			int addr_len, int flags);
+ int __inet_stream_connect(struct socket *sock, struct sockaddr_unsized *uaddr,
+-			  int addr_len, int flags, int is_sendmsg);
++			  int addr_len, int flags, bool defer_connect);
+ int inet_dgram_connect(struct socket *sock, struct sockaddr_unsized *uaddr,
+ 		       int addr_len, int flags);
+ int inet_accept(struct socket *sock, struct socket *newsock,
+diff --git a/net/ipv4/af_inet.c b/net/ipv4/af_inet.c
+index 14ce01092fda6..bc3bbb2366d81 100644
+--- a/net/ipv4/af_inet.c
++++ b/net/ipv4/af_inet.c
+@@ -629,7 +629,7 @@ static long inet_wait_for_connect(struct sock *sk, long timeo, int writebias)
+  *	TCP 'magic' in here.
+  */
+ int __inet_stream_connect(struct socket *sock, struct sockaddr_unsized *uaddr,
+-			  int addr_len, int flags, int is_sendmsg)
++			  int addr_len, int flags, bool defer_connect)
+ {
+ 	struct sock *sk = sock->sk;
+ 	int err;
+@@ -664,8 +664,10 @@ int __inet_stream_connect(struct socket *sock, struct sockaddr_unsized *uaddr,
+ 		err = -EISCONN;
+ 		goto out;
+ 	case SS_CONNECTING:
+-		if (inet_test_bit(DEFER_CONNECT, sk))
+-			err = is_sendmsg ? -EINPROGRESS : -EISCONN;
++		if (defer_connect)
++			err = -EINPROGRESS;
++		else if (inet_test_bit(DEFER_CONNECT, sk))
++			err = -EISCONN;
+ 		else
+ 			err = -EALREADY;
+ 		/* Fall out of switch with err, set for this state */
+@@ -752,7 +754,7 @@ int inet_stream_connect(struct socket *sock, struct sockaddr_unsized *uaddr,
+ 	int err;
+ 
+ 	lock_sock(sock->sk);
+-	err = __inet_stream_connect(sock, uaddr, addr_len, flags, 0);
++	err = __inet_stream_connect(sock, uaddr, addr_len, flags, false);
+ 	release_sock(sock->sk);
+ 	return err;
+ }
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index f88548e10f2a8..be772a67b05d6 100644
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -1054,6 +1054,7 @@ int tcp_sendmsg_fastopen(struct sock *sk, struct msghdr *msg, int *copied,
+ 	struct tcp_sock *tp = tcp_sk(sk);
+ 	struct inet_sock *inet = inet_sk(sk);
+ 	struct sockaddr *uaddr = msg->msg_name;
++	bool defer_connect = false;
+ 	int err, flags;
+ 
+ 	if (!(READ_ONCE(sock_net(sk)->ipv4.sysctl_tcp_fastopen) &
+@@ -1073,6 +1074,9 @@ int tcp_sendmsg_fastopen(struct sock *sk, struct msghdr *msg, int *copied,
+ 	tp->fastopen_req->uarg = uarg;
+ 
+ 	if (inet_test_bit(DEFER_CONNECT, sk)) {
++		inet_clear_bit(DEFER_CONNECT, sk);
++		defer_connect = true;
++
+ 		err = tcp_connect(sk);
+ 		/* Same failure procedure as in tcp_v4/6_connect */
+ 		if (err) {
+@@ -1083,14 +1087,13 @@ int tcp_sendmsg_fastopen(struct sock *sk, struct msghdr *msg, int *copied,
+ 	}
+ 	flags = (msg->msg_flags & MSG_DONTWAIT) ? O_NONBLOCK : 0;
+ 	err = __inet_stream_connect(sk->sk_socket, (struct sockaddr_unsized *)uaddr,
+-				    msg->msg_namelen, flags, 1);
++				    msg->msg_namelen, flags, defer_connect);
+ 	/* fastopen_req could already be freed in __inet_stream_connect
+ 	 * if the connection times out or gets rst
+ 	 */
+ 	if (tp->fastopen_req) {
+ 		*copied = tp->fastopen_req->copied;
+ 		tcp_free_fastopen_req(tp);
+-		inet_clear_bit(DEFER_CONNECT, sk);
+ 	}
+ 	return err;
+ }
+@@ -5151,6 +5154,8 @@ int tcp_abort(struct sock *sk, int err)
+ 		/* Don't race with userspace socket closes such as tcp_close. */
+ 		lock_sock(sk);
+ 
++	inet_clear_bit(DEFER_CONNECT, sk);
++
+ 	/* Avoid closing the same socket twice. */
+ 	if (sk->sk_state == TCP_CLOSE) {
+ 		if (!has_current_bpf_ctx())
+diff --git a/net/mptcp/protocol.c b/net/mptcp/protocol.c
+index 05c38564e8fdf..8e08feb676f78 100644
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -1920,10 +1920,12 @@ static int mptcp_sendmsg_fastopen(struct sock *sk, struct msghdr *msg,
+ 	msg->msg_flags = saved_flags;
+ 	release_sock(ssk);
+ 
++	inet_clear_bit(DEFER_CONNECT, sk);
++
+ 	/* do the blocking bits of inet_stream_connect outside the ssk socket lock */
+ 	if (ret == -EINPROGRESS && !(msg->msg_flags & MSG_DONTWAIT)) {
+ 		ret = __inet_stream_connect(sk->sk_socket, msg->msg_name,
+-					    msg->msg_namelen, msg->msg_flags, 1);
++					    msg->msg_namelen, msg->msg_flags, true);
+ 
+ 		/* Keep the same behaviour of plain TCP: zero the copied bytes in
+ 		 * case of any error, except timeout or signal
+@@ -1941,7 +1943,6 @@ static int mptcp_sendmsg_fastopen(struct sock *sk, struct msghdr *msg,
+ 			sk->sk_socket->state = SS_UNCONNECTED;
+ 		}
+ 	}
+-	inet_clear_bit(DEFER_CONNECT, sk);
+ 
+ 	return ret;
+ }
+-- 
+2.53.0
+

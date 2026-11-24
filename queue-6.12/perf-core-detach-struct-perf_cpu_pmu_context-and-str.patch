@@ -1,0 +1,171 @@
+From dd3e9ceb58f82e1a908adcaf66f7db65fbaf1d30 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 4 Nov 2024 14:39:20 +0100
+Subject: perf/core: Detach 'struct perf_cpu_pmu_context' and 'struct pmu'
+ lifetimes
+
+From: Peter Zijlstra <peterz@infradead.org>
+
+[ Upstream commit 4eabf533fb1886089ef57e0c8ec52048b1741e39 ]
+
+In prepration for being able to unregister a PMU with existing events,
+it becomes important to detach struct perf_cpu_pmu_context lifetimes
+from that of struct pmu.
+
+Notably struct perf_cpu_pmu_context embeds a struct perf_event_pmu_context
+that can stay referenced until the last event goes.
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Reviewed-by: Ravi Bangoria <ravi.bangoria@amd.com>
+Link: https://lore.kernel.org/r/20241104135518.760214287@infradead.org
+Stable-dep-of: 3bbd85b2f67a ("perf: Fix racy update of cpc->hrtimer_interval")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/linux/perf_event.h |  4 +--
+ kernel/events/core.c       | 56 ++++++++++++++++++++++++++++++++------
+ 2 files changed, 49 insertions(+), 11 deletions(-)
+
+diff --git a/include/linux/perf_event.h b/include/linux/perf_event.h
+index 58f7d4fe72819..d88c0091e57dd 100644
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@ -344,7 +344,7 @@ struct pmu {
+ 	 */
+ 	unsigned int			scope;
+ 
+-	struct perf_cpu_pmu_context __percpu *cpu_pmu_context;
++	struct perf_cpu_pmu_context __percpu **cpu_pmu_context;
+ 	atomic_t			exclusive_cnt; /* < 0: cpu; > 0: tsk */
+ 	int				task_ctx_nr;
+ 	int				hrtimer_interval_ms;
+@@ -922,7 +922,7 @@ struct perf_event_pmu_context {
+ 	struct list_head		pinned_active;
+ 	struct list_head		flexible_active;
+ 
+-	/* Used to avoid freeing per-cpu perf_event_pmu_context */
++	/* Used to identify the per-cpu perf_event_pmu_context */
+ 	unsigned int			embedded : 1;
+ 
+ 	unsigned int			nr_events;
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index ba6603bd03428..45b7a1fdc964d 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -1192,7 +1192,7 @@ static int perf_mux_hrtimer_restart_ipi(void *arg)
+ 
+ static __always_inline struct perf_cpu_pmu_context *this_cpc(struct pmu *pmu)
+ {
+-	return this_cpu_ptr(pmu->cpu_pmu_context);
++	return *this_cpu_ptr(pmu->cpu_pmu_context);
+ }
+ 
+ void perf_pmu_disable(struct pmu *pmu)
+@@ -5006,11 +5006,14 @@ find_get_pmu_context(struct pmu *pmu, struct perf_event_context *ctx,
+ 		 */
+ 		struct perf_cpu_pmu_context *cpc;
+ 
+-		cpc = per_cpu_ptr(pmu->cpu_pmu_context, event->cpu);
++		cpc = *per_cpu_ptr(pmu->cpu_pmu_context, event->cpu);
+ 		epc = &cpc->epc;
+ 		raw_spin_lock_irq(&ctx->lock);
+ 		if (!epc->ctx) {
+-			atomic_set(&epc->refcount, 1);
++			/*
++			 * One extra reference for the pmu; see perf_pmu_free().
++			 */
++			atomic_set(&epc->refcount, 2);
+ 			epc->embedded = 1;
+ 			list_add(&epc->pmu_ctx_entry, &ctx->pmu_ctx_list);
+ 			epc->ctx = ctx;
+@@ -5086,6 +5089,15 @@ static void get_pmu_ctx(struct perf_event_pmu_context *epc)
+ 	WARN_ON_ONCE(!atomic_inc_not_zero(&epc->refcount));
+ }
+ 
++static void free_cpc_rcu(struct rcu_head *head)
++{
++	struct perf_cpu_pmu_context *cpc =
++		container_of(head, typeof(*cpc), epc.rcu_head);
++
++	kfree(cpc->epc.task_ctx_data);
++	kfree(cpc);
++}
++
+ static void free_epc_rcu(struct rcu_head *head)
+ {
+ 	struct perf_event_pmu_context *epc = container_of(head, typeof(*epc), rcu_head);
+@@ -5120,8 +5132,10 @@ static void put_pmu_ctx(struct perf_event_pmu_context *epc)
+ 
+ 	raw_spin_unlock_irqrestore(&ctx->lock, flags);
+ 
+-	if (epc->embedded)
++	if (epc->embedded) {
++		call_rcu(&epc->rcu_head, free_cpc_rcu);
+ 		return;
++	}
+ 
+ 	call_rcu(&epc->rcu_head, free_epc_rcu);
+ }
+@@ -11716,7 +11730,7 @@ perf_event_mux_interval_ms_store(struct device *dev,
+ 	cpus_read_lock();
+ 	for_each_online_cpu(cpu) {
+ 		struct perf_cpu_pmu_context *cpc;
+-		cpc = per_cpu_ptr(pmu->cpu_pmu_context, cpu);
++		cpc = *per_cpu_ptr(pmu->cpu_pmu_context, cpu);
+ 		cpc->hrtimer_interval = ns_to_ktime(NSEC_PER_MSEC * timer);
+ 
+ 		cpu_function_call(cpu, perf_mux_hrtimer_restart_ipi, cpc);
+@@ -11889,7 +11903,25 @@ static void perf_pmu_free(struct pmu *pmu)
+ 		device_del(pmu->dev);
+ 		put_device(pmu->dev);
+ 	}
+-	free_percpu(pmu->cpu_pmu_context);
++
++	if (pmu->cpu_pmu_context) {
++		int cpu;
++
++		for_each_possible_cpu(cpu) {
++			struct perf_cpu_pmu_context *cpc;
++
++			cpc = *per_cpu_ptr(pmu->cpu_pmu_context, cpu);
++			if (!cpc)
++				continue;
++			if (cpc->epc.embedded) {
++				/* refcount managed */
++				put_pmu_ctx(&cpc->epc);
++				continue;
++			}
++			kfree(cpc);
++		}
++		free_percpu(pmu->cpu_pmu_context);
++	}
+ }
+ 
+ DEFINE_FREE(pmu_unregister, struct pmu *, if (_T) perf_pmu_free(_T))
+@@ -11928,14 +11960,20 @@ int perf_pmu_register(struct pmu *_pmu, const char *name, int type)
+ 			return ret;
+ 	}
+ 
+-	pmu->cpu_pmu_context = alloc_percpu(struct perf_cpu_pmu_context);
++	pmu->cpu_pmu_context = alloc_percpu(struct perf_cpu_pmu_context *);
+ 	if (!pmu->cpu_pmu_context)
+ 		return -ENOMEM;
+ 
+ 	for_each_possible_cpu(cpu) {
+-		struct perf_cpu_pmu_context *cpc;
++		struct perf_cpu_pmu_context *cpc =
++			kmalloc_node(sizeof(struct perf_cpu_pmu_context),
++				     GFP_KERNEL | __GFP_ZERO,
++				     cpu_to_node(cpu));
++
++		if (!cpc)
++			return -ENOMEM;
+ 
+-		cpc = per_cpu_ptr(pmu->cpu_pmu_context, cpu);
++		*per_cpu_ptr(pmu->cpu_pmu_context, cpu) = cpc;
+ 		__perf_init_event_pmu_context(&cpc->epc, pmu);
+ 		__perf_mux_hrtimer_init(cpc, cpu);
+ 	}
+-- 
+2.53.0
+

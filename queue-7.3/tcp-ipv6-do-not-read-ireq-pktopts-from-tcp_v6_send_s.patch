@@ -1,0 +1,116 @@
+From f3d8ab7b3f53ad97f4434b84f70d4e0d9e5bf915 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 2 Nov 2026 08:54:41 +0100
+Subject: tcp: ipv6: do not read ireq->pktopts from tcp_v6_send_synack()
+
+From: Eric Dumazet <edumazet@kernel.org>
+
+[ Upstream commit 8e069fd3fd396b89af417e50b359bc9892dd41cd ]
+
+When IPV6_FL_F_REFLECT is set on a listener, or the
+net.ipv6.flowlabel_reflect sysctl has FLOWLABEL_REFLECT_ESTABLISHED,
+tcp_v6_send_synack() reflects the flowlabel of the SYN packet,
+reading it from the skb stored in ireq->pktopts.
+
+Since commit 079096f103fa ("tcp/dccp: install syn_recv requests
+into ehash table"), request sockets are processed without holding
+the listener lock. A cpu can then process a retransmitted SYN for a
+request socket, and send a SYNACK from tcp_check_req(), while another
+cpu receives the ACK completing the 3WHS. tcp_v6_syn_recv_sock()
+consumes ireq->pktopts when it wins the hashdance, and the first cpu
+reads a freed skb:
+
+  BUG: KASAN: slab-use-after-free in tcp_v6_send_synack (include/linux/skbuff.h:3152 include/linux/ipv6.h:110 net/ipv6/tcp_ipv6.c:582)
+  Read of size 8 at addr ffff88802b08b608 by task poc-ipv6-pktopt/5076
+
+  Call Trace:
+   <IRQ>
+   tcp_v6_send_synack (include/linux/skbuff.h:3152 include/linux/ipv6.h:110 net/ipv6/tcp_ipv6.c:582)
+   tcp_rtx_synack (net/ipv4/tcp_output.c:4719)
+   tcp_check_req (net/ipv4/tcp_minisocks.c:762)
+   tcp_v6_rcv (net/ipv6/tcp_ipv6.c:1826)
+   ip6_protocol_deliver_rcu (net/ipv6/ip6_input.c:479)
+   ip6_input_finish (net/ipv6/ip6_input.c:534)
+   ip6_input (include/linux/netfilter.h:325 include/linux/netfilter.h:319 net/ipv6/ip6_input.c:545)
+   ipv6_rcv (include/net/dst.h:481 net/ipv6/ip6_input.c:119 include/linux/netfilter.h:325 include/linux/netfilter.h:319 net/ipv6/ip6_input.c:351)
+
+  Freed by task 5074 on cpu 0 at 15.412249s:
+   kmem_cache_free (include/linux/kasan.h:235 mm/slub.c:2780 mm/slub.c:6630 mm/slub.c:6757)
+   tcp_v6_syn_recv_sock (net/ipv6/tcp_ipv6.c:1528)
+   tcp_check_req (net/ipv4/tcp_minisocks.c:934)
+   tcp_v6_rcv (net/ipv6/tcp_ipv6.c:1826)
+   ip6_protocol_deliver_rcu (net/ipv6/ip6_input.c:479)
+   ip6_input_finish (net/ipv6/ip6_input.c:534)
+
+Request socket migration has the same issue: reqsk_migrate_reset()
+transfers ireq->pktopts to the clone, which can be freed while
+another cpu holding a reference on the old request socket is still
+sending a SYNACK.
+
+The SYNACK timer itself is not an issue, because
+inet_csk_reqsk_queue_drop() calls timer_delete_sync().
+
+Save the flowlabel of the SYN in the request socket instead, so that
+tcp_v6_send_synack() no longer needs ireq->pktopts.
+
+As a side effect, the flowlabel is also reflected for SYN packets
+reusing a TIME_WAIT socket, as ireq->pktopts is not set in this case.
+
+Fixes: e994b2f0fb92 ("tcp: do not lock listener to process SYN packets")
+Fixes: 079096f103fa ("tcp/dccp: install syn_recv requests into ehash table")
+Fixes: c905dee62232 ("tcp: Migrate TCP_NEW_SYN_RECV requests at retransmitting SYN+ACKs.")
+Reported-by: Anvik Loitongbam <permissiontogallop@gmail.com>
+Reported-by: Yingjie Wang <x-professor@outlook.com>
+Closes: https://lore.kernel.org/netdev/82c31e4d5043f3dbd11b44177cfba779d335aae3.1793599929.git.x-professor@outlook.com/
+Signed-off-by: Eric Dumazet <edumazet@kernel.org>
+Reviewed-by: Jiayuan Chen <jiayuan.chen@linux.dev>
+Reviewed-by: Neal Cardwell <ncardwell@google.com>
+Reviewed-by: Kuniyuki Iwashima <kuniyu@google.com>
+Link: https://patch.msgid.link/20261102075441.3771550-1-edumazet@kernel.org
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/linux/tcp.h | 3 +++
+ net/ipv6/tcp_ipv6.c | 5 +++--
+ 2 files changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/include/linux/tcp.h b/include/linux/tcp.h
+index 6a8c77719322f..647b585e1cf94 100644
+--- a/include/linux/tcp.h
++++ b/include/linux/tcp.h
+@@ -179,6 +179,9 @@ struct tcp_request_sock {
+ 	u8				ao_rcv_next;
+ 	bool				used_tcp_ao;
+ #endif
++#if IS_ENABLED(CONFIG_IPV6)
++	__be32				syn_flowlabel;
++#endif
+ };
+ 
+ #define tcp_rsk(ptr) container_of_const(ptr, struct tcp_request_sock, req.req)
+diff --git a/net/ipv6/tcp_ipv6.c b/net/ipv6/tcp_ipv6.c
+index be50b2fe12742..40025284b9110 100644
+--- a/net/ipv6/tcp_ipv6.c
++++ b/net/ipv6/tcp_ipv6.c
+@@ -578,8 +578,8 @@ static int tcp_v6_send_synack(const struct sock *sk, struct dst_entry *dst,
+ 				    &ireq->ir_v6_rmt_addr);
+ 
+ 		fl6->daddr = ireq->ir_v6_rmt_addr;
+-		if (inet6_test_bit(REPFLOW, sk) && ireq->pktopts)
+-			fl6->flowlabel = ip6_flowlabel(ipv6_hdr(ireq->pktopts));
++		if (inet6_test_bit(REPFLOW, sk))
++			fl6->flowlabel = tcp_rsk(req)->syn_flowlabel;
+ 
+ 		tclass = READ_ONCE(sock_net(sk)->ipv4.sysctl_tcp_reflect_tos) ?
+ 				(tcp_rsk(req)->syn_tos & ~INET_ECN_MASK) |
+@@ -789,6 +789,7 @@ static void tcp_v6_init_req(struct request_sock *req,
+ 	ireq->ir_v6_loc_addr = ipv6_hdr(skb)->daddr;
+ 	ireq->ir_rmt_addr = LOOPBACK4_IPV6;
+ 	ireq->ir_loc_addr = LOOPBACK4_IPV6;
++	tcp_rsk(req)->syn_flowlabel = ip6_flowlabel(ipv6_hdr(skb));
+ 
+ 	/* So that link locals have meaning */
+ 	if ((!sk_listener->sk_bound_dev_if || l3_slave) &&
+-- 
+2.53.0
+

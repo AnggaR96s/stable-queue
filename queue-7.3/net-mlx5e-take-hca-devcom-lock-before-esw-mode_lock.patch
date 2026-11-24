@@ -1,0 +1,113 @@
+From ed712b32017a968d4fe8124d03bf2eced6557540 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 5 Nov 2026 23:16:31 +0200
+Subject: net/mlx5e: Take HCA devcom lock before esw->mode_lock
+
+From: Cosmin Ratiu <cratiu@nvidia.com>
+
+[ Upstream commit b7e98883eeb72b736dbdeb443e1f43e45f8e5dc1 ]
+
+Uplink ETH driver removal waits for any eswitch operation in progress
+before removing REPs. Removal through mlx5_unregister_device() or
+mlx5_detach_device() does this while holding the HCA devcom lock, which
+is used by peer devices in the same group.
+
+An E-Switch mode change can therefore race with a Socket Direct
+secondary device removal:
+
+T1: primary mode set             T2: SD secondary dev removal
+mlx5_devlink_eswitch_mode_set()
+  sets operation in progress
+                                 mlx5_unregister_device()
+                                   mlx5_devcom_comp_lock(hca)
+                                   ...
+                                   mlx5e_remove()
+                                     mlx5_sd_get_adev() -> T1 dev
+                                     mlx5_eswitch_safe_aux_devs_remove()
+                                       waits for T1's operation
+  esw_offloads_start()
+    esw_mode_change()
+      mlx5_devcom_comp_lock(hca)
+        waits for T2's lock
+
+The timeout in mlx5_eswitch_safe_aux_devs_remove() makes this not a
+deadlock, but representor removal is skipped in that case which is
+incorrect.
+
+This bug was found by Sashiko inspecting the next patch in the series,
+which removes the timeout. It wasn't reproduced but the scenario seems
+plausible, albeit unlikely. This was undetectable by lockdep because the
+down_read_trylock() in mlx5_esw_hold() doesn't register as a lock edge,
+and also because it can't see the wait on the flag as a lock edge.
+
+Fix the lock order so the HCA devcom lock is taken in
+mlx5_devlink_eswitch_mode_set() before esw->mode_lock and held for the
+duration of the mode change.
+Expanding the HCA devcom lock critical section implies new lock edges
+being added, but this is safe:
+- mlx5_devlink_netdev_netns_immutable_set() adds HCA devcom -> RTNL, but
+  there's already a HCA devcom -> RTNL dependency in
+  mlx5_register_device() -..-> register_netdev()
+- esw_offloads_disable/enable() -> esw devcom cleanup/init: adds HCA
+  devcom -> esw devcom. Nothing takes the HCA devcom lock while holding
+  the esw devcom lock.
+
+Fixes: 2ae8c7edea87 ("net/mlx5: Fix Unbinding uplink-netdev in switchdev mode")
+Signed-off-by: Cosmin Ratiu <cratiu@nvidia.com>
+Reviewed-by: Jianbo Liu <jianbol@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Link: https://patch.msgid.link/20261105211637.1083978-4-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ .../net/ethernet/mellanox/mlx5/core/eswitch_offloads.c   | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+index f298e72eeec53..8dd9d96d499c9 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@ -2457,8 +2457,8 @@ void mlx5_esw_reps_unblock(struct mlx5_eswitch *esw)
+ 
+ static void esw_mode_change(struct mlx5_eswitch *esw, u16 mode)
+ {
++	mlx5_devcom_comp_assert_locked(esw->dev->priv.hca_devcom_comp);
+ 	mlx5_esw_reps_unblock(esw);
+-	mlx5_devcom_comp_lock(esw->dev->priv.hca_devcom_comp);
+ 	if (esw->dev->priv.flags & MLX5_PRIV_FLAGS_DISABLE_IB_ADEV ||
+ 	    mlx5_core_mp_enabled(esw->dev)) {
+ 		esw->mode = mode;
+@@ -2471,7 +2471,6 @@ static void esw_mode_change(struct mlx5_eswitch *esw, u16 mode)
+ 	esw->dev->priv.flags &= ~MLX5_PRIV_FLAGS_DISABLE_IB_ADEV;
+ out:
+ 	mlx5_rescan_drivers_locked(esw->dev);
+-	mlx5_devcom_comp_unlock(esw->dev->priv.hca_devcom_comp);
+ 	mlx5_esw_reps_block(esw);
+ }
+ 
+@@ -4485,10 +4484,11 @@ int mlx5_devlink_eswitch_mode_set(struct devlink *devlink, u16 mode,
+ 		return 0;
+ 
+ 	mlx5_lag_disable_change(esw->dev);
++	mlx5_devcom_comp_lock(esw->dev->priv.hca_devcom_comp);
+ 	err = mlx5_esw_try_lock(esw);
+ 	if (err < 0) {
+ 		NL_SET_ERR_MSG_MOD(extack, "Can't change mode, E-Switch is busy");
+-		goto enable_lag;
++		goto unlock_hca;
+ 	}
+ 	cur_mlx5_mode = err;
+ 	err = 0;
+@@ -4551,7 +4551,8 @@ int mlx5_devlink_eswitch_mode_set(struct devlink *devlink, u16 mode,
+ 	esw->eswitch_operation_in_progress = false;
+ unlock:
+ 	mlx5_esw_unlock(esw);
+-enable_lag:
++unlock_hca:
++	mlx5_devcom_comp_unlock(esw->dev->priv.hca_devcom_comp);
+ 	mlx5_lag_enable_change(esw->dev);
+ 	/* Shared FDB activation is creating LAG which is changing reps. */
+ 	if (!err)
+-- 
+2.53.0
+

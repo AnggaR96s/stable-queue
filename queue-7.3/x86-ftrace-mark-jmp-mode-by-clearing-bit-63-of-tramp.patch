@@ -1,0 +1,121 @@
+From 9227c9acc1408e066c59af08054be06465975ba6 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 28 Oct 2026 21:23:44 +0100
+Subject: x86/ftrace: Mark jmp mode by clearing bit 63 of trampoline address
+
+From: Daniel Borkmann <daniel@iogearbox.net>
+
+[ Upstream commit 31ac959c915cc7f379d84cf9dadf3664cbcace02 ]
+
+Since commit 0c3772a8db1f ("x86/ftrace: Implement DYNAMIC_FTRACE_WITH_JMP")
+ftrace_call_replace() emits a jmp instead of a call when bit 0 of the
+target is set, the mark of a direct trampoline that is entered by a jmp.
+ftrace_update_ftrace_func() and arch_ftrace_update_trampoline() use it
+too, for the call of the ftrace callback in ftrace_caller, ftrace_regs_caller
+and the ftrace trampolines, but a callback is a C function and can start
+at an odd address. It does with gcc13 and CONFIG_CC_OPTIMIZE_FOR_SIZE=y:
+gcc13 has no -fmin-function-alignment, so CONFIG_CC_HAS_SANE_FUNCTION_ALIGNMENT
+is not set, and the -falign-functions=16 used in its place does not apply
+to functions optimized for size. Here ftrace_ops_list_func() starts at:
+
+  ffffffff810e0147 T ftrace_ops_list_func
+
+ftrace_regs_call then becomes a jmp to the byte before it:
+
+  ftrace_regs_call ffffffff810374f3: e9 4e 8c 0a 00
+
+That byte is the last one of the preceding function's tail jump, and with
+the first two of ftrace_ops_list_func() it decodes as an inc DWORD PTR
+[rcx+0x57], which swallows the push %r15 of the prologue. Entered without
+a return address and one push short, the list function returns through
+the pt_regs that ftrace_regs_caller saved, here to the saved R14:
+
+  BUG: unable to handle page fault for address: ffff888116c29f40
+  #PF: supervisor instruction fetch in kernel mode
+  RIP: 0010:0xffff888116c29f40
+  R13: 0000000000000000 R14: ffff888116c29f40 R15: 0000000000000000
+  Call Trace:
+   ? bpf_trampoline_6442499918+0x1/0x149
+   ? bpf_lsm_file_open+0x5/0x8
+   ? bpf_lsm_file_open+0x5/0x8
+   ? security_file_open+0x19/0x46
+   ? do_dentry_open+0x16c/0x32a
+
+The list function is installed whenever two ftrace_ops are registered,
+and a function that two of them trace calls it. A kprobe next to a BPF
+trampoline is one such case, and with the single ftrace_ops of the BPF
+trampolines every update_ftrace_direct_mod() is another, as it registers
+a stub ops for the sites it modifies. Here, detaching one of several BPF
+LSM programs from a busy hook crashed the tasks that ran the hook during
+the update.
+
+Bit 0 is free only in the direct trampolines that a dyn_ftrace record can
+point to, but bit 63 is set in every kernel text address on x86_64. Thus,
+mark jmp mode by clearing bit 63 instead, so that ftrace_is_jmp() is false
+for any callback, whatever its alignment, and ftrace_regs_caller sets the
+bit again where it cleared bit 0 before. A marked address is not canonical,
+so a return or indirect branch to one that missed ftrace_jmp_get() faults
+instead of running from a byte before its target.
+
+Fixes: 0c3772a8db1f ("x86/ftrace: Implement DYNAMIC_FTRACE_WITH_JMP")
+Suggested-by: Steven Rostedt <rostedt@goodmis.org>
+Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Reviewed-by: Jiri Olsa <jolsa@kernel.org>
+Reviewed-by: Steven Rostedt <rostedt@goodmis.org>
+Link: https://patch.msgid.link/20261028202345.1215859-1-daniel@iogearbox.net
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ arch/x86/kernel/ftrace_64.S | 6 +++---
+ include/linux/ftrace.h      | 8 +++++---
+ 2 files changed, 8 insertions(+), 6 deletions(-)
+
+diff --git a/arch/x86/kernel/ftrace_64.S b/arch/x86/kernel/ftrace_64.S
+index 62c1c93aa1c6a..4b20673a33959 100644
+--- a/arch/x86/kernel/ftrace_64.S
++++ b/arch/x86/kernel/ftrace_64.S
+@@ -286,9 +286,9 @@ SYM_INNER_LABEL(ftrace_regs_caller_end, SYM_L_GLOBAL)
+ 	RET
+ 
+ 1:
+-	testb	$1, %al
+-	jz	2f
+-	andq $0xfffffffffffffffe, %rax
++	/* See ftrace_jmp_set(), jmp to the trampoline */
++	btsq	$63, %rax
++	jc	2f
+ 	movq %rax, MCOUNT_REG_SIZE+8(%rsp)
+ 	restore_mcount_regs
+ 	/* Restore flags */
+diff --git a/include/linux/ftrace.h b/include/linux/ftrace.h
+index b041d9142d2b8..1c2056a1a68b3 100644
+--- a/include/linux/ftrace.h
++++ b/include/linux/ftrace.h
+@@ -618,19 +618,21 @@ static inline void arch_ftrace_set_direct_caller(struct ftrace_regs *fregs,
+ #endif /* CONFIG_DYNAMIC_FTRACE_WITH_DIRECT_CALLS */
+ 
+ #ifdef CONFIG_DYNAMIC_FTRACE_WITH_JMP
++#define FTRACE_JMP_BIT	BIT(BITS_PER_LONG - 1)
++
+ static inline bool ftrace_is_jmp(unsigned long addr)
+ {
+-	return addr & 1;
++	return !(addr & FTRACE_JMP_BIT);
+ }
+ 
+ static inline unsigned long ftrace_jmp_set(unsigned long addr)
+ {
+-	return addr | 1UL;
++	return addr & ~FTRACE_JMP_BIT;
+ }
+ 
+ static inline unsigned long ftrace_jmp_get(unsigned long addr)
+ {
+-	return addr & ~1UL;
++	return addr | FTRACE_JMP_BIT;
+ }
+ #else
+ static inline bool ftrace_is_jmp(unsigned long addr)
+-- 
+2.53.0
+

@@ -1,0 +1,96 @@
+From 7c34cacd18125a9b9090fa76e23356f73391406c Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 26 Oct 2026 21:58:08 +0530
+Subject: bpf: Fix bpf_dynptr_copy() for overlapping ranges in one packet
+
+From: Ayushman Rout <ayushmanrout27@gmail.com>
+
+[ Upstream commit 696f0954e3b6280aa87ea4a6196153e506b0ab9c ]
+
+When both dynptrs point into the same packet and the ranges overlap,
+bpf_dynptr_copy() can copy wrong data in two ways.
+
+If one range fits into a segment and the other one does not, the slice
+of the first range is used as the buffer for __bpf_dynptr_read() or
+__bpf_dynptr_write(). The range that crosses into a frag is copied piece
+by piece, and an earlier piece can overwrite bytes that a later piece
+has yet to read.
+
+If neither range fits into a segment, the chunks are copied from the
+start to the end through a 256 byte stack buffer. When the destination
+is above the source, a chunk written to the destination overwrites
+source bytes that later chunks have yet to read. For a copy of 1200
+bytes with the destination 100 bytes above the source, the first chunk
+writes source bytes 100..355 and the second chunk then reads bytes
+256..355 after they were overwritten.
+
+Do not use a slice as the buffer when both dynptrs share the same data,
+and copy the chunks from the end to the start when the destination is
+above the source, like memmove() does.
+
+The selftests added later in this series pass with this change.
+
+Fixes: daec295a7094 ("bpf/helpers: Introduce bpf_dynptr_copy kfunc")
+Suggested-by: Alexei Starovoitov <ast@kernel.org>
+Signed-off-by: Ayushman Rout <ayushmanrout27@gmail.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://patch.msgid.link/20261026162810.12862-2-ayushmanrout27@gmail.com
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ kernel/bpf/helpers.c | 16 ++++++++++++----
+ 1 file changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index 7c2e6f0e74091..9100283e2935e 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -3255,8 +3255,10 @@ __bpf_kfunc int bpf_dynptr_copy(const struct bpf_dynptr *dst_ptr, u64 dst_off,
+ {
+ 	const struct bpf_dynptr_kern *dst = (struct bpf_dynptr_kern *)dst_ptr;
+ 	const struct bpf_dynptr_kern *src = (struct bpf_dynptr_kern *)src_ptr;
++	bool same = src->data == dst->data;
+ 	void *src_slice, *dst_slice;
+ 	char buf[256];
++	bool rev;
+ 	u64 off;
+ 
+ 	src_slice = bpf_dynptr_slice(src_ptr, src_off, NULL, size);
+@@ -3267,25 +3269,31 @@ __bpf_kfunc int bpf_dynptr_copy(const struct bpf_dynptr *dst_ptr, u64 dst_off,
+ 		return 0;
+ 	}
+ 
+-	if (src_slice)
++	/* The other range is copied piece by piece. A slice of the same packet
++	 * may overlap with it, so it cannot be the buffer for that.
++	 */
++	if (src_slice && !same)
+ 		return __bpf_dynptr_write(dst, dst_off, src_slice, size, 0);
+ 
+-	if (dst_slice)
++	if (dst_slice && !same)
+ 		return __bpf_dynptr_read(dst_slice, size, src, src_off, 0);
+ 
+ 	if (bpf_dynptr_check_off_len(dst, dst_off, size) ||
+ 	    bpf_dynptr_check_off_len(src, src_off, size))
+ 		return -E2BIG;
+ 
++	/* like memmove(): from the end if the destination is above the source */
++	rev = same && dst->offset + dst_off > src->offset + src_off;
+ 	off = 0;
+ 	while (off < size) {
+ 		u64 chunk_sz = min_t(u64, sizeof(buf), size - off);
++		u64 pos = rev ? size - off - chunk_sz : off;
+ 		int err;
+ 
+-		err = __bpf_dynptr_read(buf, chunk_sz, src, src_off + off, 0);
++		err = __bpf_dynptr_read(buf, chunk_sz, src, src_off + pos, 0);
+ 		if (err)
+ 			return err;
+-		err = __bpf_dynptr_write(dst, dst_off + off, buf, chunk_sz, 0);
++		err = __bpf_dynptr_write(dst, dst_off + pos, buf, chunk_sz, 0);
+ 		if (err)
+ 			return err;
+ 
+-- 
+2.53.0
+

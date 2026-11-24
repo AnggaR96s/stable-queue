@@ -1,0 +1,195 @@
+From 7f1c284b404c8207157067dcdfc7269c41fe0e2a Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 5 Nov 2026 23:16:34 +0200
+Subject: net/mlx5e: Block E-Switch mode changes during IPsec policy creation
+
+From: Cosmin Ratiu <cratiu@nvidia.com>
+
+[ Upstream commit d9e4ac08ea892da54c5aa7ae4a368f2d09db589c ]
+
+Eswitch mode changes can tear down the IPsec context while policy
+creation is accessing it. The mode-blocking reference acquired when
+creating a flow table comes too late: the table lookup already accesses
+the IPsec context before taking that reference.
+
+Take a temporary mode-blocking reference before checking the IPsec
+context and validating the policy. This gets dropped after successful
+setup, when the flow table holds its own reference.
+
+The temporary reservation must allow reuse of existing IPsec tables.
+For example:
+1. An offloaded inbound IPsec policy is added on the uplink.
+2. A TC flower rule is added on a VF representor.
+3. Another uplink policy is added using the same RX tables.
+
+The third policy reuses the first policy's tables, so it must not be
+rejected merely because esw->user_count is nonzero. Add a check_users
+argument to mlx5_eswitch_block_mode(). Pass false for temporary policy
+reservations and true when creating the first table (rx_get()/tx_get()).
+
+Temporary reservations take mode_lock and check operation ownership
+without requiring eswitch user_count to be zero.
+
+mlx5e_xfrm_add_state() needs the same early mode reservation and is
+handled in the next patch.
+
+This was found by Sashiko, during review of the last patch in the
+series. No reproduction attempted, as it seems quite a tricky race to
+successfully trigger.
+
+Fixes: a5b8ca9471d3 ("net/mlx5e: Add XFRM policy offload logic")
+Signed-off-by: Cosmin Ratiu <cratiu@nvidia.com>
+Reviewed-by: Jianbo Liu <jianbol@nvidia.com>
+Reviewed-by: Dragos Tatulea <dtatulea@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Link: https://patch.msgid.link/20261105211637.1083978-7-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ .../mellanox/mlx5/core/en_accel/ipsec.c       | 23 +++++++++++++++----
+ .../mellanox/mlx5/core/en_accel/ipsec_fs.c    |  4 ++--
+ .../net/ethernet/mellanox/mlx5/core/eswitch.h |  8 +++++--
+ .../mellanox/mlx5/core/eswitch_offloads.c     |  9 +++++---
+ 4 files changed, 32 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.c b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.c
+index c8c103b0a879a..09f51f6fa8675 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.c
+@@ -814,7 +814,7 @@ static int mlx5e_xfrm_add_state(struct net_device *dev,
+ 		goto err_xfrm;
+ 	}
+ 
+-	err = mlx5_eswitch_block_mode(mdev);
++	err = mlx5_eswitch_block_mode(mdev, true);
+ 	if (err)
+ 		goto unblock_ipsec;
+ 
+@@ -1288,18 +1288,28 @@ static int mlx5e_xfrm_add_policy(struct xfrm_policy *x,
+ 		return -EBUSY;
+ 	}
+ 
++	/* Block esw mode changes until the policy holds its own block. */
++	err = mlx5_eswitch_block_mode(mdev, false);
++	if (err) {
++		NL_SET_ERR_MSG_MOD(extack, "Eswitch busy, can't add policy");
++		return err;
++	}
++
+ 	if (!priv->ipsec) {
+ 		NL_SET_ERR_MSG_MOD(extack, "Device doesn't support IPsec packet offload");
+-		return -EOPNOTSUPP;
++		err = -EOPNOTSUPP;
++		goto unblock_mode;
+ 	}
+ 
+ 	err = mlx5e_xfrm_validate_policy(mdev, x, extack);
+ 	if (err)
+-		return err;
++		goto unblock_mode;
+ 
+ 	pol_entry = kzalloc_obj(*pol_entry);
+-	if (!pol_entry)
+-		return -ENOMEM;
++	if (!pol_entry) {
++		err = -ENOMEM;
++		goto unblock_mode;
++	}
+ 
+ 	pol_entry->x = x;
+ 	pol_entry->ipsec = priv->ipsec;
+@@ -1315,6 +1325,7 @@ static int mlx5e_xfrm_add_policy(struct xfrm_policy *x,
+ 		goto err_fs;
+ 
+ 	x->xdo.offload_handle = (unsigned long)pol_entry;
++	mlx5_eswitch_unblock_mode(mdev);
+ 	return 0;
+ 
+ err_fs:
+@@ -1322,6 +1333,8 @@ static int mlx5e_xfrm_add_policy(struct xfrm_policy *x,
+ ipsec_busy:
+ 	kfree(pol_entry);
+ 	NL_SET_ERR_MSG_MOD(extack, "Device failed to offload this policy");
++unblock_mode:
++	mlx5_eswitch_unblock_mode(mdev);
+ 	return err;
+ }
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec_fs.c b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec_fs.c
+index 1529d47303234..dbe5547d7a498 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec_fs.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec_fs.c
+@@ -1134,7 +1134,7 @@ static int rx_get(struct mlx5_core_dev *mdev, struct mlx5e_ipsec *ipsec,
+ 	if (rx->ft.refcnt)
+ 		goto skip;
+ 
+-	err = mlx5_eswitch_block_mode(mdev);
++	err = mlx5_eswitch_block_mode(mdev, true);
+ 	if (err)
+ 		return err;
+ 
+@@ -1427,7 +1427,7 @@ static int tx_get(struct mlx5_core_dev *mdev, struct mlx5e_ipsec *ipsec,
+ 	if (tx->ft.refcnt)
+ 		goto skip;
+ 
+-	err = mlx5_eswitch_block_mode(mdev);
++	err = mlx5_eswitch_block_mode(mdev, true);
+ 	if (err)
+ 		return err;
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+index c0f2af86a9342..176940a20b756 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@ -971,7 +971,7 @@ bool mlx5_eswitch_is_peer(struct mlx5_eswitch *esw,
+ int mlx5_eswitch_block_encap(struct mlx5_core_dev *dev, bool from_fdb);
+ void mlx5_eswitch_unblock_encap(struct mlx5_core_dev *dev);
+ 
+-int mlx5_eswitch_block_mode(struct mlx5_core_dev *dev);
++int mlx5_eswitch_block_mode(struct mlx5_core_dev *dev, bool check_users);
+ void mlx5_eswitch_unblock_mode(struct mlx5_core_dev *dev);
+ 
+ static inline int mlx5_eswitch_num_vfs(struct mlx5_eswitch *esw)
+@@ -1082,7 +1082,11 @@ static inline void mlx5_eswitch_unblock_encap(struct mlx5_core_dev *dev)
+ {
+ }
+ 
+-static inline int mlx5_eswitch_block_mode(struct mlx5_core_dev *dev) { return 0; }
++static inline int mlx5_eswitch_block_mode(struct mlx5_core_dev *dev,
++					  bool check_users)
++{
++	return 0;
++}
+ static inline void mlx5_eswitch_unblock_mode(struct mlx5_core_dev *dev) {}
+ static inline bool mlx5_eswitch_block_ipsec(struct mlx5_core_dev *dev)
+ {
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+index 0debb02fea268..023d87f17e90b 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@ -4342,7 +4342,7 @@ static int esw_inline_mode_to_devlink(u8 mlx5_mode, u8 *mode)
+ 	return 0;
+ }
+ 
+-int mlx5_eswitch_block_mode(struct mlx5_core_dev *dev)
++int mlx5_eswitch_block_mode(struct mlx5_core_dev *dev, bool check_users)
+ {
+ 	struct mlx5_eswitch *esw = dev->priv.eswitch;
+ 	int err;
+@@ -4350,8 +4350,11 @@ int mlx5_eswitch_block_mode(struct mlx5_core_dev *dev)
+ 	if (!mlx5_esw_allowed(esw))
+ 		return 0;
+ 
+-	/* Take TC into account */
+-	err = mlx5_esw_try_lock(esw);
++	/* Temporary reservations may reuse tables while TC users exist. */
++	if (check_users)
++		err = mlx5_esw_try_lock(esw);
++	else
++		err = mlx5_esw_lock(esw);
+ 	if (err < 0)
+ 		return err;
+ 
+-- 
+2.53.0
+

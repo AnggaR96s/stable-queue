@@ -1,0 +1,94 @@
+From 6f0fd1120e06b1fd92f4c9113f7a813a253b516d Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Sun, 1 Nov 2026 19:05:34 +0000
+Subject: bpf: Use the inner transport header after a decap
+
+From: Chris Mason <mason@kernel.org>
+
+[ Upstream commit 33be492c2e239de8c525254e593357ae5e80852d ]
+
+If skb->encapsulation is set, qdisc_pkt_len_segs_init() reads the TCP
+header of a GSO packet at skb->inner_transport_header. Otherwise it uses
+skb->transport_header. A decap with BPF_F_ADJ_ROOM_DECAP_L4_{GRE,UDP}
+removes the outer transport header. It clears skb->encapsulation if no
+tunnel flag remains in gso_type. The result in BPF_ADJ_ROOM_MAC mode is:
+
+  before  | MAC | outer IP | GRE | inner IP | TCP | payload
+          transport_header ^                ^ inner_transport_header
+  after                    | MAC | inner IP | TCP | payload
+                transport_header ^          ^ inner_transport_header
+
+Then qdisc_pkt_len_segs_init() reads the inner IP header as a TCP header.
+Thus the kernel can drop a valid packet with SKB_DROP_REASON_SKB_BAD_GSO.
+
+Copy skb->inner_transport_header to skb->transport_header when a decap
+clears skb->encapsulation. Keep skb->transport_header if it is larger. This
+occurs if nothing sets the inner field. At tc ingress nothing changes for
+IPIP or GRO packets. Both fields are at the TCP header there.
+
+Fixes: ec20dee2f2c4 ("bpf: Clear decap state on skb_adjust_room shrink path")
+Signed-off-by: Chris Mason <mason@kernel.org>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://patch.msgid.link/20261101190535.1454146-27-alexei.starovoitov@gmail.com
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ net/core/filter.c | 29 +++++++++++++++++++++++------
+ 1 file changed, 23 insertions(+), 6 deletions(-)
+
+diff --git a/net/core/filter.c b/net/core/filter.c
+index 475c9e06cf06b..d27e73647a8df 100644
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -3769,6 +3769,25 @@ static int bpf_skb_net_grow(struct sk_buff *skb, u32 off, u32 len_diff,
+ 	return 0;
+ }
+ 
++/*
++ * Code that went by the inner transport header while skb->encapsulation was set
++ * goes by the transport header from now on. So take the inner one over, unless
++ * it is the smaller one, as it is if nobody has set it. Do not leave the result
++ * in front of @off, where the bytes were removed.
++ */
++static void bpf_skb_clear_encap(struct sk_buff *skb, u32 off)
++{
++	int thoff;
++
++	if (!skb->encapsulation)
++		return;
++
++	thoff = max(skb->inner_transport_header, skb->transport_header) -
++		skb_headroom(skb);
++	skb_set_transport_header(skb, max_t(int, thoff, off));
++	skb->encapsulation = 0;
++}
++
+ static int bpf_skb_net_shrink(struct sk_buff *skb, u32 off, u32 len_diff,
+ 			      u64 flags)
+ {
+@@ -3850,8 +3869,7 @@ static int bpf_skb_net_shrink(struct sk_buff *skb, u32 off, u32 len_diff,
+ 						  SKB_GSO_IPXIP4 |
+ 						  SKB_GSO_IPXIP6 |
+ 						  SKB_GSO_ESP)))
+-				if (skb->encapsulation)
+-					skb->encapsulation = 0;
++				bpf_skb_clear_encap(skb, off);
+ 		}
+ 
+ 		/* Header must be checked, and gso_segs recomputed. */
+@@ -3859,10 +3877,9 @@ static int bpf_skb_net_shrink(struct sk_buff *skb, u32 off, u32 len_diff,
+ 		shinfo->gso_segs = 0;
+ 	} else {
+ 		/* For non-GSO packets, clear encapsulation if decap flags are set */
+-		if ((flags & (BPF_F_ADJ_ROOM_DECAP_L4_MASK |
+-			      BPF_F_ADJ_ROOM_DECAP_IPXIP_MASK)) &&
+-		    skb->encapsulation)
+-			skb->encapsulation = 0;
++		if (flags & (BPF_F_ADJ_ROOM_DECAP_L4_MASK |
++			     BPF_F_ADJ_ROOM_DECAP_IPXIP_MASK))
++			bpf_skb_clear_encap(skb, off);
+ 	}
+ 
+ 	return 0;
+-- 
+2.53.0
+

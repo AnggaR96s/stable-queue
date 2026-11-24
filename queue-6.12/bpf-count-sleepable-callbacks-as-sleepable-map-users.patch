@@ -1,0 +1,108 @@
+From 25ee5499cd2b881aa03437814cf343ed7c8214c9 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Sat, 17 Oct 2026 16:37:25 +0000
+Subject: bpf: Count sleepable callbacks as sleepable map users
+
+From: Josef Bacik <josef@toxicpanda.com>
+
+[ Upstream commit 927c9c985f3ef4d30c086884b7e0ecb933f742ef ]
+
+map->sleepable_refcnt tells bpf_map_fd_put_ptr() whether an inner map that
+is taken out of its outer map has to wait for an RCU Tasks Trace grace
+period as well.  It counts the sleepable programs that use the outer map.
+The bpf_wq or bpf_task_work callback of a program that is not sleepable
+runs under rcu_read_lock_trace() only, and is not counted.
+
+Such a callback can look an inner map up and keep it while user space
+deletes it from the outer map.  The inner map is freed behind a plain RCU
+grace period, under the callback:
+
+  BUG: KASAN: slab-use-after-free in array_map_update_elem+0x6bc/0x7d0
+
+Count a program with such a callback.  The maps are bound before the
+verifier meets the callback, so raise the count of those that are bound
+when it does.
+
+Fixes: 8e83da9732d9 ("bpf: add bpf_wq_start")
+Signed-off-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://patch.msgid.link/20261017163745.3341787-24-alexei.starovoitov@gmail.com
+[ sashal: Adapted to missing helpers by keeping the local is_bpf_wq_set_callback_impl_kfunc() check and is_may_goto_insn() name, and by editing add_used_map_from_fd() without the check_map_prog_compatibility() context. ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ kernel/bpf/core.c     |  2 +-
+ kernel/bpf/syscall.c  |  2 +-
+ kernel/bpf/verifier.c | 17 +++++++++++++++--
+ 3 files changed, 17 insertions(+), 4 deletions(-)
+
+diff --git a/kernel/bpf/core.c b/kernel/bpf/core.c
+index df529db44f35c..de2c0ffb30252 100644
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@ -2873,7 +2873,7 @@ void __bpf_free_used_maps(struct bpf_prog_aux *aux,
+ 	bool sleepable;
+ 	u32 i;
+ 
+-	sleepable = aux->prog->sleepable;
++	sleepable = bpf_prog_runs_sleepable(aux->prog);
+ 	for (i = 0; i < len; i++) {
+ 		map = used_maps[i];
+ 		if (map->ops->map_poke_untrack)
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index 3e084cf77d134..8fd823047c3a0 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -5754,7 +5754,7 @@ static int bpf_prog_bind_map(union bpf_attr *attr)
+ 	/* The bpf program will not access the bpf map, but for the sake of
+ 	 * simplicity, increase sleepable_refcnt for sleepable program as well.
+ 	 */
+-	if (prog->sleepable)
++	if (bpf_prog_runs_sleepable(prog))
+ 		atomic64_inc(&map->sleepable_refcnt);
+ 	memcpy(used_maps_new, used_maps_old,
+ 	       sizeof(used_maps_old[0]) * prog->aux->used_map_cnt);
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index d8317cef6e8ab..1404e842580ba 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -547,6 +547,19 @@ static bool is_async_callback_calling_insn(struct bpf_insn *insn)
+ 	       (bpf_pseudo_kfunc_call(insn) && is_async_callback_calling_kfunc(insn->imm));
+ }
+ 
++/* From here on the maps of the program count it as a sleepable user. */
++static void mark_sleepable_async_cb(struct bpf_verifier_env *env)
++{
++	int i;
++
++	if (bpf_prog_runs_sleepable(env->prog))
++		return;
++
++	env->prog->aux->sleepable_async_cb = true;
++	for (i = 0; i < env->used_map_cnt; i++)
++		atomic64_inc(&env->used_maps[i]->sleepable_refcnt);
++}
++
+ static bool is_may_goto_insn(struct bpf_insn *insn)
+ {
+ 	return insn->code == (BPF_JMP | BPF_JCOND) && insn->src_reg == BPF_MAY_GOTO;
+@@ -10175,7 +10188,7 @@ static int push_callback_call(struct bpf_verifier_env *env, struct bpf_insn *ins
+ 		if (IS_ERR(async_cb))
+ 			return PTR_ERR(async_cb);
+ 		if (is_bpf_wq_set_callback_impl_kfunc(insn->imm))
+-			env->prog->aux->sleepable_async_cb = true;
++			mark_sleepable_async_cb(env);
+ 		callee = async_cb->frame[0];
+ 		callee->async_entry_cnt = state->frame[0]->async_entry_cnt + 1;
+ 
+@@ -19651,7 +19664,7 @@ static int add_used_map_from_fd(struct bpf_verifier_env *env, int fd, bool *reus
+ 		return -E2BIG;
+ 	}
+ 
+-	if (env->prog->sleepable)
++	if (bpf_prog_runs_sleepable(env->prog))
+ 		atomic64_inc(&map->sleepable_refcnt);
+ 
+ 	/* hold the map. If the program is rejected by verifier,
+-- 
+2.53.0
+

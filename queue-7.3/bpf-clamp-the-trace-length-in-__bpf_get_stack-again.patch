@@ -1,0 +1,81 @@
+From ab0a9b3a0bb58a72f8df147529521dba8e160fe3 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Sun, 1 Nov 2026 19:05:09 +0000
+Subject: bpf: Clamp the trace length in __bpf_get_stack() again
+
+From: Josef Bacik <josef@toxicpanda.com>
+
+[ Upstream commit 007fd460798be9af7d4874734f934afa47742f29 ]
+
+get_perf_callchain() and get_callchain_entry_for_task() store a trace in a
+per-CPU entry, one per context. They release the entry before they return
+it. Thus a second user in the same context can write to the entry while the
+first user reads it. preempt_disable() stops only other tasks.
+
+__bpf_get_stack() requests at most max_depth frames. This is skip plus the
+frames that fit in the buffer, but not more than perf_event_max_stack.
+Since the commit below, it copies 'trace->nr - skip' frames with no limit.
+But a second user can store a longer trace. The unwinders of PowerPC add
+context markers that max_depth does not limit. In both cases the copy
+writes after the end of the buffer.
+
+Read trace->nr one time. Clamp the value to max_depth before the skip test,
+as __bpf_get_stack_pe() does. Thus when max_depth is less than skip, the
+helper returns -EFAULT, and 'trace_nr - skip' does not underflow. The
+copied frames can still be those of the second user.
+
+Fixes: e17d62fedd10 ("bpf: Refactor stack map trace depth calculation into helper function")
+Signed-off-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://patch.msgid.link/20261101190535.1454146-2-alexei.starovoitov@gmail.com
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ kernel/bpf/stackmap.c | 24 +++++++++++++++++-------
+ 1 file changed, 17 insertions(+), 7 deletions(-)
+
+diff --git a/kernel/bpf/stackmap.c b/kernel/bpf/stackmap.c
+index d09d4c3fe547c..84ccfa9df4637 100644
+--- a/kernel/bpf/stackmap.c
++++ b/kernel/bpf/stackmap.c
+@@ -827,14 +827,20 @@ static long __bpf_get_stack(struct pt_regs *regs, struct task_struct *task,
+ 					   crosstask, false, 0);
+ 	}
+ 
+-	if (unlikely(!trace) || trace->nr < skip) {
+-		if (may_fault)
+-			rcu_read_unlock();
+-		preempt_enable();
+-		goto err_fault;
+-	}
++	if (unlikely(!trace))
++		goto err_unlock;
++
++	/*
++	 * trace->nr can be above max_depth. The per-CPU entry is released
++	 * already: a tracing program or an NMI which takes a callchain in the
++	 * same context before the copy below reuses it. And the unwinders of
++	 * PowerPC store context markers on top of max_depth.
++	 */
++	trace_nr = min_t(u32, READ_ONCE(trace->nr), max_depth);
++	if (trace_nr < skip)
++		goto err_unlock;
+ 
+-	trace_nr = callchain_store(trace, trace->nr, buf, elem_size, flags);
++	trace_nr = callchain_store(trace, trace_nr, buf, elem_size, flags);
+ 
+ 	/* trace should not be dereferenced after this point */
+ 	if (may_fault)
+@@ -843,6 +849,10 @@ static long __bpf_get_stack(struct pt_regs *regs, struct task_struct *task,
+ 
+ 	return callchain_finalize(buf, size, trace_nr, elem_size, flags, may_fault);
+ 
++err_unlock:
++	if (may_fault)
++		rcu_read_unlock();
++	preempt_enable();
+ err_fault:
+ 	err = -EFAULT;
+ clear:
+-- 
+2.53.0
+

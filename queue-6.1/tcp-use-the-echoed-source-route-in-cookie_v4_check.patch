@@ -1,0 +1,92 @@
+From 3e7ebd6be8961fc077849f564bf5ab0ce7e565a9 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 12 Oct 2026 12:10:29 +0200
+Subject: tcp: use the echoed source route in cookie_v4_check()
+
+From: Eric Dumazet <edumazet@kernel.org>
+
+[ Upstream commit 54d574d4afd9de820c8a017665c8095f0f5fdbaa ]
+
+When the ACK carries a source route option, cookie_v4_check() routes
+the new socket to opt->faddr, where opt points to the options of the
+received packet.
+
+ip_options_compile() only fills faddr for options given by
+setsockopt() (when called without an skb), so on receive faddr is 0
+and the lookup is done for daddr 0, which gives a local route.
+
+Use the options echoed by tcp_v4_save_options() instead, as
+inet_csk_route_req() and inet_csk_route_child_sock() do with
+ireq->ireq_opt. Read them after security_inet_conn_request(),
+since CIPSO can replace ireq->ireq_opt there.
+
+The route now goes to the first hop of the source route, so also
+refuse a strict source route through a gateway, as
+inet_csk_route_req() does.
+
+Found by sashiko while reviewing the sk_mc_loop() fix.
+
+Fixes: 1da177e4c3f4 ("Linux-2.6.12-rc2")
+Signed-off-by: Eric Dumazet <edumazet@kernel.org>
+Reviewed-by: Kuniyuki Iwashima <kuniyu@google.com>
+Link: https://patch.msgid.link/20261012101029.927296-3-edumazet@kernel.org
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+[ sashal: Replaced the received packet's IP options with the echoed request options and adapted context to older code: RT_CONN_FLAGS, sk->sk_uid, and reqsk_free()/goto out error paths instead of SKB_DR_SET/out_free. ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ net/ipv4/syncookies.c | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/net/ipv4/syncookies.c b/net/ipv4/syncookies.c
+index 0b6e0a9569cb4..0497a2d4a2d75 100644
+--- a/net/ipv4/syncookies.c
++++ b/net/ipv4/syncookies.c
+@@ -320,13 +320,13 @@ EXPORT_SYMBOL_GPL(cookie_tcp_reqsk_alloc);
+  */
+ struct sock *cookie_v4_check(struct sock *sk, struct sk_buff *skb)
+ {
+-	struct ip_options *opt = &TCP_SKB_CB(skb)->header.h4.opt;
+ 	struct tcp_options_received tcp_opt;
+ 	struct inet_request_sock *ireq;
+ 	struct tcp_request_sock *treq;
+ 	struct tcp_sock *tp = tcp_sk(sk);
+ 	const struct tcphdr *th = tcp_hdr(skb);
+ 	__u32 cookie = ntohl(th->ack_seq) - 1;
++	struct ip_options_rcu *opt;
+ 	struct sock *ret = sk;
+ 	struct request_sock *req;
+ 	int full_space, mss;
+@@ -408,6 +408,8 @@ struct sock *cookie_v4_check(struct sock *sk, struct sk_buff *skb)
+ 		reqsk_free(req);
+ 		goto out;
+ 	}
++	/* Load ireq->ireq_opt after the LSM hook, which can replace it. */
++	opt = rcu_dereference_protected(ireq->ireq_opt, true);
+ 
+ 	req->num_retrans = 0;
+ 
+@@ -420,7 +422,7 @@ struct sock *cookie_v4_check(struct sock *sk, struct sk_buff *skb)
+ 	flowi4_init_output(&fl4, ireq->ir_iif, ireq->ir_mark,
+ 			   RT_CONN_FLAGS(sk), RT_SCOPE_UNIVERSE, IPPROTO_TCP,
+ 			   inet_sk_flowi_flags(sk),
+-			   opt->srr ? opt->faddr : ireq->ir_rmt_addr,
++			   (opt && opt->opt.srr) ? opt->opt.faddr : ireq->ir_rmt_addr,
+ 			   ireq->ir_loc_addr, th->source, th->dest, sk->sk_uid);
+ 	security_req_classify_flow(req, flowi4_to_flowi_common(&fl4));
+ 	rt = ip_route_output_key(sock_net(sk), &fl4);
+@@ -428,6 +430,12 @@ struct sock *cookie_v4_check(struct sock *sk, struct sk_buff *skb)
+ 		reqsk_free(req);
+ 		goto out;
+ 	}
++	/* Same check as in inet_csk_route_req(). */
++	if (opt && opt->opt.is_strictroute && rt->rt_uses_gateway) {
++		ip_rt_put(rt);
++		reqsk_free(req);
++		goto out;
++	}
+ 
+ 	/* Try to redo what tcp_v4_send_synack did. */
+ 	req->rsk_window_clamp = tp->window_clamp ? :dst_metric(&rt->dst, RTAX_WINDOW);
+-- 
+2.53.0
+

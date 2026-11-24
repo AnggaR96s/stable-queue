@@ -1,0 +1,76 @@
+From d976eae7cd357479b3d57d79a89f8be342c236fc Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 16 Oct 2026 10:54:29 +0800
+Subject: virtio_balloon: initialize wakeup_lock before virtqueues are set up
+
+From: Mingbing Zhai <zhaimingbing@cmss.chinamobile.com>
+
+[ Upstream commit 161aa708b02cc997a51701c342f3cebade0b5164 ]
+
+Since c578123e63da ("virtio_balloon: Treat stats requests as wakeup
+events") the stats_request() virtqueue callback takes vb->wakeup_lock
+via start_wakeup_event().  init_vqs() registers that callback and even
+primes and kicks the stats queue, so the lock is reachable from irq
+context as soon as init_vqs() returns, long before the driver sets
+DRIVER_OK: vring_interrupt() dispatches to the callback without any
+DRIVER_OK check unless CONFIG_VIRTIO_HARDEN_NOTIFICATION is set, and
+that option depends on BROKEN.  syzbot hit it from a threaded irq:
+
+  INFO: trying to register non-static key in stats_request
+  ...
+  assign_lock_key
+  register_lock_class
+  lock_acquire
+  rt_spin_lock
+  start_wakeup_event drivers/virtio/virtio_balloon.c:150 [inline]
+  stats_request drivers/virtio/virtio_balloon.c:435
+
+The lock is only initialized near the end of virtballoon_probe(),
+after init_vqs() and several steps that can still fail and unwind
+through del_vqs(), where a racing interrupt still finds the callback
+registered.  Until then it is whatever kzalloc() left in vb: lockdep
+complains about the unregistered lock class, and wakeup_signal_mask
+and processing_wakeup_event get updated from irq context while probe
+is still running.
+
+The rt_spin_lock() in the report is just spin_lock() on PREEMPT_RT;
+any PROVE_LOCKING build takes the same path.
+
+stop_update_lock(), which the same callback also acquires, is already
+initialized before init_vqs(); do the same for wakeup_lock.
+
+Fixes: c578123e63da ("virtio_balloon: Treat stats requests as wakeup events")
+Reported-by: syzbot+13df72e0dc4be5c62215@syzkaller.appspotmail.com
+Closes: https://syzkaller.appspot.com/bug?extid=13df72e0dc4be5c62215
+Signed-off-by: Mingbing Zhai <zhaimingbing@cmss.chinamobile.com>
+Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+Message-ID: <20261016025429.901-1-zhaimingbing@cmss.chinamobile.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/virtio/virtio_balloon.c | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/drivers/virtio/virtio_balloon.c b/drivers/virtio/virtio_balloon.c
+index ab3e3d887e00f..8c1b47ec17a29 100644
+--- a/drivers/virtio/virtio_balloon.c
++++ b/drivers/virtio/virtio_balloon.c
+@@ -942,6 +942,7 @@ static int virtballoon_probe(struct virtio_device *vdev)
+ 	INIT_WORK(&vb->update_balloon_stats_work, update_balloon_stats_func);
+ 	INIT_WORK(&vb->update_balloon_size_work, update_balloon_size_func);
+ 	spin_lock_init(&vb->stop_update_lock);
++	spin_lock_init(&vb->wakeup_lock);
+ 	mutex_init(&vb->balloon_lock);
+ 	init_waitqueue_head(&vb->acked);
+ 	vb->vdev = vdev;
+@@ -1049,8 +1050,6 @@ static int virtballoon_probe(struct virtio_device *vdev)
+ 			goto out_unregister_oom;
+ 	}
+ 
+-	spin_lock_init(&vb->wakeup_lock);
+-
+ 	/*
+ 	 * The virtio balloon itself can't wake up the device, but it is
+ 	 * responsible for processing wakeup events passed up from the transport
+-- 
+2.53.0
+

@@ -1,0 +1,148 @@
+From 6b883d6c501af421604c8eb82fadc606e588ee3d Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Sat, 17 Oct 2026 23:09:41 +0000
+Subject: bpf, cpumap: Hold the device of frames in the queue
+
+From: Josef Bacik <josef@toxicpanda.com>
+
+[ Upstream commit f99351272933ba2e1221484a5e53b7a5d2c035f0 ]
+
+A frame that is redirected to another CPU waits in the queue of the cpumap
+entry with a plain pointer to the device it came from, and an skb from
+generic XDP with skb->dev.  Nothing keeps that device.  Closing and
+unregistering it waits for its NAPI and for RCU, but not for the kthread
+of the entry.  If the kthread is late by more than that, since its CPU is
+busy with something of a higher priority, it builds skbs for a device that
+has been freed and hands them to the stack:
+
+  BUG: KASAN: use-after-free in dev_gro_receive+0x1f51/0x2b30
+  Read of size 8 at addr ffff88800a7340b0 by task cpumap/1/map:1/54
+
+Take a reference to the device for each entry of the queue.  The kthread
+cannot drop it at the end of the batch, since its GRO node may keep the skb
+for longer.  Let it note the devices and drop the references behind a full
+GRO flush, which it does whenever the queue is empty, and from now on also
+when it has noted about 2048 of them.
+
+A device whose frames are stuck in a queue is now unregistered only when
+the kthread has got to them.  RTNL is not held meanwhile, but if the device
+goes with its network namespace, the cleanup of all namespaces waits.
+
+Fixes: 1c601d829ab0 ("bpf: cpumap xdp_buff to skb conversion and allocation")
+Fixes: 11941f8a8536 ("bpf: cpumap: Implement generic cpumap")
+Signed-off-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://patch.msgid.link/20261017230950.802052-8-alexei.starovoitov@gmail.com
+[ sashal: Shrunk the held-device array from 2048 to 8 entries (tied to the batch size) and release the device references at the end of each batch, since this tree has no GRO flush. ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ kernel/bpf/cpumap.c | 30 +++++++++++++++++++++++++-----
+ 1 file changed, 25 insertions(+), 5 deletions(-)
+
+diff --git a/kernel/bpf/cpumap.c b/kernel/bpf/cpumap.c
+index df03e66a687c1..a93f5953283b0 100644
+--- a/kernel/bpf/cpumap.c
++++ b/kernel/bpf/cpumap.c
+@@ -43,6 +43,7 @@
+  */
+ 
+ #define CPU_MAP_BULK_SIZE 8  /* 8 == one cacheline on 64-bit archs */
++#define CPU_MAP_HELD_DEVS 8
+ struct bpf_cpu_map_entry;
+ struct bpf_cpu_map;
+ 
+@@ -70,6 +71,13 @@ struct bpf_cpu_map_entry {
+ 
+ 	struct completion kthread_running;
+ 	struct rcu_work free_work;
++
++	/*
++	 * Every frame and skb in the queue holds a reference to its device.
++	 * The kthread keeps it until the batch has been handed to the stack.
++	 */
++	struct net_device *held[CPU_MAP_HELD_DEVS];
++	u32 nr_held;
+ };
+ 
+ struct bpf_cpu_map {
+@@ -127,9 +135,11 @@ static void __cpu_map_ring_cleanup(struct ptr_ring *ring)
+ 		WARN_ON_ONCE(1);
+ 		if (unlikely(__ptr_test_bit(0, &ptr))) {
+ 			__ptr_clear_bit(0, &ptr);
++			dev_put(((struct sk_buff *)ptr)->dev);
+ 			kfree_skb(ptr);
+ 			continue;
+ 		}
++		dev_put(((struct xdp_frame *)ptr)->dev_rx);
+ 		xdp_return_frame(ptr);
+ 	}
+ }
+@@ -233,7 +243,7 @@ static int cpu_map_bpf_prog_run_xdp(struct bpf_cpu_map_entry *rcpu,
+ 	return nframes;
+ }
+ 
+-#define CPUMAP_BATCH 8
++#define CPUMAP_BATCH CPU_MAP_HELD_DEVS
+ 
+ static int cpu_map_bpf_prog_run(struct bpf_cpu_map_entry *rcpu, void **frames,
+ 				int xdp_n, struct xdp_cpumap_stats *stats,
+@@ -312,10 +322,12 @@ static int cpu_map_kthread_run(void *data)
+ 				struct sk_buff *skb = f;
+ 
+ 				__ptr_clear_bit(0, &skb);
++				rcpu->held[rcpu->nr_held++] = skb->dev;
+ 				list_add_tail(&skb->list, &list);
+ 				continue;
+ 			}
+ 
++			rcpu->held[rcpu->nr_held++] = ((struct xdp_frame *)f)->dev_rx;
+ 			frames[xdp_n++] = f;
+ 			page = virt_to_page(f);
+ 
+@@ -352,6 +364,8 @@ static int cpu_map_kthread_run(void *data)
+ 			list_add_tail(&skb->list, &list);
+ 		}
+ 		netif_receive_skb_list(&list);
++		while (rcpu->nr_held)
++			dev_put(rcpu->held[--rcpu->nr_held]);
+ 
+ 		/* Feedback loop via tracepoint */
+ 		trace_xdp_cpumap_kthread(rcpu->map_id, n, kmem_alloc_drops,
+@@ -681,12 +695,14 @@ static void bq_flush_to_queue(struct xdp_bulk_queue *bq)
+ 
+ 	for (i = 0; i < bq->count; i++) {
+ 		struct xdp_frame *xdpf = bq->q[i];
+-		int err;
+ 
+-		err = __ptr_ring_produce(q, xdpf);
+-		if (err) {
++		if (__ptr_ring_full(q)) {
+ 			drops++;
+ 			xdp_return_frame_rx_napi(xdpf);
++		} else {
++			/* The device cannot go before the flush, from now on it can */
++			dev_hold(xdpf->dev_rx);
++			__ptr_ring_produce(q, xdpf);
+ 		}
+ 		processed++;
+ 	}
+@@ -742,11 +758,15 @@ int cpu_map_generic_redirect(struct bpf_cpu_map_entry *rcpu,
+ 
+ 	__skb_pull(skb, skb->mac_len);
+ 	skb_set_redirected(skb, false);
++	dev_hold(skb->dev);
+ 	__ptr_set_bit(0, &skb);
+ 
+ 	ret = ptr_ring_produce(rcpu->queue, skb);
+-	if (ret < 0)
++	if (ret < 0) {
++		__ptr_clear_bit(0, &skb);
++		dev_put(skb->dev);
+ 		goto trace;
++	}
+ 
+ 	wake_up_process(rcpu->kthread);
+ trace:
+-- 
+2.53.0
+

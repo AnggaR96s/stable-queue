@@ -1,0 +1,84 @@
+From db1f40b31789094d4faa81133f1ec73f42260ab3 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Sat, 31 Oct 2026 21:48:40 -0700
+Subject: net: bridge: disable MRP ports before the FDB flush in del_nbp()
+
+From: Cheng Yongkang <teel4res@gmail.com>
+
+[ Upstream commit 37dfd0efbfffc20a57e41c2eb349ac49b1ca1ff8 ]
+
+del_nbp() flushes the port's FDB entries before it unregisters the RX
+handler. For a normal port, br_stp_disable_port() moves the port to
+BR_STATE_DISABLED before this cleanup.
+
+That does not hold for an MRP ring port. br_set_state() ignores state
+changes while BR_MRP_AWARE_BIT is set, so br_stp_disable_port() leaves
+the port state alone. br_mrp_port_del() then restores forwarding when
+the bridge is up before clearing the bit. A frame received between
+br_fdb_cleanup_by_dst() and netdev_rx_handler_unregister() can therefore
+create a new FDB entry referencing the dying port. Nothing removes that
+entry before destroy_nbp_rcu() frees the port, so a later frame to the
+learned MAC can be forwarded through the freed port.
+
+Remove the MRP and CFM instances before disabling the port, so that
+br_stp_disable_port() actually transitions it to BR_STATE_DISABLED.
+With CONFIG_BRIDGE_VLAN_FILTERING=y, synchronize_net() in
+nbp_vlan_group_unpublish() also drains receive paths that could still
+learn with the old state before the final FDB cleanup.
+
+Found through an LLM-assisted source code analysis workflow and
+reproduced on net with KASAN and CONFIG_BRIDGE_VLAN_FILTERING=y in QEMU.
+A diagnostic switchdev module accepts MRP objects and delays the
+NETDEV_CHANGEUPPER callback for 1.5 s, holding del_nbp() after the FDB
+cleanup and before RX handler removal. The reproducer floods the MRP
+port with rotating source MACs, waits for the port's RCU callback
+through the module's rcu_barrier(), then sends frames to those MACs
+from another port. The unpatched kernel reports:
+
+  BUG: KASAN: slab-use-after-free in br_forward+0xb1/0x820
+  Call Trace:
+   <IRQ>
+   br_forward+0xb1/0x820
+   br_handle_frame_finish+0x148b/0x1e50
+   br_handle_frame+0x90a/0x15c0
+
+With this patch, three runs of six cycles each reach the delay without
+a KASAN report.
+
+Fixes: 6536993371fa ("bridge: mrp: Integrate MRP into the bridge")
+Suggested-by: Ido Schimmel <idosch@nvidia.com>
+Link: https://lore.kernel.org/netdev/20261012123051.GA714215@shredder/
+Closes: https://lore.kernel.org/netdev/20261022090431.3641707-1-teel4res@gmail.com/
+Signed-off-by: Cheng Yongkang <teel4res@gmail.com>
+Reviewed-by: Ido Schimmel <idosch@nvidia.com>
+Link: https://patch.msgid.link/20261101044840.1595584-1-1020691186@qq.com
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ net/bridge/br_if.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/net/bridge/br_if.c b/net/bridge/br_if.c
+index 7fb8014b84699..fd11b04173893 100644
+--- a/net/bridge/br_if.c
++++ b/net/bridge/br_if.c
+@@ -330,13 +330,13 @@ static void del_nbp(struct net_bridge_port *p)
+ 
+ 	nbp_delete_promisc(p);
+ 
++	br_mrp_port_del(br, p);
++	br_cfm_port_del(br, p);
++
+ 	spin_lock_bh(&br->lock);
+ 	br_stp_disable_port(p);
+ 	spin_unlock_bh(&br->lock);
+ 
+-	br_mrp_port_del(br, p);
+-	br_cfm_port_del(br, p);
+-
+ 	br_ifinfo_notify(RTM_DELLINK, NULL, p);
+ 
+ 	list_del_rcu(&p->list);
+-- 
+2.53.0
+

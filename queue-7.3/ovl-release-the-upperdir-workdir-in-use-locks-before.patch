@@ -1,0 +1,142 @@
+From 290198fd88fff4329ef250471b1ba1d0605a54a1 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 6 Nov 2026 19:14:59 +0100
+Subject: ovl: release the upperdir/workdir in-use locks before the umount sync
+
+From: Denis V. Lunev <den@openvz.org>
+
+[ Upstream commit cb6c084182d4c69b7eeff0bd519dd7e018749602 ]
+
+The in-use locks on upperdir and workdir are released by ovl_free_fs()
+from ->put_super(). generic_shutdown_super() calls sync_filesystem()
+before that, and ovl_sync_fs() syncs the whole upper filesystem, so the
+locks stay held across a journal commit and a cache flush of the upper
+fs after the overlay is gone. With index=on a new overlay that uses the
+same upperdir, or uses it as a lowerdir, fails to mount in that window:
+
+  overlayfs: upperdir is in-use as upperdir/workdir of another mount,
+  mount with '-o index=off' to override exclusive upperdir protection.
+
+Userspace hits this when the last reference is not dropped by umount(2)
+itself. Docker with the containerd snapshotter mounts a snapshot on a
+thread with a private mount namespace for docker cp and for buildkit,
+and the superblock dies when that thread exits, after the reply to the
+client has gone out. The next request then gets EBUSY. The window grows
+with the flush latency of the upper fs and is there even if nothing was
+written through the overlay, as the mount itself dirties the upper.
+
+->kill_sb() is called once s_active drops to zero, with no mount and no
+open file left. Release the locks there, before generic_shutdown_super()
+runs. What the dying superblock still does to the upper fs, the sync and
+dropping its references to upper dentries and inodes, does not touch the
+contents of upperdir or workdir. ovl_free_fs() still releases the locks
+for a failed mount, so clear the *_locked flags to keep it from
+unlocking a second time and dropping the lock of a newer mount.
+
+This takes the sync out of the window but does not close it: the final
+mntput of a dying mount namespace runs from task_work, after the exiting
+thread may have reported completion. Userspace that needs the
+directories free should umount(2) before saying the job is done.
+
+Fixes: 2cac0c00a6cd ("ovl: get exclusive ownership on upper/work dirs")
+Cc: Miklos Szeredi <miklos@szeredi.hu>
+Cc: Amir Goldstein <amir73il@gmail.com>
+Cc: Pavel Tikhomirov <ptikhomirov@virtuozzo.com>
+Signed-off-by: Denis V. Lunev <den@openvz.org>
+Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/overlayfs/overlayfs.h |  1 +
+ fs/overlayfs/params.c    |  5 +----
+ fs/overlayfs/super.c     | 12 +++++++++++-
+ fs/overlayfs/util.c      | 12 ++++++++++++
+ 4 files changed, 25 insertions(+), 5 deletions(-)
+
+diff --git a/fs/overlayfs/overlayfs.h b/fs/overlayfs/overlayfs.h
+index a5aa22cc79a83..5966d46e09d6a 100644
+--- a/fs/overlayfs/overlayfs.h
++++ b/fs/overlayfs/overlayfs.h
+@@ -580,6 +580,7 @@ static inline int ovl_set_impure_dir(struct dentry *dentry)
+ bool ovl_inuse_trylock(struct dentry *dentry);
+ void ovl_inuse_unlock(struct dentry *dentry);
+ bool ovl_is_inuse(struct dentry *dentry);
++void ovl_inuse_unlock_all(struct ovl_fs *ofs);
+ bool ovl_need_index(struct dentry *dentry);
+ int ovl_nlink_start(struct dentry *dentry);
+ void ovl_nlink_end(struct dentry *dentry);
+diff --git a/fs/overlayfs/params.c b/fs/overlayfs/params.c
+index 5a15e5478a6b8..ad7f30177ef4c 100644
+--- a/fs/overlayfs/params.c
++++ b/fs/overlayfs/params.c
+@@ -845,15 +845,12 @@ void ovl_free_fs(struct ovl_fs *ofs)
+ 	struct vfsmount **mounts;
+ 	unsigned i;
+ 
++	ovl_inuse_unlock_all(ofs);
+ 	iput(ofs->workbasedir_trap);
+ 	iput(ofs->workdir_trap);
+ 	dput(ofs->whiteout);
+ 	dput(ofs->workdir);
+-	if (ofs->workdir_locked)
+-		ovl_inuse_unlock(ofs->workbasedir);
+ 	dput(ofs->workbasedir);
+-	if (ofs->upperdir_locked)
+-		ovl_inuse_unlock(ovl_upper_mnt(ofs)->mnt_root);
+ 
+ 	/* Reuse ofs->config.lowerdirs as a vfsmount array before freeing it */
+ 	mounts = (struct vfsmount **) ofs->config.lowerdirs;
+diff --git a/fs/overlayfs/super.c b/fs/overlayfs/super.c
+index c06bfe9765e25..0a923ae126964 100644
+--- a/fs/overlayfs/super.c
++++ b/fs/overlayfs/super.c
+@@ -1598,13 +1598,23 @@ int ovl_fill_super(struct super_block *sb, struct fs_context *fc)
+ 	return err;
+ }
+ 
++static void ovl_kill_sb(struct super_block *sb)
++{
++	struct ovl_fs *ofs = OVL_FS(sb);
++
++	/* Nothing can modify them now, do not hold them across the sync */
++	if (ofs)
++		ovl_inuse_unlock_all(ofs);
++	kill_anon_super(sb);
++}
++
+ struct file_system_type ovl_fs_type = {
+ 	.owner			= THIS_MODULE,
+ 	.name			= "overlay",
+ 	.init_fs_context	= ovl_init_fs_context,
+ 	.parameters		= ovl_parameter_spec,
+ 	.fs_flags		= FS_USERNS_MOUNT | FS_ALLOW_IDMAP,
+-	.kill_sb		= kill_anon_super,
++	.kill_sb		= ovl_kill_sb,
+ };
+ MODULE_ALIAS_FS("overlay");
+ 
+diff --git a/fs/overlayfs/util.c b/fs/overlayfs/util.c
+index 04103a6741ba0..b31b8f7d7ce0f 100644
+--- a/fs/overlayfs/util.c
++++ b/fs/overlayfs/util.c
+@@ -1059,6 +1059,18 @@ bool ovl_is_inuse(struct dentry *dentry)
+ 	return inuse;
+ }
+ 
++void ovl_inuse_unlock_all(struct ovl_fs *ofs)
++{
++	if (ofs->workdir_locked) {
++		ovl_inuse_unlock(ofs->workbasedir);
++		ofs->workdir_locked = false;
++	}
++	if (ofs->upperdir_locked) {
++		ovl_inuse_unlock(ovl_upper_mnt(ofs)->mnt_root);
++		ofs->upperdir_locked = false;
++	}
++}
++
+ /*
+  * Does this overlay dentry need to be indexed on copy up?
+  */
+-- 
+2.53.0
+

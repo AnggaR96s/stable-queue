@@ -1,0 +1,130 @@
+From 881d412a2b833886e9eaa0ad014eef8e783b202b Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 9 Sep 2026 10:58:02 +0800
+Subject: mm: khugepaged: fix folio is used after pte_unmap_unlock()
+
+From: Vernon Yang <yanglincheng@kylinos.cn>
+
+[ Upstream commit ba2f1f92ddfabd340c9248fd2380104f717ee8b1 ]
+
+After the page table lock has dropped, the folio can be freed
+concurrently.  The trace_mm_khugepaged_scan_pmd() is left with a dangling
+folio pointer.
+
+So using the folio_pfn() before dropping the page table lock, closing
+use-after-free window.
+
+And other pre-existing bug, When the `for (i = 0; i < HPAGE_PMD_NR; i++)`
+iteration to terminate and the folio operation preceding is normal, but
+pfn will be incorrect.  so we really only trace the PFN if it really was
+problematic.
+
+Link: https://lore.kernel.org/20260909025804.3233645-3-vernon2gm@gmail.com
+Fixes: 7d2eba0557c1 ("mm: add tracepoint for scanning pages")
+Signed-off-by: Vernon Yang <yanglincheng@kylinos.cn>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Acked-by: David Hildenbrand (Arm) <david@kernel.org>
+Acked-by: Lorenzo Stoakes (ARM) <ljs@kernel.org>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Dev Jain <dev.jain@arm.com>
+Cc: Lance Yang <lance.yang@linux.dev>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Zach O'Keefe <zokeefe@google.com>
+Cc: <stable@vger.kernel.org>
+[ sashal: Replaced upstream's folio_pfn(folio) with folio_pfn(page_folio(page)) at the shared-PTE exit, since folio isn't assigned yet there, and kept the older function names and the tracepoint's writable argument. ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/trace/events/huge_memory.h | 6 +++---
+ mm/khugepaged.c                    | 9 ++++++++-
+ 2 files changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/include/trace/events/huge_memory.h b/include/trace/events/huge_memory.h
+index 23bd4c1f984e8..54a85638ab99f 100644
+--- a/include/trace/events/huge_memory.h
++++ b/include/trace/events/huge_memory.h
+@@ -53,10 +53,10 @@ SCAN_STATUS
+ 
+ TRACE_EVENT(mm_khugepaged_scan_pmd,
+ 
+-	TP_PROTO(struct mm_struct *mm, struct page *page, bool writable,
++	TP_PROTO(struct mm_struct *mm, unsigned long pfn, bool writable,
+ 		 int referenced, int none_or_zero, int status, int unmapped),
+ 
+-	TP_ARGS(mm, page, writable, referenced, none_or_zero, status, unmapped),
++	TP_ARGS(mm, pfn, writable, referenced, none_or_zero, status, unmapped),
+ 
+ 	TP_STRUCT__entry(
+ 		__field(struct mm_struct *, mm)
+@@ -70,7 +70,7 @@ TRACE_EVENT(mm_khugepaged_scan_pmd,
+ 
+ 	TP_fast_assign(
+ 		__entry->mm = mm;
+-		__entry->pfn = page ? page_to_pfn(page) : -1;
++		__entry->pfn = pfn;
+ 		__entry->writable = writable;
+ 		__entry->referenced = referenced;
+ 		__entry->none_or_zero = none_or_zero;
+diff --git a/mm/khugepaged.c b/mm/khugepaged.c
+index ba41de673bc15..fabbcf2d735d4 100644
+--- a/mm/khugepaged.c
++++ b/mm/khugepaged.c
+@@ -1142,6 +1142,7 @@ static int hpage_collapse_scan_pmd(struct mm_struct *mm,
+ 	int none_or_zero = 0, shared = 0;
+ 	struct page *page = NULL;
+ 	struct folio *folio = NULL;
++	unsigned long failed_pfn = -1;
+ 	unsigned long _address;
+ 	spinlock_t *ptl;
+ 	int node = NUMA_NO_NODE, unmapped = 0;
+@@ -1218,6 +1219,7 @@ static int hpage_collapse_scan_pmd(struct mm_struct *mm,
+ 			if (cc->is_khugepaged &&
+ 			    shared > khugepaged_max_ptes_shared) {
+ 				result = SCAN_EXCEED_SHARED_PTE;
++				failed_pfn = folio_pfn(page_folio(page));
+ 				count_vm_event(THP_SCAN_EXCEED_SHARED_PTE);
+ 				goto out_unmap;
+ 			}
+@@ -1233,19 +1235,23 @@ static int hpage_collapse_scan_pmd(struct mm_struct *mm,
+ 		node = folio_nid(folio);
+ 		if (hpage_collapse_scan_abort(node, cc)) {
+ 			result = SCAN_SCAN_ABORT;
++			failed_pfn = folio_pfn(folio);
+ 			goto out_unmap;
+ 		}
+ 		cc->node_load[node]++;
+ 		if (!folio_test_lru(folio)) {
+ 			result = SCAN_PAGE_LRU;
++			failed_pfn = folio_pfn(folio);
+ 			goto out_unmap;
+ 		}
+ 		if (folio_test_locked(folio)) {
+ 			result = SCAN_PAGE_LOCK;
++			failed_pfn = folio_pfn(folio);
+ 			goto out_unmap;
+ 		}
+ 		if (!folio_test_anon(folio)) {
+ 			result = SCAN_PAGE_ANON;
++			failed_pfn = folio_pfn(folio);
+ 			goto out_unmap;
+ 		}
+ 
+@@ -1268,6 +1274,7 @@ static int hpage_collapse_scan_pmd(struct mm_struct *mm,
+ 		 */
+ 		if (!is_refcount_suitable(&folio->page)) {
+ 			result = SCAN_PAGE_COUNT;
++			failed_pfn = folio_pfn(folio);
+ 			goto out_unmap;
+ 		}
+ 
+@@ -1299,7 +1306,7 @@ static int hpage_collapse_scan_pmd(struct mm_struct *mm,
+ 		*mmap_locked = false;
+ 	}
+ out:
+-	trace_mm_khugepaged_scan_pmd(mm, &folio->page, writable, referenced,
++	trace_mm_khugepaged_scan_pmd(mm, failed_pfn, writable, referenced,
+ 				     none_or_zero, result, unmapped);
+ 	return result;
+ }
+-- 
+2.53.0
+

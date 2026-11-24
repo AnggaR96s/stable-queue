@@ -1,0 +1,103 @@
+From 9dd218eb001f0b5d343729fd81d413e5b23e0c7a Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 5 Nov 2026 14:26:40 -0400
+Subject: ipv4: route: don't blackhole in-use routes when retiring fnhe routes
+
+From: Chase Hiltz <me@chasehil.tz>
+
+[ Upstream commit ae89f2724db1afa96a1f1b661174fc41ae1e88fa ]
+
+When a route cached in a nexthop exception (fnhe) is replaced or
+flushed, rt_bind_exception() and fnhe_flush_routes() call
+dst_dev_put() on it. That sets dst->dev to blackhole_netdev and
+dst->input/output to dst_discard*(), but other CPUs can still be
+using the route, e.g. as a noref dst taken from the fnhe under RCU.
+Packets that reach dst_input() or dst_output() after that are dropped.
+
+If dst_dev_put() runs after a forwarded packet has entered ip_output(),
+ip_skb_dst_mtu() in __ip_finish_output() can return the MTU of
+blackhole_netdev (68), and ip_fragment() can then drop a DF packet and
+send ICMP_FRAG_NEEDED with mtu 68 to its source.
+
+Commit 5018c59607a5 ("ipv4: fix race condition between route lookup and
+invalidation") fixed the same race in rt_cache_route() by putting the
+old route on the uncached list instead of calling dst_dev_put(). Do the
+same for routes retired from an fnhe. rt_flush_dev() still moves them
+to blackhole_netdev when their device is unregistered.
+
+fnhe routes are also retired on fnhe expiry (ip_del_fnhe()) and
+eviction (fnhe_remove_oldest()). Those paths don't bump rt_genid, so
+without the obsolete marking ipv4_dst_check() could still accept the
+route. Keep marking retired routes DST_OBSOLETE_DEAD, as dst_dev_put()
+did, so that users that cached them, such as sockets, look up again.
+
+In a netns reproducer that forwards IPv4 traffic over an ip6tnl device,
+with an fnhe for the destination, while the FIB keeps changing, this
+patch stops the mtu 68 ICMPs and the drops.
+
+Fixes: 95c47f9cf5e0 ("ipv4: call dst_dev_put() properly")
+Reviewed-by: Eric Dumazet <edumazet@kernel.org>
+Signed-off-by: Chase Hiltz <me@chasehil.tz>
+Reviewed-by: Ido Schimmel <idosch@nvidia.com>
+Link: https://patch.msgid.link/20261105182640.2999521-1-me@chasehil.tz
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ net/ipv4/route.c | 23 +++++++++++++++--------
+ 1 file changed, 15 insertions(+), 8 deletions(-)
+
+diff --git a/net/ipv4/route.c b/net/ipv4/route.c
+index d9a44430df72d..8528786ec9603 100644
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@ -583,6 +583,17 @@ static void ip_rt_build_flow_key(struct flowi4 *fl4, const struct sock *sk,
+ 
+ static DEFINE_SPINLOCK(fnhe_lock);
+ 
++/* Other CPUs may still be using @rt, so don't dst_dev_put() it.
++ * rt_flush_dev() handles it if its device is unregistered.
++ * Marking it dead makes ipv4_dst_check() fail for users that cached it.
++ */
++static void fnhe_retire_route(struct rtable *rt)
++{
++	WRITE_ONCE(rt->dst.obsolete, DST_OBSOLETE_DEAD);
++	rt_add_uncached_list(rt);
++	dst_release(&rt->dst);
++}
++
+ static void fnhe_flush_routes(struct fib_nh_exception *fnhe)
+ {
+ 	struct rtable *rt;
+@@ -590,14 +601,12 @@ static void fnhe_flush_routes(struct fib_nh_exception *fnhe)
+ 	rt = rcu_dereference(fnhe->fnhe_rth_input);
+ 	if (rt) {
+ 		RCU_INIT_POINTER(fnhe->fnhe_rth_input, NULL);
+-		dst_dev_put(&rt->dst);
+-		dst_release(&rt->dst);
++		fnhe_retire_route(rt);
+ 	}
+ 	rt = rcu_dereference(fnhe->fnhe_rth_output);
+ 	if (rt) {
+ 		RCU_INIT_POINTER(fnhe->fnhe_rth_output, NULL);
+-		dst_dev_put(&rt->dst);
+-		dst_release(&rt->dst);
++		fnhe_retire_route(rt);
+ 	}
+ }
+ 
+@@ -1510,10 +1519,8 @@ static bool rt_bind_exception(struct rtable *rt, struct fib_nh_exception *fnhe,
+ 		if (do_cache) {
+ 			dst_hold(&rt->dst);
+ 			rcu_assign_pointer(*porig, rt);
+-			if (orig) {
+-				dst_dev_put(&orig->dst);
+-				dst_release(&orig->dst);
+-			}
++			if (orig)
++				fnhe_retire_route(orig);
+ 			ret = true;
+ 		}
+ 
+-- 
+2.53.0
+

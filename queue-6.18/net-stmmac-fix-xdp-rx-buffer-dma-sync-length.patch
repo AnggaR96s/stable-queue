@@ -1,0 +1,90 @@
+From 8b8663fa1ec565ed0ef94a33653639e220c2cbd7 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 27 Oct 2026 14:48:41 +0100
+Subject: net: stmmac: fix XDP RX buffer DMA sync length
+
+From: Lorenzo Bianconi <lorenzo.bianconi@oss.qualcomm.com>
+
+[ Upstream commit 363ff816277d4c7064514b160e655bed1dfb3ed8 ]
+
+stmmac_rx() bounded the DMA sync length by the largest data_end seen
+before and after the XDP program and passed it to page_pool_put_page()
+on the XDP_CONSUMED path. bpf_xdp_adjust_tail() zeroes the grown area,
+which dirties the CPU cache, but a later negative adjust only moves
+data_end back. If the program grows and then shrinks the tail, both
+endpoints miss the zeroed range, so those dirty cache lines are not
+written back before the page is reused.
+
+The length was also wrong since commit 88095728511e ("net: stmmac: fix
+rx Scatter-Gather support") moved the page_pool DMA window to offset 0
+and set max_len to dma_buf_sz + page_offset: the driver still
+subtracted buf->page_offset, so it synced [base, data_end - page_offset)
+instead of [base, data_end).
+
+On a non-coherent platform those dirty lines can be evicted after the
+device has DMA'd the next frame into the recycled page and corrupt it.
+
+Sync the whole page_pool DMA window on the XDP_CONSUMED path with
+page_pool_recycle_direct(), as the PASS path and page_pool allocation
+already do. The device only writes [page_offset, page_offset +
+dma_buf_sz), so syncing [base, base + max_len) covers every cache line
+it can touch, regardless of how the program adjusted the packet.
+
+Fixes: be8b38a722e6 ("net: stmmac: Add support for XDP_TX action")
+Fixes: 88095728511e ("net: stmmac: fix rx Scatter-Gather support")
+Signed-off-by: Lorenzo Bianconi <lorenzo.bianconi@oss.qualcomm.com>
+Link: https://patch.msgid.link/20261027-stmmac-xdp-fixes-v2-6-10eae8a093a8@oss.qualcomm.com
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ .../net/ethernet/stmicro/stmmac/stmmac_main.c   | 17 ++---------------
+ 1 file changed, 2 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+index 123f2415e745e..2e7b146895ba8 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -5689,8 +5689,6 @@ static int stmmac_rx(struct stmmac_priv *priv, int limit, u32 queue)
+ 			len -= ETH_FCS_LEN;
+ 
+ 		if (!skb) {
+-			unsigned int pre_len, sync_len;
+-
+ 			/* Each frame starts here: reset the FCS handling */
+ 			fcs_stripped = false;
+ 
+@@ -5708,29 +5706,18 @@ static int stmmac_rx(struct stmmac_priv *priv, int limit, u32 queue)
+ 			xdp_prepare_buff(&ctx.xdp, page_address(buf->page),
+ 					 buf->page_offset, buf1_len, true);
+ 
+-			pre_len = ctx.xdp.data_end - ctx.xdp.data_hard_start -
+-				  buf->page_offset;
+-
+ 			ctx.priv = priv;
+ 			ctx.desc = p;
+ 			ctx.ndesc = np;
+ 
+ 			skb = stmmac_xdp_run_prog(priv, &ctx.xdp);
+-			/* Due xdp_adjust_tail: DMA sync for_device
+-			 * cover max len CPU touch
+-			 */
+-			sync_len = ctx.xdp.data_end - ctx.xdp.data_hard_start -
+-				   buf->page_offset;
+-			sync_len = max(sync_len, pre_len);
+-
+ 			/* For Not XDP_PASS verdict */
+ 			if (IS_ERR(skb)) {
+ 				unsigned int xdp_res = -PTR_ERR(skb);
+ 
+ 				if (xdp_res & STMMAC_XDP_CONSUMED) {
+-					page_pool_put_page(rx_q->page_pool,
+-							   virt_to_head_page(ctx.xdp.data),
+-							   sync_len, true);
++					page_pool_recycle_direct(rx_q->page_pool,
++								 virt_to_head_page(ctx.xdp.data));
+ 					buf->page = NULL;
+ 					rx_dropped++;
+ 					goto next;
+-- 
+2.53.0
+

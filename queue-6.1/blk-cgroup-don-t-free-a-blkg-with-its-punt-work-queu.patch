@@ -1,0 +1,109 @@
+From fe88de9f348cb3163ebe9fd683891a25ffe31a91 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 28 Oct 2026 10:41:22 -0600
+Subject: blk-cgroup: don't free a blkg with its punt work queued
+
+From: Josef Bacik <josef@toxicpanda.com>
+
+[ Upstream commit 4def096314cf29fb6940b74c087a0b923185580e ]
+
+blkg_async_bio_workfn() relies on the bios on the list pinning the blkg.
+But blkcg_punt_bio_submit() can call queue_work() after a running
+instance already took and completed the bio, and queue_work() succeeds
+on an empty list for the same reason. Nothing holds the blkg then, and
+free_work shares its memory with async_bio_work on top of that.
+
+Hold a reference across blkcg_punt_bio_submit(), give the two works
+memory of their own, and cancel async_bio_work in blkg_free_workfn().
+
+Fixes: d3f77dfdc718 ("blkcg: implement REQ_CGROUP_PUNT")
+Cc: Tejun Heo <tj@kernel.org>
+Signed-off-by: Josef Bacik <josef@toxicpanda.com>
+Acked-by: Tejun Heo <tj@kernel.org>
+Link: https://patch.msgid.link/20261028164415.1262013-20-axboe@kernel.dk
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+[ sashal: Moved INIT_WORK of async_bio_work earlier in blkg_alloc() so early-failure frees don't cancel an uninitialized work, and dropped upstream's CONFIG_BLK_CGROUP_PUNT_BIO guards and adapted to the older punt helper layout. ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ block/blk-cgroup.c | 14 ++++++++++++--
+ block/blk-cgroup.h |  6 ++----
+ 2 files changed, 14 insertions(+), 6 deletions(-)
+
+diff --git a/block/blk-cgroup.c b/block/blk-cgroup.c
+index b65aaf585f04d..2ba82bd2dd422 100644
+--- a/block/blk-cgroup.c
++++ b/block/blk-cgroup.c
+@@ -90,6 +90,9 @@ static void blkg_free_workfn(struct work_struct *work)
+ 					     free_work);
+ 	int i;
+ 
++	/* It may have been queued for bios which an earlier run has taken */
++	cancel_work_sync(&blkg->async_bio_work);
++
+ 	for (i = 0; i < BLKCG_MAX_POLS; i++)
+ 		if (blkg->pd[i])
+ 			blkcg_policy[i]->pd_free_fn(blkg->pd[i]);
+@@ -157,7 +160,7 @@ static void blkg_async_bio_workfn(struct work_struct *work)
+ 	struct blk_plug plug;
+ 	bool need_plug = false;
+ 
+-	/* as long as there are pending bios, @blkg can't go away */
++	/* blkg_free_workfn() waits for us */
+ 	spin_lock_bh(&blkg->async_bio_lock);
+ 	bio_list_merge(&bios, &blkg->async_bios);
+ 	bio_list_init(&blkg->async_bios);
+@@ -220,6 +223,8 @@ static struct blkcg_gq *blkg_alloc(struct blkcg *blkcg, struct gendisk *disk,
+ 	if (!blkg)
+ 		return NULL;
+ 
++	INIT_WORK(&blkg->async_bio_work, blkg_async_bio_workfn);
++
+ 	if (percpu_ref_init(&blkg->refcnt, blkg_release, 0, gfp_mask))
+ 		goto err_free;
+ 
+@@ -234,7 +239,6 @@ static struct blkcg_gq *blkg_alloc(struct blkcg *blkcg, struct gendisk *disk,
+ 	INIT_LIST_HEAD(&blkg->q_node);
+ 	spin_lock_init(&blkg->async_bio_lock);
+ 	bio_list_init(&blkg->async_bios);
+-	INIT_WORK(&blkg->async_bio_work, blkg_async_bio_workfn);
+ 	blkg->blkcg = blkcg;
+ 
+ 	u64_stats_init(&blkg->iostat.sync);
+@@ -1683,11 +1687,17 @@ bool __blkcg_punt_bio_submit(struct bio *bio)
+ 	if (!blkg->parent)
+ 		return false;
+ 
++	/*
++	 * Once it is on the list, a run which is under way can submit
++	 * @bio, and its reference goes when it completes.
++	 */
++	blkg_get(blkg);
+ 	spin_lock_bh(&blkg->async_bio_lock);
+ 	bio_list_add(&blkg->async_bios, bio);
+ 	spin_unlock_bh(&blkg->async_bio_lock);
+ 
+ 	queue_work(blkcg_punt_bio_wq, &blkg->async_bio_work);
++	blkg_put(blkg);
+ 	return true;
+ }
+ 
+diff --git a/block/blk-cgroup.h b/block/blk-cgroup.h
+index 840deb32746c1..4619aef1bc6f5 100644
+--- a/block/blk-cgroup.h
++++ b/block/blk-cgroup.h
+@@ -71,10 +71,8 @@ struct blkcg_gq {
+ 
+ 	spinlock_t			async_bio_lock;
+ 	struct bio_list			async_bios;
+-	union {
+-		struct work_struct	async_bio_work;
+-		struct work_struct	free_work;
+-	};
++	struct work_struct		async_bio_work;
++	struct work_struct		free_work;
+ 
+ 	atomic_t			use_delay;
+ 	atomic64_t			delay_nsec;
+-- 
+2.53.0
+

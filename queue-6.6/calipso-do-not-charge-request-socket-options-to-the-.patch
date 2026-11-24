@@ -1,0 +1,121 @@
+From 2b8bdc6f09645ff8d159f71bb51aac4078bac342 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 4 Nov 2026 16:03:18 +0100
+Subject: calipso: do not charge request socket options to the listener
+
+From: Eric Dumazet <edumazet@kernel.org>
+
+[ Upstream commit b4a2cc6d748d3056a25812dcf5f5377a59afd02f ]
+
+calipso_req_setattr() and calipso_req_delattr() allocate ireq->ipv6_opt
+with ipv6_renew_options(), which charges the listener sk_omem_alloc
+through sock_kmalloc().
+
+tcp_v6_reqsk_destructor() frees ireq->ipv6_opt without uncharging it,
+so each request socket leaks its options size from the listener
+budget. Once sysctl_optmem_max is reached, sock_kmalloc() fails,
+calipso_req_setattr() returns -ENOBUFS, and tcp_v6_route_req() drops
+all subsequent SYN packets. __sk_destruct() also reports an optmem
+leakage when the listener is destroyed.
+
+Uncharging in tcp_v6_reqsk_destructor() would not be correct: after a
+migration, req->rsk_listener is no longer the socket that was charged.
+
+These options belong to the request socket, there is no reason to
+charge them to the listener. Change ipv6_renew_options() to use
+kmalloc() when its sk argument is NULL, and use this from
+calipso_req_setattr() and calipso_req_delattr(),
+like cipso_v4_req_setattr() which uses kzalloc().
+
+Note:
+
+After this patch, calipso_req_setattr() and calipso_req_delattr()
+no longer need the listener. Commit 10876da918fa ("calipso: Fix
+null-ptr-deref in calipso_req_{set,del}attr().") could be reverted
+in net-next (also removing the then unused sk variables), so that
+CALIPSO works with SYN cookies.
+
+Fixes: e1adea927080 ("calipso: Allow request sockets to be relabelled by the lsm.")
+Reported-by: Sashiko <sashiko-bot@kernel.org>
+Closes: https://lore.kernel.org/netdev/179378292255.488856.6917577451813010963@kernel.org/
+Signed-off-by: Eric Dumazet <edumazet@kernel.org>
+Cc: Kuniyuki Iwashima <kuniyu@google.com>
+Cc: Paul Moore <paul@paul-moore.com>
+Reviewed-by: Kuniyuki Iwashima <kuniyu@google.com>
+Acked-by: Paul Moore <paul@paul-moore.com>
+Link: https://patch.msgid.link/20261104150318.1156620-1-edumazet@kernel.org
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ net/ipv6/calipso.c | 12 ++++--------
+ net/ipv6/exthdrs.c |  5 +++--
+ 2 files changed, 7 insertions(+), 10 deletions(-)
+
+diff --git a/net/ipv6/calipso.c b/net/ipv6/calipso.c
+index 60f921edbc71b..3a994a0331805 100644
+--- a/net/ipv6/calipso.c
++++ b/net/ipv6/calipso.c
+@@ -1223,7 +1223,7 @@ static int calipso_req_setattr(struct request_sock *req,
+ 	if (IS_ERR(new))
+ 		return PTR_ERR(new);
+ 
+-	txopts = ipv6_renew_options(sk, req_inet->ipv6_opt, IPV6_HOPOPTS, new);
++	txopts = ipv6_renew_options(NULL, req_inet->ipv6_opt, IPV6_HOPOPTS, new);
+ 
+ 	kfree(new);
+ 
+@@ -1231,10 +1231,8 @@ static int calipso_req_setattr(struct request_sock *req,
+ 		return PTR_ERR(txopts);
+ 
+ 	txopts = xchg(&req_inet->ipv6_opt, txopts);
+-	if (txopts) {
+-		atomic_sub(txopts->tot_len, &sk->sk_omem_alloc);
++	if (txopts)
+ 		txopt_put(txopts);
+-	}
+ 
+ 	return 0;
+ }
+@@ -1264,14 +1262,12 @@ static void calipso_req_delattr(struct request_sock *req)
+ 	if (calipso_opt_del(req_inet->ipv6_opt->hopopt, &new))
+ 		return; /* Nothing to do */
+ 
+-	txopts = ipv6_renew_options(sk, req_inet->ipv6_opt, IPV6_HOPOPTS, new);
++	txopts = ipv6_renew_options(NULL, req_inet->ipv6_opt, IPV6_HOPOPTS, new);
+ 
+ 	if (!IS_ERR(txopts)) {
+ 		txopts = xchg(&req_inet->ipv6_opt, txopts);
+-		if (txopts) {
+-			atomic_sub(txopts->tot_len, &sk->sk_omem_alloc);
++		if (txopts)
+ 			txopt_put(txopts);
+-		}
+ 	}
+ 	kfree(new);
+ }
+diff --git a/net/ipv6/exthdrs.c b/net/ipv6/exthdrs.c
+index 0f9d8119b34c6..7b679c8fa3650 100644
+--- a/net/ipv6/exthdrs.c
++++ b/net/ipv6/exthdrs.c
+@@ -1286,7 +1286,7 @@ static void ipv6_renew_option(int renewtype,
+  * not copied into the new set of options.
+  *
+  * The new set of options is allocated from the socket option memory
+- * buffer of @sk.
++ * buffer of @sk, or with kmalloc() if @sk is NULL.
+  */
+ struct ipv6_txoptions *
+ ipv6_renew_options(struct sock *sk, struct ipv6_txoptions *opt,
+@@ -1314,7 +1314,8 @@ ipv6_renew_options(struct sock *sk, struct ipv6_txoptions *opt,
+ 		return NULL;
+ 
+ 	tot_len += sizeof(*opt2);
+-	opt2 = sock_kmalloc(sk, tot_len, GFP_ATOMIC);
++	opt2 = sk ? sock_kmalloc(sk, tot_len, GFP_ATOMIC) :
++		    kmalloc(tot_len, GFP_ATOMIC);
+ 	if (!opt2)
+ 		return ERR_PTR(-ENOBUFS);
+ 
+-- 
+2.53.0
+

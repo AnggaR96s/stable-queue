@@ -1,0 +1,195 @@
+From e5f8d95a99cef0c1bd49c9bf0b9858aaaace3caf Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 1 Oct 2026 11:26:12 +0200
+Subject: net: stmmac: fix TX coalesce race and div-by-zero in XDP/legacy path
+
+From: Lorenzo Bianconi <lorenzo.bianconi@oss.qualcomm.com>
+
+[ Upstream commit 237782c3d416b392a12642f32959e9d3c94e0c26 ]
+
+tx_coal_frames[] is written by ethtool (stmmac_set_coalesce) and read
+locklessly from the TX fast path (stmmac_xmit, stmmac_tso_xmit,
+stmmac_xdp_xmit_zc and stmmac_xdp_xmit_xdpf), so pair every access
+with READ_ONCE()/WRITE_ONCE() to mark the intentional data race and
+read a consistent value into a local variable.
+
+Moreover, ethtool allows disabling TX coalescing by setting
+tx_max_coalesced_frames to 0: guard the modulo operation in
+stmmac_xdp_xmit_xdpf() against a zero tx_coal_frames[queue] to avoid
+a division by zero.
+
+Both issues were found by code inspection while extending the XDP TX
+path with multi-buff support, and neither has ever been triggered, so
+they are only theoretical. Tested on the Qualcomm RB3-gen2 board.
+
+Fixes: db2f2842e6f5 ("net: stmmac: add per-queue TX & RX coalesce ethtool support")
+Fixes: be8b38a722e6 ("net: stmmac: Add support for XDP_TX action")
+Signed-off-by: Lorenzo Bianconi <lorenzo.bianconi@oss.qualcomm.com>
+Link: https://patch.msgid.link/20261001-b4-stmmac-xmit-mb-v4-1-664e0c3eb289@oss.qualcomm.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+[ sashal: Dropped the unused sdu_len declaration and kept local declaration blocks as they were, adding only tx_coal, because the surrounding functions differ from upstream. ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ .../ethernet/stmicro/stmmac/stmmac_ethtool.c  | 11 ++---
+ .../net/ethernet/stmicro/stmmac/stmmac_main.c | 41 ++++++++-----------
+ 2 files changed, 24 insertions(+), 28 deletions(-)
+
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_ethtool.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_ethtool.c
+index 5d94de4670557..4569b950e96b2 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_ethtool.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_ethtool.c
+@@ -979,7 +979,8 @@ static int __stmmac_get_coalesce(struct net_device *dev,
+ 
+ 	if (queue < tx_cnt) {
+ 		ec->tx_coalesce_usecs = priv->tx_coal_timer[queue];
+-		ec->tx_max_coalesced_frames = priv->tx_coal_frames[queue];
++		ec->tx_max_coalesced_frames =
++			READ_ONCE(priv->tx_coal_frames[queue]);
+ 	} else {
+ 		ec->tx_coalesce_usecs = 0;
+ 		ec->tx_max_coalesced_frames = 0;
+@@ -1068,14 +1069,14 @@ static int __stmmac_set_coalesce(struct net_device *dev,
+ 		int i;
+ 
+ 		for (i = 0; i < tx_cnt; i++) {
+-			priv->tx_coal_frames[i] =
+-				ec->tx_max_coalesced_frames;
++			WRITE_ONCE(priv->tx_coal_frames[i],
++				   ec->tx_max_coalesced_frames);
+ 			priv->tx_coal_timer[i] =
+ 				ec->tx_coalesce_usecs;
+ 		}
+ 	} else if (queue < tx_cnt) {
+-		priv->tx_coal_frames[queue] =
+-			ec->tx_max_coalesced_frames;
++		WRITE_ONCE(priv->tx_coal_frames[queue],
++			   ec->tx_max_coalesced_frames);
+ 		priv->tx_coal_timer[queue] =
+ 			ec->tx_coalesce_usecs;
+ 	}
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+index e17a203290552..81e97ab3178b4 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -2504,7 +2504,8 @@ static bool stmmac_xdp_xmit_zc(struct stmmac_priv *priv, u32 queue, u32 budget)
+ 		struct stmmac_metadata_request meta_req;
+ 		struct xsk_tx_metadata *meta = NULL;
+ 		dma_addr_t dma_addr;
+-		bool set_ic;
++		bool set_ic = false;
++		u32 tx_coal;
+ 
+ 		/* We are sharing with slow path and stop XSK TX desc submission when
+ 		 * available TX ring is less than threshold.
+@@ -2555,12 +2556,9 @@ static bool stmmac_xdp_xmit_zc(struct stmmac_priv *priv, u32 queue, u32 budget)
+ 
+ 		tx_q->tx_count_frames++;
+ 
+-		if (!priv->tx_coal_frames[queue])
+-			set_ic = false;
+-		else if (tx_q->tx_count_frames % priv->tx_coal_frames[queue] == 0)
++		tx_coal = READ_ONCE(priv->tx_coal_frames[queue]);
++		if (tx_coal && !(tx_q->tx_count_frames % tx_coal))
+ 			set_ic = true;
+-		else
+-			set_ic = false;
+ 
+ 		meta_req.priv = priv;
+ 		meta_req.tx_desc = tx_desc;
+@@ -3161,7 +3159,7 @@ static void stmmac_init_coalesce(struct stmmac_priv *priv)
+ 	for (chan = 0; chan < tx_channel_count; chan++) {
+ 		struct stmmac_tx_queue *tx_q = &priv->dma_conf.tx_queue[chan];
+ 
+-		priv->tx_coal_frames[chan] = STMMAC_TX_FRAMES;
++		WRITE_ONCE(priv->tx_coal_frames[chan], STMMAC_TX_FRAMES);
+ 		priv->tx_coal_timer[chan] = STMMAC_COAL_TX_TIMER;
+ 
+ 		hrtimer_init(&tx_q->txtimer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+@@ -4259,9 +4257,9 @@ static netdev_tx_t stmmac_tso_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	struct stmmac_priv *priv = netdev_priv(dev);
+ 	unsigned int first_entry, entry, tx_packets;
+ 	struct stmmac_txq_stats *txq_stats;
++	u32 tx_coal, pay_len, mss, queue;
+ 	int i, first_tx, nfrags, ndesc;
+ 	struct stmmac_tx_queue *tx_q;
+-	u32 pay_len, mss, queue;
+ 	u8 proto_hdr_len, hdr;
+ 	dma_addr_t des;
+ 	bool set_ic;
+@@ -4399,16 +4397,16 @@ static netdev_tx_t stmmac_tso_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	tx_packets = (tx_q->cur_tx + 1) - first_tx;
+ 	tx_q->tx_count_frames += tx_packets;
+ 
++	tx_coal = READ_ONCE(priv->tx_coal_frames[queue]);
+ 	if ((skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP) && priv->hwts_tx_en)
+ 		set_ic = true;
+-	else if (!priv->tx_coal_frames[queue])
++	else if (!tx_coal)
+ 		set_ic = false;
+ 	else if (!netdev_xmit_more())
+ 		set_ic = true;
+-	else if (tx_packets > priv->tx_coal_frames[queue])
++	else if (tx_packets > tx_coal)
+ 		set_ic = true;
+-	else if ((tx_q->tx_count_frames %
+-		  priv->tx_coal_frames[queue]) < tx_packets)
++	else if ((tx_q->tx_count_frames % tx_coal) < tx_packets)
+ 		set_ic = true;
+ 	else
+ 		set_ic = false;
+@@ -4552,6 +4550,7 @@ static netdev_tx_t stmmac_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	struct dma_desc *desc, *first;
+ 	struct stmmac_tx_queue *tx_q;
+ 	bool has_vlan, set_ic;
++	u32 tx_coal;
+ 	int entry, first_tx;
+ 	dma_addr_t des;
+ 
+@@ -4681,16 +4680,16 @@ static netdev_tx_t stmmac_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	tx_packets = (entry + 1) - first_tx;
+ 	tx_q->tx_count_frames += tx_packets;
+ 
++	tx_coal = READ_ONCE(priv->tx_coal_frames[queue]);
+ 	if ((skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP) && priv->hwts_tx_en)
+ 		set_ic = true;
+-	else if (!priv->tx_coal_frames[queue])
++	else if (!tx_coal)
+ 		set_ic = false;
+ 	else if (!netdev_xmit_more())
+ 		set_ic = true;
+-	else if (tx_packets > priv->tx_coal_frames[queue])
++	else if (tx_packets > tx_coal)
+ 		set_ic = true;
+-	else if ((tx_q->tx_count_frames %
+-		  priv->tx_coal_frames[queue]) < tx_packets)
++	else if ((tx_q->tx_count_frames % tx_coal) < tx_packets)
+ 		set_ic = true;
+ 	else
+ 		set_ic = false;
+@@ -4977,7 +4976,7 @@ static int stmmac_xdp_xmit_xdpf(struct stmmac_priv *priv, int queue,
+ 	unsigned int entry = tx_q->cur_tx;
+ 	struct dma_desc *tx_desc;
+ 	dma_addr_t dma_addr;
+-	bool set_ic;
++	u32 tx_coal;
+ 
+ 	if (stmmac_tx_avail(priv, queue) < STMMAC_TX_THRESH(priv))
+ 		return STMMAC_XDP_CONSUMED;
+@@ -5030,12 +5029,8 @@ static int stmmac_xdp_xmit_xdpf(struct stmmac_priv *priv, int queue,
+ 
+ 	tx_q->tx_count_frames++;
+ 
+-	if (tx_q->tx_count_frames % priv->tx_coal_frames[queue] == 0)
+-		set_ic = true;
+-	else
+-		set_ic = false;
+-
+-	if (set_ic) {
++	tx_coal = READ_ONCE(priv->tx_coal_frames[queue]);
++	if (tx_coal && !(tx_q->tx_count_frames % tx_coal)) {
+ 		tx_q->tx_count_frames = 0;
+ 		stmmac_set_tx_ic(priv, tx_desc);
+ 		u64_stats_update_begin(&txq_stats->q_syncp);
+-- 
+2.53.0
+

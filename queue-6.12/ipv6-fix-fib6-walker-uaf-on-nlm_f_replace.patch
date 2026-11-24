@@ -1,0 +1,141 @@
+From 66a2a38f163ad96c96a77ed29dc8c3a38d175a1b Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 28 Oct 2026 12:00:18 -0400
+Subject: ipv6: fix fib6 walker UAF on NLM_F_REPLACE
+
+From: Cen Zhang (Microsoft) <cenzhang@linux.microsoft.com>
+
+[ Upstream commit 23fec4bd76904e9df7a8cc0a81ceb14c36971da4 ]
+
+fib6_walker uses w->leaf to remember the next fib6_info to dump, so an
+RTM_GETROUTE dump can continue there on the next recvmsg().  This
+assumes that whoever removes a route from the tree also updates the
+walkers pointing at it.  fib6_del_route() does: it moves w->leaf to
+the next route.  The NLM_F_REPLACE branch of fib6_add_rt2node() does
+not: it removes the old route, fib6_add() frees it, and w->leaf keeps
+pointing at the freed object.
+
+The fn_sernum version check in fib6_dump_table() normally protects
+against resuming on a stale w->leaf, but it can be bypassed:
+ip6_link_failure() resets fn_sernum to -1 when the default route
+fails, which an unprivileged user in a user+net namespace can cause:
+
+  1) link failure            fn_sernum = -1
+  2) dump pauses on route R
+  3) replace R               fn_sernum changed, R freed
+  4) link failure            fn_sernum = -1
+  5) dump resumes            -1 == -1, reads freed R  <- UAF
+
+  BUG: KASAN: slab-use-after-free in rt6_fill_node+0x1c22/0x2cd0
+  Read of size 4 at addr ff11000011fa0064 by task poc/101
+   rt6_fill_node <- rt6_dump_route
+
+Fix by adjusting walkers separately for replacement and deletion.
+For replacement, add fib6_walkers_replace_leaf() points w->leaf
+at the new route. For deletion and ECMP sibling removal,
+fib6_walkers_skip_rt() calls fib6_walkers_replace_leaf() with the
+next route. Reset w->skip_in_node when updating w->leaf, and set
+w->state to FWS_U when no next route remains.
+
+Fixes: 4a287eba2de3 ("IPv6 routing, NLM_F_* flag support: REPLACE and EXCL flags support, warn about missing CREATE flag")
+Cc: AutonomousCodeSecurity@microsoft.com
+Signed-off-by: Cen Zhang (Microsoft) <cenzhang@linux.microsoft.com>
+Reviewed-by: Ido Schimmel <idosch@nvidia.com>
+Signed-off-by: Dave Miller <davem@davem-thinkpadp1gen8.ibmlond.csb>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ net/ipv6/ip6_fib.c | 50 ++++++++++++++++++++++++++++++++++------------
+ 1 file changed, 37 insertions(+), 13 deletions(-)
+
+diff --git a/net/ipv6/ip6_fib.c b/net/ipv6/ip6_fib.c
+index 630b520f72410..aab1dddf1f59f 100644
+--- a/net/ipv6/ip6_fib.c
++++ b/net/ipv6/ip6_fib.c
+@@ -89,6 +89,40 @@ static void fib6_walker_unlink(struct net *net, struct fib6_walker *w)
+ 	write_unlock_bh(&net->ipv6.fib6_walker_lock);
+ }
+ 
++/* @old is leaving the tree.  Walkers resting on it continue from @new, or
++ * climb to the parent node when there is no @new.  Called with tb6_lock
++ * held.
++ */
++static void fib6_walkers_replace_leaf(struct net *net, struct fib6_info *old,
++				      struct fib6_info *new)
++{
++	struct fib6_walker *w;
++
++	read_lock(&net->ipv6.fib6_walker_lock);
++	FOR_WALKERS(net, w) {
++		if (w->state == FWS_C && w->leaf == old) {
++			pr_debug("walker %p adjusted by unlink of %p\n", w, old);
++			w->leaf = new;
++			w->skip_in_node = 0;
++			if (!new)
++				w->state = FWS_U;
++		}
++	}
++	read_unlock(&net->ipv6.fib6_walker_lock);
++}
++
++/* @rt is removed from its node: walkers resting on it continue from the
++ * next route of the node.
++ */
++static void fib6_walkers_skip_rt(struct net *net, struct fib6_info *rt)
++{
++	struct fib6_info *next;
++
++	next = rcu_dereference_protected(rt->fib6_next,
++					 lockdep_is_held(&rt->fib6_table->tb6_lock));
++	fib6_walkers_replace_leaf(net, rt, next);
++}
++
+ static int fib6_new_sernum(struct net *net)
+ {
+ 	int new, old = atomic_read(&net->ipv6.fib6_sernum);
+@@ -1302,6 +1336,7 @@ static int fib6_add_rt2node(struct fib6_node *fn, struct fib6_info *rt,
+ 		rcu_assign_pointer(rt->fib6_node, fn);
+ 		rt->fib6_next = iter->fib6_next;
+ 		rcu_assign_pointer(*ins, rt);
++		fib6_walkers_replace_leaf(info->nl_net, iter, rt);
+ 		if (!info->skip_notify)
+ 			inet6_rt_notify(RTM_NEWROUTE, rt, info, NLM_F_REPLACE);
+ 		if (!(fn->fn_flags & RTN_RTINFO)) {
+@@ -1324,6 +1359,7 @@ static int fib6_add_rt2node(struct fib6_node *fn, struct fib6_info *rt,
+ 				if (iter->fib6_metric > rt->fib6_metric)
+ 					break;
+ 				if (rt6_qualify_for_ecmp(iter)) {
++					fib6_walkers_skip_rt(info->nl_net, iter);
+ 					*ins = iter->fib6_next;
+ 					iter->fib6_node = NULL;
+ 					fib6_purge_rt(iter, fn, info->nl_net);
+@@ -1933,7 +1969,6 @@ static void fib6_del_route(struct fib6_table *table, struct fib6_node *fn,
+ 			   struct fib6_info __rcu **rtp, struct nl_info *info)
+ {
+ 	struct fib6_info *leaf, *replace_rt = NULL;
+-	struct fib6_walker *w;
+ 	struct fib6_info *rt = rcu_dereference_protected(*rtp,
+ 				    lockdep_is_held(&table->tb6_lock));
+ 	struct net *net = info->nl_net;
+@@ -1984,18 +2019,7 @@ static void fib6_del_route(struct fib6_table *table, struct fib6_node *fn,
+ 		rt6_multipath_rebalance(next_sibling);
+ 	}
+ 
+-	/* Adjust walkers */
+-	read_lock(&net->ipv6.fib6_walker_lock);
+-	FOR_WALKERS(net, w) {
+-		if (w->state == FWS_C && w->leaf == rt) {
+-			pr_debug("walker %p adjusted by delroute\n", w);
+-			w->leaf = rcu_dereference_protected(rt->fib6_next,
+-					    lockdep_is_held(&table->tb6_lock));
+-			if (!w->leaf)
+-				w->state = FWS_U;
+-		}
+-	}
+-	read_unlock(&net->ipv6.fib6_walker_lock);
++	fib6_walkers_skip_rt(net, rt);
+ 
+ 	/* If it was last route, call fib6_repair_tree() to:
+ 	 * 1. For root node, put back null_entry as how the table was created.
+-- 
+2.53.0
+

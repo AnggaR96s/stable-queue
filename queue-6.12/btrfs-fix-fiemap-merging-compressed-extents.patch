@@ -1,0 +1,86 @@
+From 4cfe44c22b7a18a67296dc26dff8cacffbb31466 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 15 Oct 2026 15:55:55 +0100
+Subject: btrfs: fix fiemap merging compressed extents
+
+From: Filipe Manana <fdmanana@suse.com>
+
+[ Upstream commit 980fbbd041ac2538fdbe7cfda4253dfc28fdcad1 ]
+
+Compressed extents are never supposed to be merged by the fiemap code and
+reported as a single extent, as each extent's content comes from a
+different compression stream and has its own header and context.
+
+We currently rely on checking the logical and physical address adjacency
+to prevent merging compressed extents but that is broken. Consider the
+following reproducer which explains why the merging happens:
+
+  $ cat test.sh
+  #!/bin/bash
+
+  DEV=/dev/sdi
+  MNT=/mnt/sdi
+
+  mkfs.btrfs -s 4K -f $DEV
+  mount -o compress $DEV $MNT
+
+  # Do a write that compresses to a single 4K extent and represents the
+  # maximum compressed chunk size (128K).
+  xfs_io -f -c "pwrite 0 128K" $MNT/foo
+
+  # Sync to flush delalloc and allocate the 4K extent.
+  sync -f $MNT
+
+  # Now allocate a 124K extent in some other file, which will be adjacent
+  # (to the right) of the 4K extent previously allocated.
+  xfs_io -f -c "falloc 0 124K" $MNT/filler
+
+  # Do another write to the main file at its current EOF that is
+  # compressible and fits in a 4K extent.
+  xfs_io -c "pwrite 128K 128K" $MNT/foo
+  # Sync to flush delalloc and allocate the 4K extent.
+  sync -f $MNT
+
+  # Run fiemap which should report 2 encoded extents, each with a
+  # logical size of 128K.
+  xfs_io -c "fiemap -v" $MNT/foo
+
+  umount $MNT
+
+Running this, fiemap will report a single extent:
+
+  $ ./test.sh
+  (...)
+  /mnt/sdi/foo:
+   EXT: FILE-OFFSET      BLOCK-RANGE      TOTAL FLAGS
+     0: [0..511]:        26624..27135       512   0x9
+
+Fix this by never attempting to merge extents if the flags contain
+FIEMAP_EXTENT_ENCODED.
+
+Fixes: 4751832da990 ("btrfs: fiemap: Cache and merge fiemap extent before submit it to user")
+Reviewed-by: Qu Wenruo <wqu@suse.com>
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/btrfs/fiemap.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/fs/btrfs/fiemap.c b/fs/btrfs/fiemap.c
+index 7364bae6b1720..cf93318d14080 100644
+--- a/fs/btrfs/fiemap.c
++++ b/fs/btrfs/fiemap.c
+@@ -228,7 +228,8 @@ static int emit_fiemap_extent(struct fiemap_extent_info *fieinfo,
+ 	 *
+ 	 * 3) Share same flags
+ 	 */
+-	if (cache->offset + cache->len  == offset &&
++	if (!(flags & FIEMAP_EXTENT_ENCODED) &&
++	    cache->offset + cache->len == offset &&
+ 	    cache->phys + cache->len == phys  &&
+ 	    cache->flags == flags) {
+ 		cache->len += len;
+-- 
+2.53.0
+

@@ -1,0 +1,136 @@
+From d5ce13fc4277d336ea066a4939bd6748176c64fa Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 18 Nov 2025 08:43:40 -0800
+Subject: drm/xe/forcewake: Add scope-based cleanup for forcewake
+
+From: Matt Roper <matthew.d.roper@intel.com>
+
+[ Upstream commit 074edfbdfba25493324807f749fbc86bf0af3a2d ]
+
+Since forcewake uses a reference counting get/put model, there are many
+places where we need to be careful to drop the forcewake reference when
+bailing out of a function early on an error path.  Add scope-based
+cleanup options that can be used in place of explicit get/put to help
+prevent mistakes in this area.
+
+Examples:
+
+   CLASS(xe_force_wake, fw_ref)(gt_to_fw(gt), XE_FW_GT);
+
+       Obtain forcewake on the XE_FW_GT domain and hold it until the
+       end of the current block.  The wakeref will be dropped
+       automatically when the current scope is exited by any means
+       (return, break, reaching the end of the block, etc.).
+
+   xe_with_force_wake(fw_ref, gt_to_fw(ss->gt), XE_FORCEWAKE_ALL) {
+        ...
+   }
+
+       Hold all forcewake domains for the following block.  As with the
+       CLASS usage, forcewake will be dropped automatically when the
+       block is exited by any means.
+
+Use of these cleanup helpers should allow us to remove some ugly
+goto-based error handling and help avoid mistakes in functions with lots
+of early error exits.
+
+An 'xe_force_wake_release_only' class is also added for cases where a
+forcewake reference is passed in from another function and the current
+function is responsible for releasing it in every flow and error path.
+
+v2:
+ - Create a separate constructor that just wraps xe_force_wake_get for
+   use in the class.  This eliminates the need to update the signature
+   of xe_force_wake_get().  (Michal)
+
+v3:
+ - Wrap xe_with_force_wake's 'done' marker in __UNIQUE_ID.  (Gustavo)
+ - Add a note to xe_force_wake_get()'s kerneldoc explaining that
+   scope-based cleanup is preferred when possible.  (Gustavo)
+ - Add an xe_force_wake_release_only class.  (Gustavo)
+
+v4:
+ - Add NULL check on fw in release_only variant.  (Gustavo)
+
+Cc: Michal Wajdeczko <michal.wajdeczko@intel.com>
+Cc: Gustavo Sousa <gustavo.sousa@intel.com>
+Reviewed-by: Gustavo Sousa <gustavo.sousa@intel.com>
+Link: https://patch.msgid.link/20251118164338.3572146-30-matthew.d.roper@intel.com
+Signed-off-by: Matt Roper <matthew.d.roper@intel.com>
+Stable-dep-of: 557c7b434378 ("drm/xe: Sync Wa_16023105232 in xe_was to match OOB rule")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/gpu/drm/xe/xe_force_wake.c |  7 ++++++
+ drivers/gpu/drm/xe/xe_force_wake.h | 40 ++++++++++++++++++++++++++++++
+ 2 files changed, 47 insertions(+)
+
+diff --git a/drivers/gpu/drm/xe/xe_force_wake.c b/drivers/gpu/drm/xe/xe_force_wake.c
+index c59a9b330697d..76e054f314ee1 100644
+--- a/drivers/gpu/drm/xe/xe_force_wake.c
++++ b/drivers/gpu/drm/xe/xe_force_wake.c
+@@ -166,6 +166,13 @@ static int domain_sleep_wait(struct xe_gt *gt,
+  * xe_force_wake_ref_has_domain() function. Caller must call
+  * xe_force_wake_put() function to decrease incremented refcounts.
+  *
++ * When possible, scope-based forcewake (through CLASS(xe_force_wake, ...) or
++ * xe_with_force_wake()) should be used instead of direct calls to this
++ * function.  Direct usage of get/put should only be used when the function
++ * has goto-based flows that can interfere with scope-based cleanup, or when
++ * the lifetime of the forcewake reference does not match a specific scope
++ * (e.g., forcewake obtained in one function and released in a different one).
++ *
+  * Return: opaque reference to woken domains or zero if none of requested
+  * domains were awake.
+  */
+diff --git a/drivers/gpu/drm/xe/xe_force_wake.h b/drivers/gpu/drm/xe/xe_force_wake.h
+index 0e3e84bfa51c3..1e2198f6a0078 100644
+--- a/drivers/gpu/drm/xe/xe_force_wake.h
++++ b/drivers/gpu/drm/xe/xe_force_wake.h
+@@ -61,4 +61,44 @@ xe_force_wake_ref_has_domain(unsigned int fw_ref, enum xe_force_wake_domains dom
+ 	return fw_ref & domain;
+ }
+ 
++struct xe_force_wake_ref {
++	struct xe_force_wake *fw;
++	unsigned int domains;
++};
++
++static struct xe_force_wake_ref
++xe_force_wake_constructor(struct xe_force_wake *fw, unsigned int domains)
++{
++	struct xe_force_wake_ref fw_ref = { .fw = fw };
++
++	fw_ref.domains = xe_force_wake_get(fw, domains);
++
++	return fw_ref;
++}
++
++DEFINE_CLASS(xe_force_wake, struct xe_force_wake_ref,
++	     xe_force_wake_put(_T.fw, _T.domains),
++	     xe_force_wake_constructor(fw, domains),
++	     struct xe_force_wake *fw, unsigned int domains);
++
++/*
++ * Scoped helper for the forcewake class, using the same trick as scoped_guard()
++ * to bind the lifetime to the next statement/block.
++ */
++#define __xe_with_force_wake(ref, fw, domains, done) \
++	for (CLASS(xe_force_wake, ref)(fw, domains), *(done) = NULL; \
++	     !(done); (done) = (void *)1)
++
++#define xe_with_force_wake(ref, fw, domains) \
++	__xe_with_force_wake(ref, fw, domains, __UNIQUE_ID(done))
++
++/*
++ * Used when xe_force_wake_constructor() has already been called by another
++ * function and the current function is responsible for releasing the forcewake
++ * reference in all possible cases and error paths.
++ */
++DEFINE_CLASS(xe_force_wake_release_only, struct xe_force_wake_ref,
++	     if (_T.fw) xe_force_wake_put(_T.fw, _T.domains), fw_ref,
++	     struct xe_force_wake_ref fw_ref);
++
+ #endif
+-- 
+2.53.0
+

@@ -1,0 +1,117 @@
+From 0c955cc77ae66766b0462e466344f7ff2baf5c1c Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 30 Oct 2026 13:09:56 +0100
+Subject: soreuseport: annotate data-races around reuse->socks[] and num_socks
+
+From: Eric Dumazet <edumazet@kernel.org>
+
+[ Upstream commit 213d491308b99d026514c93980cf8dd572226b1b ]
+
+reuseport_select_sock() and reuseport_migrate_sock() read
+reuse->num_socks and reuse->socks[] locklessly under RCU, while
+writers holding reuseport_lock can change them.
+
+Readers snapshot num_socks once, then index socks[] with it.
+Meanwhile, writers can perform several operations, storing into
+slots below the reader's stale count:
+
+- __reuseport_detach_sock() moves the last socket into slot i.
+- __reuseport_add_sock() then writes the new socket at the
+  (now smaller) num_socks index.
+- reuseport_stop_listen_sock() calls __reuseport_detach_sock()
+  then __reuseport_add_closed_sock(), which writes slot
+  max_socks - num_closed_socks - 1. This can be the slot a reader
+  still considers part of the listener region when the array is full.
+- __reuseport_detach_closed_sock() can then rewrite that slot.
+
+All pointers stored in socks[] remain valid for the RCU grace period,
+but without annotations the compiler is allowed to tear or reload
+these accesses. For instance, reuseport_select_sock_by_hash() could
+reload reuse->socks[i] between the sk_state/sk_incoming_cpu checks
+and the return, returning a socket that did not pass them.
+
+Use WRITE_ONCE() for all socks[] stores done while the array is
+visible to readers, and for num_socks updates (readers already use
+READ_ONCE()). Use READ_ONCE() in the two lockless readers.
+
+Fixes: ef456144da8e ("soreuseport: define reuseport groups")
+Link: https://lore.kernel.org/netdev/20260902071900.395567-1-ruanjinjie@huawei.com/
+Cc: Kuniyuki Iwashima <kuniyu@google.com>
+Signed-off-by: Eric Dumazet <edumazet@kernel.org>
+Reviewed-by: Kuniyuki Iwashima <kuniyu@google.com>
+Reviewed-by: Jiayuan Chen <jiayuan.chen@linux.dev>
+Link: https://patch.msgid.link/20261030120956.3026324-1-edumazet@kernel.org
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ net/core/sock_reuseport.c | 17 +++++++++--------
+ 1 file changed, 9 insertions(+), 8 deletions(-)
+
+diff --git a/net/core/sock_reuseport.c b/net/core/sock_reuseport.c
+index 5a165286e4d8e..e7685956b09d7 100644
+--- a/net/core/sock_reuseport.c
++++ b/net/core/sock_reuseport.c
+@@ -124,10 +124,10 @@ static int reuseport_sock_index(struct sock *sk,
+ static void __reuseport_add_sock(struct sock *sk,
+ 				 struct sock_reuseport *reuse)
+ {
+-	reuse->socks[reuse->num_socks] = sk;
++	WRITE_ONCE(reuse->socks[reuse->num_socks], sk);
+ 	/* paired with smp_rmb() in reuseport_(select|migrate)_sock() */
+ 	smp_wmb();
+-	reuse->num_socks++;
++	WRITE_ONCE(reuse->num_socks, reuse->num_socks + 1);
+ 	reuseport_get_incoming_cpu(sk, reuse);
+ }
+ 
+@@ -139,8 +139,8 @@ static bool __reuseport_detach_sock(struct sock *sk,
+ 	if (i == -1)
+ 		return false;
+ 
+-	reuse->socks[i] = reuse->socks[reuse->num_socks - 1];
+-	reuse->num_socks--;
++	WRITE_ONCE(reuse->socks[i], reuse->socks[reuse->num_socks - 1]);
++	WRITE_ONCE(reuse->num_socks, reuse->num_socks - 1);
+ 	reuseport_put_incoming_cpu(sk, reuse);
+ 
+ 	return true;
+@@ -149,7 +149,7 @@ static bool __reuseport_detach_sock(struct sock *sk,
+ static void __reuseport_add_closed_sock(struct sock *sk,
+ 					struct sock_reuseport *reuse)
+ {
+-	reuse->socks[reuse->max_socks - reuse->num_closed_socks - 1] = sk;
++	WRITE_ONCE(reuse->socks[reuse->max_socks - reuse->num_closed_socks - 1], sk);
+ 	/* paired with READ_ONCE() in inet_csk_bind_conflict() */
+ 	WRITE_ONCE(reuse->num_closed_socks, reuse->num_closed_socks + 1);
+ 	reuseport_get_incoming_cpu(sk, reuse);
+@@ -163,7 +163,8 @@ static bool __reuseport_detach_closed_sock(struct sock *sk,
+ 	if (i == -1)
+ 		return false;
+ 
+-	reuse->socks[i] = reuse->socks[reuse->max_socks - reuse->num_closed_socks];
++	WRITE_ONCE(reuse->socks[i],
++		   reuse->socks[reuse->max_socks - reuse->num_closed_socks]);
+ 	/* paired with READ_ONCE() in inet_csk_bind_conflict() */
+ 	WRITE_ONCE(reuse->num_closed_socks, reuse->num_closed_socks - 1);
+ 	reuseport_put_incoming_cpu(sk, reuse);
+@@ -522,7 +523,7 @@ static struct sock *run_bpf_filter(struct sock_reuseport *reuse, u16 socks,
+ 	if (index >= socks)
+ 		return NULL;
+ 
+-	return reuse->socks[index];
++	return READ_ONCE(reuse->socks[index]);
+ }
+ 
+ static struct sock *reuseport_select_sock_by_hash(struct sock_reuseport *reuse,
+@@ -533,7 +534,7 @@ static struct sock *reuseport_select_sock_by_hash(struct sock_reuseport *reuse,
+ 
+ 	i = j = reciprocal_scale(hash, num_socks);
+ 	do {
+-		struct sock *sk = reuse->socks[i];
++		struct sock *sk = READ_ONCE(reuse->socks[i]);
+ 
+ 		if (sk->sk_state != TCP_ESTABLISHED) {
+ 			/* Paired with WRITE_ONCE() in __reuseport_(get|put)_incoming_cpu(). */
+-- 
+2.53.0
+

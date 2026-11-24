@@ -1,0 +1,73 @@
+From 78fd981a0c8abac83363dc4dbae4c4e544db5796 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 27 Oct 2026 15:33:05 +0100
+Subject: btrfs: zoned: don't wait for ordered extents in do_zone_finish()
+
+From: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+
+[ Upstream commit bcad7df05237382237ad1517411721d839174009 ]
+
+do_zone_finish() calls btrfs_wait_ordered_roots(), which holds
+fs_info->ordered_operations_mutex while waiting for writeback. It can be
+reached from writeback itself:
+
+  cow_file_range()
+  `-> btrfs_reserve_extent()
+    `-> find_free_extent()
+      `-> btrfs_zone_finish_one_bg()
+        `-> do_zone_finish()
+
+If another task holds the mutex and waits for that writeback, this
+deadlocks.
+
+In general, we want to ensure all writes in the block group to
+complete before finishing the zone, as relocation does. However, the
+current callers do not need the wait (or cannot wait) in do_zone_finish():
+
+- Relocation already waits for reservations and ordered extents itself
+  before calling btrfs_zone_finish().
+- btrfs_delete_unused_bgs() checks that ->reserved is zero and sets the
+  block group read-only while holding groups_sem, so there can be no
+  in-flight data write.
+- btrfs_zone_finish_one_bg() is called from the allocation path and
+  cannot wait.
+
+Dropping the wait is still safe. Once the block group is read-only,
+->reserved can only drop, and for data it only drops after the ordered
+extent's I/O has completed. So if ->reserved is zero, no data write is
+left in flight. If it is non-zero, do_zone_finish() returns -EAGAIN,
+which all callers handle.
+
+This makes btrfs_zone_finish_one_bg() fail with -EAGAIN when it races
+with an allocation in the selected block group.
+
+Fixes: 393f646e34c1 ("btrfs: zoned: finish least available block group on data bg allocation")
+Reviewed-by: Naohiro Aota <naohiro.aota@wdc.com>
+Signed-off-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/btrfs/zoned.c | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/fs/btrfs/zoned.c b/fs/btrfs/zoned.c
+index f25cd3ddbd630..65c238d38e5d5 100644
+--- a/fs/btrfs/zoned.c
++++ b/fs/btrfs/zoned.c
+@@ -2575,9 +2575,10 @@ static int do_zone_finish(struct btrfs_block_group *block_group, bool fully_writ
+ 
+ 		/* Ensure all writes in this block group finish */
+ 		btrfs_wait_block_group_reservations(block_group);
+-		/* No need to wait for NOCOW writers. Zoned mode does not allow that */
+-		btrfs_wait_ordered_roots(fs_info, U64_MAX, block_group);
+-		/* Wait for extent buffers to be written. */
++		/*
++		 * No need to wait for NOCOW writers, as zoned mode does not
++		 * allow that, only wait for extent buffers to be written.
++		 */
+ 		if (is_metadata)
+ 			wait_eb_writebacks(block_group);
+ 
+-- 
+2.53.0
+

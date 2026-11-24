@@ -1,0 +1,137 @@
+From aa85f2b8cc52f1fb6577af483a92c7693bcca449 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 27 Oct 2026 14:48:40 +0100
+Subject: net: stmmac: fix VLAN tag stripping on short and non-linear RX frames
+
+From: Lorenzo Bianconi <lorenzo.bianconi@oss.qualcomm.com>
+
+[ Upstream commit 68bdbffcae08699af5c16f7a2ec61a5489b78dbe ]
+
+stmmac_rx_vlan() reads the VLAN header straight from skb->data and
+removes it with skb_pull(), assuming the header is fully present in the
+linear part of the skb. XDP can change the frame length and head layout
+before the tag is stripped.
+
+An XDP program can use bpf_xdp_adjust_tail() to shrink a frame to as
+little as ETH_HLEN while bytes 12-13 still contain a VLAN ethertype. The
+driver then reads h_vlan_TCI past skb->len and pops the tag, leaving less
+than ETH_HLEN in the skb. eth_type_trans() cannot pull the MAC header, so
+a malformed skb is passed up. The TCI is also read from the wrong place
+when the tag is not fully in the linear head, e.g. when it spans into a
+frag.
+
+Read h_vlan_proto after pulling ETH_HLEN into the linear part, and check
+it together with the device features. Only if the tag is actually going
+to be popped, pull VLAN_ETH_HLEN and re-derive the header pointer
+afterwards, as pskb_may_pull() may reallocate the skb head. Return an
+error so the callers can drop a frame that claims a VLAN tag but cannot
+provide the full header. This also drops and counts frames shorter than
+ETH_HLEN in rx_dropped, even when VLAN RX offload is disabled;
+bpf_xdp_adjust_head() and bpf_xdp_adjust_tail() cannot produce such a
+frame, so it only affects a runt that reaches the driver, and dropping it
+is safer than handing it to eth_type_trans().
+
+Also move the XDP metadata written with bpf_xdp_adjust_meta() together
+with the MAC header when the tag is popped, so data_meta still points at
+the metadata after eth_type_trans() anchors mac_header, instead of at the
+first bytes of the destination MAC.
+
+Fixes: 5fabb01207a2 ("net: stmmac: Add initial XDP support")
+Reviewed-by: Nicolai Buchwitz <nb@tipi-net.de>
+Signed-off-by: Lorenzo Bianconi <lorenzo.bianconi@oss.qualcomm.com>
+Link: https://patch.msgid.link/20261027-stmmac-xdp-fixes-v2-5-10eae8a093a8@oss.qualcomm.com
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ .../net/ethernet/stmicro/stmmac/stmmac_main.c | 48 +++++++++++++------
+ 1 file changed, 33 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+index c115ddfad5892..896ec37961a94 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -5063,22 +5063,35 @@ static netdev_features_t stmmac_features_check(struct sk_buff *skb,
+ 	return vlan_features_check(skb, features);
+ }
+ 
+-static void stmmac_rx_vlan(struct net_device *dev, struct sk_buff *skb)
++static int stmmac_rx_vlan(struct net_device *dev, struct sk_buff *skb)
+ {
+-	struct vlan_ethhdr *veth = skb_vlan_eth_hdr(skb);
+-	__be16 vlan_proto = veth->h_vlan_proto;
+-	u16 vlanid;
++	struct vlan_ethhdr *veth;
+ 
+-	if ((vlan_proto == htons(ETH_P_8021Q) &&
++	if (!pskb_may_pull(skb, ETH_HLEN))
++		return -EINVAL;
++
++	veth = skb_vlan_eth_hdr(skb);
++	if ((veth->h_vlan_proto == htons(ETH_P_8021Q) &&
+ 	     dev->features & NETIF_F_HW_VLAN_CTAG_RX) ||
+-	    (vlan_proto == htons(ETH_P_8021AD) &&
++	    (veth->h_vlan_proto == htons(ETH_P_8021AD) &&
+ 	     dev->features & NETIF_F_HW_VLAN_STAG_RX)) {
++		__be16 vlan_proto = veth->h_vlan_proto;
++		u8 meta_len = skb_metadata_len(skb);
++		u16 vlanid;
++
+ 		/* pop the vlan tag */
++		if (!pskb_may_pull(skb, VLAN_ETH_HLEN))
++			return -EINVAL;
++
++		veth = skb_vlan_eth_hdr(skb);
+ 		vlanid = ntohs(veth->h_vlan_TCI);
+-		memmove(skb->data + VLAN_HLEN, veth, ETH_ALEN * 2);
++		memmove(skb->data - meta_len + VLAN_HLEN,
++			skb->data - meta_len, meta_len + ETH_ALEN * 2);
+ 		skb_pull(skb, VLAN_HLEN);
+ 		__vlan_hwaccel_put_tag(skb, vlan_proto, vlanid);
+ 	}
++
++	return 0;
+ }
+ 
+ /**
+@@ -5445,12 +5458,15 @@ static void stmmac_dispatch_skb_zc(struct stmmac_priv *priv, u32 queue,
+ 	}
+ 
+ 	stmmac_get_rx_hwtstamp(priv, p, np, skb);
+-	if (priv->hw->hw_vlan_en)
++	if (priv->hw->hw_vlan_en) {
+ 		/* MAC level stripping. */
+ 		stmmac_rx_hw_vlan(priv, priv->hw, p, skb);
+-	else
+-		/* Driver level stripping. */
+-		stmmac_rx_vlan(priv->dev, skb);
++	} else if (stmmac_rx_vlan(priv->dev, skb)) {
++		dev_kfree_skb_any(skb);
++		priv->xstats.rx_dropped++;
++		return;
++	}
++
+ 	skb->protocol = eth_type_trans(skb, priv->dev);
+ 
+ 	if (unlikely(!coe) || !stmmac_has_ip_ethertype(skb))
+@@ -5973,12 +5989,14 @@ static int stmmac_rx(struct stmmac_priv *priv, int limit, u32 queue)
+ 
+ 		stmmac_get_rx_hwtstamp(priv, p, np, skb);
+ 
+-		if (priv->hw->hw_vlan_en)
++		if (priv->hw->hw_vlan_en) {
+ 			/* MAC level stripping. */
+ 			stmmac_rx_hw_vlan(priv, priv->hw, p, skb);
+-		else
+-			/* Driver level stripping. */
+-			stmmac_rx_vlan(priv->dev, skb);
++		} else if (stmmac_rx_vlan(priv->dev, skb)) {
++			dev_kfree_skb_any(skb);
++			rx_dropped++;
++			goto next;
++		}
+ 
+ 		skb->protocol = eth_type_trans(skb, priv->dev);
+ 
+-- 
+2.53.0
+

@@ -1,0 +1,151 @@
+From 0922eaaf63b86b54dc9edf517e5e15c7fcae13dc Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 26 Oct 2026 04:18:36 +0000
+Subject: perf/amd/ibs: Fix kernel address leak via REGS_USER and REGS_INTR
+
+From: Ravi Bangoria <ravi.bangoria@amd.com>
+
+[ Upstream commit b61c12527223423ab66891b2e8131da0d66537c4 ]
+
+IBS hardware captures a sample and raises an NMI. Since the NMI can be
+delivered with a delay, a privilege change may occur between sample
+capture and NMI delivery. Because IBS only provides the sample RIP, the
+kernel records GPRs from the NMI pt_regs, which may reflect kernel mode
+if a privilege switch occurred in the interim. This can leak kernel
+addresses to unprivileged users through PERF_SAMPLE_REGS_USER and/or
+PERF_SAMPLE_REGS_INTR.
+
+Fix this by using interrupt regs while preparing PERF_SAMPLE_REGS_USER
+and PERF_SAMPLE_REGS_INTR. With the change, when IBS samples a user mode
+instruction but the NMI is delivered in kernel mode, PERF_SAMPLE_REGS_USER
+will source its register state from task_pt_regs(current) and
+PERF_SAMPLE_REGS_INTR will be omitted from the data sent to userspace.
+
+In addition to fixing the kernel address leak, this change also ensures
+GPR snapshot consistency, which resolves the DWARF unwinding issue with
+IBS.
+
+Closes: https://lore.kernel.org/r/CAPu-DQqF0aF6=GS8Z6KKWeeX_V5LiXeKU_rJQZC+uGg8zuTPNw@mail.gmail.com
+Fixes: d29e744c7167 ("perf/x86: Relax privilege filter restriction on AMD IBS")
+Reported-by: Gennady Kupava <gennady.kupava@gmail.com>
+Reported-by: Jayapal Ashwin Nair <janair@amd.com>
+Signed-off-by: Ravi Bangoria <ravi.bangoria@amd.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Link: https://patch.msgid.link/20261026041838.941-3-ravi.bangoria@amd.com
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ arch/x86/events/amd/ibs.c  | 50 ++++++++++++++++++++++++++++++++++++++
+ include/linux/perf_event.h |  6 +++++
+ kernel/events/core.c       | 10 ++++----
+ 3 files changed, 61 insertions(+), 5 deletions(-)
+
+diff --git a/arch/x86/events/amd/ibs.c b/arch/x86/events/amd/ibs.c
+index 23d834e7b565e..d57b34a72dddf 100644
+--- a/arch/x86/events/amd/ibs.c
++++ b/arch/x86/events/amd/ibs.c
+@@ -1339,6 +1339,56 @@ static int perf_ibs_handle_irq(struct perf_ibs *perf_ibs, struct pt_regs *iregs)
+ 		throttle = perf_event_account_interrupt(event);
+ 		goto out;
+ 	}
++
++	/*
++	 * IBS captured RIP is out of sync with NMI pt_regs due to NMI
++	 * delivery latency. Use NMI pt_regs for PERF_SAMPLE_REGS_USER.
++	 *
++	 * Note: Valid user regs are required for PERF_SAMPLE_STACK_USER.
++	 */
++	if (event->attr.sample_type & (PERF_SAMPLE_REGS_USER |
++				       PERF_SAMPLE_STACK_USER)) {
++		perf_sample_regs_user(&data.regs_user, iregs);
++
++		/*
++		 * Don't update dyn_size if user has not requested for
++		 * PERF_SAMPLE_REGS_USER.
++		 */
++		if (event->attr.sample_type & PERF_SAMPLE_REGS_USER) {
++			/* regs dump ABI info */
++			int size = sizeof(u64);
++
++			if (data.regs_user.regs) {
++				u64 mask = event->attr.sample_regs_user;
++				size += hweight64(mask) * sizeof(u64);
++			}
++
++			data.dyn_size += size;
++		}
++
++		data.sample_flags |= PERF_SAMPLE_REGS_USER;
++	}
++
++	/*
++	 * IBS captured RIP is out of sync with NMI pt_regs due to NMI
++	 * delivery latency. Use NMI pt_regs for PERF_SAMPLE_REGS_INTR.
++	 */
++	if (event->attr.sample_type & PERF_SAMPLE_REGS_INTR) {
++		/* regs dump ABI info */
++		int size = sizeof(u64);
++
++		perf_sample_regs_intr(&data.regs_intr, iregs,
++				      event->attr.exclude_kernel);
++
++		if (data.regs_intr.regs) {
++			u64 mask = event->attr.sample_regs_intr;
++			size += hweight64(mask) * sizeof(u64);
++		}
++
++		data.dyn_size += size;
++		data.sample_flags |= PERF_SAMPLE_REGS_INTR;
++	}
++
+ 	/*
+ 	 * Prevent leaking physical addresses to unprivileged users. Skip
+ 	 * PERF_SAMPLE_PHYS_ADDR check since generic code prevents it for
+diff --git a/include/linux/perf_event.h b/include/linux/perf_event.h
+index d698a232df114..23444b1b2503b 100644
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@ -1829,6 +1829,12 @@ extern unsigned long perf_misc_flags(struct perf_event *event, struct pt_regs *r
+ extern unsigned long perf_instruction_pointer(struct perf_event *event,
+ 					      struct pt_regs *regs);
+ 
++extern void perf_sample_regs_user(struct perf_regs *regs_user,
++				  struct pt_regs *regs);
++extern void perf_sample_regs_intr(struct perf_regs *regs_intr,
++				  struct pt_regs *regs,
++				  bool exclude_kernel);
++
+ #ifndef perf_arch_misc_flags
+ # define perf_arch_misc_flags(regs) \
+ 		(user_mode(regs) ? PERF_RECORD_MISC_USER : PERF_RECORD_MISC_KERNEL)
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index 42057df334af3..6d3fe508b7406 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -7682,8 +7682,8 @@ perf_output_sample_simd_regs(struct perf_output_handle *handle,
+ 	}
+ }
+ 
+-static void perf_sample_regs_user(struct perf_regs *regs_user,
+-				  struct pt_regs *regs)
++void perf_sample_regs_user(struct perf_regs *regs_user,
++			   struct pt_regs *regs)
+ {
+ 	if (user_mode(regs)) {
+ 		regs_user->abi = perf_reg_abi(current);
+@@ -7696,9 +7696,9 @@ static void perf_sample_regs_user(struct perf_regs *regs_user,
+ 	}
+ }
+ 
+-static void perf_sample_regs_intr(struct perf_regs *regs_intr,
+-				  struct pt_regs *regs,
+-				  bool exclude_kernel)
++void perf_sample_regs_intr(struct perf_regs *regs_intr,
++			   struct pt_regs *regs,
++			   bool exclude_kernel)
+ {
+ 	/*
+ 	 * Hardware skid can lead to a scenario where a PMI is
+-- 
+2.53.0
+

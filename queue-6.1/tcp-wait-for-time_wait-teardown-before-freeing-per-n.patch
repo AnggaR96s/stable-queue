@@ -1,0 +1,98 @@
+From 1ab06c2e7ee5d44518d02756edf578fee4aa009e Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 30 Oct 2026 08:58:43 +0100
+Subject: tcp: wait for TIME_WAIT teardown before freeing per-netns ehash
+
+From: Kyle Zeng <kylebot@openai.com>
+
+[ Upstream commit 647b81ddefc6364290e67bf33c89d54971f8995e ]
+
+inet_twsk_kill() removes a TIME_WAIT socket from the established hash
+before it finishes using the ehash lock, hashinfo and bind tables, and
+before it drops the death-row reference. A running timer can therefore
+unhash its socket before inet_twsk_purge() reaches it. The purge cannot
+synchronize with that timer, and tcp_sk_exit_batch() can free the
+private ehash and hashinfo while inet_twsk_kill() is still using them.
+
+An unprivileged reproducer using user and network namespaces, a private
+TCP ehash and a FIN_WAIT2 timer triggers a KASAN slab-use-after-free in
+inet_twsk_kill(). The allocation and free stacks point to
+inet_pernet_hashinfo_alloc() and inet_pernet_hashinfo_free().
+
+Wait for an RCU grace period after purging the whole batch, if one
+netns in the batch uses a private ehash. TIME_WAIT removal runs with
+bottom halves disabled, so this also waits for removers that were
+already invisible to the purge. Keep the wait under
+tcp_exit_batch_mutex, before freeing any private hashinfo.
+
+The same window exists with the shared tcp_hashinfo. There, the
+hashinfo memory stays valid, but tcp_sk_exit_batch() can decrement
+tcp_death_row.tw_refcount from 2 to 1 before inet_twsk_kill() drops its
+own reference. This triggers the WARN_ON_ONCE() in tcp_sk_exit_batch(),
+then a refcount_t "decrement hit 0" warning from inet_twsk_kill().
+
+Adding a grace period for the shared case would be costly on busy
+hosts. It is not needed: struct net is freed by a later cleanup_net(),
+after the synchronize_rcu() in ops_undo_list(), so inet_twsk_kill()
+can safely drop the last tw_refcount reference itself.
+Use refcount_dec_if_one() and only warn if tw_refcount is not 1
+after a grace period.
+
+Fixes: d1e5e6408b30 ("tcp: Introduce optional per-netns ehash.")
+Signed-off-by: Kyle Zeng <kylebot@openai.com>
+[edumazet: only call synchronize_net() if one netns in the batch uses a private ehash,
+ use refcount_dec_if_one() to avoid a false WARN with the shared ehash]
+Signed-off-by: Eric Dumazet <edumazet@kernel.org>
+Reviewed-by: Jiayuan Chen <jiayuan.chen@linux.dev>
+Reviewed-by: Kuniyuki Iwashima <kuniyu@google.com>
+Link: https://patch.msgid.link/20261030075843.2567707-1-edumazet@kernel.org
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ net/ipv4/tcp_ipv4.c | 21 ++++++++++++++++++++-
+ 1 file changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/net/ipv4/tcp_ipv4.c b/net/ipv4/tcp_ipv4.c
+index 0e6d03af09e5b..c88228c76920d 100644
+--- a/net/ipv4/tcp_ipv4.c
++++ b/net/ipv4/tcp_ipv4.c
+@@ -3392,6 +3392,7 @@ static int __net_init tcp_sk_init(struct net *net)
+ 
+ static void __net_exit tcp_sk_exit_batch(struct list_head *net_exit_list)
+ {
++	bool synced = false;
+ 	struct net *net;
+ 
+ 	/* make sure concurrent calls to tcp_sk_exit_batch from net_cleanup_work
+@@ -3406,9 +3407,27 @@ static void __net_exit tcp_sk_exit_batch(struct list_head *net_exit_list)
+ 
+ 	tcp_twsk_purge(net_exit_list);
+ 
++	/* inet_twsk_kill() unhashes a twsk before it is done with ehash
++	 * and bhash, and before it drops its tw_refcount reference,
++	 * so tcp_twsk_purge() can miss it. Such callers run with BH
++	 * disabled: wait for them before freeing a private ehash.
++	 */
++	list_for_each_entry(net, net_exit_list, exit_list) {
++		if (net->ipv4.tcp_death_row.hashinfo->pernet) {
++			synchronize_net();
++			synced = true;
++			break;
++		}
++	}
++
+ 	list_for_each_entry(net, net_exit_list, exit_list) {
+ 		inet_pernet_hashinfo_free(net->ipv4.tcp_death_row.hashinfo);
+-		WARN_ON_ONCE(!refcount_dec_and_test(&net->ipv4.tcp_death_row.tw_refcount));
++		/* Without a grace period, a concurrent inet_twsk_kill() might
++		 * still hold a tw_refcount reference. Let it drop it: struct net
++		 * is freed by a later cleanup_net(), after an RCU grace period.
++		 */
++		if (!refcount_dec_if_one(&net->ipv4.tcp_death_row.tw_refcount))
++			WARN_ON_ONCE(synced);
+ 		tcp_fastopen_ctx_destroy(net);
+ 	}
+ 
+-- 
+2.53.0
+

@@ -1,0 +1,110 @@
+From d99269047c484ce52bf90a2ea5a54f2c45014f25 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Sun, 1 Nov 2026 19:05:30 +0000
+Subject: bpf: Reset skb->cb after an lwt prog pushes an IP header
+
+From: Alexei Starovoitov <ast@kernel.org>
+
+[ Upstream commit b3ad42f6183286ab376389a5d26edf7ee3bdba27 ]
+
+IPCB(skb)->opt holds the offsets from the network header to the IPv4
+options. But bpf_lwt_push_ip_encap() moves the network header and does not
+change IPCB(skb). Then ip_forward_options() and __ip_options_echo() use the
+old offsets on the pushed header. Thus the kernel corrupts the skb and the
+stack. If the family changes, the kernel also reads IP6CB(skb) as
+IPCB(skb), or the reverse. With CONFIG_IPV6_MIP6, it reads IPSKB_FORWARDED
+as frag_max_size and adds a needless fragment header.
+
+Reset skb->cb after the prog. bpf_lwt_push_ip_encap() cannot do it, because
+bpf_prog_run_save_cb() can restore skb->cb. For IPv4 in IPv4, clear
+IPCB(skb)->opt as ip_tunnel_xmit() does. If the family changes, clear the
+cb of the new family but keep iif, because ip6_forward() gets the input
+device from it. Behind a VRF, skb->skb_iif is the VRF device and cannot
+replace iif. Do nothing for IPv6 in IPv6, as in seg6_do_srh_encap().
+
+Do the reset in bpf_input() only after a push. Without a push,
+ip_forward_options() needs the offsets. Do it in bpf_xmit() before each
+reroute, because an lwt_xmit prog can also change the options. Thus after a
+reroute without a push, ip_options_fragment() leaves the options in all
+fragments, and ICMP errors echo none. After BPF_OK or BPF_REDIRECT the skb
+goes to a device, thus bpf_xmit() does no reset. The inner IPv4 checksum
+can still be wrong after ip_rcv_options() changes an option.
+
+Fixes: 52f278774e79 ("bpf: implement BPF_LWT_ENCAP_IP mode in bpf_lwt_push_encap")
+Reported-by: Xiang Mei <xmei5@asu.edu>
+Suggested-by: Daniel Borkmann <daniel@iogearbox.net>
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://patch.msgid.link/20261101190535.1454146-23-alexei.starovoitov@gmail.com
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ net/core/lwt_bpf.c | 33 +++++++++++++++++++++++++++++++++
+ 1 file changed, 33 insertions(+)
+
+diff --git a/net/core/lwt_bpf.c b/net/core/lwt_bpf.c
+index b9270a08cc6d1..3a946e8709b16 100644
+--- a/net/core/lwt_bpf.c
++++ b/net/core/lwt_bpf.c
+@@ -85,6 +85,32 @@ static int run_lwt_bpf(struct sk_buff *skb, struct bpf_lwt_prog *lwt,
+ 	return ret;
+ }
+ 
++/*
++ * skb->cb still describes the IP header that was the first one before the
++ * prog ran. The option offsets in IPCB(skb)->opt are wrong for a pushed
++ * header, and a header of the other family needs the other layout. iif
++ * stays: behind a VRF skb->skb_iif is the L3 master and not the port.
++ * bpf_lwt_push_encap() cannot do this, because bpf_prog_run_save_cb() can
++ * restore skb->cb after the prog.
++ */
++static void bpf_lwt_reset_cb(struct sk_buff *skb, __be16 proto)
++{
++	int iif;
++
++	if (skb->protocol == proto) {
++		if (proto == htons(ETH_P_IP))
++			memset(&IPCB(skb)->opt, 0, sizeof(IPCB(skb)->opt));
++	} else if (skb->protocol == htons(ETH_P_IP)) {
++		iif = IP6CB(skb)->iif;
++		memset(IPCB(skb), 0, sizeof(*IPCB(skb)));
++		IPCB(skb)->iif = iif;
++	} else {
++		iif = IPCB(skb)->iif;
++		memset(IP6CB(skb), 0, sizeof(*IP6CB(skb)));
++		IP6CB(skb)->iif = iif;
++	}
++}
++
+ static int bpf_lwt_input_reroute(struct sk_buff *skb)
+ {
+ 	enum skb_drop_reason reason;
+@@ -124,6 +150,8 @@ static int bpf_lwt_input_reroute(struct sk_buff *skb)
+ static int bpf_input(struct sk_buff *skb)
+ {
+ 	struct dst_entry *dst = skb_dst(skb);
++	__be16 proto = skb->protocol;
++	unsigned int len = skb->len;
+ 	struct bpf_lwt *bpf;
+ 	int ret;
+ 
+@@ -132,6 +160,9 @@ static int bpf_input(struct sk_buff *skb)
+ 		ret = run_lwt_bpf(skb, &bpf->in, dst, NO_REDIRECT);
+ 		if (ret < 0)
+ 			return ret;
++		/* An lwt_in prog can change the length only with a push. */
++		if (skb->len != len)
++			bpf_lwt_reset_cb(skb, proto);
+ 		if (ret == BPF_LWT_REROUTE)
+ 			return bpf_lwt_input_reroute(skb);
+ 	}
+@@ -311,6 +342,8 @@ static int bpf_xmit(struct sk_buff *skb)
+ 		case BPF_REDIRECT:
+ 			return LWTUNNEL_XMIT_DONE;
+ 		case BPF_LWT_REROUTE:
++			/* An lwt_xmit prog can also write to the options. */
++			bpf_lwt_reset_cb(skb, proto);
+ 			return bpf_lwt_xmit_reroute(skb);
+ 		default:
+ 			return ret;
+-- 
+2.53.0
+

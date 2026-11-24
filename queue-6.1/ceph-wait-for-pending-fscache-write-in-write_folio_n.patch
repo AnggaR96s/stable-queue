@@ -1,0 +1,79 @@
+From 7bf9bb8a62f39a7966503d6483f07182fd270a64 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 2 Sep 2026 12:11:26 -0400
+Subject: ceph: wait for pending fscache write in write_folio_nounlock()
+
+From: Tal Zussman <tz2294@columbia.edu>
+
+[ Upstream commit 3f7655f0d9186656c6f1cbc012a39c866d4aaabf ]
+
+write_folio_nounlock() marks the folio with PG_private_2 via
+ceph_set_page_fscache() and starts an async write to the cache via
+ceph_fscache_write_to_cache(). PG_private_2 is only cleared once that
+write completes.
+
+If the OSD write fails, the error paths return without waiting for the
+cache write. On retry, ceph_find_incompatible() would wait for
+writeback, but not for PG_private_2, before calling
+write_folio_nounlock() again, which would trip the VM_BUG_ON_FOLIO() in
+folio_start_private_2().
+
+Wait for any pending cache write before starting writeback on the
+folio. Do so before bumping the writeback congestion count and
+allocating the possibly mempool-backed OSD request, so that a thread
+sleeping on the cache I/O does not hold either while it waits.
+Add ceph_folio_wait_fscache(), a wrapper for folio_wait_private_2(), and
+use it.
+
+Fixes: 1702e7973410 ("ceph: add fscache writeback support")
+Reported-by: Sashiko <sashiko-bot@kernel.org>
+Link: https://sashiko.dev/#/patchset/20260804-remove-wait-on-page-writeback-v2-0-81f0ab065284%40columbia.edu?part=7
+Signed-off-by: Tal Zussman <tz2294@columbia.edu>
+Reviewed-by: Alex Markuze <amarkuze@redhat.com>
+Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+[ sashal: Added a ceph_folio_wait_fscache() wrapper and stub, and placed the call in the older writepage_nounlock() with dout() macros, keeping the extra was_async argument in ceph_fscache_write_terminated(). ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/ceph/addr.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/fs/ceph/addr.c b/fs/ceph/addr.c
+index 11bbcda371124..0e5fa2617c6cc 100644
+--- a/fs/ceph/addr.c
++++ b/fs/ceph/addr.c
+@@ -479,6 +479,11 @@ static void ceph_set_page_fscache(struct page *page)
+ 	set_page_fscache(page);
+ }
+ 
++static void ceph_folio_wait_fscache(struct folio *folio)
++{
++	folio_wait_private_2(folio); /* [DEPRECATED] */
++}
++
+ static void ceph_fscache_write_terminated(void *priv, ssize_t error, bool was_async)
+ {
+ 	struct inode *inode = priv;
+@@ -500,6 +505,10 @@ static inline void ceph_set_page_fscache(struct page *page)
+ {
+ }
+ 
++static inline void ceph_folio_wait_fscache(struct folio *folio)
++{
++}
++
+ static inline void ceph_fscache_write_to_cache(struct inode *inode, u64 off, u64 len, bool caching)
+ {
+ }
+@@ -660,6 +669,9 @@ static int writepage_nounlock(struct page *page, struct writeback_control *wbc)
+ 	dout("writepage %p page %p index %lu on %llu~%llu snapc %p seq %lld\n",
+ 	     inode, page, page->index, page_off, len, snapc, snapc->seq);
+ 
++	/* wait for a cache write left pending by a previously failed attempt */
++	ceph_folio_wait_fscache(folio);
++
+ 	if (atomic_long_inc_return(&fsc->writeback_count) >
+ 	    CONGESTION_ON_THRESH(fsc->mount_options->congestion_kb))
+ 		fsc->write_congested = true;
+-- 
+2.53.0
+

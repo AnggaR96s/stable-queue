@@ -1,0 +1,117 @@
+From 41dc5f308fa49b6b84bcdb21c7c07f08eeed2370 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 1 Oct 2026 20:47:17 +0000
+Subject: ipv4: Batch rt_flush_dev() in netdev_run_todo().
+
+From: Kuniyuki Iwashima <kuniyu@google.com>
+
+[ Upstream commit ca6854799069778fef446d307935f764cc3d3afb ]
+
+IPv4 uncached routes are linked to the global per-cpu lists,
+rt_uncached_list.
+
+When unregistering a netdev, rt_flush_dev() iterates over the
+potentially long lists to find uncached routes tied to the device
+and swap it with blackhole_netdev.
+
+Since it is called for every device in dying netns under RTNL,
+it adds O(N_dev x (N_cpu + N_route)) costs to any batched device
+unregistration.
+
+Let's call it once per batched device unregistration without RTNL.
+
+Note that rt_flush_dev() must be called after setting dev->reg_state
+to NETREG_UNREGISTERED.  Otherwise, because rt_flush_dev(NULL) runs
+without RTNL, it could race with unregister_netdevice_many_notify()
+and prematurely purge routes for NETREG_UNREGISTERING dev, for
+which flush_all_backlogs() has not been called yet.
+
+Reported-by: Chris J Arges <carges@cloudflare.com>
+Closes: https://lore.kernel.org/netdev/20260917-hash-bucket-route-lists-v3-0-30493a37b6eb@cloudflare.com/
+Signed-off-by: Kuniyuki Iwashima <kuniyu@google.com>
+Reviewed-by: Ido Schimmel <idosch@nvidia.com>
+Tested-by: Chris J Arges <carges@cloudflare.com>
+Link: https://patch.msgid.link/20261001204752.2572265-6-kuniyu@google.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Stable-dep-of: a0fe1a3f390a ("ipv6: Flush rt->from in rt6_uncached_list_flush_dev().")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/net/route.h |  6 ++++++
+ net/core/dev.c      |  4 ++++
+ net/ipv4/route.c    | 11 +++++++++--
+ 3 files changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/include/net/route.h b/include/net/route.h
+index 45290177a33c4..b4dfa2dcfd6cc 100644
+--- a/include/net/route.h
++++ b/include/net/route.h
+@@ -129,7 +129,13 @@ struct in_device;
+ 
+ int ip_rt_init(void);
+ void rt_cache_flush(struct net *net);
++#ifdef CONFIG_INET
+ void rt_flush_dev(struct net_device *dev);
++#else
++static inline void rt_flush_dev(struct net_device *dev)
++{
++}
++#endif
+ 
+ static inline void inet_sk_init_flowi4(const struct inet_sock *inet,
+ 				       struct flowi4 *fl4)
+diff --git a/net/core/dev.c b/net/core/dev.c
+index cc95d271a3ec8..270adccbdcff5 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -129,6 +129,7 @@
+ #include <linux/ip.h>
+ #include <net/ip.h>
+ #include <net/mpls.h>
++#include <net/route.h>
+ #include <linux/ipv6.h>
+ #include <linux/in.h>
+ #include <linux/jhash.h>
+@@ -11885,6 +11886,9 @@ void netdev_run_todo(void)
+ 		linkwatch_sync_dev(dev);
+ 	}
+ 
++	if (!list_empty(&list))
++		rt_flush_dev(NULL);
++
+ 	cnt = 0;
+ 	while (!list_empty(&list)) {
+ 		dev = netdev_wait_allrefs_any(&list);
+diff --git a/net/ipv4/route.c b/net/ipv4/route.c
+index 1d8fcd19eaf65..67c4fae2384b3 100644
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@ -1589,6 +1589,9 @@ void rt_flush_dev(struct net_device *dev)
+ 	struct rtable *rt, *safe;
+ 	int cpu;
+ 
++	if (dev && dev->dismantle)
++		return;
++
+ 	for_each_possible_cpu(cpu) {
+ 		struct uncached_list *ul = &per_cpu(rt_uncached_list, cpu);
+ 
+@@ -1597,10 +1600,14 @@ void rt_flush_dev(struct net_device *dev)
+ 
+ 		spin_lock_bh(&ul->lock);
+ 		list_for_each_entry_safe(rt, safe, &ul->head, dst.rt_uncached) {
+-			if (rt->dst.dev != dev)
++			struct net_device *rt_dev = rt->dst.dev;
++
++			if (dev ? rt_dev != dev :
++			    READ_ONCE(rt_dev->reg_state) != NETREG_UNREGISTERED)
+ 				continue;
++
+ 			rcu_assign_pointer(rt->dst.dev_rcu, blackhole_netdev);
+-			netdev_ref_replace(dev, blackhole_netdev,
++			netdev_ref_replace(rt_dev, blackhole_netdev,
+ 					   &rt->dst.dev_tracker, GFP_ATOMIC);
+ 			list_del_init(&rt->dst.rt_uncached);
+ 		}
+-- 
+2.53.0
+

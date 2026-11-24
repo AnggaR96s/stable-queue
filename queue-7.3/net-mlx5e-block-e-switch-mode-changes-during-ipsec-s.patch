@@ -1,0 +1,140 @@
+From 4ae12177d63faaccead2c4da1adf4dbeafa963a8 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 5 Nov 2026 23:16:35 +0200
+Subject: net/mlx5e: Block E-Switch mode changes during IPsec state creation
+
+From: Cosmin Ratiu <cratiu@nvidia.com>
+
+[ Upstream commit 0d09de8e4f11391e8468219dbbc7af027e39e9b8 ]
+
+mlx5e_xfrm_add_state() reads priv->ipsec before blocking eswitch mode
+changes. A concurrent profile change can free the saved IPsec context
+and cause use-after-free.
+
+The temporary mode reservation was added in commit 22239eb258bc
+("net/mlx5e: Prevent tunnel reformat when tunnel mode not allowed")
+after saving priv->ipsec but the race was actually enabled by the
+"Fixes" commit.
+Extend the reservation to cover obtaining the context as well.
+
+Use mlx5_eswitch_block_mode(mdev, false) for the temporary reservation,
+as policy creation does, to check operation ownership under mode_lock
+without rejecting existing eswitch users. This allows reusing existing
+IPsec tables while TC rules exist on VF representors.
+
+Check the context only after taking the mode reservation, so a
+concurrent mode change consistently returns -EBUSY and a missing context
+returns -EOPNOTSUPP, preserving software fallback for crypto offload.
+Keep the atomic acquire-placeholder path exempt, since it creates no
+hardware state and cannot take sleeping locks.
+
+This was found by Sashiko, during review of the last patch in the
+series. No reproduction attempted, as it seems quite a tricky race to
+successfully trigger.
+
+Fixes: 7a9fb35e8c3a ("net/mlx5e: Do not reload ethernet ports when changing eswitch mode")
+Signed-off-by: Cosmin Ratiu <cratiu@nvidia.com>
+Reviewed-by: Dragos Tatulea <dtatulea@nvidia.com>
+Reviewed-by: Jianbo Liu <jianbol@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Link: https://patch.msgid.link/20261105211637.1083978-8-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ .../mellanox/mlx5/core/en_accel/ipsec.c       | 37 ++++++++++++-------
+ 1 file changed, 23 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.c b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.c
+index 09f51f6fa8675..c1ff8f7a056e0 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ipsec.c
+@@ -771,6 +771,7 @@ static int mlx5e_xfrm_add_state(struct net_device *dev,
+ 				struct xfrm_state *x,
+ 				struct netlink_ext_ack *extack)
+ {
++	bool is_acq = x->xso.flags & XFRM_DEV_OFFLOAD_FLAG_ACQ;
+ 	struct mlx5e_ipsec_sa_entry *sa_entry = NULL;
+ 	bool allow_tunnel_mode = false;
+ 	struct mlx5_core_dev *mdev;
+@@ -787,20 +788,31 @@ static int mlx5e_xfrm_add_state(struct net_device *dev,
+ 		NL_SET_ERR_MSG_MOD(extack, "Eswitch busy, can't add state");
+ 		return -EBUSY;
+ 	}
+-	if (!priv->ipsec)
+-		return -EOPNOTSUPP;
++
++	if (!is_acq) {
++		err = mlx5_eswitch_block_mode(mdev, false);
++		if (err)
++			return err;
++	}
+ 
+ 	ipsec = priv->ipsec;
+-	gfp = (x->xso.flags & XFRM_DEV_OFFLOAD_FLAG_ACQ) ? GFP_ATOMIC : GFP_KERNEL;
++	if (!ipsec) {
++		err = -EOPNOTSUPP;
++		goto unblock_mode;
++	}
++
++	gfp = is_acq ? GFP_ATOMIC : GFP_KERNEL;
+ 	sa_entry = kzalloc_obj(*sa_entry, gfp);
+-	if (!sa_entry)
+-		return -ENOMEM;
++	if (!sa_entry) {
++		err = -ENOMEM;
++		goto unblock_mode;
++	}
+ 
+ 	sa_entry->x = x;
+ 	sa_entry->dev = dev;
+ 	sa_entry->ipsec = ipsec;
+ 	/* Check if this SA is originated from acquire flow temporary SA */
+-	if (x->xso.flags & XFRM_DEV_OFFLOAD_FLAG_ACQ) {
++	if (is_acq) {
+ 		x->xso.offload_handle = (unsigned long)sa_entry;
+ 		return 0;
+ 	}
+@@ -814,21 +826,17 @@ static int mlx5e_xfrm_add_state(struct net_device *dev,
+ 		goto err_xfrm;
+ 	}
+ 
+-	err = mlx5_eswitch_block_mode(mdev, true);
+-	if (err)
+-		goto unblock_ipsec;
+-
+ 	if (x->props.mode == XFRM_MODE_TUNNEL &&
+ 	    x->xso.type == XFRM_DEV_OFFLOAD_PACKET) {
+ 		err = mlx5e_ipsec_fs_tunnel_allowed(sa_entry);
+ 		if (err < 0)
+-			goto unblock_mode;
++			goto unblock_ipsec;
+ 		allow_tunnel_mode = err;
+ 		if (!allow_tunnel_mode) {
+ 			NL_SET_ERR_MSG_MOD(extack,
+ 					   "Packet offload tunnel mode is disabled due to encap settings");
+ 			err = -EINVAL;
+-			goto unblock_mode;
++			goto unblock_ipsec;
+ 		}
+ 	}
+ 
+@@ -904,13 +912,14 @@ static int mlx5e_xfrm_add_state(struct net_device *dev,
+ unblock_encap:
+ 	if (allow_tunnel_mode)
+ 		mlx5_eswitch_unblock_encap(mdev);
+-unblock_mode:
+-	mlx5_eswitch_unblock_mode(mdev);
+ unblock_ipsec:
+ 	mlx5_eswitch_unblock_ipsec(mdev);
+ err_xfrm:
+ 	kfree(sa_entry);
+ 	NL_SET_ERR_MSG_WEAK_MOD(extack, "Device failed to offload this state");
++unblock_mode:
++	if (!is_acq)
++		mlx5_eswitch_unblock_mode(mdev);
+ 	return err;
+ }
+ 
+-- 
+2.53.0
+

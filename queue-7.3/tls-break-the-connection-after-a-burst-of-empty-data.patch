@@ -1,0 +1,152 @@
+From 26c7c7df53f1a3db755489ef6db071736c125449 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 11 Nov 2026 10:55:18 -0800
+Subject: tls: Break the connection after a burst of empty data records
+
+From: Jakub Kicinski <kuba@kernel.org>
+
+[ Upstream commit 201f0531e413d6cdd9673a77bea340839e1713ae ]
+
+TLS permits zero-length application_data records, and RFC 8446
+suggests them for generating cover traffic. Nothing bounds how many of
+them a reader processes back to back, though. They advance neither
+loop bound in tls_sw_recvmsg() and tls_sw_read_sock(), so a peer
+streaming them faster than the reader decrypts them keeps it in the
+kernel for as long as they arrive. recvmsg() does not check for signals
+while records are ready, and its peek and async paths queue every empty
+record on rx_list. read_sock consumers like nvme-tcp hold the socket
+lock throughout and never get control back.
+
+Break the connection once a reader decrypts more than 128 consecutive
+empty data records without sleeping or returning to its caller in
+between, treating the burst as a protocol violation like a malformed
+record header. A stream of empty records which the reader keeps up with
+costs no more than any other traffic, so the count starts over on every
+read and whenever the reader waits for the next record. The strparser
+is stopped before it parses the next record, so the reader gets the
+error from tls_rx_rec_wait() and no later record is delivered.
+Returning to the caller and keeping the connection alive would need a
+way to wake read_sock consumers which installed their own sk_data_ready
+after the handshake, a lot of code for a peer that is either broken or
+malicious.
+
+Consume empty records in recvmsg() rather than queuing them on rx_list,
+so that repeated MSG_PEEK cannot pile them up past the per-read count.
+Decrypt them synchronously, too. Once a recvmsg() call has decrypted a
+record asynchronously, recv_end replaces the error with the result of
+process_rx_list(), so a call that saw only empty records returns 0, a
+false EOF, instead of the error or -EAGAIN.
+
+Reported-by: sashiko-bot <sashiko-bot@kernel.org>
+Closes: https://sashiko.dev/#/patchset/20260720-tcp-read-sock-v2-0-29545d034f3c@kernel.org?part=1
+Closes: https://sashiko.dev/#/patchset/20260630191551.875664-1-cel@kernel.org?part=1
+Link: https://lore.kernel.org/all/20261019-tls-follow-on-v6-0-ab01c4ecca0c@kernel.org/
+Fixes: c46234ebb4d1 ("tls: RX path for ktls")
+Fixes: 3be28e2c9cd0 ("net/tls: Consume empty data records in tls_sw_read_sock()")
+Reviewed-by: Chuck Lever <cel@kernel.org>
+Link: https://patch.msgid.link/20261111185522.2859004-2-kuba@kernel.org
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/net/tls.h |  1 +
+ net/tls/tls_sw.c  | 29 +++++++++++++++++++++++++----
+ 2 files changed, 26 insertions(+), 4 deletions(-)
+
+diff --git a/include/net/tls.h b/include/net/tls.h
+index e57bef58851ea..0b001b8ab1c3b 100644
+--- a/include/net/tls.h
++++ b/include/net/tls.h
+@@ -139,6 +139,7 @@ struct tls_sw_context_rx {
+ 	u8 zc_capable:1;
+ 	u8 reader_contended:1;
+ 	bool key_update_pending;
++	u8 empty_run;
+ 
+ 	struct tls_strparser strp;
+ 
+diff --git a/net/tls/tls_sw.c b/net/tls/tls_sw.c
+index 47e46547108e9..3dc0d9db3e882 100644
+--- a/net/tls/tls_sw.c
++++ b/net/tls/tls_sw.c
+@@ -1153,6 +1153,7 @@ tls_rx_rec_wait(struct sock *sk, bool nonblock, bool released, bool has_copied)
+ 		if (!timeo)
+ 			return -EAGAIN;
+ 
++		ctx->empty_run = 0;
+ 		released = true;
+ 		add_wait_queue(sk_sleep(sk), &wait);
+ 		sk_set_bit(SOCKWQ_ASYNC_WAITDATA, sk);
+@@ -1572,6 +1573,7 @@ static int tls_rx_one_record(struct sock *sk, struct msghdr *msg,
+ 			     struct tls_decrypt_arg *darg)
+ {
+ 	struct tls_context *tls_ctx = tls_get_ctx(sk);
++	struct tls_sw_context_rx *ctx = tls_sw_ctx_rx(tls_ctx);
+ 	struct tls_prot_info *prot = &tls_ctx->prot_info;
+ 	struct strp_msg *rxm;
+ 	int err;
+@@ -1589,6 +1591,19 @@ static int tls_rx_one_record(struct sock *sk, struct msghdr *msg,
+ 	rxm->full_len -= prot->overhead_size;
+ 	tls_advance_record_sn(sk, prot, &tls_ctx->rx);
+ 
++	/* A peer may send empty data records, e.g. as cover traffic, but
++	 * a burst of them traps the reader in the kernel. Treat more than
++	 * 128 in a row, without the reader sleeping or returning to the
++	 * caller in between, as a protocol violation. Stop the strparser
++	 * before the next record gets parsed, so the reader finds the
++	 * error in tls_rx_rec_wait().
++	 */
++	if (rxm->full_len ||
++	    tls_msg(darg->skb)->control != TLS_RECORD_TYPE_DATA)
++		ctx->empty_run = 0;
++	else if (unlikely(++ctx->empty_run > 128))
++		tls_strp_abort_strp(&ctx->strp, -EBADMSG);
++
+ 	return tls_check_pending_rekey(sk, tls_ctx, darg->skb);
+ }
+ 
+@@ -1768,6 +1783,7 @@ static int tls_rx_reader_acquire(struct sock *sk, struct tls_sw_context_rx *ctx,
+ 	}
+ 
+ 	WRITE_ONCE(ctx->reader_present, 1);
++	ctx->empty_run = 0;
+ 
+ 	return 0;
+ }
+@@ -1881,9 +1897,11 @@ int tls_sw_recvmsg(struct sock *sk,
+ 		    tlm->control == TLS_RECORD_TYPE_DATA)
+ 			darg.zc = true;
+ 
+-		/* Do not use async mode if record is non-data */
++		/* Do not use async mode if record is non-data or empty,
++		 * recv_end would report an error after empty records as EOF.
++		 */
+ 		if (tlm->control == TLS_RECORD_TYPE_DATA)
+-			darg.async = ctx->async_capable;
++			darg.async = ctx->async_capable && to_decrypt;
+ 		else
+ 			darg.async = false;
+ 
+@@ -1925,7 +1943,10 @@ int tls_sw_recvmsg(struct sock *sk,
+ 
+ 			DEBUG_NET_WARN_ON_ONCE(darg.skb == ctx->strp.anchor);
+ 
+-			if (async) {
++			/* Consume empty records, even when peeking, so that
++			 * they cannot pile up on rx_list.
++			 */
++			if (async && chunk) {
+ 				/* TLS 1.2-only, to_decrypt must be text len */
+ 				chunk = min_t(int, to_decrypt, len);
+ 				async_copy_bytes += chunk;
+@@ -1946,7 +1967,7 @@ int tls_sw_recvmsg(struct sock *sk,
+ 			if (err < 0)
+ 				goto put_on_rx_list_err;
+ 
+-			if (is_peek) {
++			if (is_peek && chunk) {
+ 				peeked += chunk;
+ 				goto put_on_rx_list;
+ 			}
+-- 
+2.53.0
+

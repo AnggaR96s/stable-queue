@@ -1,0 +1,149 @@
+From cbcade0b62c1c5ad00ef0a757f30281e3f779ed5 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 3 Mar 2025 19:15:35 -0500
+Subject: introduce a flag for explicitly marking persistently pinned dentries
+
+From: Al Viro <viro@zeniv.linux.org.uk>
+
+[ Upstream commit 8a210cacf5dc2a6210ee42aeca5cd03b2400876f ]
+
+Some filesystems use a kinda-sorta controlled dentry refcount leak to pin
+dentries of created objects in dcache (and undo it when removing those).
+Reference is grabbed and not released, but it's not actually _stored_
+anywhere.  That works, but it's hard to follow and verify; among other
+things, we have no way to tell _which_ of the increments is intended
+to be an unpaired one.  Worse, on removal we need to decide whether
+the reference had already been dropped, which can be non-trivial if
+that removal is on umount and we need to figure out if this dentry is
+pinned due to e.g. unlink() not done.  Usually that is handled by using
+kill_litter_super() as ->kill_sb(), but there are open-coded special
+cases of the same (consider e.g. /proc/self).
+
+Things get simpler if we introduce a new dentry flag (DCACHE_PERSISTENT)
+marking those "leaked" dentries.  Having it set claims responsibility
+for +1 in refcount.
+
+The end result this series is aiming for:
+
+* get these unbalanced dget() and dput() replaced with new primitives that
+  would, in addition to adjusting refcount, set and clear persistency flag.
+* instead of having kill_litter_super() mess with removing the remaining
+  "leaked" references (e.g. for all tmpfs files that hadn't been removed
+  prior to umount), have the regular shrink_dcache_for_umount() strip
+  DCACHE_PERSISTENT of all dentries, dropping the corresponding
+  reference if it had been set.  After that kill_litter_super() becomes
+  an equivalent of kill_anon_super().
+
+Doing that in a single step is not feasible - it would affect too many places
+in too many filesystems.  It has to be split into a series.
+
+Here we
+	* introduce the new flag
+	* teach shrink_dcache_for_umount() to handle it (i.e. remove
+and drop refcount on anything that survives to umount with that flag
+still set)
+	* teach kill_litter_super() that anything with that flag does
+*not* need to be unpinned.
+
+Next commits will add primitives for maintaing that flag and convert the
+common helpers to those.  After that - a long series of per-filesystem
+patches converting to those primitives.
+
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+Stable-dep-of: 309f7a5585ae ("libfs: walk offset directories in offset order")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/dcache.c            | 27 ++++++++++++++++++++++-----
+ include/linux/dcache.h |  1 +
+ 2 files changed, 23 insertions(+), 5 deletions(-)
+
+diff --git a/fs/dcache.c b/fs/dcache.c
+index 77792a9e86737..467095024991b 100644
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@ -1526,6 +1526,15 @@ static enum d_walk_ret select_collect(void *_data, struct dentry *dentry)
+ 	return ret;
+ }
+ 
++static enum d_walk_ret select_collect_umount(void *_data, struct dentry *dentry)
++{
++	if (dentry->d_flags & DCACHE_PERSISTENT) {
++		dentry->d_flags &= ~DCACHE_PERSISTENT;
++		dentry->d_lockref.count--;
++	}
++	return select_collect(_data, dentry);
++}
++
+ static enum d_walk_ret select_collect2(void *_data, struct dentry *dentry)
+ {
+ 	struct select_data *data = _data;
+@@ -1554,18 +1563,20 @@ static enum d_walk_ret select_collect2(void *_data, struct dentry *dentry)
+ }
+ 
+ /**
+- * shrink_dcache_parent - prune dcache
++ * shrink_dcache_tree - prune dcache
+  * @parent: parent of entries to prune
++ * @for_umount: true if we want to unpin the persistent ones
+  *
+  * Prune the dcache to remove unused children of the parent dentry.
+  */
+-void shrink_dcache_parent(struct dentry *parent)
++static void shrink_dcache_tree(struct dentry *parent, bool for_umount)
+ {
+ 	for (;;) {
+ 		struct select_data data = {.start = parent};
+ 
+ 		INIT_LIST_HEAD(&data.dispose);
+-		d_walk(parent, &data, select_collect);
++		d_walk(parent, &data,
++			for_umount ? select_collect_umount : select_collect);
+ 
+ 		if (!list_empty(&data.dispose)) {
+ 			shrink_dentry_list(&data.dispose);
+@@ -1590,6 +1601,11 @@ void shrink_dcache_parent(struct dentry *parent)
+ 			shrink_dentry_list(&data.dispose);
+ 	}
+ }
++
++void shrink_dcache_parent(struct dentry *parent)
++{
++	shrink_dcache_tree(parent, false);
++}
+ EXPORT_SYMBOL(shrink_dcache_parent);
+ 
+ static enum d_walk_ret umount_check(void *_data, struct dentry *dentry)
+@@ -1616,7 +1632,7 @@ static enum d_walk_ret umount_check(void *_data, struct dentry *dentry)
+ 
+ static void do_one_tree(struct dentry *dentry)
+ {
+-	shrink_dcache_parent(dentry);
++	shrink_dcache_tree(dentry, true);
+ 	d_walk(dentry, dentry, umount_check);
+ 	d_drop(dentry);
+ 	dput(dentry);
+@@ -3130,7 +3146,8 @@ static enum d_walk_ret d_genocide_kill(void *data, struct dentry *dentry)
+ {
+ 	struct dentry *root = data;
+ 	if (dentry != root) {
+-		if (d_unhashed(dentry) || !dentry->d_inode)
++		if (d_unhashed(dentry) || !dentry->d_inode ||
++		    dentry->d_flags & DCACHE_PERSISTENT)
+ 			return D_WALK_SKIP;
+ 
+ 		if (!(dentry->d_flags & DCACHE_GENOCIDE)) {
+diff --git a/include/linux/dcache.h b/include/linux/dcache.h
+index c83e02b943894..94b58655322a0 100644
+--- a/include/linux/dcache.h
++++ b/include/linux/dcache.h
+@@ -225,6 +225,7 @@ enum dentry_flags {
+ 	DCACHE_PAR_LOOKUP		= BIT(24),	/* being looked up (with parent locked shared) */
+ 	DCACHE_DENTRY_CURSOR		= BIT(25),
+ 	DCACHE_NORCU			= BIT(26),	/* No RCU delay for freeing */
++	DCACHE_PERSISTENT		= BIT(27)
+ };
+ 
+ #define DCACHE_MANAGED_DENTRY \
+-- 
+2.53.0
+

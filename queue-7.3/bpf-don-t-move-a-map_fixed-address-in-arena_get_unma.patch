@@ -1,0 +1,104 @@
+From 66c207c80401e09b09693b4196ef2a2ae61352c1 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 2 Nov 2026 06:42:30 +0000
+Subject: bpf: Don't move a MAP_FIXED address in arena_get_unmapped_area()
+
+From: Alexei Starovoitov <ast@kernel.org>
+
+[ Upstream commit 92b5ce3ca5b7c641e2678f92419aa7833951bc9d ]
+
+The user range of an arena must not cross a 4 GiB boundary. Thus
+arena_get_unmapped_area() asks the mm for 2 * len bytes and rounds the
+result up if necessary. This is correct only if the mm finds a free range.
+With MAP_FIXED the mm does no search and returns addr. For
+MAP_FIXED_NOREPLACE, do_mmap() also sets MAP_FIXED.
+
+With MAP_FIXED the arena is not at addr after round_up(). Thus mmap()
+removes mappings outside the range from addr to addr + len. It keeps a part
+of those in this range. Also, round_up() can wrap to address 0, and the
+test for address 0 is before it.
+
+The arch code gets twice the length of the mapping. Thus it can refuse a
+valid MAP_FIXED range. On s390 the arch code also grows the page table for
+the range. With the double length it can omit this step for a valid range.
+
+The test for a crossing is not exact. Because ret is a long, ret >> 32
+extends the sign, but the other side is unsigned. The sides are never equal
+for an address with bit 63 set, and round_up() always runs. Such user
+addresses exist on s390. arena_map_alloc() does the same test with a u64.
+
+With MAP_FIXED, pass len to the mm. Return -EINVAL if the range crosses a
+boundary, as for address 0. Make ret unsigned, so that only these ranges
+get the error. On x86-64, if round_up() gives address 0 today, mmap() now
+fails with -EINVAL or with -ENOMEM from the mm. Today mmap() can also fail
+for the address after round_up(), for example with -ENOMEM, -EEXIST, -EPERM
+or -EBUSY.
+
+Without MAP_FIXED the mm must still find a free range of 2 * len bytes
+inside the address space of the task. The range after round_up() is inside
+it, and round_up() cannot wrap. An address with bit 63 set now moves only
+if its range crosses a boundary.
+
+For an arena, libbpf uses MAP_FIXED only with map_extra, and
+arena_map_alloc() refuses a map_extra range that crosses a boundary. A
+subsequent mmap() must use the range of the first mmap(). For mmap() of the
+map fd, this range comes from arena_get_unmapped_area(), thus it crosses no
+boundary. arena_map_alloc() still accepts a map_extra above TASK_SIZE, and
+mmap() of such an arena fails.
+
+Fixes: 317460317a02 ("bpf: Introduce bpf_arena.")
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://patch.msgid.link/20261102064231.2153879-2-alexei.starovoitov@gmail.com
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ kernel/bpf/arena.c | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/kernel/bpf/arena.c b/kernel/bpf/arena.c
+index 8e1f7bfd2b4f7..5b65ffefbebd6 100644
+--- a/kernel/bpf/arena.c
++++ b/kernel/bpf/arena.c
+@@ -7,6 +7,7 @@
+ #include <linux/irq_work.h>
+ #include "linux/filter.h"
+ #include <linux/llist.h>
++#include <linux/mman.h>
+ #include <linux/btf_ids.h>
+ #include <linux/vmalloc.h>
+ #include <linux/pagemap.h>
+@@ -630,7 +631,7 @@ static unsigned long arena_get_unmapped_area(struct file *filp, unsigned long ad
+ {
+ 	struct bpf_map *map = filp->private_data;
+ 	struct bpf_arena *arena = container_of(map, struct bpf_arena, map);
+-	long ret;
++	unsigned long ret;
+ 
+ 	if (pgoff)
+ 		return -EINVAL;
+@@ -647,7 +648,13 @@ static unsigned long arena_get_unmapped_area(struct file *filp, unsigned long ad
+ 			return -EINVAL;
+ 	}
+ 
+-	ret = mm_get_unmapped_area(filp, addr, len * 2, 0, flags);
++	/*
++	 * Without MAP_FIXED the mm finds a free range. Ask for twice the
++	 * length, so that there is room for round_up(). With MAP_FIXED the mm
++	 * does no search, and the caller wants this address. Thus the range
++	 * cannot move.
++	 */
++	ret = mm_get_unmapped_area(filp, addr, flags & MAP_FIXED ? len : len * 2, 0, flags);
+ 	if (IS_ERR_VALUE(ret))
+ 		return ret;
+ 	if (!ret)
+@@ -655,6 +662,8 @@ static unsigned long arena_get_unmapped_area(struct file *filp, unsigned long ad
+ 		return -EINVAL;
+ 	if ((ret >> 32) == ((ret + len - 1) >> 32))
+ 		return ret;
++	if (flags & MAP_FIXED)
++		return -EINVAL;
+ 	return round_up(ret, SZ_4G);
+ }
+ 
+-- 
+2.53.0
+

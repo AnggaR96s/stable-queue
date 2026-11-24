@@ -1,0 +1,101 @@
+From 8d73f09bd932dd8b64fcec7080afa8ef4c441da6 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 6 Nov 2026 18:20:06 +0000
+Subject: net: Make PSP skb extension survive packet scrubbing
+
+From: Wei Wang <weiwan@google.com>
+
+[ Upstream commit b22268fc3ddc1e634daf177e53b04e96fa58c330 ]
+
+skb_scrub_packet() drops all skb extensions unconditionally via
+skb_ext_reset(). It runs on tunnel encap/decap (ip_tunnel_rcv, vxlan_rcv,
+etc.) and virtual device forwarding/redirection (dev_forward_skb,
+netkit_xmit, skb_do_redirect).
+
+When a virtual device such as netkit is associated with a PSP device in
+another network namespace via PSP_CMD_DEV_ASSOC, incoming PSP packets
+decapsulated by psp_dev_rcv() lose their SKB_EXT_PSP extension when
+scrubbed during redirection into the peer netns. Without SKB_EXT_PSP,
+__psp_sk_rx_policy_check() rejects incoming TCP data segments at the
+socket layer with SKB_DROP_REASON_PSP_INPUT.
+
+Introduce a static skb_ext_scrub() helper in net/core/skbuff.c to
+preserve SKB_EXT_PSP across skb_scrub_packet() while dropping all other
+extensions. If SKB_EXT_PSP is not active, skb_ext_scrub() simply calls
+skb_ext_reset(). If SKB_EXT_PSP is the only extension in the skb_ext
+buffer, nothing needs to be scrubbed. Otherwise, save the PSP metadata,
+reset the extension block, and re-add a fresh SKB_EXT_PSP extension.
+
+Fixes: 06c2dce2d0f6 ("psp: add new netlink cmd for dev-assoc and dev-disassoc")
+Link: https://lore.kernel.org/r/20260910-bpf-meta-inside-skb-ext-v2-3-0b21e42180b0@cloudflare.com
+Reported-by: Daniel Zahka <daniel.zahka@gmail.com>
+Closes: https://lore.kernel.org/netdev/DLODSKPY6ON6.1G6SP3CFFLCPJ@gmail.com/
+Co-developed-by: Jakub Sitnicki <jakub@cloudflare.com>
+Signed-off-by: Jakub Sitnicki <jakub@cloudflare.com>
+Signed-off-by: Wei Wang <weiwan@google.com>
+Reviewed-by: Daniel Zahka <daniel.zahka@gmail.com>
+Link: https://patch.msgid.link/20261106182007.374660-2-weiwan@google.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ net/core/skbuff.c | 30 ++++++++++++++++++++++++++++--
+ 1 file changed, 28 insertions(+), 2 deletions(-)
+
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+index 892ab589ad396..e685964654df5 100644
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -6311,6 +6311,31 @@ bool skb_try_coalesce(struct sk_buff *to, struct sk_buff *from,
+ }
+ EXPORT_SYMBOL(skb_try_coalesce);
+ 
++static void skb_ext_scrub(struct sk_buff *skb)
++{
++#if IS_ENABLED(CONFIG_INET_PSP)
++	struct psp_skb_ext *pse = skb_ext_find(skb, SKB_EXT_PSP);
++
++	if (pse) {
++		struct skb_ext *ext = skb->extensions;
++		struct psp_skb_ext tmp;
++
++		/* Nothing else to scrub if PSP is the only extension in ext. */
++		if (ext->chunks == SKB_EXT_CHUNKSIZEOF(*ext) +
++				   skb_ext_type_len[SKB_EXT_PSP])
++			return;
++
++		tmp = *pse;
++		skb_ext_reset(skb);
++		pse = skb_ext_add(skb, SKB_EXT_PSP);
++		if (pse)
++			memcpy(pse, &tmp, sizeof(*pse));
++		return;
++	}
++#endif
++	skb_ext_reset(skb);
++}
++
+ /**
+  * skb_scrub_packet - scrub an skb
+  *
+@@ -6322,7 +6347,8 @@ EXPORT_SYMBOL(skb_try_coalesce);
+  * operations.
+  * skb_scrub_packet can also be used to clean a skb before injecting it in
+  * another namespace (@xnet == true). We have to clear all information in the
+- * skb that could impact namespace isolation.
++ * skb that could impact namespace isolation. Note that PSP skb extension is
++ * preserved across packet scrubbing by design.
+  */
+ void skb_scrub_packet(struct sk_buff *skb, bool xnet)
+ {
+@@ -6330,7 +6356,7 @@ void skb_scrub_packet(struct sk_buff *skb, bool xnet)
+ 	skb->skb_iif = 0;
+ 	skb->ignore_df = 0;
+ 	skb_dst_drop(skb);
+-	skb_ext_reset(skb);
++	skb_ext_scrub(skb);
+ 	nf_reset_ct(skb);
+ 	nf_reset_trace(skb);
+ 
+-- 
+2.53.0
+

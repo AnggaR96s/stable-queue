@@ -1,0 +1,131 @@
+From e88ce3b55fd18a0cf1d0fb46bccaacb634d69403 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 2 Oct 2026 17:11:28 -0400
+Subject: dlm: validate node weights before building member array
+
+From: Qing Ming <a0yami@mailbox.org>
+
+[ Upstream commit 7f662eb1807ed732ac7d5e119753c8185f241bb8 ]
+
+DLM node weights are parsed as signed integers and copied into the member
+list. make_member_array() uses their sum as the allocation count, but only
+positive weights contribute entries to the array. A negative weight can
+therefore reduce the allocation without reducing the number of writes.
+
+The issue was found through static analysis of the configfs input and
+member array construction. With two recovery members weighted -31 and 32,
+the sum is 1, so recovery allocates one int and then writes the positive
+member's node ID 32 times. A reproducer using dlm_controld and dlm_tool
+triggered the same report on a KASAN kernel:
+
+  BUG: KASAN: slab-out-of-bounds in dlm_recover_members [dlm]
+  Write of size 4 by task dlm_recoverd
+
+  Call Trace:
+   dlm_recover_members
+   dlm_recoverd
+   kthread
+   ret_from_fork
+
+Reject negative weights at the configfs input boundary. Also detect
+overflow when adding non-negative weights to the signed allocation count,
+and propagate array construction errors to the recovery path.
+
+Fixes: e7fd41792fc0 ("[DLM] The core of the DLM for GFS2/CLVM")
+Signed-off-by: Qing Ming <a0yami@mailbox.org>
+Assisted-by: Codex:gpt-5
+Acked-by: Alexander Aring <aahringo@redhat.com>
+Signed-off-by: Alexander Aring <aahringo@redhat.com>
+Signed-off-by: David Teigland <teigland@redhat.com>
+[ sashal: Kept the tree's kmalloc_array() instead of kmalloc_objs() and dropped the early ls_total_weight assignment; ping_members(ls) context also differs. ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/dlm/config.c |  9 ++++++++-
+ fs/dlm/member.c | 17 +++++++++++------
+ 2 files changed, 19 insertions(+), 7 deletions(-)
+
+diff --git a/fs/dlm/config.c b/fs/dlm/config.c
+index 20b60709eccf0..3d48d7548c1cd 100644
+--- a/fs/dlm/config.c
++++ b/fs/dlm/config.c
+@@ -804,10 +804,17 @@ static ssize_t node_weight_show(struct config_item *item, char *buf)
+ static ssize_t node_weight_store(struct config_item *item, const char *buf,
+ 				 size_t len)
+ {
+-	int rc = kstrtoint(buf, 0, &config_item_to_node(item)->weight);
++	struct dlm_node *node = config_item_to_node(item);
++	int weight;
++	int rc;
+ 
++	rc = kstrtoint(buf, 0, &weight);
+ 	if (rc)
+ 		return rc;
++	if (weight < 0)
++		return -EINVAL;
++
++	node->weight = weight;
+ 	return len;
+ }
+ 
+diff --git a/fs/dlm/member.c b/fs/dlm/member.c
+index 2af2ccfe43a9d..aece94eaf66f8 100644
+--- a/fs/dlm/member.c
++++ b/fs/dlm/member.c
+@@ -386,7 +386,7 @@ void dlm_clear_members_gone(struct dlm_ls *ls)
+ 	clear_memb_list(&ls->ls_nodes_gone, NULL);
+ }
+ 
+-static void make_member_array(struct dlm_ls *ls)
++static int make_member_array(struct dlm_ls *ls)
+ {
+ 	struct dlm_member *memb;
+ 	int i, w, x = 0, total = 0, all_zero = 0, *array;
+@@ -395,8 +395,8 @@ static void make_member_array(struct dlm_ls *ls)
+ 	ls->ls_node_array = NULL;
+ 
+ 	list_for_each_entry(memb, &ls->ls_nodes, list) {
+-		if (memb->weight)
+-			total += memb->weight;
++		if (check_add_overflow(total, memb->weight, &total))
++			return -EOVERFLOW;
+ 	}
+ 
+ 	/* all nodes revert to weight of 1 if all have weight 0 */
+@@ -406,10 +406,9 @@ static void make_member_array(struct dlm_ls *ls)
+ 		all_zero = 1;
+ 	}
+ 
+-	ls->ls_total_weight = total;
+ 	array = kmalloc_array(total, sizeof(*array), GFP_NOFS);
+ 	if (!array)
+-		return;
++		return -ENOMEM;
+ 
+ 	list_for_each_entry(memb, &ls->ls_nodes, list) {
+ 		if (!all_zero && !memb->weight)
+@@ -426,7 +425,10 @@ static void make_member_array(struct dlm_ls *ls)
+ 			array[x++] = memb->nodeid;
+ 	}
+ 
++	ls->ls_total_weight = total;
+ 	ls->ls_node_array = array;
++
++	return 0;
+ }
+ 
+ /* send a status request to all members just to establish comms connections */
+@@ -583,7 +585,10 @@ int dlm_recover_members(struct dlm_ls *ls, struct dlm_recover *rv, int *neg_out)
+ 	}
+ 	ls->ls_low_nodeid = low;
+ 
+-	make_member_array(ls);
++	error = make_member_array(ls);
++	if (error)
++		return error;
++
+ 	*neg_out = neg;
+ 
+ 	error = ping_members(ls);
+-- 
+2.53.0
+

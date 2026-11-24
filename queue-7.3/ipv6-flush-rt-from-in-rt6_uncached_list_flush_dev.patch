@@ -1,0 +1,101 @@
+From 29b64ca0f6f6d937e41bf7291770ae8f448a7f94 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Sun, 1 Nov 2026 06:35:23 +0000
+Subject: ipv6: Flush rt->from in rt6_uncached_list_flush_dev().
+
+From: Kuniyuki Iwashima <kuniyu@google.com>
+
+[ Upstream commit a0fe1a3f390a75152c7395fdf63fc39da77d7838 ]
+
+When a device is unregistered, rt6_uncached_list_flush_dev()
+iterates over uncached routes and switches the dying dev
+with blackhole_netdev.
+
+However, rt->from could be cached via sk->sk_rx_dst and
+hold the device reference.
+
+Then, unregister_netdevice() gets stuck with the splat
+below. [0]
+
+Let's release rt->from in rt6_uncached_list_flush_dev().
+
+Note that ip6_rt_copy_init() could set rt->from even if
+in6_dev_get() returns NULL (e.g. mtu < IPV6_MIN_MTU is
+set concurrently).
+
+Also, rt->from->nh could be replaced with another device
+than rt_dev and rt_idev->dev, and in such a case,
+nexthop_flush_dev() sets fib6_destroying before
+rt6_uncached_list_flush_dev().
+
+[0]:
+unregister_netdevice: waiting for dummy2 to become free. Usage count = 2
+ref_tracker: netdev@000000006fb9da8c has 1/1 users at
+     netdev_get_by_index+0x14c/0x170
+     fib6_nh_init+0x1ae/0x1950
+     ip6_route_info_create_nh+0x15d/0x780
+     ip6_route_add+0x55/0x150
+     inet6_rtm_newroute+0x15d/0x1360
+     rtnetlink_rcv_msg+0x606/0x710
+     netlink_rcv_skb+0x14f/0x2f0
+     netlink_unicast+0x71b/0x940
+     netlink_sendmsg+0x595/0x840
+     __sock_sendmsg+0x119/0x150
+     ____sys_sendmsg+0x3e9/0x5c0
+     ___sys_sendmsg+0x157/0x1a0
+     __x64_sys_sendmsg+0x119/0x170
+     do_syscall_64+0x109/0x330
+     entry_SYSCALL_64_after_hwframe+0x77/0x7f
+
+Fixes: 93531c674315 ("net/ipv6: separate handling of FIB entries from dst based routes")
+Reported-by: Jason Zhang <jdz@google.com>
+Signed-off-by: Kuniyuki Iwashima <kuniyu@google.com>
+Link: https://patch.msgid.link/20261101064418.2055158-3-kuniyu@google.com
+Reviewed-by: Ido Schimmel <idosch@nvidia.com>
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ net/ipv6/route.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/net/ipv6/route.c b/net/ipv6/route.c
+index 94273e6476885..1ec9fd20b07d8 100644
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@ -179,12 +179,20 @@ void rt6_uncached_list_flush_dev(struct net_device *dev)
+ 		list_for_each_entry_safe(rt, safe, &ul->head, dst.rt_uncached) {
+ 			struct inet6_dev *rt_idev = rt->rt6i_idev;
+ 			struct net_device *rt_dev = rt->dst.dev;
++			struct fib6_info *from;
++			bool release_fib;
++
++			rcu_read_lock();
++			from = rcu_dereference(rt->from);
++			release_fib = from && from->fib6_destroying;
++			rcu_read_unlock();
+ 
+ 			if (rt_idev &&
+ 			    (dev ? rt_idev->dev == dev :
+ 			     READ_ONCE(rt_idev->dev->reg_state) == NETREG_UNREGISTERED)) {
+ 				rt->rt6i_idev = in6_dev_get(blackhole_netdev);
+ 				in6_dev_put(rt_idev);
++				release_fib = true;
+ 			}
+ 
+ 			if (dev ? rt_dev == dev :
+@@ -193,6 +201,12 @@ void rt6_uncached_list_flush_dev(struct net_device *dev)
+ 				netdev_ref_replace(rt_dev, blackhole_netdev,
+ 						   &rt->dst.dev_tracker,
+ 						   GFP_ATOMIC);
++				release_fib = true;
++			}
++
++			if (release_fib) {
++				from = unrcu_pointer(xchg(&rt->from, NULL));
++				fib6_info_release(from);
+ 			}
+ 
+ 			if (rt->dst.dev == blackhole_netdev &&
+-- 
+2.53.0
+

@@ -1,0 +1,176 @@
+From a5962e631ae084d08b96725dd2b691b8cfffedea Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Sun, 22 Nov 2026 17:21:09 -0500
+Subject: accel/amdxdna: Fix race between unmap and free BO
+
+From: Lizhi Hou <lizhi.hou@amd.com>
+
+[ Upstream commit ac18f34f5927e420ae529be72aec86201a262d04 ]
+
+A userspace process can concurrently trigger an unmap, which queues
+hmm_unreg_work, and free BO. If amdxdna_hmm_unreg_work() executes
+list_del(&mapp->node) and is preempted before calling amdxdna_umap_put(),
+amdxdna_hmm_unregister_all() can fail to find the mapping in the list
+and return without calling cancel_work_sync(). This allows object
+destruction to proceed while the worker still holds a pointer to the BO
+in the umap structure.
+
+Moving the work item from struct amdxdna_umap to struct amdxdna_gem_obj.
+The worker no longer holds a pointer to an individual mapping, so there
+is no longer a window where the umap has been unlinked from umap_list but
+work is still pending against it. The work item now lives in the BO
+itself, so use a single cancel_work_sync() in the free path to drain the
+work.
+
+Fixes: 445d20910429 ("accel/amdxdna: Fix unexpected wait when flushing notifier_wq")
+Reviewed-by: Max Zhen <max.zhen@amd.com>
+Signed-off-by: Lizhi Hou <lizhi.hou@amd.com>
+Link: https://patch.msgid.link/20260917154824.1872220-1-lizhi.hou@amd.com
+[ sashal: Adapted the hmm_unreg_work move to the older gem code: the uva field is named userptr, and amdxdna_gem_create_obj() was not relocated since it already follows the worker. ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/accel/amdxdna/amdxdna_gem.c | 47 +++++++++++------------------
+ drivers/accel/amdxdna/amdxdna_gem.h |  3 +-
+ 2 files changed, 18 insertions(+), 32 deletions(-)
+
+diff --git a/drivers/accel/amdxdna/amdxdna_gem.c b/drivers/accel/amdxdna/amdxdna_gem.c
+index e416a6ef7304e..cc22981d73598 100644
+--- a/drivers/accel/amdxdna/amdxdna_gem.c
++++ b/drivers/accel/amdxdna/amdxdna_gem.c
+@@ -127,10 +127,8 @@ static bool amdxdna_hmm_invalidate(struct mmu_interval_notifier *mni,
+ 
+ 	if (range->event == MMU_NOTIFY_UNMAP) {
+ 		down_write(&xdna->notifier_lock);
+-		if (!mapp->unmapped) {
+-			queue_work(xdna->notifier_wq, &mapp->hmm_unreg_work);
+-			mapp->unmapped = true;
+-		}
++		mapp->unmapped = true;
++		queue_work(xdna->notifier_wq, &abo->hmm_unreg_work);
+ 		up_write(&xdna->notifier_lock);
+ 	}
+ 
+@@ -160,13 +158,13 @@ static void amdxdna_hmm_unregister(struct amdxdna_gem_obj *abo,
+ 		if (!compare_range(mapp, vma->vm_mm, vma->vm_start, vma->vm_end))
+ 			continue;
+ 
+-		queue_work(xdna->notifier_wq, &mapp->hmm_unreg_work);
+ 		mapp->unmapped = true;
++		queue_work(xdna->notifier_wq, &abo->hmm_unreg_work);
+ 	}
+ 	up_write(&xdna->notifier_lock);
+ }
+ 
+-static void amdxdna_hmm_unregister_all(struct amdxdna_gem_obj *abo)
++static void amdxdna_hmm_unreg_umaps(struct amdxdna_gem_obj *abo, bool force)
+ {
+ 	struct amdxdna_dev *xdna = to_xdna_dev(to_gobj(abo)->dev);
+ 	struct amdxdna_umap *mapp, *tmp;
+@@ -174,16 +172,18 @@ static void amdxdna_hmm_unregister_all(struct amdxdna_gem_obj *abo)
+ 
+ 	down_write(&xdna->notifier_lock);
+ 	list_for_each_entry_safe(mapp, tmp, &abo->mem.umap_list, node) {
++		if (!force && !mapp->unmapped)
++			continue;
++
+ 		mapp->unmapped = true;
+-		mapp->cleanup = true;
+ 		list_move(&mapp->node, &dead);
+ 	}
++	if (list_empty(&abo->mem.umap_list))
++		abo->mem.userptr = AMDXDNA_INVALID_ADDR;
+ 	up_write(&xdna->notifier_lock);
+ 
+-	list_for_each_entry_safe(mapp, tmp, &dead, node) {
+-		cancel_work_sync(&mapp->hmm_unreg_work);
++	list_for_each_entry_safe(mapp, tmp, &dead, node)
+ 		amdxdna_umap_put(mapp);
+-	}
+ }
+ 
+ static void amdxdna_umap_release(struct kref *ref)
+@@ -202,24 +202,10 @@ void amdxdna_umap_put(struct amdxdna_umap *mapp)
+ 
+ static void amdxdna_hmm_unreg_work(struct work_struct *work)
+ {
+-	struct amdxdna_umap *mapp = container_of(work, struct amdxdna_umap,
+-						 hmm_unreg_work);
+-	struct amdxdna_gem_obj *abo = mapp->abo;
+-	struct amdxdna_dev *xdna;
++	struct amdxdna_gem_obj *abo = container_of(work, struct amdxdna_gem_obj,
++						   hmm_unreg_work);
+ 
+-	xdna = to_xdna_dev(to_gobj(mapp->abo)->dev);
+-	down_write(&xdna->notifier_lock);
+-	if (mapp->cleanup) {
+-		up_write(&xdna->notifier_lock);
+-		return;
+-	}
+-
+-	list_del(&mapp->node);
+-	if (list_empty(&abo->mem.umap_list))
+-		abo->mem.userptr = AMDXDNA_INVALID_ADDR;
+-	up_write(&xdna->notifier_lock);
+-
+-	amdxdna_umap_put(mapp);
++	amdxdna_hmm_unreg_umaps(abo, false);
+ }
+ 
+ static int amdxdna_hmm_register(struct amdxdna_gem_obj *abo,
+@@ -271,8 +257,6 @@ static int amdxdna_hmm_register(struct amdxdna_gem_obj *abo,
+ 	mapp->abo = abo;
+ 	kref_init(&mapp->refcnt);
+ 
+-	INIT_WORK(&mapp->hmm_unreg_work, amdxdna_hmm_unreg_work);
+-
+ 	ret = mmu_interval_notifier_insert_locked(&mapp->notifier,
+ 						  current->mm,
+ 						  addr,
+@@ -591,7 +575,9 @@ static void amdxdna_gem_obj_free(struct drm_gem_object *gobj)
+ 
+ 	XDNA_DBG(xdna, "BO type %d xdna_addr 0x%llx", abo->type, abo->mem.dev_addr);
+ 
+-	amdxdna_hmm_unregister_all(abo);
++	/* No notifier survives this, so no new work can be queued. */
++	amdxdna_hmm_unreg_umaps(abo, true);
++	cancel_work_sync(&abo->hmm_unreg_work);
+ 
+ 	if (abo->pinned)
+ 		amdxdna_gem_unpin(abo);
+@@ -644,6 +630,7 @@ amdxdna_gem_create_obj(struct drm_device *dev, size_t size)
+ 	abo->mem.dev_addr = AMDXDNA_INVALID_ADDR;
+ 	abo->mem.size = size;
+ 	INIT_LIST_HEAD(&abo->mem.umap_list);
++	INIT_WORK(&abo->hmm_unreg_work, amdxdna_hmm_unreg_work);
+ 
+ 	return abo;
+ }
+diff --git a/drivers/accel/amdxdna/amdxdna_gem.h b/drivers/accel/amdxdna/amdxdna_gem.h
+index 8d89874f1fca3..b6573ffe8d7cc 100644
+--- a/drivers/accel/amdxdna/amdxdna_gem.h
++++ b/drivers/accel/amdxdna/amdxdna_gem.h
+@@ -11,13 +11,11 @@
+ struct amdxdna_umap {
+ 	struct mmu_interval_notifier	notifier;
+ 	struct hmm_range		range;
+-	struct work_struct		hmm_unreg_work;
+ 	struct amdxdna_gem_obj		*abo;
+ 	struct list_head		node;
+ 	struct kref			refcnt;
+ 	bool				invalid;
+ 	bool				unmapped;
+-	bool				cleanup;
+ };
+ 
+ struct amdxdna_mem {
+@@ -38,6 +36,7 @@ struct amdxdna_gem_obj {
+ 	bool				pinned;
+ 	struct mutex			lock; /* Protects: pinned */
+ 	struct amdxdna_mem		mem;
++	struct work_struct		hmm_unreg_work;
+ 
+ 	/* Below members is uninitialized when needed */
+ 	struct drm_mm			mm; /* For AMDXDNA_BO_DEV_HEAP */
+-- 
+2.53.0
+

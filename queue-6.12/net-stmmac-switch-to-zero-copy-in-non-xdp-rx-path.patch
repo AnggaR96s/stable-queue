@@ -1,0 +1,113 @@
+From eca7515d4df7c3db2cc92b8bb386c3ab8871b5be Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 15 Jan 2025 11:27:02 +0800
+Subject: net: stmmac: Switch to zero-copy in non-XDP RX path
+
+From: Furong Xu <0x1207@gmail.com>
+
+[ Upstream commit df542f669307918f054a17878ff6dd1ddbb2fe18 ]
+
+Avoid memcpy in non-XDP RX path by marking all allocated SKBs to
+be recycled in the upper network stack.
+
+This patch brings ~11.5% driver performance improvement in a TCP RX
+throughput test with iPerf tool on a single isolated Cortex-A65 CPU
+core, from 2.18 Gbits/sec increased to 2.43 Gbits/sec.
+
+Signed-off-by: Furong Xu <0x1207@gmail.com>
+Reviewed-by: Alexander Lobakin <aleksander.lobakin@intel.com>
+Reviewed-by: Larysa Zaremba <larysa.zaremba@intel.com>
+Reviewed-by: Yanteng Si <si.yanteng@linux.dev>
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Stable-dep-of: 6d9b7c85af57 ("net: stmmac: set XDP metadata length on the page_pool RX path")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/net/ethernet/stmicro/stmmac/stmmac.h  |  1 +
+ .../net/ethernet/stmicro/stmmac/stmmac_main.c | 26 ++++++++++++-------
+ 2 files changed, 18 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac.h b/drivers/net/ethernet/stmicro/stmmac/stmmac.h
+index c087accd72726..dcdc4e24002ed 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac.h
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac.h
+@@ -125,6 +125,7 @@ struct stmmac_rx_queue {
+ 	unsigned int cur_rx;
+ 	unsigned int dirty_rx;
+ 	unsigned int buf_alloc_num;
++	unsigned int napi_skb_frag_size;
+ 	dma_addr_t dma_rx_phy;
+ 	u32 rx_tail_addr;
+ 	unsigned int state_saved;
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+index c420a449459ed..818722d5dbcba 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -1329,7 +1329,7 @@ static unsigned int stmmac_rx_offset(struct stmmac_priv *priv)
+ 	if (stmmac_xdp_is_enabled(priv))
+ 		return XDP_PACKET_HEADROOM;
+ 
+-	return 0;
++	return NET_SKB_PAD;
+ }
+ 
+ static int stmmac_set_bfsize(int mtu, int bufsize)
+@@ -2030,17 +2030,21 @@ static int __alloc_dma_rx_desc_resources(struct stmmac_priv *priv,
+ 	struct stmmac_channel *ch = &priv->channel[queue];
+ 	bool xdp_prog = stmmac_xdp_is_enabled(priv);
+ 	struct page_pool_params pp_params = { 0 };
+-	unsigned int num_pages;
++	unsigned int dma_buf_sz_pad, num_pages;
+ 	unsigned int napi_id;
+ 	int ret;
+ 
++	dma_buf_sz_pad = stmmac_rx_offset(priv) + dma_conf->dma_buf_sz +
++			 SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
++	num_pages = DIV_ROUND_UP(dma_buf_sz_pad, PAGE_SIZE);
++
+ 	rx_q->queue_index = queue;
+ 	rx_q->priv_data = priv;
++	rx_q->napi_skb_frag_size = num_pages * PAGE_SIZE;
+ 
+ 	pp_params.flags = PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV;
+ 	pp_params.pool_size = dma_conf->dma_rx_size;
+-	num_pages = DIV_ROUND_UP(dma_conf->dma_buf_sz, PAGE_SIZE);
+-	pp_params.order = ilog2(num_pages);
++	pp_params.order = order_base_2(num_pages);
+ 	pp_params.nid = dev_to_node(priv->device);
+ 	pp_params.dev = priv->device;
+ 	pp_params.dma_dir = xdp_prog ? DMA_BIDIRECTIONAL : DMA_FROM_DEVICE;
+@@ -5696,22 +5700,26 @@ static int stmmac_rx(struct stmmac_priv *priv, int limit, u32 queue)
+ 		}
+ 
+ 		if (!skb) {
++			unsigned int head_pad_len;
++
+ 			/* XDP program may expand or reduce tail */
+ 			buf1_len = ctx.xdp.data_end - ctx.xdp.data;
+ 
+-			skb = napi_alloc_skb(&ch->rx_napi, buf1_len);
++			skb = napi_build_skb(page_address(buf->page),
++					     rx_q->napi_skb_frag_size);
+ 			if (!skb) {
++				page_pool_recycle_direct(rx_q->page_pool,
++							 buf->page);
+ 				rx_dropped++;
+ 				count++;
+ 				goto drain_data;
+ 			}
+ 
+ 			/* XDP program may adjust header */
+-			skb_copy_to_linear_data(skb, ctx.xdp.data, buf1_len);
++			head_pad_len = ctx.xdp.data - ctx.xdp.data_hard_start;
++			skb_reserve(skb, head_pad_len);
+ 			skb_put(skb, buf1_len);
+-
+-			/* Data payload copied into SKB, page ready for recycle */
+-			page_pool_recycle_direct(rx_q->page_pool, buf->page);
++			skb_mark_for_recycle(skb);
+ 			buf->page = NULL;
+ 		} else if (buf1_len) {
+ 			dma_sync_single_for_cpu(priv->device, buf->addr,
+-- 
+2.53.0
+

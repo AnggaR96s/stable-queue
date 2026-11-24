@@ -1,0 +1,141 @@
+From 97e03f80ad24700ee0d7b02b8f69410d49f0858c Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 15 May 2025 10:03:54 +0000
+Subject: net: rfs: add sock_rps_delete_flow() helper
+
+From: Eric Dumazet <edumazet@google.com>
+
+[ Upstream commit 9cd5ef0b8c04c46a15c8f5d002f02ea0d0477790 ]
+
+RFS can exhibit lower performance for workloads using short-lived
+flows and a small set of 4-tuple.
+
+This is often the case for load-testers, using a pair of hosts,
+if the server has a single listener port.
+
+Typical use case :
+
+Server : tcp_crr -T128 -F1000 -6 -U -l30 -R 14250
+Client : tcp_crr -T128 -F1000 -6 -U -l30 -c -H server | grep local_throughput
+
+This is because RFS global hash table contains stale information,
+when the same RSS key is recycled for another socket and another cpu.
+
+Make sure to undo the changes and go back to initial state when
+a flow is disconnected.
+
+Performance of the above test is increased by 22 %,
+going from 372604 transactions per second to 457773.
+
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Reported-by: Octavian Purdila <tavip@google.com>
+Reviewed-by: Neal Cardwell <ncardwell@google.com>
+Link: https://patch.msgid.link/20250515100354.3339920-1-edumazet@google.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Stable-dep-of: 8c011697f76a ("tcp: do not resurrect a former listener with SO_ATTACH_REUSEPORT_[CE]BPF")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/net/rps.h          | 24 ++++++++++++++++++++++++
+ net/ipv4/inet_hashtables.c |  6 ++++--
+ net/ipv4/udp.c             |  2 ++
+ net/sctp/socket.c          |  2 +-
+ 4 files changed, 31 insertions(+), 3 deletions(-)
+
+diff --git a/include/net/rps.h b/include/net/rps.h
+index a93401d23d66e..6e98aa7655afe 100644
+--- a/include/net/rps.h
++++ b/include/net/rps.h
+@@ -122,6 +122,30 @@ static inline void sock_rps_record_flow(const struct sock *sk)
+ #endif
+ }
+ 
++static inline void sock_rps_delete_flow(const struct sock *sk)
++{
++#ifdef CONFIG_RPS
++	struct rps_sock_flow_table *table;
++	u32 hash, index;
++
++	if (!static_branch_unlikely(&rfs_needed))
++		return;
++
++	hash = READ_ONCE(sk->sk_rxhash);
++	if (!hash)
++		return;
++
++	rcu_read_lock();
++	table = rcu_dereference(net_hotdata.rps_sock_flow_table);
++	if (table) {
++		index = hash & table->mask;
++		if (READ_ONCE(table->ents[index]) != RPS_NO_CPU)
++			WRITE_ONCE(table->ents[index], RPS_NO_CPU);
++	}
++	rcu_read_unlock();
++#endif
++}
++
+ static inline u32 rps_input_queue_tail_incr(struct softnet_data *sd)
+ {
+ #ifdef CONFIG_RPS
+diff --git a/net/ipv4/inet_hashtables.c b/net/ipv4/inet_hashtables.c
+index e7b312f7cd98f..7035e35bea5e1 100644
+--- a/net/ipv4/inet_hashtables.c
++++ b/net/ipv4/inet_hashtables.c
+@@ -23,11 +23,12 @@
+ #if IS_ENABLED(CONFIG_IPV6)
+ #include <net/inet6_hashtables.h>
+ #endif
+-#include <net/secure_seq.h>
+ #include <net/hotdata.h>
+ #include <net/ip.h>
+-#include <net/tcp.h>
++#include <net/rps.h>
++#include <net/secure_seq.h>
+ #include <net/sock_reuseport.h>
++#include <net/tcp.h>
+ 
+ u32 inet_ehashfn(const struct net *net, const __be32 laddr,
+ 		 const __u16 lport, const __be32 faddr,
+@@ -783,6 +784,7 @@ void inet_unhash(struct sock *sk)
+ 	if (sk_unhashed(sk))
+ 		return;
+ 
++	sock_rps_delete_flow(sk);
+ 	if (sk->sk_state == TCP_LISTEN) {
+ 		struct inet_listen_hashbucket *ilb2;
+ 
+diff --git a/net/ipv4/udp.c b/net/ipv4/udp.c
+index 22eee4fdd5d8d..4fc8263286f2e 100644
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@ -119,6 +119,7 @@
+ #if IS_ENABLED(CONFIG_IPV6)
+ #include <net/ipv6_stubs.h>
+ #endif
++#include <net/rps.h>
+ 
+ struct udp_table udp_table __read_mostly;
+ EXPORT_SYMBOL(udp_table);
+@@ -2050,6 +2051,7 @@ void udp_lib_unhash(struct sock *sk)
+ 		struct udp_table *udptable = udp_get_table_prot(sk);
+ 		struct udp_hslot *hslot, *hslot2;
+ 
++		sock_rps_delete_flow(sk);
+ 		hslot  = udp_hashslot(udptable, sock_net(sk),
+ 				      udp_sk(sk)->udp_port_hash);
+ 		hslot2 = udp_hashslot2(udptable, udp_sk(sk)->udp_portaddr_hash);
+diff --git a/net/sctp/socket.c b/net/sctp/socket.c
+index 7734ca92335aa..3c8b9b8b07e03 100644
+--- a/net/sctp/socket.c
++++ b/net/sctp/socket.c
+@@ -8390,7 +8390,7 @@ static int sctp_hash(struct sock *sk)
+ 
+ static void sctp_unhash(struct sock *sk)
+ {
+-	/* STUB */
++	sock_rps_delete_flow(sk);
+ }
+ 
+ /* Check if port is acceptable.  Possibly find first available port.
+-- 
+2.53.0
+

@@ -1,0 +1,221 @@
+From ad3ff66c905a687fb9a5cd4146e5ca360eed8e32 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 6 Oct 2026 14:29:56 +0100
+Subject: rxrpc: Fix lack of short-send handling in rxrpc_kernel_send_data()
+
+From: David Howells <dhowells@redhat.com>
+
+[ Upstream commit af208f36ae22440cf6011a43cb3064fd525d85b4 ]
+
+Fix rxrpc_kernel_send_data() to loop around if it detects a short send.
+David Laight suggested doing it here rather than wrapping all the calls in
+loops.  Further, remove the len argument and use the iterator count instead
+and return 0 on success, not the amount copied.
+
+Note this is also a prerequisite for changing the way rxrpc_send_data()
+works to return a short send rather than an error if some data was
+buffered.
+
+Fixes: 651350d10f93 ("[AF_RXRPC]: Add an interface to the AF_RXRPC module for the AFS filesystem to use")
+Link: https://netdev-ai.bots.linux.dev/sashiko/#/patchset/20260824091645.415423-1-dhowells%40redhat.com
+Suggested-by: David Laight <david.laight.linux@gmail.com>
+Signed-off-by: David Howells <dhowells@redhat.com>
+cc: Marc Dionne <marc.dionne@auristor.com>
+cc: Eric Dumazet <edumazet@google.com>
+cc: "David S. Miller" <davem@davemloft.net>
+cc: Jakub Kicinski <kuba@kernel.org>
+cc: Paolo Abeni <pabeni@redhat.com>
+cc: Simon Horman <horms@kernel.org>
+cc: linux-afs@lists.infradead.org
+cc: stable@vger.kernel.org
+Link: https://patch.msgid.link/20261006133011.531806-5-dhowells@redhat.com
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+[ sashal: Dropped the len argument from the rxrpc_kernel_send_data() callers, omitted the rxperf.c hunk since that file doesn't exist here, and added an -EIO return when a completed call has unsent data. ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ Documentation/networking/rxrpc.rst |  8 ++--
+ fs/afs/rxrpc.c                     |  8 ++--
+ include/net/af_rxrpc.h             |  3 +-
+ net/rxrpc/sendmsg.c                | 62 ++++++++++++++++++------------
+ 4 files changed, 47 insertions(+), 34 deletions(-)
+
+diff --git a/Documentation/networking/rxrpc.rst b/Documentation/networking/rxrpc.rst
+index 39494a6ea739c..3b4fef0ce7428 100644
+--- a/Documentation/networking/rxrpc.rst
++++ b/Documentation/networking/rxrpc.rst
+@@ -866,7 +866,6 @@ The kernel interface functions are as follows:
+ 	int rxrpc_kernel_send_data(struct socket *sock,
+ 				   struct rxrpc_call *call,
+ 				   struct msghdr *msg,
+-				   size_t len,
+ 				   rxrpc_notify_end_tx_t notify_end_rx);
+ 
+      This is used to supply either the request part of a client call or the
+@@ -875,14 +874,17 @@ The kernel interface functions are as follows:
+      exclusively to in-kernel virtual addresses.  msg.msg_flags may be given
+      MSG_MORE if there will be subsequent data sends for this call.
+ 
+-     The msg must not specify a destination address, control data or any flags
+-     other than MSG_MORE.  len is the total amount of data to transmit.
++     msg must not specify a destination address, control data or any flags
++     other than MSG_MORE or MSG_WAITALL.
+ 
+      notify_end_rx can be NULL or it can be used to specify a function to be
+      called when the call changes state to end the Tx phase.  This function is
+      called with the call-state spinlock held to prevent any reply or final ACK
+      from being delivered first.
+ 
++     It returns 0 if all the provided data has been buffered and a negative
++     error code on failure.
++
+  (#) Receive data from a call::
+ 
+ 	int rxrpc_kernel_recv_data(struct socket *sock,
+diff --git a/fs/afs/rxrpc.c b/fs/afs/rxrpc.c
+index 501a98583e810..d60f0b573dd23 100644
+--- a/fs/afs/rxrpc.c
++++ b/fs/afs/rxrpc.c
+@@ -404,8 +404,7 @@ void afs_make_call(struct afs_addr_cursor *ac, struct afs_call *call, gfp_t gfp)
+ 	msg.msg_controllen	= 0;
+ 	msg.msg_flags		= MSG_WAITALL | (call->write_iter ? MSG_MORE : 0);
+ 
+-	ret = rxrpc_kernel_send_data(call->net->socket, rxcall,
+-				     &msg, call->request_size,
++	ret = rxrpc_kernel_send_data(call->net->socket, rxcall, &msg,
+ 				     afs_notify_end_request_tx);
+ 	if (ret < 0)
+ 		goto error_do_abort;
+@@ -417,7 +416,6 @@ void afs_make_call(struct afs_addr_cursor *ac, struct afs_call *call, gfp_t gfp)
+ 
+ 		ret = rxrpc_kernel_send_data(call->net->socket,
+ 					     call->rxcall, &msg,
+-					     iov_iter_count(&msg.msg_iter),
+ 					     afs_notify_end_request_tx);
+ 		*call->write_iter = msg.msg_iter;
+ 
+@@ -869,7 +867,7 @@ void afs_send_empty_reply(struct afs_call *call)
+ 	msg.msg_controllen	= 0;
+ 	msg.msg_flags		= 0;
+ 
+-	ret = rxrpc_kernel_send_data(net->socket, call->rxcall, &msg, 0,
++	ret = rxrpc_kernel_send_data(net->socket, call->rxcall, &msg,
+ 				     afs_notify_end_reply_tx);
+ 	if (ret < 0) {
+ 		rxrpc_kernel_abort_call(net->socket, call->rxcall,
+@@ -901,7 +899,7 @@ void afs_send_simple_reply(struct afs_call *call, const void *buf, size_t len)
+ 	msg.msg_controllen	= 0;
+ 	msg.msg_flags		= 0;
+ 
+-	n = rxrpc_kernel_send_data(net->socket, call->rxcall, &msg, len,
++	n = rxrpc_kernel_send_data(net->socket, call->rxcall, &msg,
+ 				   afs_notify_end_reply_tx);
+ 	if (n >= 0) {
+ 		/* Success */
+diff --git a/include/net/af_rxrpc.h b/include/net/af_rxrpc.h
+index b69ca695935ce..70ea6f844d0ef 100644
+--- a/include/net/af_rxrpc.h
++++ b/include/net/af_rxrpc.h
+@@ -50,8 +50,7 @@ struct rxrpc_call *rxrpc_kernel_begin_call(struct socket *,
+ 					   enum rxrpc_interruptibility,
+ 					   unsigned int);
+ int rxrpc_kernel_send_data(struct socket *, struct rxrpc_call *,
+-			   struct msghdr *, size_t,
+-			   rxrpc_notify_end_tx_t);
++			   struct msghdr *, rxrpc_notify_end_tx_t);
+ int rxrpc_kernel_recv_data(struct socket *, struct rxrpc_call *,
+ 			   struct iov_iter *, size_t *, bool, u32 *, u16 *);
+ bool rxrpc_kernel_abort_call(struct socket *, struct rxrpc_call *,
+diff --git a/net/rxrpc/sendmsg.c b/net/rxrpc/sendmsg.c
+index 28cd9fe93844e..4b5ee70433039 100644
+--- a/net/rxrpc/sendmsg.c
++++ b/net/rxrpc/sendmsg.c
+@@ -781,7 +781,6 @@ int rxrpc_do_sendmsg(struct rxrpc_sock *rx, struct msghdr *msg, size_t len)
+  * @sock: The socket the call is on
+  * @call: The call to send data through
+  * @msg: The data to send
+- * @len: The amount of data to send
+  * @notify_end_tx: Notification that the last packet is queued.
+  *
+  * Allow a kernel service to send data on a call.  The call must be in an state
+@@ -790,8 +789,7 @@ int rxrpc_do_sendmsg(struct rxrpc_sock *rx, struct msghdr *msg, size_t len)
+  * more data to come, otherwise this data will end the transmission phase.
+  */
+ int rxrpc_kernel_send_data(struct socket *sock, struct rxrpc_call *call,
+-			   struct msghdr *msg, size_t len,
+-			   rxrpc_notify_end_tx_t notify_end_tx)
++			   struct msghdr *msg, rxrpc_notify_end_tx_t notify_end_tx)
+ {
+ 	int ret;
+ 
+@@ -800,31 +798,47 @@ int rxrpc_kernel_send_data(struct socket *sock, struct rxrpc_call *call,
+ 	ASSERTCMP(msg->msg_name, ==, NULL);
+ 	ASSERTCMP(msg->msg_control, ==, NULL);
+ 
+-	mutex_lock(&call->user_mutex);
++	for (;;) {
++		mutex_lock(&call->user_mutex);
+ 
+-	_debug("CALL %d USR %lx ST %d on CONN %p",
+-	       call->debug_id, call->user_call_ID, call->state, call->conn);
+-
+-	switch (READ_ONCE(call->state)) {
+-	case RXRPC_CALL_CLIENT_SEND_REQUEST:
+-	case RXRPC_CALL_SERVER_ACK_REQUEST:
+-	case RXRPC_CALL_SERVER_SEND_REPLY:
+-		ret = rxrpc_send_data(rxrpc_sk(sock->sk), call, msg, len,
+-				      notify_end_tx);
+-		goto out;
+-	case RXRPC_CALL_COMPLETE:
+-		read_lock_bh(&call->state_lock);
+-		ret = call->error;
+-		read_unlock_bh(&call->state_lock);
+-		break;
+-	default:
+-		/* Request phase complete for this client call */
+-		trace_rxrpc_rx_eproto(call, 0, tracepoint_string("late_send"));
+-		ret = -EPROTO;
++		_debug("CALL %d USR %lx ST %d on CONN %p",
++		       call->debug_id, call->user_call_ID, call->state, call->conn);
++
++		switch (READ_ONCE(call->state)) {
++		case RXRPC_CALL_CLIENT_SEND_REQUEST:
++		case RXRPC_CALL_SERVER_ACK_REQUEST:
++		case RXRPC_CALL_SERVER_SEND_REPLY:
++			ret = rxrpc_send_data(rxrpc_sk(sock->sk), call, msg,
++					      msg_data_left(msg), notify_end_tx);
++			if (ret < 0)
++				goto out;
++			if (msg_data_left(msg) == 0) {
++				ret = 0;
++				goto out;
++			}
++			if (ret == 0) {
++				ret = -EIO;
++				goto out;
++			}
++			continue;
++		case RXRPC_CALL_COMPLETE:
++			read_lock_bh(&call->state_lock);
++			ret = call->error;
++			read_unlock_bh(&call->state_lock);
++			if (!ret && msg_data_left(msg))
++				ret = -EIO;
++			break;
++		default:
++			/* Request phase complete for this client call */
++			trace_rxrpc_rx_eproto(call, 0, tracepoint_string("late_send"));
++			ret = -EPROTO;
++			break;
++		}
++
++		mutex_unlock(&call->user_mutex);
+ 		break;
+ 	}
+ 
+-	mutex_unlock(&call->user_mutex);
+ out:
+ 	_leave(" = %d", ret);
+ 	return ret;
+-- 
+2.53.0
+

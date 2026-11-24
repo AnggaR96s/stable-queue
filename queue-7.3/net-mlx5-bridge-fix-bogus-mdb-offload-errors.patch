@@ -1,0 +1,103 @@
+From 020756ec23d159079d26ac32b9893e949b420222 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 4 Nov 2026 20:37:15 +0200
+Subject: net/mlx5: Bridge, fix bogus MDB offload errors
+
+From: Gal Pressman <gal@nvidia.com>
+
+[ Upstream commit c714f324eac17b2df03419b5cd5368687efd8e27 ]
+
+MDB add operations are queued on the switchdev deferred queue
+(SWITCHDEV_F_DEFER), while vlan object deletions are handled
+synchronously.
+A 'bridge vlan del' can overtake an MDB add that is still queued, and
+the vlan is already gone by the time the driver is called.
+
+The two operations are independent in practice: in my test, the MDB add
+is triggered by assigning the VF an IPv6 address (hence joining a
+solicited-node multicast group), while another process deletes the vlan
+from its representor.
+
+Racing 'bridge mdb add' against concurrent 'bridge vlan del' could
+result in:
+
+[ 5390.967651] mlx5_core 0000:08:00.0: E-Switch: Failed to lookup bridge port vlan metadata (vport=1)
+[ 5390.969120] mlx5_core 0000:08:00.1: E-Switch: Failed to lookup bridge port vlan metadata to create MDB (MAC=33:33:ff:12:00:05,vid=2204,vport=1)
+[ 5390.971676] mlx5_core 0000:08:00.1 eth4: Failed to add Port Multicast Database entry (object id=2) with error: -EINVAL (-22).
+               Failure in updating the port's Multicast Database could lead to
+               multicast forwarding issues.
+
+The error cannot reach anyone that could do anything with it, switchdev
+returned success to the bridge as soon as the MDB object was queued, and
+the errno only flags the entry as offload failed.
+The end result is correct either way, if the MDB has been offloaded
+before the vlan was deleted, mlx5_esw_bridge_port_mdb_vlan_flush() would
+have removed it.
+
+The FDB path already treats this as a harmless race,
+mlx5_esw_bridge_port_vlan_lookup() reports it on 'info' logging level
+and skips the offload. mlxsw did the same in [1].
+
+Skip the MDB offload, report on 'info' logging level and return
+-EOPNOTSUPP: switchdev_port_obj_add_deferred() does not log it, and
+br_switchdev_mdb_complete() skips the port group flag update.
+
+[1] Commit 17b334a876fe ("mlxsw: spectrum_switchdev: Don't warn about valid situations")
+
+Fixes: 70f0302b3f20 ("net/mlx5: Bridge, implement mdb offload")
+Signed-off-by: Gal Pressman <gal@nvidia.com>
+Signed-off-by: Jianbo Liu <jianbol@nvidia.com>
+Reviewed-by: Cosmin Ratiu <cratiu@nvidia.com>
+Signed-off-by: Tariq Toukan <tariqt@nvidia.com>
+Link: https://patch.msgid.link/20261104183715.771390-1-tariqt@nvidia.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ .../ethernet/mellanox/mlx5/core/esw/bridge.c  | 21 ++++++++++---------
+ 1 file changed, 11 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/esw/bridge.c b/drivers/net/ethernet/mellanox/mlx5/core/esw/bridge.c
+index b4cf3c5ac0dde..9fac6f985a866 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/esw/bridge.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/esw/bridge.c
+@@ -1867,26 +1867,27 @@ int mlx5_esw_bridge_port_mdb_add(struct net_device *dev, u16 vport_num, u16 esw_
+ 
+ 	port = mlx5_esw_bridge_port_lookup(vport_num, esw_owner_vhca_id, br_offloads);
+ 	if (!port) {
+-		esw_warn(br_offloads->esw->dev,
++		/* MDB is added asynchronously from the switchdev deferred
++		 * queue while port might have been deleted concurrently.
++		 */
++		esw_info(br_offloads->esw->dev,
+ 			 "Failed to lookup bridge port to add MDB (MAC=%pM,vport=%u)\n",
+ 			 addr, vport_num);
+-		NL_SET_ERR_MSG_FMT_MOD(extack,
+-				       "Failed to lookup bridge port to add MDB (MAC=%pM,vport=%u)",
+-				       addr, vport_num);
+-		return -EINVAL;
++		return -EOPNOTSUPP;
+ 	}
+ 
+ 	bridge = port->bridge;
+ 	if (bridge->flags & MLX5_ESW_BRIDGE_VLAN_FILTERING_FLAG && vid) {
+ 		vlan = mlx5_esw_bridge_vlan_lookup(vid, port);
+ 		if (!vlan) {
+-			esw_warn(br_offloads->esw->dev,
++			/* MDB is added asynchronously from the switchdev
++			 * deferred queue while vlan might have been deleted
++			 * concurrently.
++			 */
++			esw_info(br_offloads->esw->dev,
+ 				 "Failed to lookup bridge port vlan metadata to create MDB (MAC=%pM,vid=%u,vport=%u)\n",
+ 				 addr, vid, vport_num);
+-			NL_SET_ERR_MSG_FMT_MOD(extack,
+-					       "Failed to lookup vlan metadata for MDB (MAC=%pM,vid=%u,vport=%u)",
+-					       addr, vid, vport_num);
+-			return -EINVAL;
++			return -EOPNOTSUPP;
+ 		}
+ 	}
+ 
+-- 
+2.53.0
+

@@ -1,0 +1,127 @@
+From 70fa442b96e2c865f1d5e3f7be7c6c0a90cc68cf Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Sun, 20 Sep 2026 18:12:39 +0300
+Subject: i3c: mipi-i3c-hci: Process multiple IBIs per interrupt
+
+From: Adrian Hunter <adrian.hunter@intel.com>
+
+[ Upstream commit 5fbd0790af9484c251341e3ba2ebbb2887c570c8 ]
+
+INTR_IBI_READY indicates that one or more IBI Status Descriptors are
+present in the IBI ring.  After clearing interrupt status, the interrupt
+handler processes only a single IBI even though additional IBIs may
+already be queued.
+
+The controller does not reassert INTR_IBI_READY solely because entries
+remain in the ring after interrupt status has been cleared.  Consequently,
+the remaining IBIs are not processed until some later interrupt occurs,
+and can accumulate if IBIs arrive more often than the interrupt handler
+runs.
+
+Process all IBIs that are pending when the handler runs: capture the IBI
+enqueue pointer up front and continue until the dequeue pointer reaches
+that position.
+
+Fixes: 9ad9a52cce28 ("i3c/master: introduce the mipi-i3c-hci driver")
+Signed-off-by: Adrian Hunter <adrian.hunter@intel.com>
+Reviewed-by: Frank Li <Frank.Li@nxp.com>
+Link: https://patch.msgid.link/20260920151248.46936-10-adrian.hunter@intel.com
+Signed-off-by: Alexandre Belloni <alexandre.belloni@bootlin.com>
+[ sashal: kept the branch's DBG() macro and its spinlock-protected dequeue pointer update, writing the fresh locked read back through *op1_val instead of a local. ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/i3c/master/mipi-i3c-hci/dma.c | 40 +++++++++++++++++----------
+ 1 file changed, 26 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/i3c/master/mipi-i3c-hci/dma.c b/drivers/i3c/master/mipi-i3c-hci/dma.c
+index d1d92be403253..80dfd30f90116 100644
+--- a/drivers/i3c/master/mipi-i3c-hci/dma.c
++++ b/drivers/i3c/master/mipi-i3c-hci/dma.c
+@@ -594,24 +594,23 @@ static void hci_dma_recycle_ibi_slot(struct i3c_hci *hci,
+ 	i3c_generic_ibi_recycle_slot(dev_ibi->pool, slot);
+ }
+ 
+-static void hci_dma_process_ibi(struct i3c_hci *hci, struct hci_rh_data *rh)
++static bool hci_dma_process_ibi(struct i3c_hci *hci, struct hci_rh_data *rh,
++				u32 *op1_val, unsigned int enq_ptr)
+ {
+ 	struct i3c_dev_desc *dev;
+ 	struct i3c_hci_dev_data *dev_data;
+ 	struct hci_dma_dev_ibi_data *dev_ibi;
+ 	struct i3c_ibi_slot *slot;
+-	u32 op1_val, op2_val, ibi_status_error;
+-	unsigned int ptr, enq_ptr, deq_ptr;
++	u32 ibi_status_error;
++	unsigned int ptr, deq_ptr;
+ 	unsigned int ibi_size, ibi_chunks, ibi_data_offset, first_part;
+ 	int ibi_addr, last_ptr;
+ 	void *ring_ibi_data;
+ 	dma_addr_t ring_ibi_data_dma;
+ 
+-	op1_val = rh_reg_read(RING_OPERATION1);
+-	deq_ptr = FIELD_GET(RING_OP1_IBI_DEQ_PTR, op1_val);
+-
+-	op2_val = rh_reg_read(RING_OPERATION2);
+-	enq_ptr = FIELD_GET(RING_OP2_IBI_ENQ_PTR, op2_val);
++	deq_ptr = FIELD_GET(RING_OP1_IBI_DEQ_PTR, *op1_val);
++	if (deq_ptr == enq_ptr)
++		return false;
+ 
+ 	ibi_status_error = 0;
+ 	ibi_addr = -1;
+@@ -659,7 +658,7 @@ static void hci_dma_process_ibi(struct i3c_hci *hci, struct hci_rh_data *rh)
+ 	if (last_ptr == -1) {
+ 		/* this IBI sequence is not yet complete */
+ 		DBG("no LAST_STATUS available (e=%d d=%d)", enq_ptr, deq_ptr);
+-		return;
++		return false;
+ 	}
+ 	deq_ptr = last_ptr + 1;
+ 	deq_ptr %= rh->ibi_status_entries;
+@@ -732,10 +731,10 @@ static void hci_dma_process_ibi(struct i3c_hci *hci, struct hci_rh_data *rh)
+ done:
+ 	/* take care to update the ibi dequeue pointer atomically */
+ 	spin_lock(&rh->lock);
+-	op1_val = rh_reg_read(RING_OPERATION1);
+-	op1_val &= ~RING_OP1_IBI_DEQ_PTR;
+-	op1_val |= FIELD_PREP(RING_OP1_IBI_DEQ_PTR, deq_ptr);
+-	rh_reg_write(RING_OPERATION1, op1_val);
++	*op1_val = rh_reg_read(RING_OPERATION1);
++	*op1_val &= ~RING_OP1_IBI_DEQ_PTR;
++	*op1_val |= FIELD_PREP(RING_OP1_IBI_DEQ_PTR, deq_ptr);
++	rh_reg_write(RING_OPERATION1, *op1_val);
+ 	spin_unlock(&rh->lock);
+ 
+ 	/* update the chunk pointer */
+@@ -744,6 +743,19 @@ static void hci_dma_process_ibi(struct i3c_hci *hci, struct hci_rh_data *rh)
+ 
+ 	/* and tell the hardware about freed chunks */
+ 	rh_reg_write(CHUNK_CONTROL, rh_reg_read(CHUNK_CONTROL) + ibi_chunks);
++
++	return true;
++}
++
++static void hci_dma_drain_ibi_ring(struct i3c_hci *hci, struct hci_rh_data *rh)
++{
++	u32 op1_val = rh_reg_read(RING_OPERATION1);
++	u32 op2_val = rh_reg_read(RING_OPERATION2);
++	unsigned int enq_ptr = FIELD_GET(RING_OP2_IBI_ENQ_PTR, op2_val);
++
++	/* Loop is bounded by enq_ptr. Further IBIs will re-assert INTR_IBI_READY */
++	while (hci_dma_process_ibi(hci, rh, &op1_val, enq_ptr))
++		;
+ }
+ 
+ static bool hci_dma_irq_handler(struct i3c_hci *hci, unsigned int mask)
+@@ -768,7 +780,7 @@ static bool hci_dma_irq_handler(struct i3c_hci *hci, unsigned int mask)
+ 		rh_reg_write(INTR_STATUS, status);
+ 
+ 		if (status & INTR_IBI_READY)
+-			hci_dma_process_ibi(hci, rh);
++			hci_dma_drain_ibi_ring(hci, rh);
+ 		if (status & (INTR_TRANSFER_COMPLETION | INTR_TRANSFER_ERR))
+ 			hci_dma_xfer_done(hci, rh);
+ 		if (status & INTR_RING_OP)
+-- 
+2.53.0
+

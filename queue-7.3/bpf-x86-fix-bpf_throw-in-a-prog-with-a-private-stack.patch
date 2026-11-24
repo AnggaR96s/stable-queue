@@ -1,0 +1,82 @@
+From b1eef10f4c2bd8b732335123f2ddf9b06c19ce88 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Sat, 31 Oct 2026 05:05:57 +0000
+Subject: bpf, x86: Fix bpf_throw() in a prog with a private stack
+
+From: Alexei Starovoitov <ast@kernel.org>
+
+[ Upstream commit 91068ed2d3ee0713d7566c7977b995f8a0936bea ]
+
+When the main prog has a private stack and the prog calls bpf_throw(), it
+returns to the kernel with wrong values in r12, rbx, r13, r14 and r15. The
+kernel crashes soon after that, for example:
+
+  BUG: kernel NULL pointer dereference, address: 0000000000000010
+  RIP: 0010:__bpf_prog_test_run_raw_tp+0x125/0x380
+
+The main prog of a prog that can throw saves these five registers at its
+entry. bpf_throw() walks the stack to the frame of the main prog and
+gives the stack pointer of that frame to the exception callback, which
+pops the registers from there. In a function with a private stack r9 is
+the frame pointer, and the JIT emits 'push r9' in front of every call
+and 'pop r9' after it. So the stack pointer that bpf_throw() finds is
+8 bytes too low:
+
+  r12
+  rbx
+  r13
+  r14
+  r15  <- the callback has to pop from here
+  r9   <- rsp of the main prog at the call
+
+r15 gets the address of the private stack and every other register gets
+the value of its neighbour.
+
+This happens in tracepoint, raw_tp, perf_event and tracing progs, except
+iterators, and in struct_ops progs that ask for a private stack, when
+the main prog has more than 48 bytes of stack. The throw can be in the
+main prog or in a subprog.
+
+aux->stack_arg_sp_adjust already moves the stack pointer from the
+outgoing stack arguments up to the saved registers. Add the 8 bytes of
+r9 to it when the main prog has a private stack.
+
+A constant is enough. Calls of helpers, kfuncs and subprogs and callx
+all have the push. A prog with tail calls has no private stack, and a
+callback cannot throw. Only the frame of the main prog matters: the
+frames of subprogs are dropped, with or without a private stack. On
+x86-64 a function with stack arguments has no private stack, hence only
+one of the two parts is not zero.
+
+The JITed code does not change.
+
+Fixes: 7d1cd70d4b16 ("bpf, x86: Support private stack in jit")
+Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://patch.msgid.link/20261031050558.2410721-2-alexei.starovoitov@gmail.com
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ arch/x86/net/bpf_jit_comp.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/arch/x86/net/bpf_jit_comp.c b/arch/x86/net/bpf_jit_comp.c
+index 10f68ee7c9e68..1b56cb973d79e 100644
+--- a/arch/x86/net/bpf_jit_comp.c
++++ b/arch/x86/net/bpf_jit_comp.c
+@@ -1838,8 +1838,13 @@ static int do_jit(struct bpf_verifier_env *env, struct bpf_prog *bpf_prog, int *
+ 	 * Arg 6 goes into r9 register, not on stack.
+ 	 */
+ 	outgoing_rsp = out_stack_arg_cnt > 1 ? (out_stack_arg_cnt - 1) * 8 : 0;
++	/*
++	 * bpf_throw() sees rsp of this frame as it is at a call. The callee-saved
++	 * regs are above the outgoing args, or above r9, which is pushed around
++	 * every call when the stack is private.
++	 */
+ 	if (bpf_prog->aux->exception_boundary)
+-		bpf_prog->aux->stack_arg_sp_adjust = outgoing_rsp;
++		bpf_prog->aux->stack_arg_sp_adjust = outgoing_rsp + (priv_frame_ptr ? 8 : 0);
+ 	emit_sub_rsp(&prog, outgoing_rsp);
+ 
+ 	if (arena_vm_start)
+-- 
+2.53.0
+

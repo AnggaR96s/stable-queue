@@ -1,0 +1,240 @@
+From c264d28e8cad991b5cdcdfc36b6808e15da86ae3 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 9 Nov 2022 09:57:58 +0000
+Subject: net: remove skb->vlan_present
+
+From: Eric Dumazet <edumazet@google.com>
+
+[ Upstream commit 354259fa73e2aac92ae5e19522adb69a92c15b49 ]
+
+skb->vlan_present seems redundant.
+
+We can instead derive it from this boolean expression:
+
+vlan_present = skb->vlan_proto != 0 || skb->vlan_tci != 0
+
+Add a new union, to access both fields in a single load/store
+when possible.
+
+	union {
+		u32	vlan_all;
+		struct {
+		__be16	vlan_proto;
+		__u16	vlan_tci;
+		};
+	};
+
+This allows following patch to remove a conditional test in GRO stack.
+
+Note:
+  We move remcsum_offload to keep TC_AT_INGRESS_MASK
+  and SKB_MONO_DELIVERY_TIME_MASK unchanged.
+
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Acked-by: Yonghong Song <yhs@fb.com>
+Acked-by: Martin KaFai Lau <martin.lau@kernel.org>
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Stable-dep-of: 511582022bfd ("net: gro: compare skb->protocol in gro_list_prepare()")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ arch/sparc/net/bpf_jit_comp_32.c              | 10 ++++-----
+ .../ethernet/marvell/octeontx2/nic/otx2_pf.c  |  2 +-
+ include/linux/if_vlan.h                       |  9 +++-----
+ include/linux/skbuff.h                        | 18 ++++++++-------
+ lib/test_bpf.c                                |  1 -
+ net/core/filter.c                             | 22 +++++++++----------
+ 6 files changed, 29 insertions(+), 33 deletions(-)
+
+diff --git a/arch/sparc/net/bpf_jit_comp_32.c b/arch/sparc/net/bpf_jit_comp_32.c
+index b1dbf2fa8c0ae..a74e5004c6c89 100644
+--- a/arch/sparc/net/bpf_jit_comp_32.c
++++ b/arch/sparc/net/bpf_jit_comp_32.c
+@@ -555,11 +555,11 @@ void bpf_jit_compile(struct bpf_prog *fp)
+ 				emit_skb_load16(vlan_tci, r_A);
+ 				break;
+ 			case BPF_ANC | SKF_AD_VLAN_TAG_PRESENT:
+-				__emit_skb_load8(__pkt_vlan_present_offset, r_A);
+-				if (PKT_VLAN_PRESENT_BIT)
+-					emit_alu_K(SRL, PKT_VLAN_PRESENT_BIT);
+-				if (PKT_VLAN_PRESENT_BIT < 7)
+-					emit_andi(r_A, 1, r_A);
++				emit_skb_load32(vlan_all, r_A);
++				emit_cmpi(r_A, 0);
++				emit_branch_off(BE, 12);
++				emit_nop();
++				emit_loadimm(1, r_A);
+ 				break;
+ 			case BPF_LD | BPF_W | BPF_LEN:
+ 				emit_skb_load32(len, r_A);
+diff --git a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+index 5daea2cc823ec..c7fdb0e1fb526 100644
+--- a/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
++++ b/drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+@@ -2073,7 +2073,7 @@ u16 otx2_select_queue(struct net_device *netdev, struct sk_buff *skb,
+ #endif
+ 
+ #ifdef CONFIG_DCB
+-	if (!skb->vlan_present)
++	if (!skb_vlan_tag_present(skb))
+ 		goto pick_tx;
+ 
+ 	vlan_prio = skb->vlan_tci >> 13;
+diff --git a/include/linux/if_vlan.h b/include/linux/if_vlan.h
+index e63081a9d7db8..38a74f67ff5c0 100644
+--- a/include/linux/if_vlan.h
++++ b/include/linux/if_vlan.h
+@@ -84,7 +84,7 @@ static inline bool is_vlan_dev(const struct net_device *dev)
+         return dev->priv_flags & IFF_802_1Q_VLAN;
+ }
+ 
+-#define skb_vlan_tag_present(__skb)	((__skb)->vlan_present)
++#define skb_vlan_tag_present(__skb)	(!!(__skb)->vlan_all)
+ #define skb_vlan_tag_get(__skb)		((__skb)->vlan_tci)
+ #define skb_vlan_tag_get_id(__skb)	((__skb)->vlan_tci & VLAN_VID_MASK)
+ #define skb_vlan_tag_get_cfi(__skb)	(!!((__skb)->vlan_tci & VLAN_CFI_MASK))
+@@ -482,7 +482,7 @@ static inline struct sk_buff *vlan_insert_tag_set_proto(struct sk_buff *skb,
+  */
+ static inline void __vlan_hwaccel_clear_tag(struct sk_buff *skb)
+ {
+-	skb->vlan_present = 0;
++	skb->vlan_all = 0;
+ }
+ 
+ /**
+@@ -494,9 +494,7 @@ static inline void __vlan_hwaccel_clear_tag(struct sk_buff *skb)
+  */
+ static inline void __vlan_hwaccel_copy_tag(struct sk_buff *dst, const struct sk_buff *src)
+ {
+-	dst->vlan_present = src->vlan_present;
+-	dst->vlan_proto = src->vlan_proto;
+-	dst->vlan_tci = src->vlan_tci;
++	dst->vlan_all = src->vlan_all;
+ }
+ 
+ /*
+@@ -530,7 +528,6 @@ static inline void __vlan_hwaccel_put_tag(struct sk_buff *skb,
+ {
+ 	skb->vlan_proto = vlan_proto;
+ 	skb->vlan_tci = vlan_tci;
+-	skb->vlan_present = 1;
+ }
+ 
+ /**
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index c19077b1e18a0..636f7cc65cdff 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -825,7 +825,7 @@ typedef unsigned char *sk_buff_data_t;
+  *	@mark: Generic packet mark
+  *	@reserved_tailroom: (aka @mark) number of bytes of free space available
+  *		at the tail of an sk_buff
+- *	@vlan_present: VLAN tag is present
++ *	@vlan_all: vlan fields (proto & tci)
+  *	@vlan_proto: vlan encapsulation protocol
+  *	@vlan_tci: vlan tag control information
+  *	@inner_protocol: Protocol (encapsulation)
+@@ -955,7 +955,7 @@ struct sk_buff {
+ 	/* private: */
+ 	__u8			__pkt_vlan_present_offset[0];
+ 	/* public: */
+-	__u8			vlan_present:1;	/* See PKT_VLAN_PRESENT_BIT */
++	__u8			remcsum_offload:1;
+ 	__u8			csum_complete_sw:1;
+ 	__u8			csum_level:2;
+ 	__u8			dst_pending_confirm:1;
+@@ -970,7 +970,6 @@ struct sk_buff {
+ 
+ 	__u8			ipvs_property:1;
+ 	__u8			inner_protocol_type:1;
+-	__u8			remcsum_offload:1;
+ #ifdef CONFIG_NET_SWITCHDEV
+ 	__u8			offload_fwd_mark:1;
+ 	__u8			offload_l3_fwd_mark:1;
+@@ -1003,8 +1002,13 @@ struct sk_buff {
+ 	__u32			priority;
+ 	int			skb_iif;
+ 	__u32			hash;
+-	__be16			vlan_proto;
+-	__u16			vlan_tci;
++	union {
++		u32		vlan_all;
++		struct {
++			__be16	vlan_proto;
++			__u16	vlan_tci;
++		};
++	};
+ #if defined(CONFIG_NET_RX_BUSY_POLL) || defined(CONFIG_XPS)
+ 	union {
+ 		unsigned int	napi_id;
+@@ -1064,15 +1068,13 @@ struct sk_buff {
+ #endif
+ #define PKT_TYPE_OFFSET		offsetof(struct sk_buff, __pkt_type_offset)
+ 
+-/* if you move pkt_vlan_present, tc_at_ingress, or mono_delivery_time
++/* if you move tc_at_ingress or mono_delivery_time
+  * around, you also must adapt these constants.
+  */
+ #ifdef __BIG_ENDIAN_BITFIELD
+-#define PKT_VLAN_PRESENT_BIT	7
+ #define TC_AT_INGRESS_MASK		(1 << 0)
+ #define SKB_MONO_DELIVERY_TIME_MASK	(1 << 2)
+ #else
+-#define PKT_VLAN_PRESENT_BIT	0
+ #define TC_AT_INGRESS_MASK		(1 << 7)
+ #define SKB_MONO_DELIVERY_TIME_MASK	(1 << 5)
+ #endif
+diff --git a/lib/test_bpf.c b/lib/test_bpf.c
+index 5820704165a64..ade9ac672adbb 100644
+--- a/lib/test_bpf.c
++++ b/lib/test_bpf.c
+@@ -14346,7 +14346,6 @@ static struct sk_buff *populate_skb(char *buf, int size)
+ 	skb->hash = SKB_HASH;
+ 	skb->queue_mapping = SKB_QUEUE_MAP;
+ 	skb->vlan_tci = SKB_VLAN_TCI;
+-	skb->vlan_present = SKB_VLAN_PRESENT;
+ 	skb->vlan_proto = htons(ETH_P_IP);
+ 	dev_net_set(&dev, &init_net);
+ 	skb->dev = &dev;
+diff --git a/net/core/filter.c b/net/core/filter.c
+index fe89172f39cb4..ff56fe1445d3a 100644
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -337,11 +337,11 @@ static u32 convert_skb_access(int skb_field, int dst_reg, int src_reg,
+ 				      offsetof(struct sk_buff, vlan_tci));
+ 		break;
+ 	case SKF_AD_VLAN_TAG_PRESENT:
+-		*insn++ = BPF_LDX_MEM(BPF_B, dst_reg, src_reg, PKT_VLAN_PRESENT_OFFSET);
+-		if (PKT_VLAN_PRESENT_BIT)
+-			*insn++ = BPF_ALU32_IMM(BPF_RSH, dst_reg, PKT_VLAN_PRESENT_BIT);
+-		if (PKT_VLAN_PRESENT_BIT < 7)
+-			*insn++ = BPF_ALU32_IMM(BPF_AND, dst_reg, 1);
++		BUILD_BUG_ON(sizeof_field(struct sk_buff, vlan_all) != 4);
++		*insn++ = BPF_LDX_MEM(BPF_W, dst_reg, src_reg,
++				      offsetof(struct sk_buff, vlan_all));
++		*insn++ = BPF_JMP_IMM(BPF_JEQ, dst_reg, 0, 1);
++		*insn++ = BPF_ALU32_IMM(BPF_MOV, dst_reg, 1);
+ 		break;
+ 	}
+ 
+@@ -9703,13 +9703,11 @@ static u32 bpf_convert_ctx_access(enum bpf_access_type type,
+ 		break;
+ 
+ 	case offsetof(struct __sk_buff, vlan_present):
+-		*target_size = 1;
+-		*insn++ = BPF_LDX_MEM(BPF_B, si->dst_reg, si->src_reg,
+-				      PKT_VLAN_PRESENT_OFFSET);
+-		if (PKT_VLAN_PRESENT_BIT)
+-			*insn++ = BPF_ALU32_IMM(BPF_RSH, si->dst_reg, PKT_VLAN_PRESENT_BIT);
+-		if (PKT_VLAN_PRESENT_BIT < 7)
+-			*insn++ = BPF_ALU32_IMM(BPF_AND, si->dst_reg, 1);
++		*insn++ = BPF_LDX_MEM(BPF_W, si->dst_reg, si->src_reg,
++				      bpf_target_off(struct sk_buff,
++						     vlan_all, 4, target_size));
++		*insn++ = BPF_JMP_IMM(BPF_JEQ, si->dst_reg, 0, 1);
++		*insn++ = BPF_ALU32_IMM(BPF_MOV, si->dst_reg, 1);
+ 		break;
+ 
+ 	case offsetof(struct __sk_buff, vlan_tci):
+-- 
+2.53.0
+
