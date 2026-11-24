@@ -1,0 +1,102 @@
+From 7dcaf3e10a5f7c8836c07d105c3386edbb502d94 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 13 Nov 2026 12:53:01 +0100
+Subject: bpqether: reserve the Ethernet device's own header room on transmit
+
+From: Bernard Pidoux <bernard.f6bvp@gmail.com>
+
+bpq_xmit() makes sure the frame has AX25_BPQ_HEADER_LEN (16) bytes of
+headroom, then pushes the two length bytes and lets dev_hard_header()
+of the underlying device build the link layer header. That covers a
+plain Ethernet header, but not a longer one.
+
+A VLAN device on top of an Ethernet device that cannot insert the tag
+in hardware, with reorder_hdr turned off, pushes an 18 byte header
+(VLAN tag, then the Ethernet header). A UI frame sent from an AX.25
+datagram socket with 8 digipeaters reaches bpq_xmit() with 17 bytes of
+headroom once the KISS byte is dropped: skb_cow() leaves it alone, 15
+bytes remain after the length bytes, and eth_header() underflows the
+skb:
+
+  skbuff: skb_under_panic: ... len:101 put:14 ... dev:eth0.5
+  kernel BUG at net/core/skbuff.c:209!
+  Call Trace:
+   eth_header
+   vlan_dev_hard_header
+   dev_hard_start_xmit
+   __dev_queue_xmit
+   ax25_sendmsg
+   __sys_sendto
+
+No privilege is needed to open and bind such a socket, so any local
+user can crash a host that runs bpqether over this kind of VLAN.
+
+Look up the Ethernet device first and ask skb_cow() for
+LL_RESERVED_SPACE() of that device plus the two length bytes.
+
+Tested in a QEMU guest (6.12.94, KASAN) with bpq devices on eth0, on
+eth0.6 (reorder_hdr on) and on eth0.5 (reorder_hdr off), eth0 being a
+virtio-net port without VLAN tag insertion: UI frames with 0, 7 and 8
+digipeaters on each. Before the change the 8 digipeater frame on
+eth0.5 panicked the guest with 15 bytes of headroom left; after it,
+79 bytes are left and all frames are sent, with no kernel report.
+
+Fixes: 1da177e4c3f4 ("Linux-2.6.12-rc2")
+Signed-off-by: Bernard Pidoux <bernard.f6bvp@gmail.com>
+Assisted-by: Claude:claude-opus-5-5
+(cherry picked from commit 6b7e0767b46d918b5c8a5a2fbb8a9c8a2531d698)
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/net/hamradio/bpqether.c | 25 ++++++++++++++-----------
+ 1 file changed, 14 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/net/hamradio/bpqether.c b/drivers/net/hamradio/bpqether.c
+index f30616d915fd3..1adb56a5d4b86 100644
+--- a/drivers/net/hamradio/bpqether.c
++++ b/drivers/net/hamradio/bpqether.c
+@@ -237,12 +237,24 @@ static netdev_tx_t bpq_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	skb_pull(skb, 1);			/* Drop KISS byte */
+ 	size = skb->len;
+ 
++	bpq = netdev_priv(dev);
++
++	orig_dev = dev;
++	dev = bpq_get_ether_dev(dev);
++	if (!dev) {
++		orig_dev->stats.tx_dropped++;
++		kfree_skb(skb);
++		return NETDEV_TX_OK;
++	}
++
+ 	/*
+ 	 * We're about to mess with the skb which may still shared with the
+ 	 * generic networking code so unshare and ensure it's got enough
+-	 * space for the BPQ headers.
++	 * space for the length bytes and for the link layer header of the
++	 * Ethernet device. That header can be longer than an Ethernet
++	 * header, e.g. on a VLAN device that inserts the tag itself.
+ 	 */
+-	if (skb_cow(skb, AX25_BPQ_HEADER_LEN)) {
++	if (skb_cow(skb, LL_RESERVED_SPACE(dev) + 2)) {
+ 		if (net_ratelimit())
+ 			pr_err("bpqether: out of memory\n");
+ 		kfree_skb(skb);
+@@ -255,15 +267,6 @@ static netdev_tx_t bpq_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	*ptr++ = (size + 5) % 256;
+ 	*ptr++ = (size + 5) / 256;
+ 
+-	bpq = netdev_priv(dev);
+-
+-	orig_dev = dev;
+-	if ((dev = bpq_get_ether_dev(dev)) == NULL) {
+-		orig_dev->stats.tx_dropped++;
+-		kfree_skb(skb);
+-		return NETDEV_TX_OK;
+-	}
+-
+ 	skb->protocol = ax25_type_trans(skb, dev);
+ 	skb_reset_network_header(skb);
+ 	dev_hard_header(skb, dev, ETH_P_BPQ, bpq->dest_addr, NULL, 0);
+-- 
+2.53.0
+
