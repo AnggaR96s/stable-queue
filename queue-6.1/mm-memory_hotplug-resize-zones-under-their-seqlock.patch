@@ -1,0 +1,115 @@
+From 58e81bb7de5aac8ec5e4aa21d401e7dafbd4058b Mon Sep 17 00:00:00 2001
+From: Josef Bacik <josef@toxicpanda.com>
+Date: Tue, 3 Nov 2026 17:16:50 +0100
+Subject: mm/memory_hotplug: resize zones under their seqlock
+
+From: Josef Bacik <josef@toxicpanda.com>
+
+commit 58e81bb7de5aac8ec5e4aa21d401e7dafbd4058b upstream.
+
+With CONFIG_DEBUG_VM the page allocator checks that a page which is
+freed, split or allocated lies within its zone. The check reads
+zone->zone_start_pfn and zone->spanned_pages under zone->span_seqlock, as
+memory hotplug can change the two at any time.
+
+Commit 27cacaad16c5 ("mm,memory_hotplug: drop unneeded locking") removed
+the write side, since all resizing is serialized by the hotplug lock. That
+leaves the reader without protection. When memory below the start of a
+zone goes online, the start is lowered first and the size is raised
+afterwards. When the lowest memory of a zone goes offline, the size is
+reduced first. In between, the zone seems to end before its last pages. If
+one of them goes through the allocator at that moment, it is reported as
+being outside of the zone triggers VM_BUG_ON_PAGE().
+
+Write the two fields in a write section of the seqlock. Interrupts are
+disabled as pages are freed from interrupts, too, and the reader would
+wait for the writer which it has interrupted.
+
+Fixes: 27cacaad16c5 ("mm,memory_hotplug: drop unneeded locking")
+Cc: stable@vger.kernel.org
+Assisted-by: LLM
+Signed-off-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: David Hildenbrand (Arm) <david@kernel.org>
+Link: https://patch.msgid.link/20261103-pgalloc-ai-hotfixes-v2-4-e0d2890ab74f@kernel.org
+Signed-off-by: Vlastimil Babka (SUSE) <vbabka@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ mm/memory_hotplug.c |   44 ++++++++++++++++++++++++++++----------------
+ 1 file changed, 28 insertions(+), 16 deletions(-)
+
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@ -389,6 +389,22 @@ static unsigned long find_biggest_sectio
+ 	return 0;
+ }
+ 
++/*
++ * The page allocator checks pages against the span of their zone while the
++ * zone is resized, see page_outside_zone_boundaries(). It must not see the
++ * new value of one field together with the old value of the other one.
++ */
++static void zone_set_span(struct zone *zone, unsigned long start_pfn,
++			  unsigned long spanned_pages)
++{
++	unsigned long flags;
++
++	write_seqlock_irqsave(&zone->span_seqlock, flags);
++	zone->zone_start_pfn = start_pfn;
++	zone->spanned_pages = spanned_pages;
++	write_sequnlock_irqrestore(&zone->span_seqlock, flags);
++}
++
+ static void shrink_zone_span(struct zone *zone, unsigned long start_pfn,
+ 			     unsigned long end_pfn)
+ {
+@@ -404,13 +420,10 @@ static void shrink_zone_span(struct zone
+ 		 */
+ 		pfn = find_smallest_section_pfn(nid, zone, end_pfn,
+ 						zone_end_pfn(zone));
+-		if (pfn) {
+-			zone->spanned_pages = zone_end_pfn(zone) - pfn;
+-			zone->zone_start_pfn = pfn;
+-		} else {
+-			zone->zone_start_pfn = 0;
+-			zone->spanned_pages = 0;
+-		}
++		if (pfn)
++			zone_set_span(zone, pfn, zone_end_pfn(zone) - pfn);
++		else
++			zone_set_span(zone, 0, 0);
+ 	} else if (zone_end_pfn(zone) == end_pfn) {
+ 		/*
+ 		 * If the section is biggest section in the zone, it need
+@@ -421,11 +434,10 @@ static void shrink_zone_span(struct zone
+ 		pfn = find_biggest_section_pfn(nid, zone, zone->zone_start_pfn,
+ 					       start_pfn);
+ 		if (pfn)
+-			zone->spanned_pages = pfn - zone->zone_start_pfn + 1;
+-		else {
+-			zone->zone_start_pfn = 0;
+-			zone->spanned_pages = 0;
+-		}
++			zone_set_span(zone, zone->zone_start_pfn,
++				      pfn - zone->zone_start_pfn + 1);
++		else
++			zone_set_span(zone, 0, 0);
+ 	}
+ }
+ 
+@@ -642,12 +654,12 @@ static void node_states_set_node(int nod
+ static void __meminit resize_zone_range(struct zone *zone, unsigned long start_pfn,
+ 		unsigned long nr_pages)
+ {
+-	unsigned long old_end_pfn = zone_end_pfn(zone);
++	unsigned long end_pfn = max(start_pfn + nr_pages, zone_end_pfn(zone));
+ 
+-	if (zone_is_empty(zone) || start_pfn < zone->zone_start_pfn)
+-		zone->zone_start_pfn = start_pfn;
++	if (!zone_is_empty(zone) && start_pfn > zone->zone_start_pfn)
++		start_pfn = zone->zone_start_pfn;
+ 
+-	zone->spanned_pages = max(start_pfn + nr_pages, old_end_pfn) - zone->zone_start_pfn;
++	zone_set_span(zone, start_pfn, end_pfn - start_pfn);
+ }
+ 
+ static void __meminit resize_pgdat_range(struct pglist_data *pgdat, unsigned long start_pfn,
