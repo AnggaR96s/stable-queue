@@ -1,0 +1,67 @@
+From 8ba1ade3e6b595b9091040feaa3341d7e45ba95d Mon Sep 17 00:00:00 2001
+From: Zhao Feng <zhaofeng2@cmss.chinamobile.com>
+Date: Mon, 9 Nov 2026 10:37:53 +0800
+Subject: dm crypt: fix use of uninitialized percpu_counter in ctr error path
+
+From: Zhao Feng <zhaofeng2@cmss.chinamobile.com>
+
+commit 8ba1ade3e6b595b9091040feaa3341d7e45ba95d upstream.
+
+If percpu_counter_init() fails in crypt_ctr() (e.g. when the
+underlying percpu allocation fails under memory pressure or fault
+injection), the error path jumps to "bad", which calls
+crypt_dtr().  crypt_dtr() then evaluates
+WARN_ON(percpu_counter_sum(&cc->n_allocated_pages) != 0) and calls
+percpu_counter_destroy() on a counter that was never initialized,
+because __percpu_counter_init_many() returns -ENOMEM before
+calling raw_spin_lock_init() on fbc->lock.
+
+With lockdep enabled this triggers "INFO: trying to register
+non-static key" in __percpu_counter_sum(), as reported by syzbot.
+The console additionally shows "crypt: Unknown error (-ENOMEM)"
+because this failure path sets no ti->error.
+
+Move percpu_counter_init() to right after the allocation of cc,
+before ti->private is set and before any "goto bad" can happen.
+On failure, set ti->error and free cc directly, so that
+crypt_dtr() is only ever called with an initialized counter.
+
+Reported-by: syzbot+4b232570d625662eaab4@syzkaller.appspotmail.com
+Closes: https://syzbot.org/bug?extid=4b232570d625662eaab4
+Fixes: 5059353df86e ("dm crypt: limit the number of allocated pages")
+Cc: stable@vger.kernel.org
+Signed-off-by: Zhao Feng <zhaofeng2@cmss.chinamobile.com>
+Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/md/dm-crypt.c |   12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+--- a/drivers/md/dm-crypt.c
++++ b/drivers/md/dm-crypt.c
+@@ -3253,6 +3253,14 @@ static int crypt_ctr(struct dm_target *t
+ 		ti->error = "Cannot allocate encryption context";
+ 		return -ENOMEM;
+ 	}
++
++	ret = percpu_counter_init(&cc->n_allocated_pages, 0, GFP_KERNEL);
++	if (ret < 0) {
++		ti->error = "Cannot initialize page counter";
++		kfree_sensitive(cc);
++		return ret;
++	}
++
+ 	cc->key_size = key_size;
+ 	cc->sector_size = (1 << SECTOR_SHIFT);
+ 	cc->sector_shift = 0;
+@@ -3264,10 +3272,6 @@ static int crypt_ctr(struct dm_target *t
+ 	crypt_calculate_pages_per_client();
+ 	spin_unlock(&dm_crypt_clients_lock);
+ 
+-	ret = percpu_counter_init(&cc->n_allocated_pages, 0, GFP_KERNEL);
+-	if (ret < 0)
+-		goto bad;
+-
+ 	/* Optional parameters need to be read before cipher constructor */
+ 	if (argc > 5) {
+ 		ret = crypt_ctr_optional(ti, argc - 5, &argv[5]);

@@ -1,0 +1,77 @@
+From 11b5cd14c0eecae458cecbe53d21a3dbc10190f5 Mon Sep 17 00:00:00 2001
+From: Jay Vadayath <jay@artiphishell.com>
+Date: Thu, 22 Oct 2026 11:19:34 -0700
+Subject: dm-raid: bound array_position before indexing failed_devices
+
+From: Jay Vadayath <jay@artiphishell.com>
+
+commit 11b5cd14c0eecae458cecbe53d21a3dbc10190f5 upstream.
+
+super_init_validation() reads role = le32_to_cpu(sb2->array_position)
+out of an on-disk dm_raid_superblock and then uses it as a bit index into
+the failed_devices bitmap via test_bit(role, (void *)failed_devices).
+failed_devices is a uint64_t[DISKS_ARRAY_ELEMS] (DISKS_ARRAY_ELEMS == 4,
+i.e. 256 bits) living on the stack. The only guard is role < 0, so any
+on-disk array_position >= 256 makes test_bit() read past the end of the
+stack array (array_position == 256 reads failed_devices[4], 8 bytes past
+the object). For a raid1 set the role != raid_disk reorder branch falls
+through to the same test_bit().
+
+A crafted dm-raid superblock therefore causes a stack out-of-bounds read
+during table load. Reachable by anyone able to issue a dmsetup create
+with attacker-controlled metadata (CAP_SYS_ADMIN in the target
+namespace); the crash fires in the constructor / analyse_superblocks
+path, before any md_run or array sizing.
+
+  BUG: KASAN: stack-out-of-bounds in super_validate+0x1cd0/0x3390
+  Read of size 8 at addr ffff888007b17828 by task poc/152
+  Call Trace:
+   dump_stack_lvl+0x64/0x80
+   print_report+0xd0/0x630
+   kasan_report+0xe5/0x120
+   kasan_check_range+0x105/0x1b0
+   super_validate+0x1cd0/0x3390        (super_init_validation, inlined)
+   raid_ctr+0x2c4b/0xa0f0
+   dm_table_add_target+0x66f/0xf80
+   table_load+0x2ee/0x780
+   ctl_ioctl+0x362/0x9f0
+   dm_ctl_ioctl+0x9/0x10
+   __x64_sys_ioctl+0x134/0x1c0
+   do_syscall_64+0xe2/0x4b0
+   entry_SYSCALL_64_after_hwframe+0x77/0x7f
+
+role is a device position that must refer to an actual member of the
+array, so reject anything outside [0, rs->raid_disks) instead of only the
+negative case. rs->raid_disks is always <= the 256-bit capacity of
+failed_devices, so this both closes the out-of-bounds access and matches
+the intended semantics.
+
+This bug was discovered by Artiphishell's vTriage pipeline, which
+generated a crafted raid1 superblock (magic "DmRd", compat_features=1,
+num_devices=2, array_position=256, level=1) and a dmsetup-create
+reproducer that reliably triggers the KASAN report on an unpatched kernel
+(the precursor DMINFO "raid device #256 now at position #0" is visible in
+the serial log just before the splat). The fix below was drafted with the
+Claude coding assistant; a userspace reproducer is available on request.
+
+Assisted-by: Claude:claude-opus-4-8
+Signed-off-by: Jay Vadayath <jay@artiphishell.com>
+Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+Cc: stable@vger.kernel.org
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/md/dm-raid.c |    3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+--- a/drivers/md/dm-raid.c
++++ b/drivers/md/dm-raid.c
+@@ -2392,7 +2392,8 @@ static int super_init_validation(struct
+ 		 */
+ 		if (!test_bit(FirstUse, &r->flags) && (r->raid_disk >= 0)) {
+ 			role = le32_to_cpu(sb2->array_position);
+-			if (role < 0)
++			/* Bound @role before it indexes the failed_devices stack bitmap. */
++			if (role < 0 || role >= rs->raid_disks)
+ 				continue;
+ 
+ 			if (role != r->raid_disk) {
