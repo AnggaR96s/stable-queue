@@ -1,0 +1,130 @@
+From 6dd070681326ef2fef5e008b8c3d0ae9634de222 Mon Sep 17 00:00:00 2001
+From: Tiezhu Yang <yangtiezhu@loongson.cn>
+Date: Tue, 10 Nov 2026 17:20:30 +0800
+Subject: LoongArch: BPF: Make use of beqz and bnez for trampoline branches
+
+From: Tiezhu Yang <yangtiezhu@loongson.cn>
+
+commit 6dd070681326ef2fef5e008b8c3d0ae9634de222 upstream.
+
+Currently, the implementation for BPF trampoline branches does not match
+the existing technical comments. The code uses larch_insn_gen_beq, where
+the comment indicates beqz should be used.
+
+While the BPF trampoline size is restricted within a single memory page
+(at most 64KB on LoongArch) and cannot cross the original 16-bit branch
+offset limit of the reg2i16 format, switching to the beqz instruction
+(which belongs to the reg1i21 format) avoids explicitly specifying the
+zero register during dynamic JIT encoding, resulting in cleaner assembly
+generation.
+
+While at it, also apply the same optimization to the bne instruction by
+replacing it with bnez and adding a corresponding comment.
+
+Cc: stable@vger.kernel.org
+Signed-off-by: Tiezhu Yang <yangtiezhu@loongson.cn>
+Signed-off-by: Huacai Chen <chenhuacai@loongson.cn>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/loongarch/include/asm/inst.h |   21 +++++++++++++++++++++
+ arch/loongarch/kernel/inst.c      |   28 ++++++++++++++++++++++++++++
+ arch/loongarch/net/bpf_jit.c      |    5 +++--
+ 3 files changed, 52 insertions(+), 2 deletions(-)
+
+--- a/arch/loongarch/include/asm/inst.h
++++ b/arch/loongarch/include/asm/inst.h
+@@ -535,6 +535,8 @@ u32 larch_insn_gen_lu32id(enum loongarch
+ u32 larch_insn_gen_lu52id(enum loongarch_gpr rd, enum loongarch_gpr rj, int imm);
+ u32 larch_insn_gen_beq(enum loongarch_gpr rd, enum loongarch_gpr rj, int imm);
+ u32 larch_insn_gen_bne(enum loongarch_gpr rd, enum loongarch_gpr rj, int imm);
++u32 larch_insn_gen_beqz(enum loongarch_gpr rj, int imm);
++u32 larch_insn_gen_bnez(enum loongarch_gpr rj, int imm);
+ u32 larch_insn_gen_jirl(enum loongarch_gpr rd, enum loongarch_gpr rj, int imm);
+ 
+ static inline bool signed_imm_check(long val, unsigned int bit)
+@@ -592,6 +594,25 @@ DEF_EMIT_REG1I20_FORMAT(lu12iw, lu12iw_o
+ DEF_EMIT_REG1I20_FORMAT(lu32id, lu32id_op)
+ DEF_EMIT_REG1I20_FORMAT(pcaddu18i, pcaddu18i_op)
+ 
++#define DEF_EMIT_REG1I21_FORMAT(NAME, OP)				\
++static inline void emit_##NAME(union loongarch_instruction *insn,	\
++			       enum loongarch_gpr rj, int offset)	\
++{									\
++	unsigned int immediate_l, immediate_h;				\
++									\
++	immediate_l = offset & 0xffff;					\
++	offset >>= 16;							\
++	immediate_h = offset & 0x1f;					\
++									\
++	insn->reg1i21_format.opcode = OP;				\
++	insn->reg1i21_format.immediate_l = immediate_l;			\
++	insn->reg1i21_format.rj = rj;					\
++	insn->reg1i21_format.immediate_h = immediate_h;			\
++}
++
++DEF_EMIT_REG1I21_FORMAT(beqz, beqz_op)
++DEF_EMIT_REG1I21_FORMAT(bnez, bnez_op)
++
+ #define DEF_EMIT_REG2_FORMAT(NAME, OP)					\
+ static inline void emit_##NAME(union loongarch_instruction *insn,	\
+ 			       enum loongarch_gpr rd,			\
+--- a/arch/loongarch/kernel/inst.c
++++ b/arch/loongarch/kernel/inst.c
+@@ -428,6 +428,34 @@ u32 larch_insn_gen_bne(enum loongarch_gp
+ 	return insn.word;
+ }
+ 
++u32 larch_insn_gen_beqz(enum loongarch_gpr rj, int imm)
++{
++	union loongarch_instruction insn;
++
++	if ((imm & 3) || imm < -SZ_4M || imm >= SZ_4M) {
++		pr_warn("The generated beqz instruction is out of range.\n");
++		return INSN_BREAK;
++	}
++
++	emit_beqz(&insn, rj, imm >> 2);
++
++	return insn.word;
++}
++
++u32 larch_insn_gen_bnez(enum loongarch_gpr rj, int imm)
++{
++	union loongarch_instruction insn;
++
++	if ((imm & 3) || imm < -SZ_4M || imm >= SZ_4M) {
++		pr_warn("The generated bnez instruction is out of range.\n");
++		return INSN_BREAK;
++	}
++
++	emit_bnez(&insn, rj, imm >> 2);
++
++	return insn.word;
++}
++
+ u32 larch_insn_gen_jirl(enum loongarch_gpr rd, enum loongarch_gpr rj, int imm)
+ {
+ 	union loongarch_instruction insn;
+--- a/arch/loongarch/net/bpf_jit.c
++++ b/arch/loongarch/net/bpf_jit.c
+@@ -1768,7 +1768,7 @@ static int invoke_bpf_prog(struct jit_ct
+ 	/* update branch with beqz */
+ 	if (ctx->image) {
+ 		int offset = (void *)(&ctx->image[ctx->idx]) - (void *)branch;
+-		*branch = larch_insn_gen_beq(LOONGARCH_GPR_A0, LOONGARCH_GPR_ZERO, offset);
++		*branch = larch_insn_gen_beqz(LOONGARCH_GPR_A0, offset);
+ 	}
+ 
+ 	/* arg1: prog */
+@@ -2081,9 +2081,10 @@ static int __arch_prepare_bpf_trampoline
+ 		emit_insn(ctx, std, regmap[BPF_REG_0], LOONGARCH_GPR_FP, -(retval_off - 8));
+ 	}
+ 
++	/* update branches with bnez */
+ 	for (i = 0; ctx->image && i < fmod_ret->nr_nodes; i++) {
+ 		int offset = (void *)(&ctx->image[ctx->idx]) - (void *)branches[i];
+-		*branches[i] = larch_insn_gen_bne(LOONGARCH_GPR_T1, LOONGARCH_GPR_ZERO, offset);
++		*branches[i] = larch_insn_gen_bnez(LOONGARCH_GPR_T1, offset);
+ 	}
+ 
+ 	/* Set "is_return" flag for fsession */

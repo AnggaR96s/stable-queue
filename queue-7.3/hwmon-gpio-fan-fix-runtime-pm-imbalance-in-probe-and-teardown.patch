@@ -1,0 +1,99 @@
+From 221b565a3316b1ba3a9bcd1f61238440207b3e00 Mon Sep 17 00:00:00 2001
+From: Guenter Roeck <linux@roeck-us.net>
+Date: Thu, 5 Nov 2026 10:17:02 -0800
+Subject: hwmon: (gpio-fan) Fix runtime PM imbalance in probe and teardown
+
+From: Guenter Roeck <linux@roeck-us.net>
+
+commit 221b565a3316b1ba3a9bcd1f61238440207b3e00 upstream.
+
+In gpio_fan_probe(), gpio_fan_stop() is registered conditionally as a
+devres action before runtime PM is initialized, while gpio_fan_stop()
+unconditionally calls pm_runtime_disable(). This breaks runtime PM
+disable_depth and usage_count invariants across several paths:
+
+- On alarm-only devices without control GPIOs, gpio_fan_stop() is never
+  registered, leaving pm_runtime_enable() unbalanced on unbind and
+  triggering "Unbalanced pm_runtime_enable!" on subsequent binds.
+- When control GPIOs are present and devm_add_action_or_reset(), hwmon
+  registration, or fan_alarm_init() fails, gpio_fan_stop() runs before
+  pm_runtime_enable(), incrementing disable_depth to 2 (leaving runtime
+  PM permanently disabled on re-probe) and, if speed_index > 0,
+  underflowing usage_count via pm_runtime_put_sync().
+- If pm_runtime_resume_and_get() fails when speed_index > 0, it drops
+  its reference while speed_index remains non-zero, causing
+  gpio_fan_stop() to call pm_runtime_put_sync() and underflow
+  usage_count.
+- Registering the hwmon device before enabling runtime PM exposes sysfs
+  attributes that can invoke set_fan_speed() before runtime PM state is
+  initialized.
+
+Initialize runtime PM upfront with pm_runtime_set_suspended() and
+devm_pm_runtime_enable(), remove pm_runtime_disable() from
+gpio_fan_stop(), and acquire the initial active runtime PM reference
+before registering gpio_fan_stop() and the hwmon device.
+
+Fixes: 0d01110e6356 ("hwmon: (gpio-fan) Add regulator support")
+Reported-by: Sashiko <sashiko@sashiko.dev>
+Link: https://sashiko.dev/#/bug/linux-349aa3ba-30c3-4c3c-b47e-f52839af2b8d
+Cc: stable@vger.kernel.org
+Signed-off-by: Guenter Roeck <linux@roeck-us.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/hwmon/gpio-fan.c |   24 +++++++++++-------------
+ 1 file changed, 11 insertions(+), 13 deletions(-)
+
+--- a/drivers/hwmon/gpio-fan.c
++++ b/drivers/hwmon/gpio-fan.c
+@@ -531,8 +531,6 @@ static void gpio_fan_stop(void *data)
+ 	mutex_lock(&fan_data->lock);
+ 	set_fan_speed(data, 0);
+ 	mutex_unlock(&fan_data->lock);
+-
+-	pm_runtime_disable(fan_data->dev);
+ }
+ 
+ static int gpio_fan_probe(struct platform_device *pdev)
+@@ -560,6 +558,11 @@ static int gpio_fan_probe(struct platfor
+ 		return dev_err_probe(dev, PTR_ERR(fan_data->supply),
+ 				     "Failed to get fan-supply");
+ 
++	pm_runtime_set_suspended(dev);
++	err = devm_pm_runtime_enable(dev);
++	if (err)
++		return err;
++
+ 	/* Configure control GPIOs if available. */
+ 	if (fan_data->gpios && fan_data->num_gpios > 0) {
+ 		if (!fan_data->speed || fan_data->num_speed <= 1)
+@@ -567,6 +570,12 @@ static int gpio_fan_probe(struct platfor
+ 		err = fan_ctrl_init(fan_data);
+ 		if (err)
+ 			return err;
++		/* If current GPIO state is active, mark RPM as active as well */
++		if (fan_data->speed_index > 0) {
++			err = pm_runtime_resume_and_get(dev);
++			if (err)
++				return err;
++		}
+ 		err = devm_add_action_or_reset(dev, gpio_fan_stop, fan_data);
+ 		if (err)
+ 			return err;
+@@ -587,17 +596,6 @@ static int gpio_fan_probe(struct platfor
+ 			return err;
+ 	}
+ 
+-	pm_runtime_set_suspended(&pdev->dev);
+-	pm_runtime_enable(&pdev->dev);
+-	/* If current GPIO state is active, mark RPM as active as well */
+-	if (fan_data->speed_index > 0) {
+-		int ret;
+-
+-		ret = pm_runtime_resume_and_get(&pdev->dev);
+-		if (ret)
+-			return ret;
+-	}
+-
+ 	/* Optional cooling device register for Device tree platforms */
+ 	fan_data->cdev = devm_thermal_of_child_cooling_device_register(dev, np,
+ 								       "gpio-fan",

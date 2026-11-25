@@ -1,0 +1,82 @@
+From 7620a997e4854c94eacebf0c2d453fbd78ccdb46 Mon Sep 17 00:00:00 2001
+From: Andrey Misiurov <andrey.misyrov@gmail.com>
+Date: Tue, 13 Oct 2026 19:07:45 +0200
+Subject: xen/gntdev: fix deadlock between map ioctl and mmap
+
+From: Andrey Misiurov <andrey.misyrov@gmail.com>
+
+commit 7620a997e4854c94eacebf0c2d453fbd78ccdb46 upstream.
+
+Commit 45ca1afe2fd1 ("xen/gntdev: fix error handling in ioctl") moved
+copy_to_user() in gntdev_ioctl_map_grant_ref() under priv->lock. A
+fault in copy_to_user() takes mmap_lock, while gntdev_mmap() is called
+with mmap_lock held and takes priv->lock:
+
+  ioctl thread                        mmap thread
+  mutex_lock(&priv->lock)
+                                      mmap_write_lock(mm)
+                                      gntdev_mmap()
+                                        mutex_lock(&priv->lock)
+  copy_to_user() faults
+    mmap_read_lock(mm)
+
+Reproduced on Debian 6.12.111 in a Xen guest, with the ioctl argument
+on a MAP_PRIVATE file page that has not been written yet. sysrq-w:
+
+  task:repro state:D stack:0 pid:4479 tgid:4477 ppid:1 flags:0x00000000
+   rwsem_down_read_slowpath+0x25c/0x480
+   down_read_killable+0x48/0xc0
+   lock_mm_and_find_vma+0x96/0x250
+   do_user_addr_fault+0x12d/0x620
+   exc_page_fault+0x7e/0x180
+   asm_exc_page_fault+0x26/0x30
+   _copy_to_user+0x36/0x50
+   gntdev_ioctl+0x3b9/0xa00 [xen_gntdev]
+   __x64_sys_ioctl+0x97/0xc0
+  task:repro state:D stack:0 pid:4480 tgid:4477 ppid:1 flags:0x00000000
+   __mutex_lock.constprop.0+0x41b/0x720
+   gntdev_mmap+0x4d/0x330 [xen_gntdev]
+   __mmap_region+0x697/0xb10
+   mmap_region+0x78/0xa0
+   do_mmap+0x45d/0x630
+   vm_mmap_pgoff+0xf8/0x1c0
+
+Drop priv->lock before copy_to_user() again. On failure, re-take it
+and remove the map by index, as IOCTL_GNTDEV_UNMAP_GRANT_REF does,
+since another thread may have unmapped it meanwhile.
+
+Fixes: 45ca1afe2fd1 ("xen/gntdev: fix error handling in ioctl")
+Cc: stable@vger.kernel.org
+Signed-off-by: Andrey Misiurov <andrey.misyrov@gmail.com>
+Reviewed-by: Juergen Gross <jgross@suse.com>
+Signed-off-by: Juergen Gross <jgross@suse.com>
+Message-ID: <20261013170745.583279-1-andrey.misyrov@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/xen/gntdev.c |    8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+--- a/drivers/xen/gntdev.c
++++ b/drivers/xen/gntdev.c
+@@ -670,15 +670,19 @@ static long gntdev_ioctl_map_grant_ref(s
+ 	mutex_lock(&priv->lock);
+ 	gntdev_add_map(priv, map);
+ 	op.index = map->index << PAGE_SHIFT;
++	mutex_unlock(&priv->lock);
+ 
+ 	if (copy_to_user(u, &op, sizeof(op)) != 0) {
+-		list_del(&map->next);
++		mutex_lock(&priv->lock);
++		map = gntdev_find_map_index(priv, op.index >> PAGE_SHIFT,
++					    op.count);
++		if (map)
++			list_del(&map->next);
+ 		mutex_unlock(&priv->lock);
+ 		gntdev_put_map(priv, map);
+ 		return -EFAULT;
+ 	}
+ 
+-	mutex_unlock(&priv->lock);
+ 	return 0;
+ }
+ 

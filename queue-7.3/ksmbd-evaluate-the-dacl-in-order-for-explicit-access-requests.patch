@@ -1,0 +1,249 @@
+From 20bed0d6ff62d985fe8222958825504b8aad4e88 Mon Sep 17 00:00:00 2001
+From: Ian Bridges <icb@fastmail.org>
+Date: Sun, 8 Nov 2026 12:20:10 -0600
+Subject: ksmbd: evaluate the DACL in order for explicit access requests
+
+From: Ian Bridges <icb@fastmail.org>
+
+commit 20bed0d6ff62d985fe8222958825504b8aad4e88 upstream.
+
+For requests without MAXIMUM_ALLOWED, smb_check_perm_dacl() selects one
+ACE instead of evaluating the DACL in order. When the selected ACE is a
+deny ACE, the function grants the complement of its mask, and deny ACEs
+before it are ignored. The selected ACE can also be inherit-only,
+unsupported, or an NFS mode ACE.
+
+Guest and anonymous sessions also match Authenticated Users. These bugs
+can grant read or write access that the stored DACL does not grant. For
+example, a deny of FILE_READ_DATA grants FILE_WRITE_DATA, and guests can
+read files granted only to Authenticated Users.
+
+Evaluate explicit requests in DACL order. Use exact SID matching for the
+caller, Everyone, Authenticated Users, OWNER RIGHTS and the caller's
+groups. Match Authenticated Users only for authenticated sessions, and
+ignore the NFS mode SID.
+
+An Authenticated Users ACE must still prevent the POSIX ACL fallback
+from replacing the DACL result for guest and anonymous sessions. The ACE
+does not grant them access.
+
+Keep the existing single-ACE behavior when a non-inherit-only object
+deny ACE is present because ksmbd does not parse those ACEs. Guest and
+anonymous sessions do not match Authenticated Users there either.
+MAXIMUM_ALLOWED behavior is unchanged.
+
+Fixes: e2f34481b24d ("cifsd: add server-side procedures for SMB3")
+Fixes: cc2f133e80eb ("ksmbd: fix maximum allowed access checks")
+Cc: stable@vger.kernel.org
+Signed-off-by: Ian Bridges <icb@fastmail.org>
+Signed-off-by: Namjae Jeon <linkinjeon@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/smb/server/mgmt/user_config.h |    5 +++
+ fs/smb/server/smb2pdu.c          |   11 +++++--
+ fs/smb/server/smbacl.c           |   58 ++++++++++++++++++++++++++++++---------
+ fs/smb/server/smbacl.h           |    2 -
+ 4 files changed, 60 insertions(+), 16 deletions(-)
+
+--- a/fs/smb/server/mgmt/user_config.h
++++ b/fs/smb/server/mgmt/user_config.h
+@@ -67,4 +67,9 @@ struct ksmbd_user *ksmbd_alloc_user(stru
+ void ksmbd_free_user(struct ksmbd_user *user);
+ bool ksmbd_anonymous_user(struct ksmbd_user *user);
+ bool ksmbd_compare_user(struct ksmbd_user *u1, struct ksmbd_user *u2);
++
++static inline bool ksmbd_user_authenticated(struct ksmbd_user *user)
++{
++	return user && !user_guest(user) && !ksmbd_anonymous_user(user);
++}
+ #endif /* __USER_CONFIG_MANAGEMENT_H__ */
+--- a/fs/smb/server/smb2pdu.c
++++ b/fs/smb/server/smb2pdu.c
+@@ -4359,7 +4359,8 @@ static int smb2_handle_app_instance_id(s
+ 	/* Authorize the referenced open even if its name changes meanwhile. */
+ 	old_path = &old_fp->filp->f_path;
+ 	rc = smb_check_perm_dacl(conn, old_path, &maximal_access, 0,
+-				 work->sess->user->uid, false);
++				 work->sess->user->uid,
++				 ksmbd_user_authenticated(work->sess->user), false);
+ 	if (rc) {
+ 		/* Access denial prevents takeover, not the CREATE itself. */
+ 		ksmbd_put_durable_fd(old_fp);
+@@ -4868,14 +4869,17 @@ resolve_path:
+ 	if (file_present && !(req->CreateOptions & FILE_DELETE_ON_CLOSE_LE)) {
+ 		rc = smb_check_perm_dacl(conn, &path, &daccess,
+ 					 req->DesiredAccess,
+-					 sess->user->uid, false);
++					 sess->user->uid,
++					 ksmbd_user_authenticated(sess->user), false);
+ 		if (rc)
+ 			goto err_out;
+ 
+ 		if (maximal_access_ctxt) {
+ 			maximal_access = FILE_MAXIMAL_ACCESS_LE;
+ 			rc = smb_check_perm_dacl(conn, &path, &maximal_access,
+-						 0, sess->user->uid, false);
++						 0, sess->user->uid,
++						 ksmbd_user_authenticated(sess->user),
++						 false);
+ 			if (rc)
+ 				goto err_out;
+ 
+@@ -6158,6 +6162,7 @@ static int process_query_dir_entries(str
+ 			rc = smb_check_perm_dacl(priv->work->conn, &path,
+ 						 &daccess, daccess,
+ 						 priv->work->sess->user->uid,
++						 ksmbd_user_authenticated(priv->work->sess->user),
+ 						 true);
+ 			if (rc) {
+ 				dput(dent);
+--- a/fs/smb/server/smbacl.c
++++ b/fs/smb/server/smbacl.c
+@@ -1471,6 +1471,12 @@ static bool smb_sid_in_group(const struc
+ 	return in_group_p(make_kgid(&init_user_ns, gid));
+ }
+ 
++/* Whether two SIDs are the same SID */
++static bool smb_sid_equal(const struct smb_sid *a, const struct smb_sid *b)
++{
++	return a->num_subauth == b->num_subauth && !compare_sids(a, b);
++}
++
+ /*
+  * compare_sids() compares only the sub-authorities both SIDs have, so it
+  * also matches a shorter or longer SID, such as S-1-3 or S-1-3-4-777
+@@ -1483,7 +1489,7 @@ static bool smb_sid_is_owner_rights(cons
+ 
+ int smb_check_perm_dacl(struct ksmbd_conn *conn, const struct path *path,
+ 			__le32 *pdaccess, __le32 raw_daccess, int uid,
+-			bool strict)
++			bool authenticated, bool strict)
+ {
+ 	struct mnt_idmap *idmap = mnt_idmap(path->mnt);
+ 	struct smb_ntsd *pntsd = NULL;
+@@ -1500,12 +1506,17 @@ int smb_check_perm_dacl(struct ksmbd_con
+ 	unsigned int access_bits = 0, denied = 0, grp_granted = 0;
+ 	unsigned int grp_allowed = 0, grp_denied = 0, bits;
+ 	struct smb_ace *others_ace = NULL;
+-	bool or_ace = false, obj_deny = false, member, counted;
++	bool or_ace = false, obj_deny = false, au_ace = false, member, counted;
+ 	struct posix_acl_entry *pa_entry;
+ 	unsigned int sid_type = SIDOWNER;
+ 	unsigned short ace_size;
+ 	bool is_owner, owner_rights = false;
+ 	bool maximal = *pdaccess & FILE_MAXIMAL_ACCESS_LE;
++	/*
++	 * MAXIMUM_ALLOWED requests match every session against
++	 * Authenticated Users.
++	 */
++	bool authusers = authenticated || maximal;
+ 	vfsuid_t vfsuid;
+ 
+ 	ksmbd_debug(SMB, "check permission using windows acl\n");
+@@ -1557,9 +1568,10 @@ int smb_check_perm_dacl(struct ksmbd_con
+ 
+ 	/*
+ 	 * Evaluate the DACL in order (MS-DTYP 2.5.3.2). access_bits collects
+-	 * the MAXIMUM_ALLOWED result. grp_granted collects what ACEs for the
+-	 * caller's groups, or OWNER RIGHTS for the owner, grant. It is used
+-	 * when the SID lookup and POSIX ACL fallback below do not decide.
++	 * the result for the ACEs that apply to the caller, without its groups
++	 * for MAXIMUM_ALLOWED. grp_granted collects what ACEs for the caller's
++	 * groups, or OWNER RIGHTS for the owner, grant. It is used when the
++	 * SID lookup and POSIX ACL fallback below do not decide.
+ 	 */
+ 	ace = (struct smb_ace *)((char *)pdacl + sizeof(struct smb_acl));
+ 	aces_size = pdacl_size - sizeof(struct smb_acl);
+@@ -1599,10 +1611,18 @@ int smb_check_perm_dacl(struct ksmbd_con
+ 		    (compare_sids(&sid, &ace->sid) &&
+ 		     compare_sids(&sid_unix_NFS_mode, &ace->sid) &&
+ 		     compare_sids(&sid_everyone, &ace->sid) &&
+-		     compare_sids(&sid_authusers, &ace->sid) &&
++		     (!authusers ||
++		      compare_sids(&sid_authusers, &ace->sid)) &&
+ 		     compare_sids(&sid_owner_rights, &ace->sid) &&
+ 		     !member))
+ 			goto next_ace;
++		/* An explicit request counts only SIDs that match exactly */
++		if (!maximal && !member &&
++		    !smb_sid_equal(&sid, &ace->sid) &&
++		    !smb_sid_equal(&sid_everyone, &ace->sid) &&
++		    !(authusers && smb_sid_equal(&sid_authusers, &ace->sid)) &&
++		    !smb_sid_is_owner_rights(&ace->sid))
++			goto next_ace;
+ 
+ 		bits = le32_to_cpu(ace->access_req);
+ 		switch (ace->type) {
+@@ -1620,8 +1640,8 @@ int smb_check_perm_dacl(struct ksmbd_con
+ 		case ACCESS_DENIED_CALLBACK_ACE_TYPE:
+ 			if (counted)
+ 				grp_denied |= ~grp_allowed & bits;
+-			/* access_bits takes no group denials either */
+-			if (!member)
++			/* MAXIMUM_ALLOWED takes no group denials either */
++			if (!(maximal && member))
+ 				denied |= ~access_bits & bits;
+ 			break;
+ 		}
+@@ -1641,8 +1661,14 @@ next_ace:
+ 		    (access_bits & GENERIC_READ_FLAGS) == GENERIC_READ_FLAGS)
+ 			access_bits |= FILE_EXECUTE;
+ 		granted = requested | access_bits;
++	} else if (!obj_deny) {
++		/* An explicit request takes the ordered result */
++		access_bits &= ~denied;
+ 	} else {
+-		/* An explicit request uses only grp_granted and obj_deny */
++		/*
++		 * ksmbd does not parse object deny ACEs, so with one present an
++		 * explicit request keeps the answer of the ACE found below
++		 */
+ 		access_bits = 0;
+ 	}
+ 
+@@ -1673,15 +1699,23 @@ next_ace:
+ 		    !(ace->flags & INHERIT_ONLY_ACE))
+ 			or_ace = true;
+ 		if (!compare_sids(&sid_everyone, &ace->sid) ||
+-		    !compare_sids(&sid_authusers, &ace->sid))
++		    (authusers &&
++		     !compare_sids(&sid_authusers, &ace->sid)))
+ 			others_ace = ace;
++		if (!compare_sids(&sid_authusers, &ace->sid))
++			au_ace = true;
+ 
+ 		ace = (struct smb_ace *)((char *)ace + le16_to_cpu(ace->size));
+ 	}
+ 
+ 	if (IS_ENABLED(CONFIG_FS_POSIX_ACL)) {
+ 		posix_acls = get_inode_acl(d_inode(path->dentry), ACL_TYPE_ACCESS);
+-		if (!IS_ERR_OR_NULL(posix_acls) && !found && !others_ace) {
++		/*
++		 * An Authenticated Users ACE keeps the POSIX ACL from deciding,
++		 * also for sessions that it does not match.
++		 */
++		if (!IS_ERR_OR_NULL(posix_acls) && !found && !others_ace &&
++		    !au_ace) {
+ 			unsigned int id = -1;
+ 
+ 			pa_entry = posix_acls->a_entries;
+@@ -1754,7 +1788,7 @@ next_ace:
+ 		}
+ 	}
+ 
+-	if (!maximal) {
++	if (!maximal && obj_deny) {
+ 		switch (ace->type) {
+ 		case ACCESS_ALLOWED_ACE_TYPE:
+ 			access_bits = le32_to_cpu(ace->access_req);
+--- a/fs/smb/server/smbacl.h
++++ b/fs/smb/server/smbacl.h
+@@ -96,7 +96,7 @@ int smb_inherit_dacl(struct ksmbd_conn *
+ 		     unsigned int uid, unsigned int gid);
+ int smb_check_perm_dacl(struct ksmbd_conn *conn, const struct path *path,
+ 			__le32 *pdaccess, __le32 raw_daccess, int uid,
+-			bool strict);
++			bool authenticated, bool strict);
+ int set_info_sec(struct ksmbd_conn *conn, struct ksmbd_tree_connect *tcon,
+ 		 const struct path *path, struct smb_ntsd *pntsd, int ntsd_len,
+ 		 bool type_check, bool get_write);
