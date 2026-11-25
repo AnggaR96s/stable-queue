@@ -1,0 +1,76 @@
+From 649918e04e0ead9bfc861aacdd2e5b39b5bdf869 Mon Sep 17 00:00:00 2001
+From: Josef Bacik <josef@toxicpanda.com>
+Date: Fri, 30 Oct 2026 13:38:23 +0100
+Subject: dcache: wait for a racing eviction of a secondary root
+
+From: Josef Bacik <josef@toxicpanda.com>
+
+commit 649918e04e0ead9bfc861aacdd2e5b39b5bdf869 upstream.
+
+Commit e9895609cb7f ("wind ->s_roots via ->d_sib instead of ->d_hash")
+keeps a secondary root on ->s_roots until dentry_unlist() so that
+shrink_dcache_for_umount() can find one that another thread is evicting
+and wait for it. But do_one_tree() takes every root off the list before
+its dput() which breaks that:
+
+  thread A                              umount
+  dentry_kill(root), refcount is 0
+    lock_for_kill()
+      spin_trylock(->i_lock) fails
+      spin_unlock(->d_lock)
+                                        shrink_dcache_for_umount()
+                                          dget_dlock(root)
+                                          do_one_tree(root)
+                                            unlink_secondary_root(root)
+      spin_lock(->i_lock)
+                                            dput(root), refcount is 0
+                                              lock_for_kill()
+                                                trylock fails, waits
+      spin_lock(->d_lock)
+      refcount is 0 again, go on
+    lockref_mark_dead()
+    dentry_unlink_inode()
+      drops both locks
+                                                root is dead, give up
+                                          ->s_roots is empty, done
+                                        evict_inodes()
+                                        "Busy inodes after unmount"
+      iput()
+
+Thread A evicts without pinning the superblock. namespace_unlock() does
+that for old mountpoints after dropping namespace_sem, and a secondary
+root goes with its last child.
+
+So only take busy roots off the list. Leave the others to
+dentry_unlist() so that shrink_dcache_for_umount() finds them and waits
+for an eviction in progress. A root that becomes busy after the check is
+picked up again and taken off the list then.
+
+Fixes: 78db93943210 ("dcache: keep shrink_dcache_for_umount() making progress on busy roots")
+Cc: stable@vger.kernel.org # v7.2+
+Signed-off-by: Josef Bacik <josef@toxicpanda.com>
+Link: https://patch.msgid.link/20261030-work-dcache-ai-v1-2-cd6b86e0ccc7@kernel.org
+Signed-off-by: Christian Brauner (Amutable) <brauner@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/dcache.c |    9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@ -1816,8 +1816,13 @@ static void do_one_tree(struct dentry *d
+ 	d_walk(dentry, dentry, umount_check);
+ 	spin_lock(&dentry->d_lock);
+ 	__d_drop(dentry);
+-	/* A busy root survives the dput() below so don't leave it on ->s_roots. */
+-	if (unlikely(!hlist_unhashed(&dentry->d_sib)))
++	/*
++	 * A busy root survives the dput() below so don't leave it on ->s_roots.
++	 * An idle one stays until dentry_unlist() so that umount can wait for
++	 * a racing eviction, see lock_for_kill().
++	 */
++	if (unlikely(dentry->d_lockref.count > 1 &&
++		     !hlist_unhashed(&dentry->d_sib)))
+ 		unlink_secondary_root(dentry);
+ 	spin_unlock(&dentry->d_lock);
+ 	dput(dentry);

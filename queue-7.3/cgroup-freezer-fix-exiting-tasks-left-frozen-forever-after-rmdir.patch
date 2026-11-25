@@ -1,0 +1,113 @@
+From e1aed52b68a361f6fc047b24a37d9ec4d928a158 Mon Sep 17 00:00:00 2001
+From: Tejun Heo <tj@kernel.org>
+Date: Thu, 5 Nov 2026 09:19:51 -1000
+Subject: cgroup/freezer: Fix exiting tasks left frozen forever after rmdir
+
+From: Tejun Heo <tj@kernel.org>
+
+commit e1aed52b68a361f6fc047b24a37d9ec4d928a158 upstream.
+
+Since 93618edf7538 ("cgroup: Defer css percpu_ref kill on rmdir until cgroup
+is depopulated"), rmdir succeeds once cgroup.procs is empty, but exiting
+tasks hidden from it can stay in the cgroup until their final context
+switch. If such a task is frozen in a v1 freezer cgroup, nothing is left to
+thaw it after rmdir: freezer.state is gone with the cgroup, and a THAWED
+write to an ancestor clears only CGROUP_FREEZING_PARENT.
+
+8ab6980c7007 ("cgroup/freezer: walk exiting tasks in the v1 freezer") made
+the freezer walks include exiting tasks. A FROZEN write now also freezes a
+hidden task in a freezable sleep on its exit path. The fix depends on that
+commit, as the thaw reaches hidden tasks through the same walk.
+
+Since 81933038f5e2 ("pid_namespace: make zap_pid_ns_processes() freezable"),
+an exiting pid namespace init sleeps that way until a parent outside the
+namespace reaps a zombie in it.
+
+Thaw the cgroup from ->css_killed(), as a THAWED write to it would. A
+descendant removed earlier can still hold hidden tasks frozen through
+CGROUP_FREEZING_PARENT. The thaw reaches it too, as its css stays online
+until its tasks are gone.
+
+rmdir removes freezer.state only after ->css_killed() returns, and a write
+to it takes no cgroup_mutex. A FROZEN write after the thaw would freeze the
+removed cgroup again, so refuse to freeze a dead cgroup.
+
+Verified with a reproducer, including under a frozen parent, from an already
+removed child and with a racing FROZEN write.
+
+Fixes: 93618edf7538 ("cgroup: Defer css percpu_ref kill on rmdir until cgroup is depopulated")
+Cc: stable@vger.kernel.org # v7.1+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Reviewed-by: Tao Cui <cuitao@kylinos.cn>
+Tested-by: Tao Cui <cuitao@kylinos.cn>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ kernel/cgroup/legacy_freezer.c | 34 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 34 insertions(+)
+
+diff --git a/kernel/cgroup/legacy_freezer.c b/kernel/cgroup/legacy_freezer.c
+index bd11047f2311..1792523d119a 100644
+--- a/kernel/cgroup/legacy_freezer.c
++++ b/kernel/cgroup/legacy_freezer.c
+@@ -382,6 +382,24 @@ static void freezer_change_state(struct freezer *freezer, bool freeze)
+ 	 * CGROUP_FREEZING_PARENT.
+ 	 */
+ 	mutex_lock(&freezer_mutex);
++
++	/*
++	 * A dead cgroup must not be frozen.
++	 *
++	 * rmdir thaws the cgroup from freezer_css_killed(), but freezer.state
++	 * stays writable until rmdir removes it a moment later. A FROZEN write
++	 * in that gap would freeze the cgroup again, and nothing could thaw it
++	 * after that.
++	 *
++	 * A freezer.state write doesn't take cgroup_mutex, but testing
++	 * cgroup_is_dead() without it is safe. rmdir marks the cgroup dead
++	 * before the thaw, so a write that takes freezer_mutex after the thaw
++	 * sees it dead. One that takes it before the thaw may still see the
++	 * cgroup alive, but the thaw then undoes its freeze.
++	 */
++	if (freeze && data_race(cgroup_is_dead(freezer->css.cgroup)))
++		goto out_unlock;
++
+ 	rcu_read_lock();
+ 	css_for_each_descendant_pre(pos, &freezer->css) {
+ 		struct freezer *pos_f = css_freezer(pos);
+@@ -403,10 +421,25 @@ static void freezer_change_state(struct freezer *freezer, bool freeze)
+ 		css_put(pos);
+ 	}
+ 	rcu_read_unlock();
++out_unlock:
+ 	mutex_unlock(&freezer_mutex);
+ 	cpus_read_unlock();
+ }
+ 
++/**
++ * freezer_css_killed - Thaw a freezer cgroup being removed
++ * @css: css being killed
++ *
++ * Exiting tasks hidden from cgroup.procs can still be in the cgroup when it is
++ * removed, and a frozen one has nothing left to thaw it once freezer.state is
++ * gone. Thaw the cgroup as a THAWED write to it would. A frozen ancestor keeps
++ * the tasks frozen through CGROUP_FREEZING_PARENT until the ancestor is thawed.
++ */
++static void freezer_css_killed(struct cgroup_subsys_state *css)
++{
++	freezer_change_state(css_freezer(css), false);
++}
++
+ static ssize_t freezer_write(struct kernfs_open_file *of,
+ 			     char *buf, size_t nbytes, loff_t off)
+ {
+@@ -466,6 +499,7 @@ static struct cftype files[] = {
+ struct cgroup_subsys freezer_cgrp_subsys = {
+ 	.css_alloc	= freezer_css_alloc,
+ 	.css_online	= freezer_css_online,
++	.css_killed	= freezer_css_killed,
+ 	.css_offline	= freezer_css_offline,
+ 	.css_free	= freezer_css_free,
+ 	.attach		= freezer_attach,
+-- 
+2.56.1
+

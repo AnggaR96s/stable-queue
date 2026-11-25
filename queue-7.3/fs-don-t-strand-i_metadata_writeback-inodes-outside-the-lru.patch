@@ -1,0 +1,103 @@
+From 9b4b26d110f32008134750f82c98e621f2e4758f Mon Sep 17 00:00:00 2001
+From: Christian Brauner <brauner@kernel.org>
+Date: Mon, 9 Nov 2026 17:51:24 +0100
+Subject: fs: don't strand I_METADATA_WRITEBACK inodes outside the LRU
+
+From: Christian Brauner <brauner@kernel.org>
+
+commit 9b4b26d110f32008134750f82c98e621f2e4758f upstream.
+
+Since commit c474bc56b6d1 ("fs: Provide way for filesystem to wait for
+metadata writeback") ext2, ext4 without a journal, fat, udf and minix
+set I_METADATA_WRITEBACK on an inode whose metadata was copied into a
+buffer that might not have reached the disk yet. Only data integrity
+writeback, i.e. fsync() and friends, clears it again. The flusher and
+sync(2) leave it alone.
+
+inode_lru_isolate() treats every state bit other than I_REFERENCED as a
+reason not to reclaim the inode right now. It takes the inode off the
+LRU and relies on iput(), writeback completion or the removal of the
+last page from the page cache to put it back once the reason is gone.
+
+But I_METADATA_WRITEBACK doesn't go away on its own. iput() puts the
+inode back on the LRU with the bit still set and the next scan takes it
+off again. So neither memory pressure nor drop_caches can free these
+inodes. Only fsync() and friends or unmounting the filesystem get rid
+of them.
+
+On ext4 without a journal ext4_mark_iloc_dirty() sets the bit on every
+ext4_mark_inode_dirty(), so even an atime update is enough. An
+unprivileged user creating or touching lots of files grows the inode
+cache without bound until the OOM killer comes along.
+
+The inode can't just be thrown away though. An fsync() after the inode
+was read back in wouldn't know that its metadata still has to be
+written out. So let the shrinker reclaim inodes with
+I_METADATA_WRITEBACK like any other clean inode and make evict() write
+out what the bit tracks unless the inode is being deleted. Since the
+previous patch the bit covers the tracked metadata buffers as well, and
+since the lookup patches ->sync_inode_metadata() doesn't read anything
+from disk for that. It writes and waits for whatever is still dirty or
+under writeback. The mmb_sync() calls in ->evict_inode() are redundant
+with that and the following patches drop them.
+
+Handing these inodes to a work item that syncs them and puts them back
+on the LRU would work too. But that's a second inode reclaim offload
+mechanism next to the deferred inode reclaim that is being worked on,
+and it needs a reference on the inode which leaks into remount, freeze
+and umount.
+
+For stable this needs the previous patches as well. Without the lookup
+changes evict() ends up reading inode blocks from disk with
+__GFP_NOFAIL allocations from reclaim. v7.3 also still has bfs which
+sets I_METADATA_WRITEBACK too and reads the inode block in
+bfs_sync_inode_metadata(), so the backport needs the cache-only lookup
+for bfs as well.
+
+Fixes: c474bc56b6d1 ("fs: Provide way for filesystem to wait for metadata writeback")
+Cc: stable@vger.kernel.org # v7.3; see patch description
+Reported-by: Josef Bacik <josef@toxicpanda.com>
+Link: https://patch.msgid.link/20261109-work-inode-metadata_writeback-v3-9-91ac6c024018@kernel.org
+Reviewed-by: Jan Kara <jack@suse.cz>
+Signed-off-by: Christian Brauner (Amutable) <brauner@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/inode.c | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/fs/inode.c b/fs/inode.c
+index 9cbcb0de7dfc..de207f2f95a9 100644
+--- a/fs/inode.c
++++ b/fs/inode.c
+@@ -817,6 +817,14 @@ static void evict(struct inode *inode)
+ 	inode_wait_for_writeback(inode);
+ 	spin_unlock(&inode->i_lock);
+ 
++	/*
++	 * fsync() can't find what I_METADATA_WRITEBACK tracks anymore once the
++	 * inode is gone, so write it out unless the inode is being deleted.
++	 */
++	if (inode->i_nlink &&
++	    (inode_state_read_once(inode) & I_METADATA_WRITEBACK))
++		sync_inode_metadata(inode, 1);
++
+ 	if (op->evict_inode) {
+ 		op->evict_inode(inode);
+ 	} else {
+@@ -952,9 +960,12 @@ static enum lru_status inode_lru_isolate(struct list_head *item,
+ 	 * they're already on the LRU, and this can make them
+ 	 * unreclaimable for a while. Remove them lazily here; iput,
+ 	 * sync, or the last page cache deletion will requeue them.
++	 * Nothing requeues them for I_METADATA_WRITEBACK, evict() writes
++	 * that out instead.
+ 	 */
+ 	if (icount_read(inode) ||
+-	    (inode_state_read(inode) & ~I_REFERENCED) ||
++	    (inode_state_read(inode) &
++	     ~(I_REFERENCED | I_METADATA_WRITEBACK)) ||
+ 	    !mapping_shrinkable(&inode->i_data)) {
+ 		list_lru_isolate(lru, &inode->i_lru);
+ 		spin_unlock(&inode->i_lock);
+-- 
+2.56.1
+

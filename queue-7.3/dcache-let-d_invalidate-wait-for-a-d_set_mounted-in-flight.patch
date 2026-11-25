@@ -1,0 +1,158 @@
+From 20a6a9ec19e522ae85f87337886b3fb47efce5f3 Mon Sep 17 00:00:00 2001
+From: Christian Brauner <brauner@kernel.org>
+Date: Fri, 30 Oct 2026 13:38:22 +0100
+Subject: dcache: let d_invalidate() wait for a d_set_mounted() in flight
+
+From: Christian Brauner <brauner@kernel.org>
+
+commit 20a6a9ec19e522ae85f87337886b3fb47efce5f3 upstream.
+
+d_invalidate() and d_set_mounted() are supposed to exclude each other.
+Either the mount fails with -ENOENT because an ancestor of the
+mountpoint was unhashed or d_invalidate() finds the mountpoint and
+detaches the mount. d_invalidate() unhashes the dentry first and then
+searches the subtree with d_walk() which starts out lockless and only
+looks at the seqcount of rename_lock.
+
+Since d_set_mounted() switched to read_seqlock_excl() nothing makes that
+walk wait or retry:
+
+  CPU0: mount on A/M                 CPU1: d_invalidate(A)
+  d_set_mounted(M)
+    read_seqlock_excl(&rename_lock)
+    A is hashed, go on
+                                     __d_drop(A)
+                                     shrink_dcache_parent(A)
+                                     d_walk(A, find_submount)
+                                       read_seqbegin(&rename_lock)
+                                       M is not a mountpoint
+                                       need_seqretry() == false
+                                     return
+    M->d_flags |= DCACHE_MOUNTED
+    return 0
+  mount gets attached to M
+
+The mount ends up below an unhashed dentry. It can't be reached anymore
+and pins the subtree until its parent mount or the mount namespace goes
+away. The window grows with the depth of the mountpoint. With a FUSE
+directory 3000 levels deep a bind mount racing with
+FUSE_NOTIFY_INVAL_ENTRY for the parent of the mountpoint survived in 151
+of 200 attempts.
+
+Before 5e317d23f6c6 the seqcount bump made the walk wait while
+d_set_mounted() ran and retry under the lock when one had run in the
+meantime. That was the right thing to wait for on the wrong counter:
+every rename_lock reader paid for it, d_lookup(), d_path(), the ".."
+step of the RCU walk.
+
+So give d_set_mounted() a seqlock of its own. It is the only writer and
+d_invalidate() is the only reader. After unhashing the dentry
+d_invalidate() runs an empty read_seqbegin()/read_seqretry() section on
+it. That spins while the count is odd, i.e. while a d_set_mounted() is
+between its ancestor check and its flag, and goes round once more if
+one started in the meantime. Nobody else retries anything. The ordering
+comes from the locks both already take:
+
+- If that d_set_mounted() saw the dentry hashed its check ran under the
+  dentry's d_lock before __d_drop() took it. So the count is odd by the
+  time d_invalidate() reads it and d_invalidate() waits.
+
+- Once the count is even again the flag has been set under the
+  mountpoint's d_lock and the walk takes that lock to look at it.
+
+A d_set_mounted() that starts after the unhash fails its ancestor check
+and never touches the flag. So the only flag the walk can pick up
+belongs to the one mount that saw the dentry hashed and is still in
+flight, and there is at most one of those because namespace_sem
+serializes mounts. Either it gets attached and detach_mounts() takes it
+off after waiting for namespace_sem or it fails later on and drops the
+flag again. In that case the walk goes round once more and finds
+nothing. The same goes for the mountpoint that attach_recursive_mnt()
+preallocates on the root of the tree it attaches. IOW, d_invalidate()
+does at most one extra round, which the removed-name trap (cf. [1])
+relies on.
+
+Note that on PREEMPT_RT read_seqbegin() takes the lock instead of
+spinning on a preempted d_set_mounted().
+
+The cost is a seqlock around the ancestor walk for every new mountpoint
+and two loads of a cacheline that only d_set_mounted() writes for every
+d_invalidate() of a positive dentry. Walking the ancestors a second time
+after setting the flag would close the race as well but doubles the
+cost of d_set_mounted() with the depth of the mountpoint: about 1us at
+64 levels and 75us at 4096 levels.
+
+[1]: https://patch.msgid.link/20261028-work-mount-trap-b4-v1-0-f20d9d0730d6@kernel.org
+
+Fixes: 5e317d23f6c6 ("d_set_mounted(): we don't need to bump seqcount component of rename_lock")
+Reported-by: Josef Bacik <josef@toxicpanda.com>
+Cc: stable@vger.kernel.org # v6.17+
+Link: https://patch.msgid.link/20261030-work-dcache-ai-v1-1-cd6b86e0ccc7@kernel.org
+Signed-off-by: Christian Brauner (Amutable) <brauner@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/dcache.c |   19 +++++++++++++++----
+ 1 file changed, 15 insertions(+), 4 deletions(-)
+
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@ -1589,21 +1589,25 @@ int path_has_submounts(const struct path
+ }
+ EXPORT_SYMBOL(path_has_submounts);
+ 
++/* odd while d_set_mounted() runs, d_invalidate() waits on it */
++static __cacheline_aligned_in_smp DEFINE_SEQLOCK(d_set_mounted_lock);
++
+ /*
+  * Called by mount code to set a mountpoint and check if the mountpoint is
+  * reachable (e.g. NFS can unhash a directory dentry and then the complete
+  * subtree can become unreachable).
+  *
+  * Only one of d_invalidate() and d_set_mounted() must succeed.  For
+- * this reason take rename_lock and d_lock on dentry and ancestors.
+- * Likewise for dont_mount() which marks a dentry that is being removed
+- * under d_lock.
++ * this reason take rename_lock, d_set_mounted_lock and d_lock on dentry
++ * and ancestors.  Likewise for dont_mount() which marks a dentry that
++ * is being removed under d_lock.
+  */
+ int d_set_mounted(struct dentry *dentry)
+ {
+ 	struct dentry *p;
+ 	int ret = -ENOENT;
+ 	read_seqlock_excl(&rename_lock);
++	write_seqlock(&d_set_mounted_lock);
+ 	for (p = dentry->d_parent; !IS_ROOT(p); p = p->d_parent) {
+ 		/* Need exclusion wrt. d_invalidate() */
+ 		spin_lock(&p->d_lock);
+@@ -1621,8 +1625,9 @@ int d_set_mounted(struct dentry *dentry)
+ 			ret = 0;
+ 		}
+ 	}
+- 	spin_unlock(&dentry->d_lock);
++	spin_unlock(&dentry->d_lock);
+ out:
++	write_sequnlock(&d_set_mounted_lock);
+ 	read_sequnlock_excl(&rename_lock);
+ 	return ret;
+ }
+@@ -1875,6 +1880,7 @@ static enum d_walk_ret find_submount(voi
+ void d_invalidate(struct dentry *dentry)
+ {
+ 	bool had_submounts = false;
++	unsigned seq;
+ 	spin_lock(&dentry->d_lock);
+ 	if (d_unhashed(dentry)) {
+ 		spin_unlock(&dentry->d_lock);
+@@ -1887,6 +1893,11 @@ void d_invalidate(struct dentry *dentry)
+ 	if (!dentry->d_inode)
+ 		return;
+ 
++	/* wait for a d_set_mounted() that saw us hashed to set its flag */
++	do {
++		seq = read_seqbegin(&d_set_mounted_lock);
++	} while (read_seqretry(&d_set_mounted_lock, seq));
++
+ 	shrink_dcache_parent(dentry);
+ 	for (;;) {
+ 		struct dentry *victim = NULL;

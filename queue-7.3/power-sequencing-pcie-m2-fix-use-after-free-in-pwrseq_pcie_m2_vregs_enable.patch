@@ -1,0 +1,120 @@
+From cd5f26ed96604b18e4235052525abe6b4ba505d6 Mon Sep 17 00:00:00 2001
+From: Bartosz Golaszewski <bartosz.golaszewski@oss.qualcomm.com>
+Date: Thu, 5 Nov 2026 09:28:35 +0100
+Subject: power: sequencing: pcie-m2: fix use-after-free in pwrseq_pcie_m2_vregs_enable()
+
+From: Bartosz Golaszewski <bartosz.golaszewski@oss.qualcomm.com>
+
+commit cd5f26ed96604b18e4235052525abe6b4ba505d6 upstream.
+
+During device teardown or on the probe error path, a concurrent consumer
+access triggers a use-after-free in pwrseq_pcie_m2_vregs_enable() or
+pwrseq_pcie_m2_vregs_disable() due to a lifetime inversion between
+devm-managed device registration and manual resource cleanup.
+
+The driver exposes the power sequencer using devm_pwrseq_device_register(),
+meaning the device remains fully registered and accessible on the
+pwrseq_bus until the driver core schedules devm_pwrseq_device_unregister()
+to run after pwrseq_pcie_m2_remove() returns. However, the driver performs
+manual resource teardown within pwrseq_pcie_m2_remove() and the
+pwrseq_pcie_m2_probe() error path, prematurely destroying the backing
+regulator array.
+
+This creates a narrow vulnerability window where the globally visible power
+sequencer is backed by freed memory. If a concurrent consumer invokes
+pwrseq_enable() during this window, execution is routed to the sequencer
+callback and dereferences the destroyed ctx->regs array, resulting in a
+direct use-after-free and a kernel crash.
+
+Schedule a devres action for freeing the memory used for the regulator
+array to ensure it runs *after* the pwrseq provider was unregistered.
+
+Cc: stable@vger.kernel.org
+Fixes: 3f736aecbdc8 ("power: sequencing: pcie-m2: Create serdev device for WCN7850 bluetooth")
+Closes: https://sashiko.dev/#/bug/linux-bd17e5b1-a000-4717-b392-0ff0c2a9c376
+Link: https://patch.msgid.link/20261105-pwrseq-pcie-m2-uaf-v2-1-3e1dd415af9a@oss.qualcomm.com
+Signed-off-by: Bartosz Golaszewski <bartosz.golaszewski@oss.qualcomm.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/power/sequencing/pwrseq-pcie-m2.c |   36 +++++++++++++++---------------
+ 1 file changed, 18 insertions(+), 18 deletions(-)
+
+--- a/drivers/power/sequencing/pwrseq-pcie-m2.c
++++ b/drivers/power/sequencing/pwrseq-pcie-m2.c
+@@ -492,6 +492,14 @@ err_remove_serdev:
+ 	return ret;
+ }
+ 
++static void pwrseq_pcie_m2_free_regulators(void *data)
++{
++	struct pwrseq_pcie_m2_ctx *ctx = data;
++
++	regulator_bulk_free(ctx->num_vregs, ctx->regs);
++	kfree(ctx->regs);
++}
++
+ static int pwrseq_pcie_m2_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -522,19 +530,19 @@ static int pwrseq_pcie_m2_probe(struct p
+ 
+ 	ctx->num_vregs = ret;
+ 
++	ret = devm_add_action_or_reset(dev, pwrseq_pcie_m2_free_regulators, ctx);
++	if (ret)
++		return ret;
++
+ 	ctx->w_disable1_gpio = devm_gpiod_get_optional(dev, "w-disable1", GPIOD_OUT_HIGH);
+-	if (IS_ERR(ctx->w_disable1_gpio)) {
+-		ret = dev_err_probe(dev, PTR_ERR(ctx->w_disable1_gpio),
++	if (IS_ERR(ctx->w_disable1_gpio))
++		return dev_err_probe(dev, PTR_ERR(ctx->w_disable1_gpio),
+ 				     "Failed to get the W_DISABLE_1# GPIO\n");
+-		goto err_free_regulators;
+-	}
+ 
+ 	ctx->w_disable2_gpio = devm_gpiod_get_optional(dev, "w-disable2", GPIOD_OUT_HIGH);
+-	if (IS_ERR(ctx->w_disable2_gpio)) {
+-		ret = dev_err_probe(dev, PTR_ERR(ctx->w_disable2_gpio),
++	if (IS_ERR(ctx->w_disable2_gpio))
++		return dev_err_probe(dev, PTR_ERR(ctx->w_disable2_gpio),
+ 				     "Failed to get the W_DISABLE_2# GPIO\n");
+-		goto err_free_regulators;
+-	}
+ 
+ 	config.parent = dev;
+ 	config.owner = THIS_MODULE;
+@@ -543,11 +551,9 @@ static int pwrseq_pcie_m2_probe(struct p
+ 	config.targets = ctx->pdata->targets;
+ 
+ 	ctx->pwrseq = devm_pwrseq_device_register(dev, &config);
+-	if (IS_ERR(ctx->pwrseq)) {
+-		ret = dev_err_probe(dev, PTR_ERR(ctx->pwrseq),
++	if (IS_ERR(ctx->pwrseq))
++		return dev_err_probe(dev, PTR_ERR(ctx->pwrseq),
+ 				     "Failed to register the power sequencer\n");
+-		goto err_free_regulators;
+-	}
+ 
+ 	mutex_init(&ctx->list_lock);
+ 	INIT_LIST_HEAD(&ctx->pci_devices);
+@@ -572,9 +578,6 @@ err_remove_serdev:
+ 	pwrseq_pcie_m2_remove_serdev(ctx, NULL);
+ err_destroy_mutex:
+ 	mutex_destroy(&ctx->list_lock);
+-err_free_regulators:
+-	regulator_bulk_free(ctx->num_vregs, ctx->regs);
+-	kfree(ctx->regs);
+ 
+ 	return ret;
+ }
+@@ -586,9 +589,6 @@ static void pwrseq_pcie_m2_remove(struct
+ 	bus_unregister_notifier(&pci_bus_type, &ctx->nb);
+ 	pwrseq_pcie_m2_remove_serdev(ctx, NULL);
+ 	mutex_destroy(&ctx->list_lock);
+-
+-	regulator_bulk_free(ctx->num_vregs, ctx->regs);
+-	kfree(ctx->regs);
+ }
+ 
+ static const struct of_device_id pwrseq_pcie_m2_of_match[] = {
