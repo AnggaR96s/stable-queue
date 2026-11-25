@@ -1,0 +1,119 @@
+From 6c6508e742b47539224eb18cb23f7ed5d401dcb6 Mon Sep 17 00:00:00 2001
+From: Radhey Shyam Pandey <radhey.shyam.pandey@amd.com>
+Date: Mon, 28 Sep 2026 17:30:15 +0530
+Subject: usb: dwc3: xilinx: unwind ZynqMP platform init on probe failure and remove
+
+From: Radhey Shyam Pandey <radhey.shyam.pandey@amd.com>
+
+commit 6c6508e742b47539224eb18cb23f7ed5d401dcb6 upstream.
+
+dwc3_xlnx_init_zynqmp() leaves the controller out of reset with the PHY
+powered on, but nothing undoes that if probe fails later or when the
+driver is removed. The resets stay deasserted and the PHY stays on with
+no driver bound.
+
+Register the teardown with devm_add_action_or_reset() once init has
+completed, so it runs on probe failure without the driver having to
+track how far init progressed. The teardown only undoes the reset cycle
+init performed, so it carries the same usb3-phy guard: with no PHY the
+resets were never asserted, and asserting them could break a USB3
+configuration that is live but missing from the device tree.
+
+The resets have to be asserted while the clocks are still running, so
+both the probe error path and remove() run the teardown explicitly
+before gating the clocks rather than leaving it to devres, which would
+otherwise run it afterwards. devm_release_action() unlinks the action
+before calling it, so devres cannot run it a second time.
+
+Running it from remove() also covers .shutdown, which shares
+dwc3_xlnx_remove(): device_shutdown() does not call
+devres_release_all(), so a teardown left to devres would never run
+there.
+
+Fixes: 84770f028fab ("usb: dwc3: Add driver for Xilinx platforms")
+Cc: stable <stable@kernel.org>
+Suggested-by: Philipp Zabel <p.zabel@pengutronix.de>
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Radhey Shyam Pandey <radhey.shyam.pandey@amd.com>
+Acked-by: Thinh Nguyen <Thinh.Nguyen@synopsys.com>
+Link: https://patch.msgid.link/20260928120015.3152461-4-radhey.shyam.pandey@amd.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/dwc3/dwc3-xilinx.c |   44 ++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 43 insertions(+), 1 deletion(-)
+
+--- a/drivers/usb/dwc3/dwc3-xilinx.c
++++ b/drivers/usb/dwc3/dwc3-xilinx.c
+@@ -112,6 +112,39 @@ static int dwc3_xlnx_init_versal(struct
+ 	return 0;
+ }
+ 
++static void dwc3_xlnx_zynqmp_teardown(void *data)
++{
++	struct dwc3_xlnx *priv_data = data;
++
++	phy_power_off(priv_data->usb3_phy);
++
++	/*
++	 * Undo only the reset cycle init performed.  As on the init error
++	 * path, the unconditional deasserts are not paired with an assert
++	 * here: with no usb3-phy, resetting the core could break a USB3
++	 * configuration that is live but missing from the device tree.
++	 */
++	if (priv_data->usb3_phy) {
++		reset_control_assert(priv_data->usb_hibrst);
++		reset_control_assert(priv_data->usb_crst);
++		reset_control_assert(priv_data->usb_apbrst);
++	}
++
++	phy_exit(priv_data->usb3_phy);
++}
++
++/*
++ * Run the platform teardown explicitly, so the resets are asserted while the
++ * clocks are still running.  devm_release_action() unlinks the action before
++ * calling it, so devres will not run it a second time.
++ */
++static void dwc3_xlnx_release_teardown(struct device *dev,
++				       struct dwc3_xlnx *priv_data)
++{
++	if (devm_is_action_added(dev, dwc3_xlnx_zynqmp_teardown, priv_data))
++		devm_release_action(dev, dwc3_xlnx_zynqmp_teardown, priv_data);
++}
++
+ static int dwc3_xlnx_init_zynqmp(struct dwc3_xlnx *priv_data)
+ {
+ 	struct device		*dev = priv_data->dev;
+@@ -228,7 +261,8 @@ static int dwc3_xlnx_init_zynqmp(struct
+ 
+ 	dwc3_xlnx_set_coherency(priv_data, XLNX_USB_TRAFFIC_ROUTE_CONFIG);
+ 
+-	return 0;
++	return devm_add_action_or_reset(dev, dwc3_xlnx_zynqmp_teardown,
++					priv_data);
+ 
+ err_phy_power_off:
+ 	phy_power_off(priv_data->usb3_phy);
+@@ -355,6 +389,7 @@ err_pm_set_suspended:
+ 	pm_runtime_set_suspended(dev);
+ 
+ err_clk_put:
++	dwc3_xlnx_release_teardown(dev, priv_data);
+ 	clk_bulk_disable_unprepare(priv_data->num_clocks, priv_data->clks);
+ 
+ 	return ret;
+@@ -367,6 +402,13 @@ static void dwc3_xlnx_remove(struct plat
+ 
+ 	of_platform_depopulate(dev);
+ 
++	/*
++	 * This is also what makes .shutdown behave the same as .remove:
++	 * device_shutdown() does not call devres_release_all(), so a teardown
++	 * left to devres would never run on the shutdown path.
++	 */
++	dwc3_xlnx_release_teardown(dev, priv_data);
++
+ 	clk_bulk_disable_unprepare(priv_data->num_clocks, priv_data->clks);
+ 	priv_data->num_clocks = 0;
+ 
