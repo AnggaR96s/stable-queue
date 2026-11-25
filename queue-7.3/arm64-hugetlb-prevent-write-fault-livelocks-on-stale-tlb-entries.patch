@@ -1,0 +1,92 @@
+From 3c47ec82540ce89a6fdfd5e0e6d79f35892adfa4 Mon Sep 17 00:00:00 2001
+From: Chris Down <chris@chrisdown.name>
+Date: Tue, 10 Nov 2026 20:39:02 -0800
+Subject: arm64: hugetlb: Prevent write fault livelocks on stale TLB entries
+
+From: Chris Down <chris@chrisdown.name>
+
+commit 3c47ec82540ce89a6fdfd5e0e6d79f35892adfa4 upstream.
+
+In Meta production, we have had tasks get stuck in a fault loop while
+using hugetlb on arm64. During my investigations I found that affected
+tasks share a private hugetlb page.
+
+Looking at the stuck task states, I found the following ordering:
+
+  CPU0                                 CPU1
+  ----                                 ----
+  read page
+  [read only entry cached in TLB]
+                                       write page
+                                       hugetlb_fault()
+                                         hugetlb_wp()
+                                         [reuse folio]
+                                         set_huge_ptep_maybe_writable()
+                                           set_huge_ptep_writable()
+                                         [flush local TLB only]
+
+  write page using stale entry
+  hugetlb_fault()
+    huge_ptep_set_access_flags()
+    [entry already writable, no flush]
+  retry write using stale entry
+  [fault indefinitely. well, that's not ideal!]
+
+The reason is that when a write fault makes a non-contiguous hugetlb
+entry writable, it only invalidates the local TLB. However, another CPU
+can keep the old read-only entry, so its write will fault even though
+the page table already permits it. hugetlb_fault() then finds nothing to
+change and leaves the stale entry in place, so the same write keeps
+going round in circles.
+
+This is particularly bad because, if the kernel is copying to user
+memory, the retry stays inside the kernel and the task can't act on the
+pending signal.
+
+It can even remain unkillable while holding locks across the copy,
+resulting in further failures. For example, a read into a hugetlb
+buffer can hold the pipe mutex and block other users of the pipe until
+the loop ends, causing cascading lockups across the machine.
+
+To fix this, when a write fault finds nothing to change in a
+non-contiguous hugetlb entry, let's invalidate the local entry.
+
+Fixes: cb1fa2e99955 ("arm64, tlbflush: don't TLBI broadcast if page reused in write fault")
+Cc: stable@vger.kernel.org
+Signed-off-by: Chris Down <chris@chrisdown.name>
+Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/arm64/mm/hugetlbpage.c |   21 ++++++++++++++++++---
+ 1 file changed, 18 insertions(+), 3 deletions(-)
+
+--- a/arch/arm64/mm/hugetlbpage.c
++++ b/arch/arm64/mm/hugetlbpage.c
+@@ -429,9 +429,24 @@ int huge_ptep_set_access_flags(struct vm
+ 	VM_WARN_ON(!pte_present(pte));
+ 	ncontig = num_contig_ptes(huge_page_size(hstate_vma(vma)), &pgsize);
+ 
+-	if (!pte_cont(pte))
+-		return __ptep_set_access_flags_anysz(vma, addr, ptep, pte,
+-						     dirty, pgsize);
++	if (!pte_cont(pte)) {
++		if (__ptep_set_access_flags_anysz(vma, addr, ptep, pte,
++						  dirty, pgsize))
++			return 1;
++
++		/*
++		 * Another CPU may have made the entry writable without
++		 * invalidating our stale read-only TLB entry. To avoid
++		 * indefinitely faulting on this entry, flush it.
++		 */
++		if (dirty)
++			__flush_hugetlb_tlb_range(vma, addr, addr + pgsize,
++						  pgsize,
++						  TLBF_NOWALKCACHE |
++						  TLBF_NOBROADCAST |
++						  TLBF_NONOTIFY);
++		return 0;
++	}
+ 
+ 	if (!__cont_access_flags_changed(ptep, pte, ncontig))
+ 		return 0;
