@@ -1,0 +1,67 @@
+From c47e766c5307c06a78304582b2b5b5ab01ee1358 Mon Sep 17 00:00:00 2001
+From: Rishikesh Jethwani <rjethwani@purestorage.com>
+Date: Mon, 2 Nov 2026 14:30:06 -0700
+Subject: tls: only install push_pending_record for a TX context
+
+From: Rishikesh Jethwani <rjethwani@purestorage.com>
+
+commit c47e766c5307c06a78304582b2b5b5ab01ee1358 upstream.
+
+tls_set_sw_offload() assigns ctx->push_pending_record for both
+directions, but the hook is a TX-side dispatcher. On a socket whose TX
+side is HW offloaded, tls_set_device_offload() installs
+tls_device_push_pending_record(); any later TLS_RX setsockopt
+overwrites it with tls_sw_push_pending_record(), because
+tls_set_device_offload_rx() itself calls tls_set_sw_offload(sk, 0, NULL)
+for the software half of a successful HW RX offload, and so does the
+fallback when the RX offload is declined (NIC with TX-only offload,
+tls_dev_add() failure).
+
+From then on tls_handle_open_record() (a TLS_SET_RECORD_TYPE cmsg after
+a MSG_MORE send, or the close path with a pending writer) runs
+tls_sw_push_pending_record() against priv_ctx_tx, which is a
+struct tls_offload_context_tx, not a struct tls_sw_context_tx, and
+reads open_rec from inside the offload context. On x86_64 without lock
+debugging that field overlays sg_tx_data[2].dma_address, which is never
+set, so the push is silently skipped and the data buffered by the
+MSG_MORE send is later sent under the cmsg's record type, e.g.
+application data in a handshake or alert record. Enabling
+CONFIG_DEBUG_SPINLOCK, CONFIG_DEBUG_LOCK_ALLOC and CONFIG_LOCKDEP, but
+not CONFIG_LOCK_STAT, in the tested x86_64 configuration moves open_rec
+over sg_tx_data[5].page_link. Once populated, its page pointer and
+scatterlist flags are interpreted as a tls_rec pointer and dereferenced
+while reading msg_plaintext.sg.size.
+
+Only set the hook when initialising the TX side.
+
+Found by code review while developing TLS 1.3 HW offload rekey support.
+
+Tested with HW TLS TX and RX offload on Mellanox ConnectX-6 Dx (Crypto
+Enabled): after setting TLS_RX, send() "AAAA" with MSG_MORE, then
+sendmsg() "BBBB" with a TLS_SET_RECORD_TYPE cmsg for a handshake
+record. Without this patch the peer receives a single handshake record
+"AAAABBBB"; with it, an application data record "AAAA" followed by a
+handshake record "BBBB".
+
+Fixes: e8f69799810c ("net/tls: Add generic NIC offload infrastructure")
+Cc: stable@vger.kernel.org
+Signed-off-by: Rishikesh Jethwani <rjethwani@purestorage.com>
+Link: https://patch.msgid.link/20261102213011.4191020-1-rjethwani@purestorage.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/tls/tls_sw.c |    3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+--- a/net/tls/tls_sw.c
++++ b/net/tls/tls_sw.c
+@@ -2567,7 +2567,8 @@ int tls_set_sw_offload(struct sock *sk,
+ 		}
+ 	}
+ 
+-	ctx->push_pending_record = tls_sw_push_pending_record;
++	if (tx)
++		ctx->push_pending_record = tls_sw_push_pending_record;
+ 
+ 	rc = crypto_aead_setkey(*aead, key, keysize);
+ 
