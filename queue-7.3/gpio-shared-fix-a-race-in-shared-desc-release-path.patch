@@ -1,0 +1,85 @@
+From 53043b9e83cc7f4e30e70161b67ae93c4c9fdb87 Mon Sep 17 00:00:00 2001
+From: Bartosz Golaszewski <bartosz.golaszewski@oss.qualcomm.com>
+Date: Tue, 10 Nov 2026 11:10:40 +0100
+Subject: gpio: shared: fix a race in shared desc release path
+
+From: Bartosz Golaszewski <bartosz.golaszewski@oss.qualcomm.com>
+
+commit 53043b9e83cc7f4e30e70161b67ae93c4c9fdb87 upstream.
+
+gpiod_shared_put() races with concurrent calls to
+devm_gpiod_shared_get() like so:
+
+CPU 0 (unbind / probe failure)      CPU 1 (concurrent proxy probe)
+==============================      ==============================
+gpiod_shared_put()
+  kref_put(&entry->ref, ...)
+    refcount_dec_and_test() // -> 0
+                                    devm_gpiod_shared_get()
+                                      mutex_lock(&entry->lock);
+                                      if (entry->shared_desc) {
+                                        kref_get(&entry->ref); // on 0!
+                                        shared_desc = entry->shared_desc;
+                                      }
+                                      mutex_unlock(&entry->lock);
+    gpio_shared_release()
+      mutex_lock(&entry->lock);
+      kfree(shared_desc);
+      entry->shared_desc = NULL;
+      mutex_unlock(&entry->lock);
+                                      // uses freed shared_desc
+
+Because gpiod_shared_put() decrements entry->ref without holding
+entry->lock and gpio_shared_release() only acquires entry->lock after the
+reference count has already reached zero, a concurrent call to
+devm_gpiod_shared_get() can acquire entry->lock in the intermediate window
+and observe a non-NULL entry->shared_desc. This can result in a
+use-after-free and a double-free when the second consumer releases its
+reference.
+
+Use kref_put_mutex() to ensure the entry lock is taken without a window
+in which a concurrent user can see a non-NULL entry->shared_desc while
+it's being released.
+
+Cc: stable@vger.kernel.org
+Closes: https://sashiko.dev/#/bug/linux-30e071e4-4e4a-4b63-bd83-df1147055d35
+Fixes: a060b8c511ab ("gpiolib: implement low-level, shared GPIO support")
+Reviewed-by: Linus Walleij <linusw@kernel.org>
+Link: https://patch.msgid.link/20261110-gpio-shared-refcnt-race-v2-1-8a0b76e01714@oss.qualcomm.com
+Signed-off-by: Bartosz Golaszewski <bartosz.golaszewski@oss.qualcomm.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/gpio/gpiolib-shared.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpio/gpiolib-shared.c b/drivers/gpio/gpiolib-shared.c
+index 8c9ac9d93304..edb04a5bb987 100644
+--- a/drivers/gpio/gpiolib-shared.c
++++ b/drivers/gpio/gpiolib-shared.c
+@@ -635,20 +635,20 @@ static void gpio_shared_release(struct kref *kref)
+ 		container_of(kref, struct gpio_shared_entry, ref);
+ 	struct gpio_shared_desc *shared_desc;
+ 
+-	guard(mutex)(&entry->lock);
+-
+ 	shared_desc = entry->shared_desc;
+ 	gpio_device_put(shared_desc->desc->gdev);
+ 	mutex_destroy(&shared_desc->mutex);
+ 	kfree(shared_desc);
+ 	entry->shared_desc = NULL;
++
++	mutex_unlock(&entry->lock);
+ }
+ 
+ static void gpiod_shared_put(void *data)
+ {
+ 	struct gpio_shared_entry *entry = data;
+ 
+-	kref_put(&entry->ref, gpio_shared_release);
++	kref_put_mutex(&entry->ref, gpio_shared_release, &entry->lock);
+ }
+ 
+ static struct gpio_shared_desc *
+-- 
+2.56.1
+
