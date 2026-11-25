@@ -1,0 +1,81 @@
+From dc61b19db1f77deb4c15bb71e64f46071447837c Mon Sep 17 00:00:00 2001
+From: Karol Wachowski <karol.wachowski@linux.intel.com>
+Date: Tue, 10 Nov 2026 13:15:34 +0100
+Subject: accel/ivpu: Defer recovery until probe completes
+
+From: Karol Wachowski <karol.wachowski@linux.intel.com>
+
+commit dc61b19db1f77deb4c15bb71e64f46071447837c upstream.
+
+An error IRQ that fires after ivpu_boot() enables interrupts queues
+recovery_work during probe. If probe then fails, the device is torn
+down while the work runs, and the work faults on the unmapped BARs:
+
+  BUG: unable to handle page fault for address: ffffcfc6680200f4
+  Workqueue: events_unbound ivpu_pm_recovery_work [intel_vpu]
+  RIP: 0010:ivpu_hw_ip_ipc_rx_addr_get+0xc/0xb0 [intel_vpu]
+  Call Trace:
+   ivpu_wait_for_ready+0x155/0x220 [intel_vpu]
+   ivpu_boot+0x9e/0x270 [intel_vpu]
+   ivpu_resume+0xa4/0xd0 [intel_vpu]
+   ivpu_pm_reset_complete+0x2c/0x90 [intel_vpu]
+   ivpu_pm_recovery_work+0xf6/0x140 [intel_vpu]
+
+If probe succeeds, the recovery runs concurrently with the rest of
+probe, and its pm_runtime_disable() discards the initial autosuspend
+request, leaving the NPU active until first use. Any recovery that
+starts while the NPU is idle loses the pending autosuspend the same way.
+
+Keep recovery_work disabled from ivpu_pm_init() until ivpu_pm_enable().
+A trigger during probe still runs diagnostics and masks interrupts, and
+ivpu_pm_enable() runs the deferred recovery before the initial
+autosuspend request. A trigger racing with ivpu_pm_enable() can cause
+a second, harmless recovery. Request autosuspend at the end of
+ivpu_pm_reset_complete() so the NPU suspends again after every reset.
+
+Fixes: 852be13f3bd3 ("accel/ivpu: Add PM support")
+Cc: stable@vger.kernel.org # v6.10+
+Reported-by: Daksh Sahni <swizzguy76@gmail.com>
+Closes: https://lore.kernel.org/r/20261107174215.15818-1-swizzguy76@gmail.com
+Tested-by: Daksh Sahni <swizzguy76@gmail.com>
+Reviewed-by: Jeff Hugo <jeff.hugo@oss.qualcomm.com>
+Signed-off-by: Karol Wachowski <karol.wachowski@linux.intel.com>
+Link: https://patch.msgid.link/20261110121534.3566028-1-karol.wachowski@linux.intel.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/accel/ivpu/ivpu_pm.c |    9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+--- a/drivers/accel/ivpu/ivpu_pm.c
++++ b/drivers/accel/ivpu/ivpu_pm.c
+@@ -151,8 +151,8 @@ static void ivpu_pm_reset_complete(struc
+ 	up_write(&vdev->pm->reset_lock);
+ 	atomic_set(&vdev->pm->reset_pending, 0);
+ 
+-	pm_runtime_mark_last_busy(vdev->drm.dev);
+ 	pm_runtime_enable(vdev->drm.dev);
++	pm_request_autosuspend(vdev->drm.dev);
+ }
+ 
+ static void ivpu_pm_recovery_work(struct work_struct *work)
+@@ -416,6 +416,7 @@ void ivpu_pm_init(struct ivpu_device *vd
+ 	atomic_set(&pm->engine_reset_counter, 0);
+ 
+ 	INIT_WORK(&pm->recovery_work, ivpu_pm_recovery_work);
++	disable_work(&pm->recovery_work);
+ 	INIT_DELAYED_WORK(&pm->job_timeout_work, ivpu_job_timeout_work);
+ 
+ 	if (ivpu_disable_recovery)
+@@ -440,6 +441,12 @@ void ivpu_pm_enable(struct ivpu_device *
+ {
+ 	struct device *dev = vdev->drm.dev;
+ 
++	enable_work(&vdev->pm->recovery_work);
++	if (atomic_read(&vdev->pm->reset_pending)) {
++		queue_work(system_dfl_wq, &vdev->pm->recovery_work);
++		flush_work(&vdev->pm->recovery_work);
++	}
++
+ 	pm_runtime_allow(dev);
+ 	pm_runtime_put_autosuspend(dev);
+ }
