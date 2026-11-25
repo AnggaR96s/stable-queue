@@ -1,0 +1,104 @@
+From 59f1398140869432c7171b9a2a279ca315467c4e Mon Sep 17 00:00:00 2001
+From: Phat Dinh <phatdt1116@gmail.com>
+Date: Fri, 6 Nov 2026 17:16:42 +0700
+Subject: perf/core: Do not resurrect cpuctx->cgrp after last cgroup event exit
+
+From: Phat Dinh <phatdt1116@gmail.com>
+
+commit 59f1398140869432c7171b9a2a279ca315467c4e upstream.
+
+perf_cgroup_switch() relies on:
+
+    /*
+     * cpuctx->cgrp is set when the first cgroup event enabled,
+     * and is cleared when the last cgroup event disabled.
+     */
+
+It computes the next task's cgroup, schedules out the CPU context and
+then assigns cpuctx->cgrp unconditionally:
+
+    ctx_sched_out(&cpuctx->ctx, NULL, EVENT_ALL|EVENT_CGROUP);
+    /*
+     * must not be done before ctxswout due
+     * to update_cgrp_time_from_cpuctx() in
+     * ctx_sched_out()
+     */
+    cpuctx->cgrp = cgrp;
+
+However, ctx_sched_out() can disable events itself. If a cgroup event
+has a pending disable from perf_event_disable_inatomic() (e.g. its
+PERF_EVENT_IOC_REFRESH limit ran out) that the irq_work has not
+handled yet, event_sched_out() consumes it inline:
+
+    if (event->pending_disable) {
+        event->pending_disable = 0;
+        perf_cgroup_event_disable(event, ctx);
+        state = PERF_EVENT_STATE_OFF;
+    }
+
+If that was the last cgroup event, perf_cgroup_event_disable() clears
+cpuctx->cgrp:
+
+    if (--ctx->nr_cgroups)
+        return;
+
+    cpuctx->cgrp = NULL;
+
+and perf_cgroup_switch() then sets it again. cpuctx->cgrp is left
+non-NULL with ctx.nr_cgroups == 0, so the NULL check in
+perf_cgroup_switch() no longer catches it and the next switch trips:
+
+    WARN_ON_ONCE(cpuctx->ctx.nr_cgroups == 0);
+
+cpuctx->cgrp does not hold a reference on the cgroup. Once that cgroup
+is removed, the next ctx_sched_in() dereferences the stale pointer:
+
+  BUG: KASAN: slab-use-after-free in ctx_sched_in+0xb1f/0xfa0
+  Read of size 8 at addr ffff8881008972d0 by task swapper/3/0
+
+  Tainted: [W]=WARN
+  Call Trace:
+   <IRQ>
+   ctx_sched_in+0xb1f/0xfa0
+   perf_event_sched_in+0x1a/0x70
+   ctx_resched+0x32b/0xac0
+   __perf_install_in_context+0x475/0xab0
+   remote_function+0x105/0x200
+   __flush_smp_call_function_queue+0x179/0x8d0
+   __sysvec_call_function_single+0x1b/0x1c0
+   sysvec_call_function_single+0x66/0x80
+   </IRQ>
+   <TASK>
+   asm_sysvec_call_function_single+0x1a/0x20
+
+Only assign cpuctx->cgrp when cgroup events remain after the context
+has been scheduled out, so that it stays NULL as the invariant
+requires.
+
+Fixes: e19cd0b6fa59 ("perf/core: Always set cpuctx cgrp when enable cgroup event")
+Signed-off-by: Phat Dinh <phatdt1116@gmail.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: stable@vger.kernel.org
+Link: https://patch.msgid.link/20261106101642.494674-1-phatdt1116@gmail.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ kernel/events/core.c |    7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -971,8 +971,13 @@ static void perf_cgroup_switch(struct ta
+ 	 * must not be done before ctxswout due
+ 	 * to update_cgrp_time_from_cpuctx() in
+ 	 * ctx_sched_out()
++	 *
++	 * ctx_sched_out() can consume a pending disable and drop the last cgroup
++	 * event, which clear the cpuctx->cgrp. Cgroup tracking follow active cgroup
++	 * event, so do not resurrect it
+ 	 */
+-	cpuctx->cgrp = cgrp;
++	if (cpuctx->ctx.nr_cgroups)
++		cpuctx->cgrp = cgrp;
+ 	/*
+ 	 * set cgrp before ctxsw in to allow
+ 	 * perf_cgroup_set_timestamp() in ctx_sched_in()
