@@ -1,0 +1,111 @@
+From aa40afa831ebfe45e40a23721711059f2ac584d4 Mon Sep 17 00:00:00 2001
+From: Hyunwoo Kim <imv4bel@gmail.com>
+Date: Tue, 10 Nov 2026 23:04:44 +0900
+Subject: tcp: fix NULL pointer dereference when restarting a Fast Open listener
+
+From: Hyunwoo Kim <imv4bel@gmail.com>
+
+commit aa40afa831ebfe45e40a23721711059f2ac584d4 upstream.
+
+When a valid RST is received for a Fast Open child accepted before the
+three-way handshake completes, reqsk_fastopen_remove() adds the
+request_sock to the listener's RST list if the listener is in TCP_LISTEN.
+
+An application can call shutdown(SHUT_RD) on a listener socket.
+inet_csk_listen_stop() checks rskq_rst_head without holding
+fastopenq.lock. If rskq_rst_head is NULL, it does not acquire the lock
+and therefore does not synchronize with an insertion by
+reqsk_fastopen_remove() after that function has passed the TCP_LISTEN
+check.
+
+The more likely outcome of this race, even without a subsequent
+listen(), is a leak. If reqsk_fastopen_remove() inserts a request_sock
+after inet_csk_listen_stop() observes an empty list and returns, the
+request_sock is stranded in rskq_rst_head and keeps a reference on the
+listener. The socket is already in TCP_CLOSE, so a subsequent close()
+does not call inet_csk_listen_stop() again.
+
+If listen() is called again on the same socket before the delayed list
+insertion, the insertion can overlap the queue initialization in
+reqsk_queue_alloc(). If it occurs after rskq_rst_head is set to NULL but
+before rskq_rst_tail is set to NULL, rskq_rst_head points to the
+request_sock while rskq_rst_tail is NULL.
+
+When a valid RST is later received for another accepted Fast Open child,
+rskq_rst_head is not NULL, so reqsk_fastopen_remove() attempts to write
+the request_sock pointer to rskq_rst_tail->dl_next while rskq_rst_tail is
+NULL. KASAN reports:
+
+  BUG: KASAN: null-ptr-deref in reqsk_fastopen_remove+0x147/0x210
+  Write of size 8 at addr 0000000000000088 by task swapper/3/0
+  ...
+  Call Trace:
+   <IRQ>
+   ...
+   reqsk_fastopen_remove+0x147/0x210
+   tcp_check_req+0xa70/0x1060
+   ...
+   tcp_rcv_state_process+0x1cb/0x2ae0
+   ...
+   tcp_v4_do_rcv+0x1fe/0x740
+   tcp_v4_rcv+0x1744/0x2070
+   ...
+   ip_protocol_deliver_rcu+0x5c/0x280
+   ip_local_deliver_finish+0x171/0x330
+   ip_local_deliver+0x107/0x370
+   ...
+   </IRQ>
+
+To widen the race window, the issue was reproduced after adding
+mdelay(3000) immediately after reqsk_fastopen_remove() checks that the
+listener is in TCP_LISTEN and immediately after reqsk_queue_alloc() sets
+rskq_rst_head to NULL.
+
+Make inet_csk_listen_stop() acquire fastopenq.lock regardless of the
+value of rskq_rst_head and detach the list while holding the lock. With
+this synchronization, reqsk_fastopen_remove() either inserts the
+request_sock before inet_csk_listen_stop() acquires the lock, in which
+case inet_csk_listen_stop() reclaims it, or sees that the listener is
+not in TCP_LISTEN and does not insert anything.
+
+Fixes: 0536fcc039a8 ("tcp: prepare fastopen code for upcoming listener changes")
+Cc: stable@vger.kernel.org
+Signed-off-by: Hyunwoo Kim <imv4bel@gmail.com>
+Reviewed-by: Kuniyuki Iwashima <kuniyu@google.com>
+Reviewed-by: Eric Dumazet <edumazet@kernel.org>
+Link: https://patch.msgid.link/avMkfJrXhCFXn8M_@v4bel
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/ipv4/inet_connection_sock.c |   20 +++++++++-----------
+ 1 file changed, 9 insertions(+), 11 deletions(-)
+
+--- a/net/ipv4/inet_connection_sock.c
++++ b/net/ipv4/inet_connection_sock.c
+@@ -1488,17 +1488,15 @@ skip_child_forget:
+ 
+ 		cond_resched();
+ 	}
+-	if (queue->fastopenq.rskq_rst_head) {
+-		/* Free all the reqs queued in rskq_rst_head. */
+-		spin_lock_bh(&queue->fastopenq.lock);
+-		req = queue->fastopenq.rskq_rst_head;
+-		queue->fastopenq.rskq_rst_head = NULL;
+-		spin_unlock_bh(&queue->fastopenq.lock);
+-		while (req != NULL) {
+-			next = req->dl_next;
+-			reqsk_put(req);
+-			req = next;
+-		}
++	/* Free all the reqs queued in rskq_rst_head. */
++	spin_lock_bh(&queue->fastopenq.lock);
++	req = queue->fastopenq.rskq_rst_head;
++	queue->fastopenq.rskq_rst_head = NULL;
++	spin_unlock_bh(&queue->fastopenq.lock);
++	while (req != NULL) {
++		next = req->dl_next;
++		reqsk_put(req);
++		req = next;
+ 	}
+ 	WARN_ON_ONCE(sk->sk_ack_backlog);
+ }
