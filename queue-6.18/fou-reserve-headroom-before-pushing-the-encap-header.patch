@@ -1,0 +1,129 @@
+From bcb42672751a8786dce871a35bde363b041cb2f7 Mon Sep 17 00:00:00 2001
+From: Theodor Arsenij Larionov Trichkine <theodorlarionov@gmail.com>
+Date: Mon, 16 Nov 2026 14:38:45 +0300
+Subject: fou: reserve headroom before pushing the encap header
+
+From: Theodor Arsenij Larionov Trichkine <theodorlarionov@gmail.com>
+
+commit bcb42672751a8786dce871a35bde363b041cb2f7 upstream.
+
+ip_tunnel_xmit() and ip_md_tunnel_xmit() push the encap header before
+reserving headroom. A packet redirected into the tunnel (tc mirred, nft
+fwd/dup) keeps the headroom of its original device, so fou_build_udp()
+panics:
+
+  kernel BUG at net/core/skbuff.c:214!
+  Call Trace:
+   skb_push+0xcc/0xf0
+   fou_build_udp+0x2f/0x380
+   gue_build_header+0xfa/0x150
+   ip_tunnel_xmit+0x87f/0x21c0
+
+With a mirred mirror, the push overwrites the original packet instead.
+Reachable with CAP_NET_ADMIN in a user namespace.
+
+Reserve the headroom in fou_build_header() and gue_build_header(); GUE
+sizes and builds the header from one copy of the encap fields. The skb
+head may move, so reload inner_iph after ip_tunnel_encap() and read
+tnl_params, which points into the head for GRE with header_ops, before
+the call. sit's ipip6_tunnel_xmit() holds no head pointer across it.
+
+Fixes: 56328486539d ("net: Changes to ip_tunnel to support foo-over-udp encapsulation")
+Fixes: ac931d4cdec3 ("ipip,ip_tunnel,sit: Add FOU support for externally controlled ipip devices")
+Reported-by: Chengfeng Ye <nicoyip.dev@gmail.com>
+Closes: https://lore.kernel.org/netdev/20260801060115.3538849-1-nicoyip.dev@gmail.com/
+Cc: stable@vger.kernel.org
+Signed-off-by: Theodor Arsenij Larionov Trichkine <theodorlarionov@gmail.com>
+Reviewed-by: Ido Schimmel <idosch@nvidia.com>
+Link: https://patch.msgid.link/20261116113845.166280-1-theodorlarionov@gmail.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/ipv4/fou_core.c  |   19 +++++++++++++++----
+ net/ipv4/ip_tunnel.c |    6 ++++--
+ 2 files changed, 19 insertions(+), 6 deletions(-)
+
+--- a/net/ipv4/fou_core.c
++++ b/net/ipv4/fou_core.c
+@@ -1074,6 +1074,9 @@ static int fou_build_header(struct sk_bu
+ 	__be16 sport;
+ 	int err;
+ 
++	if (skb_cow_head(skb, fou_encap_hlen(e)))
++		return -ENOMEM;
++
+ 	err = __fou_build_header(skb, e, protocol, &sport, type);
+ 	if (err)
+ 		return err;
+@@ -1086,16 +1089,24 @@ static int fou_build_header(struct sk_bu
+ static int gue_build_header(struct sk_buff *skb, struct ip_tunnel_encap *e,
+ 			    u8 *protocol, struct flowi4 *fl4)
+ {
+-	int type = e->flags & TUNNEL_ENCAP_FLAG_CSUM ? SKB_GSO_UDP_TUNNEL_CSUM :
+-						       SKB_GSO_UDP_TUNNEL;
++	struct ip_tunnel_encap encap = {
++		.flags = READ_ONCE(e->flags),
++		.sport = READ_ONCE(e->sport),
++		.dport = READ_ONCE(e->dport),
++	};
++	int type = encap.flags & TUNNEL_ENCAP_FLAG_CSUM ?
++		   SKB_GSO_UDP_TUNNEL_CSUM : SKB_GSO_UDP_TUNNEL;
+ 	__be16 sport;
+ 	int err;
+ 
+-	err = __gue_build_header(skb, e, protocol, &sport, type);
++	if (skb_cow_head(skb, gue_encap_hlen(&encap)))
++		return -ENOMEM;
++
++	err = __gue_build_header(skb, &encap, protocol, &sport, type);
+ 	if (err)
+ 		return err;
+ 
+-	fou_build_udp(skb, e, fl4, protocol, sport);
++	fou_build_udp(skb, &encap, fl4, protocol, sport);
+ 
+ 	return 0;
+ }
+--- a/net/ipv4/ip_tunnel.c
++++ b/net/ipv4/ip_tunnel.c
+@@ -604,6 +604,7 @@ void ip_md_tunnel_xmit(struct sk_buff *s
+ 
+ 	if (ip_tunnel_encap(skb, &tun_info->encap, &proto, &fl4) < 0)
+ 		goto tx_error;
++	inner_iph = (const struct iphdr *)skb_inner_network_header(skb);
+ 
+ 	use_cache = ip_tunnel_dst_cache_usable(skb, tun_info);
+ 	if (use_cache)
+@@ -746,6 +747,8 @@ void ip_tunnel_xmit(struct sk_buff *skb,
+ 	}
+ 
+ 	tos = tnl_params->tos;
++	df = tnl_params->frag_off;
++	ttl = tnl_params->ttl;
+ 	if (tos & 0x1) {
+ 		tos &= ~0x1;
+ 		if (payload_protocol == htons(ETH_P_IP)) {
+@@ -764,6 +767,7 @@ void ip_tunnel_xmit(struct sk_buff *skb,
+ 
+ 	if (ip_tunnel_encap(skb, &tunnel->encap, &protocol, &fl4) < 0)
+ 		goto tx_error;
++	inner_iph = (const struct iphdr *)skb_inner_network_header(skb);
+ 
+ 	if (connected && md) {
+ 		use_cache = ip_tunnel_dst_cache_usable(skb, tun_info);
+@@ -796,7 +800,6 @@ void ip_tunnel_xmit(struct sk_buff *skb,
+ 		goto tx_error;
+ 	}
+ 
+-	df = tnl_params->frag_off;
+ 	if (payload_protocol == htons(ETH_P_IP) && !tunnel->ignore_df)
+ 		df |= (inner_iph->frag_off & htons(IP_DF));
+ 
+@@ -816,7 +819,6 @@ void ip_tunnel_xmit(struct sk_buff *skb,
+ 	}
+ 
+ 	tos = ip_tunnel_ecn_encap(tos, inner_iph, skb);
+-	ttl = tnl_params->ttl;
+ 	if (ttl == 0) {
+ 		if (payload_protocol == htons(ETH_P_IP))
+ 			ttl = inner_iph->ttl;
