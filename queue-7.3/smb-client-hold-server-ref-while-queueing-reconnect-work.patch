@@ -1,0 +1,78 @@
+From f02d249e9756b78990aaaa1635e47e06deb2cb51 Mon Sep 17 00:00:00 2001
+From: Joseph Qi <joseph.qi@linux.alibaba.com>
+Date: Tue, 3 Nov 2026 17:15:57 +0800
+Subject: smb: client: hold server ref while queueing reconnect work
+
+From: Joseph Qi <joseph.qi@linux.alibaba.com>
+
+commit f02d249e9756b78990aaaa1635e47e06deb2cb51 upstream.
+
+When query_server_interfaces() returns -EOPNOTSUPP on a secondary
+channel, smb2_reconnect() calls smb3_update_ses_channels() which for a
+channel runs cifs_chan_skip_or_disable().  That clears the channel's
+slot in the session and calls cifs_put_tcp_session(), which can drop
+the last reference of the channel and tear it down.
+
+smb2_reconnect() then falls through to skip_add_channels and queues
+reconnect work on that server, using a server that may already be
+freed.  The send path obtained the channel from cifs_pick_channel(),
+which does not take a reference, so the session's channel reference is
+the only one.
+
+Take our own reference on the channel before calling
+smb3_update_ses_channels() and drop it after the reconnect work has
+been queued, so the channel cannot be freed while it is still used.
+
+Fixes: f591062bdbf4 ("cifs: handle servers that still advertise multichannel after disabling")
+Cc: stable@vger.kernel.org
+Signed-off-by: Joseph Qi <joseph.qi@linux.alibaba.com>
+Signed-off-by: Paulo Alcantara <pc@manguebit.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/smb/client/smb2pdu.c |   19 ++++++++++++++++++-
+ 1 file changed, 18 insertions(+), 1 deletion(-)
+
+--- a/fs/smb/client/smb2pdu.c
++++ b/fs/smb/client/smb2pdu.c
+@@ -250,9 +250,10 @@ static int
+ smb2_reconnect(__le16 smb2_command, struct cifs_tcon *tcon,
+ 	       struct TCP_Server_Info *server, bool from_reconnect)
+ {
++	bool hold_server_ref = false;
+ 	struct cifs_ses *ses;
+-	int xid;
+ 	int rc = 0;
++	int xid;
+ 
+ 	/*
+ 	 * SMB2s NegProt, SessSetup, Logoff do not have tcon yet so
+@@ -470,6 +471,20 @@ skip_sess_setup:
+ 			 * treat this as server not supporting multichannel
+ 			 */
+ 
++			/*
++			 * If server is a secondary channel,
++			 * cifs_chan_skip_or_disable() called below may
++			 * drop its last reference, so hold our own
++			 * reference until the reconnect work below has
++			 * been queued.
++			 */
++			spin_lock(&cifs_tcp_ses_lock);
++			if (server->srv_count) {
++				server->srv_count++;
++				hold_server_ref = true;
++			}
++			spin_unlock(&cifs_tcp_ses_lock);
++
+ 			rc = smb3_update_ses_channels(ses, server,
+ 						       from_reconnect,
+ 						       true /* disable_mchan */);
+@@ -498,6 +513,8 @@ skip_add_channels:
+ 
+ 	if (smb2_command != SMB2_INTERNAL_CMD)
+ 		cifs_queue_server_reconn(server);
++	if (hold_server_ref)
++		cifs_put_tcp_session(server, from_reconnect);
+ 
+ 	atomic_inc(&tconInfoReconnectCount);
+ out:

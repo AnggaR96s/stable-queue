@@ -1,0 +1,112 @@
+From fb39fbd782bcd2dccd05f633bc6ac348209dc272 Mon Sep 17 00:00:00 2001
+From: Paulo Alcantara <pc@manguebit.org>
+Date: Wed, 28 Oct 2026 23:09:16 -0300
+Subject: smb: client: retry writeback on interrupts and allocation failures
+
+From: Paulo Alcantara <pc@manguebit.org>
+
+commit fb39fbd782bcd2dccd05f633bc6ac348209dc272 upstream.
+
+Issuing writes from a worker only helps when the task is already dying
+at issue time.  A fatal signal can still arrive after that check and
+before __smb_send_rqst() checks again, or while waiting for a credit in
+cifs_call_async(), or in the middle of a send.  The write then fails
+with -ERESTARTSYS, which isn't a replayable error, so netfs marks the
+subrequest failed and drops its folios clean:
+
+  netfs_sreq: R=000041f6[2] UPLD SUBMT ... s=400000 0/400000
+  smb3_write_err: R=000041f6[2] ... offset=0x400000 len=0x400000 rc=-512
+  netfs_failure: R=000041f6[2] UPLD ... upload e=-512
+
+losing 4MiB of a 64MiB file closed by a task killed meanwhile.  A failed
+memory allocation while building or sending a write drops its data the
+same way.
+
+No server status maps to an interrupt error or to -ENOMEM, so for
+writeback such errors always mean the client gave up locally.  Mark the
+subrequest for retry, with backoff and giving up on umount -f, as cifs
+did with is_retryable_error() before switching to netfslib and as NFS
+does for these errors.  netfs collects writeback from a workqueue, so
+the retry gets prepared and issued with no signals pending.
+
+Only the SMB2 read and write paths sleep before replaying, so SMB1 would
+resend such writes right away.  Move the sleep to cifs_issue_read() and
+__cifs_issue_write().
+
+Fixes: 3ee1a1fc3981 ("cifs: Cut over to using netfslib")
+Reviewed-by: David Howells <dhowells@redhat.com>
+Signed-off-by: Paulo Alcantara <pc@manguebit.org>
+Cc: stable@vger.kernel.org
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/smb/client/file.c    |   14 ++++++++++++++
+ fs/smb/client/smb2pdu.c |   12 ++----------
+ 2 files changed, 16 insertions(+), 10 deletions(-)
+
+--- a/fs/smb/client/file.c
++++ b/fs/smb/client/file.c
+@@ -179,6 +179,9 @@ static void __cifs_issue_write(struct ne
+ 	if (wdata->req->cfile->invalidHandle)
+ 		goto fail;
+ 
++	if (wdata->replay && wdata->cur_sleep)
++		msleep(wdata->cur_sleep);
++
+ 	wdata->server->ops->async_writev(wdata);
+ out:
+ 	return;
+@@ -312,6 +315,9 @@ static void cifs_issue_read(struct netfs
+ 	    subreq->rreq->origin != NETFS_DIO_READ)
+ 		__set_bit(NETFS_SREQ_CLEAR_TAIL, &subreq->flags);
+ 
++	if (rdata->replay && rdata->cur_sleep)
++		msleep(rdata->cur_sleep);
++
+ 	trace_netfs_sreq(subreq, netfs_sreq_trace_submit);
+ 	rc = rdata->server->ops->async_readv(rdata);
+ 	if (rc)
+@@ -2705,6 +2711,14 @@ void cifs_write_subrequest_terminated(st
+ 		spin_unlock(&inode->i_lock);
+ 	}
+ 
++	if ((is_interrupt_error(result) || result == -ENOMEM) &&
++	    wreq->origin == NETFS_WRITEBACK && cifs_io_should_replay(wdata)) {
++		wdata->replay = true;
++		trace_netfs_sreq(&wdata->subreq,
++				 netfs_sreq_trace_io_retry_needed);
++		__set_bit(NETFS_SREQ_NEED_RETRY, &wdata->subreq.flags);
++	}
++
+ 	netfs_write_subrequest_terminated(&wdata->subreq, result);
+ }
+ 
+--- a/fs/smb/client/smb2pdu.c
++++ b/fs/smb/client/smb2pdu.c
+@@ -4913,12 +4913,8 @@ smb2_async_readv(struct cifs_io_subreque
+ 
+ 	shdr = (struct smb2_hdr *)buf;
+ 
+-	if (rdata->replay) {
+-		/* Back-off before retry */
+-		if (rdata->cur_sleep)
+-			msleep(rdata->cur_sleep);
++	if (rdata->replay)
+ 		smb2_set_replay(server, &rqst);
+-	}
+ 
+ 	if (rdata->credits.value > 0) {
+ 		shdr->CreditCharge = cpu_to_le16(DIV_ROUND_UP(io_parms.length,
+@@ -5315,12 +5311,8 @@ smb2_async_writev(struct cifs_io_subrequ
+ 	}
+ #endif
+ 
+-	if (wdata->replay) {
+-		/* Back-off before retry */
+-		if (wdata->cur_sleep)
+-			msleep(wdata->cur_sleep);
++	if (wdata->replay)
+ 		smb2_set_replay(server, &rqst);
+-	}
+ 
+ 	cifs_dbg(FYI, "async write at %llu %u bytes iter=%zx\n",
+ 		 io_parms->offset, io_parms->length, iov_iter_count(&wdata->subreq.io_iter));

@@ -1,0 +1,100 @@
+From bb203c9af62adb59d82e8ecb715e778329e3b771 Mon Sep 17 00:00:00 2001
+From: Paulo Alcantara <pc@manguebit.org>
+Date: Wed, 28 Oct 2026 23:07:14 -0300
+Subject: smb: client: don't retry failed writes forever regardless of mount options
+
+From: Paulo Alcantara <pc@manguebit.org>
+
+commit bb203c9af62adb59d82e8ecb715e778329e3b771 upstream.
+
+smb2_writev_callback() marks a write for retry whenever the server fails
+it with a replayable status, ignoring smb2_should_replay() and so the
+hard and retrans mount options.  The latter is only used to decide on a
+backoff, so on a soft mount with no retrans, a server that keeps failing
+a write with e.g. STATUS_INSUFFICIENT_RESOURCES gets it resent forever,
+thousands of times per second, hanging anything waiting on its
+writeback:
+
+  smb3_write_err: R=005c359e[2] ... offset=0x27000 len=0xfdf0 rc=-11
+  (569410 times in 255 seconds, same subrequest, no growing delay)
+
+Only retry such writes when cifs_io_should_replay() allows it, as already
+done for send errors in smb2_async_writev(), otherwise let them fail.
+Writeback thus keeps retrying them with backoff, within its retry
+window.  Base the decision on the result of this attempt rather than on
+wdata->result, which is never reset on success and may hold the error of
+a previous attempt.
+
+Writes cut short by a reconnect get retried regardless too.  Have
+writeback ones go through cifs_io_should_replay() as well, so that they
+back off and soft mounts give up on them after the retry window, as on
+other replayable errors.  Other writes cut short keep being retried,
+without spending the mount's retries, but as replays, since they may
+have reached the server, unless umount -f stopped them, which fails them
+with -EIO.
+
+Fixes: 2c1238a7477a ("cifs: make retry logic in read/write path consistent with other paths")
+Signed-off-by: Paulo Alcantara <pc@manguebit.org>
+Cc: stable@vger.kernel.org
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/smb/client/smb2pdu.c |   25 ++++++++++++++-----------
+ 1 file changed, 14 insertions(+), 11 deletions(-)
+
+--- a/fs/smb/client/smb2pdu.c
++++ b/fs/smb/client/smb2pdu.c
+@@ -5096,6 +5096,7 @@ smb2_writev_callback(struct TCP_Server_I
+ 	};
+ 	unsigned int rreq_debug_id = wdata->rreq->debug_id;
+ 	unsigned int subreq_debug_index = wdata->subreq.debug_index;
++	bool cut_short = false;
+ 	ssize_t result = 0;
+ 	size_t written = 0;
+ 
+@@ -5109,10 +5110,7 @@ smb2_writev_callback(struct TCP_Server_I
+ 		credits.instance = server->reconnect_instance;
+ 		result = smb2_check_receive(mid, server, 0);
+ 		if (result != 0) {
+-			if (is_replayable_error(result)) {
+-				trace_netfs_sreq(&wdata->subreq, netfs_sreq_trace_io_retry_needed);
+-				__set_bit(NETFS_SREQ_NEED_RETRY, &wdata->subreq.flags);
+-			} else {
++			if (!is_replayable_error(result)) {
+ 				wdata->subreq.error = result;
+ 				trace_netfs_sreq(&wdata->subreq, netfs_sreq_trace_io_bad);
+ 			}
+@@ -5141,12 +5139,9 @@ smb2_writev_callback(struct TCP_Server_I
+ 		break;
+ 	case MID_REQUEST_SUBMITTED:
+ 		trace_netfs_sreq(&wdata->subreq, netfs_sreq_trace_io_req_submitted);
+-		__set_bit(NETFS_SREQ_NEED_RETRY, &wdata->subreq.flags);
+-		result = -EAGAIN;
+-		break;
++		fallthrough;
+ 	case MID_RETRY_NEEDED:
+-		trace_netfs_sreq(&wdata->subreq, netfs_sreq_trace_io_retry_needed);
+-		__set_bit(NETFS_SREQ_NEED_RETRY, &wdata->subreq.flags);
++		cut_short = true;
+ 		result = -EAGAIN;
+ 		break;
+ 	case MID_RESPONSE_MALFORMED:
+@@ -5200,9 +5195,17 @@ smb2_writev_callback(struct TCP_Server_I
+ 	wdata->credits.value = 0;
+ 
+ 	/* see if we need to retry */
+-	if (is_replayable_error(wdata->result) &&
+-	    cifs_io_should_replay(wdata))
++	if (is_replayable_error(result) &&
++	    ((cut_short && wdata->rreq->origin != NETFS_WRITEBACK &&
++	      !cifs_io_stopped(wdata)) ||
++	     cifs_io_should_replay(wdata))) {
+ 		wdata->replay = true;
++		trace_netfs_sreq(&wdata->subreq,
++				 netfs_sreq_trace_io_retry_needed);
++		__set_bit(NETFS_SREQ_NEED_RETRY, &wdata->subreq.flags);
++	} else if (cut_short && cifs_io_stopped(wdata)) {
++		result = -EIO;
++	}
+ 
+ 	cifs_write_subrequest_terminated(wdata, result ?: written);
+ 	release_mid(server, mid);
