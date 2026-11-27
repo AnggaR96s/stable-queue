@@ -1,0 +1,107 @@
+From 2997dc6b8e6a534e0e4153e873a3bea1a41152c0 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 24 Nov 2026 17:45:16 -0500
+Subject: mm/page_alloc: snapshot the preferred zone against shrink rebuilds
+
+From: Gregory Price (Meta) <gourry@gourry.net>
+
+[ Upstream commit b3e3a760eb68449e2794ef68ab212173d9c3e8c7 ]
+
+get_page_from_freelist() and alloc_pages_bulk_noprof() reread
+ac->preferred_zoneref->zone at every use. Offlining a zone's last block
+rebuilds the zonelists in place, and the shrunk list's NULL terminator
+can land on the preferred slot mid-walk:
+
+  CPU 0                             CPU 1
+  get_page_from_freelist(GFP_KERNEL | __GFP_THISNODE)
+    zone = NORMAL (slot 1)
+                                    offline_pages()
+                                      build_all_zonelists()
+                                        [MOVABLE, NORMAL, NULL]
+                                        -> [NORMAL, NULL]
+    rmqueue(zonelist_zone(slot 1), zone)
+      zone_statistics(NULL, zone)
+
+  BUG: kernel NULL pointer dereference, address: 0000000000000060
+  RIP: 0010:get_page_from_freelist+0x6a5/0x15f0
+  Call Trace:
+   __alloc_frozen_pages_noprof+0x125/0x330
+
+Read the slot once. Zones are never freed, so a stale zone is safe, and
+a NULL slot fails the same way as walking off the end.
+
+Fixes: 11cd8638c37f ("mm, page_alloc: remove stop_machine from build_all_zonelists")
+Cc: stable@vger.kernel.org
+Signed-off-by: Gregory Price (Meta) <gourry@gourry.net>
+Reviewed-by: Vlastimil Babka (SUSE) <vbabka@kernel.org>
+Link: https://patch.msgid.link/20261101021340.2251928-7-gourry@gourry.net
+Acked-by: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Vlastimil Babka (SUSE) <vbabka@kernel.org>
+[ sashal: Dropped the alloc_pages_bulk_noprof() hunks since 5.10 has no bulk allocator, and adjusted context for older get_page_from_freelist() locals and conditions. ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ mm/page_alloc.c | 17 +++++++++++++----
+ 1 file changed, 13 insertions(+), 4 deletions(-)
+
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index c3071d35add1b..ba21243374b5a 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -3807,9 +3807,18 @@ get_page_from_freelist(gfp_t gfp_mask, unsigned int order, int alloc_flags,
+ {
+ 	struct zoneref *z;
+ 	struct zone *zone;
++	struct zone *preferred_zone;
+ 	struct pglist_data *last_pgdat_dirty_limit = NULL;
+ 	bool no_fallback;
+ 
++	/*
++	 * A concurrent zonelist rebuild can NULL or replace this slot. Zones
++	 * are never freed, so reading it once keeps a usable zone.
++	 */
++	preferred_zone = zonelist_zone(ac->preferred_zoneref);
++	if (!preferred_zone)
++		return NULL;
++
+ retry:
+ 	/*
+ 	 * Scan zonelist, looking for a zone with enough free.
+@@ -3856,7 +3865,7 @@ get_page_from_freelist(gfp_t gfp_mask, unsigned int order, int alloc_flags,
+ 		}
+ 
+ 		if (no_fallback && nr_online_nodes > 1 &&
+-		    zone != ac->preferred_zoneref->zone) {
++		    zone != preferred_zone) {
+ 			int local_nid;
+ 
+ 			/*
+@@ -3864,7 +3873,7 @@ get_page_from_freelist(gfp_t gfp_mask, unsigned int order, int alloc_flags,
+ 			 * fragmenting fallbacks. Locality is more important
+ 			 * than fragmentation avoidance.
+ 			 */
+-			local_nid = zone_to_nid(ac->preferred_zoneref->zone);
++			local_nid = zone_to_nid(preferred_zone);
+ 			if (zone_to_nid(zone) != local_nid) {
+ 				alloc_flags &= ~ALLOC_NOFRAGMENT;
+ 				goto retry;
+@@ -3893,7 +3902,7 @@ get_page_from_freelist(gfp_t gfp_mask, unsigned int order, int alloc_flags,
+ 				goto try_this_zone;
+ 
+ 			if (node_reclaim_mode == 0 ||
+-			    !zone_allows_reclaim(ac->preferred_zoneref->zone, zone))
++			    !zone_allows_reclaim(preferred_zone, zone))
+ 				continue;
+ 
+ 			ret = node_reclaim(zone->zone_pgdat, gfp_mask, order);
+@@ -3915,7 +3924,7 @@ get_page_from_freelist(gfp_t gfp_mask, unsigned int order, int alloc_flags,
+ 		}
+ 
+ try_this_zone:
+-		page = rmqueue(ac->preferred_zoneref->zone, zone, order,
++		page = rmqueue(preferred_zone, zone, order,
+ 				gfp_mask, alloc_flags, ac->migratetype);
+ 		if (page) {
+ 			prep_new_page(page, order, gfp_mask, alloc_flags);
+-- 
+2.53.0
+

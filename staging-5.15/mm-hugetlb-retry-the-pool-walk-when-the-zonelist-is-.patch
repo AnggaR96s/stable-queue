@@ -1,0 +1,162 @@
+From af0bd97782b8d95a9b0f6edaf1ad249cb645ed99 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 24 Nov 2026 18:00:31 -0500
+Subject: mm/hugetlb: retry the pool walk when the zonelist is rebuilt
+
+From: Gregory Price (Meta) <gourry@gourry.net>
+
+[ Upstream commit 9f6674f842bbceda8326cf4e494af5ad3a5a05e6 ]
+
+Onlining the first block of a zone rebuilds every zonelist in place,
+shifting the slots after the new zone.  dequeue_hugetlb_folio_nodemask()
+approves a slot by its node, then loads the zone from it, so a hugetlb
+fault bound to one node can take a pool page from another:
+
+  CPU 0                             CPU 1
+  dequeue_hugetlb_folio_nodemask(nodemask {2})
+    slot 3 (NORMAL2) approved
+                                    online_pages()
+                                      build_all_zonelists()
+                                        [.., NORMAL1, NORMAL2]
+                                        -> [.., MOVABLE1, NORMAL1, ...]
+    zone = zonelist_zone(slot 3)    /* NORMAL1 */
+    dequeue_hugetlb_folio_node_exact(h, 1)
+
+Check zonelist_update_seq before using each zone, and on the way out
+with nothing found, and restart the walk if it changed.  Checking before
+the dequeue leaves nothing to put back.  Reset the last-tried node on
+restart, so it is not skipped.
+
+With kprobes holding the walk across the online, a fault bound to node 2
+took a node 1 page in 3 of 3 runs, and a node 2 page in 3 of 3 with this
+change.
+
+Fixes: 11cd8638c37f ("mm, page_alloc: remove stop_machine from build_all_zonelists")
+Cc: stable@vger.kernel.org
+Signed-off-by: Gregory Price (Meta) <gourry@gourry.net>
+Link: https://patch.msgid.link/20261101021340.2251928-10-gourry@gourry.net
+Signed-off-by: Vlastimil Babka (SUSE) <vbabka@kernel.org>
+[ sashal: Helpers moved into mm/internal.h since there is no page_alloc.h, and the hugetlb change was applied to dequeue_huge_page_nodemask() using struct page instead of folio. ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ mm/hugetlb.c    | 13 ++++++++++---
+ mm/internal.h   | 19 +++++++++++++++++++
+ mm/page_alloc.c | 18 +-----------------
+ 3 files changed, 30 insertions(+), 20 deletions(-)
+
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index a4d70b5ad9a70..8ebe60e6257ff 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -1109,19 +1109,25 @@ static struct page *dequeue_huge_page_node_exact(struct hstate *h, int nid)
+ static struct page *dequeue_huge_page_nodemask(struct hstate *h, gfp_t gfp_mask, int nid,
+ 		nodemask_t *nmask)
+ {
+-	unsigned int cpuset_mems_cookie;
++	unsigned int cpuset_mems_cookie, zonelist_cookie;
+ 	struct zonelist *zonelist;
+ 	struct zone *zone;
+ 	struct zoneref *z;
+-	int node = NUMA_NO_NODE;
++	int node;
+ 
+ 	zonelist = node_zonelist(nid, gfp_mask);
+ 
+ retry_cpuset:
++	node = NUMA_NO_NODE;
+ 	cpuset_mems_cookie = read_mems_allowed_begin();
++	zonelist_cookie = zonelist_iter_begin();
+ 	for_each_zone_zonelist_nodemask(zone, z, zonelist, gfp_zone(gfp_mask), nmask) {
+ 		struct page *page;
+ 
++		/* A rebuild may have shifted a node outside @nmask into this slot. */
++		if (unlikely(check_retry_zonelist(zonelist_cookie)))
++			goto retry_cpuset;
++
+ 		if (!cpuset_zone_allowed(zone, gfp_mask))
+ 			continue;
+ 		/*
+@@ -1136,7 +1142,8 @@ static struct page *dequeue_huge_page_nodemask(struct hstate *h, gfp_t gfp_mask,
+ 		if (page)
+ 			return page;
+ 	}
+-	if (unlikely(read_mems_allowed_retry(cpuset_mems_cookie)))
++	if (unlikely(read_mems_allowed_retry(cpuset_mems_cookie) ||
++		     check_retry_zonelist(zonelist_cookie)))
+ 		goto retry_cpuset;
+ 
+ 	return NULL;
+diff --git a/mm/internal.h b/mm/internal.h
+index 85b9faf74eca2..01ff5c696b0b0 100644
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -10,6 +10,7 @@
+ #include <linux/fs.h>
+ #include <linux/mm.h>
+ #include <linux/pagemap.h>
++#include <linux/seqlock.h>
+ #include <linux/tracepoint-defs.h>
+ 
+ /*
+@@ -701,4 +702,22 @@ void vunmap_range_noflush(unsigned long start, unsigned long end);
+ int numa_migrate_prep(struct page *page, struct vm_area_struct *vma,
+ 		      unsigned long addr, int page_nid, int *flags);
+ 
++extern seqlock_t zonelist_update_seq;
++
++static inline unsigned int zonelist_iter_begin(void)
++{
++	if (IS_ENABLED(CONFIG_MEMORY_HOTPLUG))
++		return read_seqbegin(&zonelist_update_seq);
++
++	return 0;
++}
++
++static inline unsigned int check_retry_zonelist(unsigned int seq)
++{
++	if (IS_ENABLED(CONFIG_MEMORY_HOTPLUG))
++		return read_seqretry(&zonelist_update_seq, seq);
++
++	return 0;
++}
++
+ #endif	/* __MM_INTERNAL_H */
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 2e6c0976535c7..f016cc37182a7 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -4639,15 +4639,7 @@ EXPORT_SYMBOL_GPL(fs_reclaim_release);
+  * retries the allocation if zonelist changes. Writer side is protected by the
+  * embedded spin_lock.
+  */
+-static DEFINE_SEQLOCK(zonelist_update_seq);
+-
+-static unsigned int zonelist_iter_begin(void)
+-{
+-	if (IS_ENABLED(CONFIG_MEMORY_HOTPLUG))
+-		return read_seqbegin(&zonelist_update_seq);
+-
+-	return 0;
+-}
++DEFINE_SEQLOCK(zonelist_update_seq);
+ 
+ /*
+  * Never wait for the writer, which an ALLOC_NOLOCK caller in NMI may have
+@@ -4662,14 +4654,6 @@ static unsigned int zonelist_iter_sample(void)
+ 	return 0;
+ }
+ 
+-static unsigned int check_retry_zonelist(unsigned int seq)
+-{
+-	if (IS_ENABLED(CONFIG_MEMORY_HOTPLUG))
+-		return read_seqretry(&zonelist_update_seq, seq);
+-
+-	return 0;
+-}
+-
+ /* Perform direct synchronous page reclaim */
+ static unsigned long
+ __perform_reclaim(gfp_t gfp_mask, unsigned int order,
+-- 
+2.53.0
+

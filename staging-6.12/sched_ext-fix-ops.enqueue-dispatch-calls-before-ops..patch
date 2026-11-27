@@ -1,0 +1,218 @@
+From 012c0be347921675c2b48a47551684fe428a2350 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 25 Nov 2026 14:57:34 -0500
+Subject: sched_ext: Fix ops.enqueue/dispatch() calls before ops.cpu_online()
+
+From: Tejun Heo <tj@kernel.org>
+
+[ Upstream commit 2227a34ff7bfcf6112931039e3554f4b70b65ab9 ]
+
+ops.cpu_online() documents that the cpu doesn't call ops.enqueue() or
+ops.dispatch() before that op. Both are gated on SCX_RQ_ONLINE, which
+follows the core's rq online state through the ext class's rq_online and
+rq_offline hooks. On a runtime cpu up, sched_cpu_activate() runs:
+
+1. set_cpu_active() marks the cpu active.
+2. cpuset_cpu_active() rebuilds the sched domains synchronously, and
+   rq_attach_root() puts the rq online as the cpu is active now. The
+   rq_online hook sets SCX_RQ_ONLINE.
+3. scx_rq_activate() calls the root's ops.cpu_online().
+
+Between 2 and 3, ops.enqueue() can be called for tasks woken or migrated
+onto the cpu, and ops.dispatch() can run on it.
+
+The hooks can't call the ops. They run under the rq lock with IRQs off while
+the ops can be sleepable BPF programs, and handle_hotplug() needs the
+rebuilt sched domains for its idle topology update.
+
+Track SCX_RQ_ONLINE in handle_hotplug() alone. Set it right after the root's
+ops.cpu_online(). Clear it and move the cpu's tasks to its local DSQ when
+the cpu goes down. Sched domain rebuilds, which take a live cpu's rq offline
+and online again, no longer touch the flag, so a remote dispatch can't see
+it cleared by a rebuild and bounce to the global DSQ.
+
+Between 2 and 3, tasks that land on the cpu now go to its local DSQ without
+ops.enqueue(), and with sub-schedulers a task whose scheduler lacks caps on
+the cpu is admitted anyway and counted in SCX_EV_SUB_FORCED_ADMIT. Both
+already happen between 1 and 2.
+
+Fixes: 60c27fb59f6c ("sched_ext: Implement sched_ext_ops.cpu_online/offline()")
+Cc: stable@vger.kernel.org # v6.12+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Reviewed-by: Andrea Righi <arighi@nvidia.com>
+[ sashal: added a scx_rq_activate() call to the sched_cpu_deactivate() rollback in core.c, dropped sub-scheduler hunks, inlined the missing drain_offline_rq() helper, and moved the paths to kernel/sched/ext.c. ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ kernel/sched/core.c  |  1 +
+ kernel/sched/ext.c   | 82 +++++++++++++++++++++++---------------------
+ kernel/sched/sched.h |  7 ++--
+ 3 files changed, 47 insertions(+), 43 deletions(-)
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index a1d0b22e46b7a..04d09274f0b15 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -8269,6 +8269,7 @@ int sched_cpu_deactivate(unsigned int cpu)
+ 	if (ret) {
+ 		sched_smt_present_inc(cpu);
+ 		sched_set_rq_online(rq, cpu);
++		scx_rq_activate(rq);
+ 		balance_push_set(cpu, false);
+ 		set_cpu_active(cpu, true);
+ 		sched_update_numa(cpu, true);
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index 7a4b23e48cc6f..63e83e55d170f 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -2003,11 +2003,11 @@ static void direct_dispatch(struct task_struct *p, u64 enq_flags)
+ static bool scx_rq_online(struct rq *rq)
+ {
+ 	/*
+-	 * Test both cpu_active() and %SCX_RQ_ONLINE. %SCX_RQ_ONLINE indicates
+-	 * the online state as seen from the BPF scheduler. cpu_active() test
+-	 * guarantees that, if this function returns %true, %SCX_RQ_ONLINE will
+-	 * stay set until the current scheduling operation is complete even if
+-	 * we aren't locking @rq.
++	 * Test both cpu_active() and %SCX_RQ_ONLINE. %SCX_RQ_ONLINE is set
++	 * after ops.cpu_online() and cleared when the cpu goes down.
++	 * cpu_active() test guarantees that, if this function returns %true,
++	 * %SCX_RQ_ONLINE will stay set until the current scheduling operation
++	 * is complete even if we aren't locking @rq.
+ 	 */
+ 	return likely((rq->scx.flags & SCX_RQ_ONLINE) && cpu_active(cpu_of(rq)));
+ }
+@@ -2114,7 +2114,7 @@ static void set_task_runnable(struct rq *rq, struct task_struct *p)
+ 	}
+ 
+ 	/*
+-	 * list_add_tail() must be used. scx_ops_bypass() and rq_offline_scx()
++	 * list_add_tail() must be used. scx_ops_bypass() and handle_hotplug()
+ 	 * depend on tasks being appended to the runnable_list.
+ 	 */
+ 	list_add_tail(&p->scx.runnable_node, &rq->scx.runnable_list);
+@@ -2831,7 +2831,7 @@ static int balance_one(struct rq *rq, struct task_struct *prev)
+ 	/*
+ 	 * scx_rq_online() can't be used. Its cpu_active() test goes false
+ 	 * before CPU hotplug waits for an RCU grace period, and
+-	 * rq_offline_scx() moves this CPU's tasks to the local DSQ only after
++	 * handle_hotplug() moves this CPU's tasks to the local DSQ only after
+ 	 * the wait. The grace period can depend on those tasks running.
+ 	 */
+ 	if (!SCX_HAS_OP(dispatch) || scx_rq_bypassing(rq) ||
+@@ -3511,6 +3511,29 @@ static void handle_hotplug(struct rq *rq, bool online)
+ {
+ 	int cpu = cpu_of(rq);
+ 
++	if (!online) {
++		struct task_struct *p, *n;
++
++		guard(rq_lock_irqsave)(rq);
++		update_rq_clock(rq);
++		rq->scx.flags &= ~SCX_RQ_ONLINE;
++
++		/*
++		 * An offline CPU no longer calls ops.dispatch(). Re-enqueue its
++		 * tasks onto the local DSQ so that they run here and
++		 * balance_push() moves them off.
++		 */
++		list_for_each_entry_safe_reverse(p, n, &rq->scx.runnable_list, scx.runnable_node) {
++			struct sched_enq_and_set_ctx ctx;
++
++			if (p->scx.dsq == &rq->scx.local_dsq)
++				continue;
++
++			sched_deq_and_put_task(p, DEQUEUE_SAVE | DEQUEUE_MOVE | DEQUEUE_NOCLOCK, &ctx);
++			sched_enq_and_set_task(&ctx);
++		}
++	}
++
+ 	atomic_long_inc(&scx_hotplug_seq);
+ 
+ 	if (online && SCX_HAS_OP(cpu_online))
+@@ -3521,6 +3544,18 @@ static void handle_hotplug(struct rq *rq, bool online)
+ 		scx_ops_exit(SCX_ECODE_ACT_RESTART | SCX_ECODE_RSN_HOTPLUG,
+ 			     "cpu %d going %s, exiting scheduler", cpu,
+ 			     online ? "online" : "offline");
++
++	if (online) {
++		/*
++		 * The cpu must not call ops.enqueue() or ops.dispatch() before
++		 * ops.cpu_online(). The core's rq online state can't gate them,
++		 * as the sched domain rebuild in sched_cpu_activate() can put
++		 * @rq online before this function runs. Set %SCX_RQ_ONLINE
++		 * here.
++		 */
++		guard(rq_lock_irqsave)(rq);
++		rq->scx.flags |= SCX_RQ_ONLINE;
++	}
+ }
+ 
+ void scx_rq_activate(struct rq *rq)
+@@ -3533,36 +3568,6 @@ void scx_rq_deactivate(struct rq *rq)
+ 	handle_hotplug(rq, false);
+ }
+ 
+-static void rq_online_scx(struct rq *rq)
+-{
+-	rq->scx.flags |= SCX_RQ_ONLINE;
+-}
+-
+-static void rq_offline_scx(struct rq *rq)
+-{
+-	struct task_struct *p, *n;
+-
+-	rq->scx.flags &= ~SCX_RQ_ONLINE;
+-
+-	/* sched domain rebuilds call rq_offline with the CPU staying alive */
+-	if (cpu_active(cpu_of(rq)))
+-		return;
+-
+-	/*
+-	 * An offline CPU no longer calls ops.dispatch(). Re-enqueue its tasks
+-	 * onto the local DSQ so that they run here and balance_push() moves
+-	 * them off.
+-	 */
+-	list_for_each_entry_safe_reverse(p, n, &rq->scx.runnable_list, scx.runnable_node) {
+-		struct sched_enq_and_set_ctx ctx;
+-
+-		if (p->scx.dsq == &rq->scx.local_dsq)
+-			continue;
+-		sched_deq_and_put_task(p, DEQUEUE_SAVE | DEQUEUE_MOVE | DEQUEUE_NOCLOCK, &ctx);
+-		sched_enq_and_set_task(&ctx);
+-	}
+-}
+-
+ #else	/* CONFIG_SMP */
+ 
+ static bool test_and_clear_cpu_idle(int cpu) { return false; }
+@@ -4243,9 +4248,6 @@ DEFINE_SCHED_CLASS(ext) = {
+ 	.select_task_rq		= select_task_rq_scx,
+ 	.task_woken		= task_woken_scx,
+ 	.set_cpus_allowed	= set_cpus_allowed_scx,
+-
+-	.rq_online		= rq_online_scx,
+-	.rq_offline		= rq_offline_scx,
+ #endif
+ 
+ 	.task_tick		= task_tick_scx,
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 855b7e39ae89d..916d23afb2ae9 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -777,9 +777,10 @@ struct cfs_rq {
+ /* scx_rq->flags, protected by the rq lock */
+ enum scx_rq_flags {
+ 	/*
+-	 * A hotplugged CPU starts scheduling before rq_online_scx(). Track
+-	 * ops.cpu_on/offline() state so that ops.enqueue/dispatch() are called
+-	 * only while the BPF scheduler considers the CPU to be online.
++	 * Set right after ops.cpu_online() when a CPU comes up and cleared when
++	 * the CPU goes down, see handle_hotplug(). A hotplugged CPU starts
++	 * scheduling before %SCX_RQ_ONLINE is set. ops.enqueue() and
++	 * ops.dispatch() are called for the CPU only while the flag is set.
+ 	 */
+ 	SCX_RQ_ONLINE		= 1 << 0,
+ 	SCX_RQ_CAN_STOP_TICK	= 1 << 1,
+-- 
+2.53.0
+

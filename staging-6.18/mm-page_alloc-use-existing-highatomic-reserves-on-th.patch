@@ -1,0 +1,134 @@
+From f4227d3293cf296e103149cca5a02135c0901f76 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Mon, 22 Jun 2026 17:46:00 -0700
+Subject: mm/page_alloc: use existing highatomic reserves on the buddy fastpath
+
+From: JP Kobryn <jp.kobryn@linux.dev>
+
+[ Upstream commit 9f2fd03c9bde366c928c9242fc9b2e2c5111a134 ]
+
+ALLOC_HIGHATOMIC currently provides both access to MIGRATE_HIGHATOMIC free
+pages and permission to create new highatomic pageblock reserves.  This
+makes it unsuitable for the fastpath.
+
+However, the fastpath can reach rmqueue_buddy() while MIGRATE_HIGHATOMIC
+reserves have free pages available.  In this situation, the allocation can
+fall back to other migratetypes without trying those reserves first.
+
+Allow high-priority non-blocking allocations to use existing
+MIGRATE_HIGHATOMIC reserves on the buddy fastpath without growing them.
+First tighten the criteria for reserving pageblocks so that growth may
+only occur in the slowpath.  Then allow fastpath usage by enabling
+ALLOC_HIGHATOMIC when the GFP mask describes a non-blocking high-priority
+allocation.  This logic has been factored out from gfp_to_alloc_flags() to
+a new function gfp_to_alloc_flags_nonblocking().
+
+A UDP receive workload was run with free MIGRATE_HIGHATOMIC pageblocks
+available in the target zone.  Before this patch, the workload did not
+consume these blocks.  With this patch, eligible order-1 allocations
+reaching the buddy path consumed existing MIGRATE_HIGHATOMIC pageblocks,
+with no highatomic misses observed.  The workload did not grow highatomic
+reserves and NAPI page-frag allocations remained healthy with no failures
+or order-0 fallbacks.
+
+Link: https://lore.kernel.org/20260623004600.113347-1-jp.kobryn@linux.dev
+Signed-off-by: JP Kobryn <jp.kobryn@linux.dev>
+Reviewed-by: Vlastimil Babka (SUSE) <vbabka@kernel.org>
+Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+Reviewed-by: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Brendan Jackman <jackmanb@google.com>
+Cc: David Hildenbrand <david@kernel.org>
+Cc: Frank van der Linden <fvdl@google.com>
+Cc: Liam R. Howlett <liam@infradead.org>
+Cc: Lorenzo Stoakes <ljs@kernel.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ mm/page_alloc.c | 44 ++++++++++++++++++++++++++++++--------------
+ 1 file changed, 30 insertions(+), 14 deletions(-)
+
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 6b4a1dd7253e8..7c10d42e31d8f 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -3259,10 +3259,11 @@ struct page *rmqueue_buddy(struct zone *preferred_zone, struct zone *zone,
+ 	} while (check_new_pages(page, order));
+ 
+ 	/*
+-	 * If this is a high-order atomic allocation then check
+-	 * if the pageblock should be reserved for the future
++	 * Slowpath (precarious) high-atomic allocations may reserve
++	 * a pageblock for future use.
+ 	 */
+-	if (unlikely(alloc_flags & ALLOC_HIGHATOMIC))
++	if (unlikely((alloc_flags & ALLOC_HIGHATOMIC) &&
++			((alloc_flags & ALLOC_WMARK_MASK) == ALLOC_WMARK_MIN)))
+ 		reserve_highatomic_pageblock(page, order, zone);
+ 
+ 	__count_zid_vm_events(PGALLOC, page_zonenum(page), 1 << order);
+@@ -4544,6 +4545,29 @@ static void wake_all_kswapds(unsigned int order, gfp_t gfp_mask,
+ 	}
+ }
+ 
++static inline unsigned int
++gfp_to_alloc_flags_nonblocking(gfp_t gfp_mask, unsigned int order)
++{
++	unsigned int alloc_flags = 0;
++
++	if (gfp_mask & __GFP_DIRECT_RECLAIM)
++		return 0;
++
++	/*
++	 * Not worth trying to allocate harder for __GFP_NOMEMALLOC even
++	 * if it can't schedule.
++	 */
++	if (gfp_mask & __GFP_NOMEMALLOC)
++		return 0;
++
++	alloc_flags |= ALLOC_NON_BLOCK;
++
++	if (order > 0 && (gfp_mask & __GFP_HIGH))
++		alloc_flags |= ALLOC_HIGHATOMIC;
++
++	return alloc_flags;
++}
++
+ static inline unsigned int
+ gfp_to_alloc_flags(gfp_t gfp_mask, unsigned int order)
+ {
+@@ -4566,18 +4590,9 @@ gfp_to_alloc_flags(gfp_t gfp_mask, unsigned int order)
+ 	alloc_flags |= (__force int)
+ 		(gfp_mask & (__GFP_HIGH | __GFP_KSWAPD_RECLAIM));
+ 
+-	if (!(gfp_mask & __GFP_DIRECT_RECLAIM)) {
+-		/*
+-		 * Not worth trying to allocate harder for __GFP_NOMEMALLOC even
+-		 * if it can't schedule.
+-		 */
+-		if (!(gfp_mask & __GFP_NOMEMALLOC)) {
+-			alloc_flags |= ALLOC_NON_BLOCK;
+-
+-			if (order > 0 && (alloc_flags & ALLOC_MIN_RESERVE))
+-				alloc_flags |= ALLOC_HIGHATOMIC;
+-		}
++	alloc_flags |= gfp_to_alloc_flags_nonblocking(gfp_mask, order);
+ 
++	if (!(gfp_mask & __GFP_DIRECT_RECLAIM)) {
+ 		/*
+ 		 * Ignore cpuset mems for non-blocking __GFP_HIGH (probably
+ 		 * GFP_ATOMIC) rather than fail, see the comment for
+@@ -5370,6 +5385,7 @@ struct page *__alloc_frozen_pages_noprof(gfp_t gfp, unsigned int order,
+ 	 * memory until all local zones are considered.
+ 	 */
+ 	alloc_flags |= alloc_flags_nofragment(zonelist_zone(ac.preferred_zoneref), gfp);
++	alloc_flags |= gfp_to_alloc_flags_nonblocking(gfp, order) & ALLOC_HIGHATOMIC;
+ 
+ 	/* First allocation attempt */
+ 	page = get_page_from_freelist(alloc_gfp, order, alloc_flags, &ac);
+-- 
+2.53.0
+

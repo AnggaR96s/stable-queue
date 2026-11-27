@@ -1,0 +1,163 @@
+From 4e8135ac6285dcc7a5f3a1e828b5eae0460fd62e Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 24 Nov 2026 11:20:50 -0500
+Subject: kprobes: Validate re-registration earlier in register_kretprobe()
+
+From: Masami Hiramatsu (Google) <mhiramat@kernel.org>
+
+[ Upstream commit a553b499f22bf054964d4fd16d136f3d4f836c23 ]
+
+register_kretprobe() only checked for re-registration if rp->kp.addr was
+specified, skipping the check when rp was registered with symbol_name
+and rp->kp.addr was NULL. In that scenario, register_kretprobe()
+proceeded to allocate a new rethook (or kretprobe holder), and when
+register_kprobe(&rp->kp) subsequently failed due to re-registration, the
+error path freed and NULL-ed rp->rh (or rp->rph) on the still-active
+kretprobe, leading to NULL pointer dereferences when the active probe
+was hit.
+
+Resolve the target address via _kprobe_addr() up-front and check whether
+the probe is already registered at that address via
+check_kprobe_rereg_at() before allocating any resources, and drop the
+WARN_ON_ONCE() in the re-registration check now that re-registration is
+gracefully detected and rejected.
+
+Link: https://lore.kernel.org/all/179375032568.247640.17429793187163536192.stgit@devnote2/
+
+Fixes: 0188b87899ff ("kretprobe: Avoid re-registration of the same kretprobe earlier")
+Cc: stable@vger.kernel.org
+Signed-off-by: Masami Hiramatsu (Google) <mhiramat@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ kernel/kprobes.c | 72 +++++++++++++++++++++++++++---------------------
+ 1 file changed, 40 insertions(+), 32 deletions(-)
+
+diff --git a/kernel/kprobes.c b/kernel/kprobes.c
+index 1954834b79556..03c7688fe2954 100644
+--- a/kernel/kprobes.c
++++ b/kernel/kprobes.c
+@@ -1483,52 +1483,61 @@ _kprobe_addr(kprobe_opcode_t *addr, const char *symbol_name,
+ 	return addr;
+ }
+ 
+-static kprobe_opcode_t *kprobe_addr(struct kprobe *p)
+-{
+-	bool on_func_entry;
+-
+-	return _kprobe_addr(p->addr, p->symbol_name, p->offset, &on_func_entry);
+-}
+-
+ /*
+  * Check the 'p' is valid and return the aggregator kprobe
+  * at the same address.
+  */
+-static struct kprobe *__get_valid_kprobe(struct kprobe *p)
++static struct kprobe *__get_valid_kprobe_at(struct kprobe *p, kprobe_opcode_t *addr)
+ {
++	struct hlist_head *head;
+ 	struct kprobe *ap, *list_p;
+ 
+ 	lockdep_assert_held(&kprobe_mutex);
+ 
+-	ap = get_kprobe(p->addr);
+-	if (unlikely(!ap))
++	if (unlikely(!addr))
+ 		return NULL;
+ 
+-	if (p == ap)
+-		return ap;
+-
+-	list_for_each_entry(list_p, &ap->list, list)
+-		if (list_p == p)
+-		/* kprobe p is a valid probe */
++	head = &kprobe_table[hash_ptr(addr, KPROBE_HASH_BITS)];
++	hlist_for_each_entry_rcu(ap, head, hlist,
++				 lockdep_is_held(&kprobe_mutex)) {
++		if (ap == p) {
++			p->addr = addr;
+ 			return ap;
++		}
++		if (ap->addr == addr && kprobe_aggrprobe(ap)) {
++			list_for_each_entry(list_p, &ap->list, list) {
++				if (list_p == p) {
++					p->addr = addr;
++					return ap;
++				}
++			}
++		}
++	}
+ 
+ 	return NULL;
+ }
+ 
+-/*
+- * Warn and return error if the kprobe is being re-registered since
+- * there must be a software bug.
+- */
+-static inline int warn_kprobe_rereg(struct kprobe *p)
++static inline struct kprobe *__get_valid_kprobe(struct kprobe *p)
++{
++	return __get_valid_kprobe_at(p, p->addr);
++}
++
++/* Return error if the kprobe is being re-registered */
++static inline int check_kprobe_rereg_at(struct kprobe *p, kprobe_opcode_t *addr)
+ {
+ 	guard(mutex)(&kprobe_mutex);
+ 
+-	if (WARN_ON_ONCE(__get_valid_kprobe(p)))
++	if (__get_valid_kprobe_at(p, addr))
+ 		return -EINVAL;
+ 
+ 	return 0;
+ }
+ 
++static inline int check_kprobe_rereg(struct kprobe *p)
++{
++	return check_kprobe_rereg_at(p, p->addr);
++}
++
+ static int check_ftrace_location(struct kprobe *p)
+ {
+ 	unsigned long addr = (unsigned long)p->addr;
+@@ -1667,7 +1676,7 @@ int register_kprobe(struct kprobe *p)
+ 		return PTR_ERR(addr);
+ 	p->addr = addr;
+ 
+-	ret = warn_kprobe_rereg(p);
++	ret = check_kprobe_rereg(p);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -2202,20 +2211,19 @@ int register_kretprobe(struct kretprobe *rp)
+ 	struct kretprobe_instance *inst;
+ 	int i;
+ 	void *addr;
++	bool on_func_entry;
+ 
+-	ret = kprobe_on_func_entry(rp->kp.addr, rp->kp.symbol_name, rp->kp.offset);
+-	if (ret)
+-		return ret;
++	addr = _kprobe_addr(rp->kp.addr, rp->kp.symbol_name, rp->kp.offset, &on_func_entry);
++	if (IS_ERR(addr))
++		return PTR_ERR(addr);
+ 
+-	/* If only 'rp->kp.addr' is specified, check reregistering kprobes */
+-	if (rp->kp.addr && warn_kprobe_rereg(&rp->kp))
++	if (!on_func_entry)
+ 		return -EINVAL;
+ 
+-	if (kretprobe_blacklist_size) {
+-		addr = kprobe_addr(&rp->kp);
+-		if (IS_ERR(addr))
+-			return PTR_ERR(addr);
++	if (check_kprobe_rereg_at(&rp->kp, addr))
++		return -EINVAL;
+ 
++	if (kretprobe_blacklist_size) {
+ 		for (i = 0; kretprobe_blacklist[i].name != NULL; i++) {
+ 			if (kretprobe_blacklist[i].addr == addr)
+ 				return -EINVAL;
+-- 
+2.53.0
+

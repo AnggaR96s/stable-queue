@@ -1,0 +1,178 @@
+From b1b48fb458e48dea70a70222ea4e92235f198732 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 24 Nov 2026 13:53:41 -0500
+Subject: page_alloc: allow migration of smaller hugepages during contig_alloc
+
+From: Gregory Price <gourry@gourry.net>
+
+[ Upstream commit 3bb64898f00368cd110d4b31334f93251d56b404 ]
+
+We presently skip regions with hugepages entirely when trying to do
+contiguous page allocation.  This will cause otherwise-movable 2MB HugeTLB
+pages to be considered unmovable, and makes 1GB gigantic page allocation
+less reliable on systems utilizing both.
+
+Commit 4d73ba5fa710 ("mm: page_alloc: skip regions with hugetlbfs pages
+when allocating 1G pages") skipped all HugePage containing regions because
+it can cause significant delays in 1G allocation (as HugeTLB migrations
+may fail for a number of reasons).
+
+Instead, if hugepage migration is enabled, consider regions with hugepages
+smaller than the target contiguous allocation request as valid targets for
+allocation.
+
+We optimize for the existing behavior by searching for non-hugetlb regions
+in a first pass, then retrying the search to include hugetlb only on
+failure.  This allows the existing fast-path to remain the default case
+with a slow-path fallback to increase reliability.
+
+We only fallback to the slow path if a hugetlb region was detected, and we
+do a full re-scan because the zones/blocks may have changed during the
+first pass (and it's not worth further complexity).
+
+isolate_migrate_pages_block() has similar hugetlb filter logic, and the
+hugetlb code does a migratable check in folio_isolate_hugetlb() during
+isolation.  The code servicing the allocation and migration already
+supports this exact use case.
+
+To test, allocate a bunch of 2MB HugeTLB pages (in this case 48GB) and
+then attempt to allocate some 1G HugeTLB pages (in this case 4GB) (Scale
+to your machine's memory capacity).
+
+echo 24576 > .../hugepages-2048kB/nr_hugepages
+echo 4 > .../hugepages-1048576kB/nr_hugepages
+
+Prior to this patch, the 1GB page reservation can fail if no contiguous
+1GB pages remain.  After this patch, the kernel will try to move 2MB pages
+and successfully allocate the 1GB pages (assuming overall sufficient
+memory is available).  Also tested this while a program had the 2MB
+reservations mapped, and the 1GB reservation still succeeds.
+
+folio_alloc_gigantic() is the primary user of alloc_contig_pages(),
+other users are debug or init-time allocations and largely unaffected.
+- ppc/memtrace is a debugfs interface
+- x86/tdx memory allocation occurs once on module-init
+- kfence/core happens once on module (late) init
+- THP uses it in debug_vm_pgtable_alloc_huge_page at __init time
+
+Link: https://lkml.kernel.org/r/20251221124656.2362540-1-gourry@gourry.net
+Signed-off-by: Gregory Price <gourry@gourry.net>
+Suggested-by: David Hildenbrand <david@redhat.com>
+Link: https://lore.kernel.org/linux-mm/6fe3562d-49b2-4975-aa86-e139c535ad00@redhat.com/
+Reviewed-by: Zi Yan <ziy@nvidia.com>
+Reviewed-by: Wei Yang <richard.weiyang@gmail.com>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Acked-by: David Hildenbrand (Red Hat) <david@kernel.org>
+Cc: Brendan Jackman <jackmanb@google.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Stable-dep-of: da0d7a895e90 ("mm/page_alloc: retry alloc_contig_pages() when the zonelist is rebuilt")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ mm/page_alloc.c | 59 +++++++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 55 insertions(+), 4 deletions(-)
+
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index ce32a8bb22da4..b8dc3071a9053 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -7277,7 +7277,8 @@ static int __alloc_contig_pages(unsigned long start_pfn,
+ }
+ 
+ static bool pfn_range_valid_contig(struct zone *z, unsigned long start_pfn,
+-				   unsigned long nr_pages)
++				   unsigned long nr_pages, bool skip_hugetlb,
++				   bool *skipped_hugetlb)
+ {
+ 	unsigned long i, end_pfn = start_pfn + nr_pages;
+ 	struct page *page;
+@@ -7293,8 +7294,42 @@ static bool pfn_range_valid_contig(struct zone *z, unsigned long start_pfn,
+ 		if (PageReserved(page))
+ 			return false;
+ 
+-		if (PageHuge(page))
+-			return false;
++		/*
++		 * Only consider ranges containing hugepages if those pages are
++		 * smaller than the requested contiguous region.  e.g.:
++		 *     Move 2MB pages to free up a 1GB range.
++		 *     Don't move 1GB pages to free up a 2MB range.
++		 *
++		 * This makes contiguous allocation more reliable if multiple
++		 * hugepage sizes are used without causing needless movement.
++		 */
++		if (PageHuge(page)) {
++			unsigned int order;
++
++			if (!IS_ENABLED(CONFIG_ARCH_ENABLE_HUGEPAGE_MIGRATION))
++				return false;
++
++			if (skip_hugetlb) {
++				*skipped_hugetlb = true;
++				return false;
++			}
++
++			page = compound_head(page);
++			order = compound_order(page);
++			if ((order >= MAX_FOLIO_ORDER) ||
++			    (nr_pages <= (1 << order)))
++				return false;
++
++			/*
++			 * Reaching this point means we've encounted a huge page
++			 * smaller than nr_pages, skip all pfn's for that page.
++			 *
++			 * We can't get here from a tail-PageHuge, as it implies
++			 * we started a scan in the middle of a hugepage larger
++			 * than nr_pages - which the prior check filters for.
++			 */
++			i += (1 << order) - 1;
++		}
+ 	}
+ 	return true;
+ }
+@@ -7337,7 +7372,10 @@ struct page *alloc_contig_pages_noprof(unsigned long nr_pages, gfp_t gfp_mask,
+ 	struct zonelist *zonelist;
+ 	struct zone *zone;
+ 	struct zoneref *z;
++	bool skip_hugetlb = true;
++	bool skipped_hugetlb = false;
+ 
++retry:
+ 	zonelist = node_zonelist(nid, gfp_mask);
+ 	for_each_zone_zonelist_nodemask(zone, z, zonelist,
+ 					gfp_zone(gfp_mask), nodemask) {
+@@ -7345,7 +7383,9 @@ struct page *alloc_contig_pages_noprof(unsigned long nr_pages, gfp_t gfp_mask,
+ 
+ 		pfn = ALIGN(zone->zone_start_pfn, nr_pages);
+ 		while (zone_spans_last_pfn(zone, pfn, nr_pages)) {
+-			if (pfn_range_valid_contig(zone, pfn, nr_pages)) {
++			if (pfn_range_valid_contig(zone, pfn, nr_pages,
++						   skip_hugetlb,
++						   &skipped_hugetlb)) {
+ 				/*
+ 				 * We release the zone lock here because
+ 				 * alloc_contig_range() will also lock the zone
+@@ -7364,6 +7404,17 @@ struct page *alloc_contig_pages_noprof(unsigned long nr_pages, gfp_t gfp_mask,
+ 		}
+ 		spin_unlock_irqrestore(&zone->lock, flags);
+ 	}
++	/*
++	 * If we failed, retry the search, but treat regions with HugeTLB pages
++	 * as valid targets.  This retains fast-allocations on first pass
++	 * without trying to migrate HugeTLB pages (which may fail). On the
++	 * second pass, we will try moving HugeTLB pages when those pages are
++	 * smaller than the requested contiguous region size.
++	 */
++	if (skip_hugetlb && skipped_hugetlb) {
++		skip_hugetlb = false;
++		goto retry;
++	}
+ 	return NULL;
+ }
+ #endif /* CONFIG_CONTIG_ALLOC */
+-- 
+2.53.0
+

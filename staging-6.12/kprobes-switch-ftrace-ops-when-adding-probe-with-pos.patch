@@ -1,0 +1,146 @@
+From 1648da13e00bb0364495332ca24384c2487d93db Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 25 Nov 2026 12:32:36 -0500
+Subject: kprobes: Switch ftrace ops when adding probe with post_handler
+
+From: Masami Hiramatsu (Google) <mhiramat@kernel.org>
+
+[ Upstream commit f60f98881b54b0cf36b61f41c91fbd93b76a2d9c ]
+
+When an ftrace-based kprobe is registered without a post_handler, it is
+armed using kprobe_ftrace_ops. If a second probe with a post_handler is
+subsequently registered at the same address, register_aggr_kprobe() sets
+ap->post_handler to aggr_post_handler, but leaves the probe armed using
+kprobe_ftrace_ops.
+
+When the probe is later disarmed or disabled, disarm_kprobe_ftrace()
+checks whether p->post_handler is non-NULL and attempts to disarm from
+kprobe_ipmodify_ops. This fails with -ENOENT, decrements
+kprobe_ipmodify_enabled below zero, leaves the probe armed on
+kprobe_ftrace_ops, and aborts unregistration, leading to a use-after-free
+if the probe module is unloaded.
+
+Switch the armed probe from kprobe_ftrace_ops to kprobe_ipmodify_ops in
+register_aggr_kprobe() outside of text_mutex and cpus_read_lock to avoid
+lockdep and deadlock issues when modifying ftrace code. Defer adding the
+new probe onto ap->list until the ftrace ops switch completes so that the
+new probe's handlers are not published prematurely while ap is still on
+kprobe_ftrace_ops, and mark ap disabled if rollback re-arming fails.
+Also restore ftrace ops registration and counter if ftrace_set_filter_ip()
+fails in __disarm_kprobe_ftrace().
+
+Link: https://lore.kernel.org/all/179440641120.328088.15542754095040659094.stgit@devnote2/
+
+Fixes: 5dd7caf0bdc5 ("kprobes: Skip clearing aggrprobe's post_handler in kprobe-on-ftrace case")
+Cc: stable@vger.kernel.org
+Signed-off-by: Masami Hiramatsu (Google) <mhiramat@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ kernel/kprobes.c | 55 +++++++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 45 insertions(+), 10 deletions(-)
+
+diff --git a/kernel/kprobes.c b/kernel/kprobes.c
+index 743d34c1a3349..e946036a84b54 100644
+--- a/kernel/kprobes.c
++++ b/kernel/kprobes.c
+@@ -1114,9 +1114,14 @@ static int __disarm_kprobe_ftrace(struct kprobe *p, struct ftrace_ops *ops,
+ 	(*cnt)--;
+ 
+ 	ret = ftrace_set_filter_ip(ops, (unsigned long)p->addr, 1, 0);
+-	WARN_ONCE(ret < 0, "Failed to disarm kprobe-ftrace at %pS (error %d)\n",
+-		  p->addr, ret);
+-	return ret;
++	if (WARN_ONCE(ret < 0, "Failed to disarm kprobe-ftrace at %pS (error %d)\n",
++		      p->addr, ret)) {
++		if (*cnt == 0)
++			register_ftrace_function(ops);
++		(*cnt)++;
++		return ret;
++	}
++	return 0;
+ }
+ 
+ static int disarm_kprobe_ftrace(struct kprobe *p)
+@@ -1245,16 +1250,12 @@ void kprobe_busy_end(void)
+ }
+ 
+ /* Add the new probe to 'ap->list'. */
+-static int add_new_kprobe(struct kprobe *ap, struct kprobe *p)
++static void add_new_kprobe(struct kprobe *ap, struct kprobe *p)
+ {
+ 	if (p->post_handler)
+ 		unoptimize_kprobe(ap, true);	/* Fall back to normal kprobe */
+ 
+ 	list_add_rcu(&p->list, &ap->list);
+-	if (p->post_handler && !ap->post_handler)
+-		ap->post_handler = aggr_post_handler;
+-
+-	return 0;
+ }
+ 
+ /*
+@@ -1287,6 +1288,8 @@ static int register_aggr_kprobe(struct kprobe *orig_p, struct kprobe *p)
+ {
+ 	int ret = 0;
+ 	struct kprobe *ap = orig_p;
++	bool reset_post_handler = false;
++	bool ftrace_switch_ops = false;
+ 
+ 	scoped_guard(cpus_read_lock) {
+ 		/* For preparing optimization, jump_label_text_reserved() is called */
+@@ -1333,18 +1336,50 @@ static int register_aggr_kprobe(struct kprobe *orig_p, struct kprobe *p)
+ 					| KPROBE_FLAG_DISABLED;
+ 		}
+ 
++		if (p->post_handler && !ap->post_handler) {
++			reset_post_handler = true;
++			if (kprobe_ftrace(ap) && !kprobes_all_disarmed &&
++			    !kprobe_disabled(ap))
++				ftrace_switch_ops = true;
++			else
++				ap->post_handler = aggr_post_handler;
++		}
++
+ 		/* Copy the insn slot of 'p' to 'ap'. */
+ 		copy_kprobe(ap, p);
+-		ret = add_new_kprobe(ap, p);
++		if (!ftrace_switch_ops)
++			add_new_kprobe(ap, p);
++	}
++
++	if (ftrace_switch_ops) {
++		/*
++		 * Must switch ftrace ops outside of text_mutex and cpus_read_lock
++		 * to prevent deadlocks when ftrace code modification acquires text_mutex.
++		 */
++		ret = disarm_kprobe_ftrace(ap);
++		if (ret)
++			return ret;
++
++		ap->post_handler = aggr_post_handler;
++		ret = arm_kprobe_ftrace(ap);
++		if (ret) {
++			ap->post_handler = NULL;
++			if (arm_kprobe_ftrace(ap))
++				ap->flags |= KPROBE_FLAG_DISABLED;
++			return ret;
++		}
++		add_new_kprobe(ap, p);
+ 	}
+ 
+-	if (ret == 0 && kprobe_disabled(ap) && !kprobe_disabled(p)) {
++	if (kprobe_disabled(ap) && !kprobe_disabled(p)) {
+ 		ap->flags &= ~KPROBE_FLAG_DISABLED;
+ 		if (!kprobes_all_disarmed) {
+ 			/* Arm the breakpoint again. */
+ 			ret = arm_kprobe(ap);
+ 			if (ret) {
+ 				ap->flags |= KPROBE_FLAG_DISABLED;
++				if (reset_post_handler)
++					ap->post_handler = NULL;
+ 				list_del_rcu(&p->list);
+ 				synchronize_rcu();
+ 			}
+-- 
+2.53.0
+

@@ -1,0 +1,146 @@
+From c98501148d6ff5195115d68c220d90b3a7bb339e Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 25 Nov 2026 12:45:23 -0500
+Subject: cpufreq: Fix updates of cached resolved frequency and index
+
+From: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+
+[ Upstream commit 75120f31aed010c326b28d7c80d22314df34d9a8 ]
+
+The cached resolved frequency and index, cached_target_freq and
+cached_resolved_idx, respectively, may be updated concurrently if
+cpufreq_driver_resolve_freq() is called by the schedutil governor
+while cpufreq_set_policy() is running for the same policy.  Those
+concurrent updates are not synchronized in any way and the values
+written by cpufreq_set_policy(), if it wins the race, may confuse
+drivers using those policy fields [1].
+
+To address this, use the observation that the only place where
+cached_target_freq and cached_resolved_idx need to be updated is
+cpufreq_driver_resolve_freq() because the only legitimate users of
+them are .fast_switch() driver callbacks.  Although cached_resolved_idx
+is also used in __cpufreq_driver_target(), that is in fact unnecessary
+and it is better to use a local variable for storing the frequency
+table index in that function.
+
+Accordingly, rearrange __resolve_freq() and its callers so that
+cached_target_freq and cached_resolved_idx are only updated in
+cpufreq_driver_resolve_freq().
+
+The cached_target_freq initialization in cpufreq_set_policy() is still
+needed, but move it after stopping the old governor and before starting
+the new one to avoid racing with cpufreq_driver_resolve_freq().
+
+Fixes: f9ccdec24d91 ("cpufreq: Reuse cpufreq_driver_resolve_freq() in __cpufreq_driver_target()")
+Fixes: 151717690694 ("cpufreq: Make policy min/max hard requirements")
+Reported-by: Zhongqiu Han <zhongqiu.han@oss.qualcomm.com>
+Closes: https://lore.kernel.org/linux-pm/20261105140357.1331894-1-zhongqiu.han@oss.qualcomm.com/ [1]
+Co-developed-by: Zhongqiu Han <zhongqiu.han@oss.qualcomm.com>
+Signed-off-by: Zhongqiu Han <zhongqiu.han@oss.qualcomm.com>
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Reviewed-by: Christian Loehle <christian.loehle@arm.com>
+Tested-by: Christian Loehle <christian.loehle@arm.com>
+Cc: All applicable <stable@vger.kernel.org> # 342d3a73c5db cpufreq: Force passing target frequency to driver during resume
+Cc: All applicable <stable@vger.kernel.org> # 166207cac451 cpufreq: Cache post-resolution target frequency in __resolve_freq()
+Link: https://patch.msgid.link/3472677.aeNJFYEL58@rafael.j.wysocki
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+[ sashal: adapted __resolve_freq() to the older signature by adding an index out-parameter and moving the cache updates into cpufreq_driver_resolve_freq(), without the min/max and force_target rework. ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/cpufreq/cpufreq.c | 32 +++++++++++++++++++++-----------
+ 1 file changed, 21 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/cpufreq/cpufreq.c b/drivers/cpufreq/cpufreq.c
+index 41d4610af72ae..b1e376318a316 100644
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@ -531,7 +531,8 @@ void cpufreq_disable_fast_switch(struct cpufreq_policy *policy)
+ EXPORT_SYMBOL_GPL(cpufreq_disable_fast_switch);
+ 
+ static unsigned int __resolve_freq(struct cpufreq_policy *policy,
+-		unsigned int target_freq, unsigned int relation)
++		unsigned int target_freq, unsigned int relation,
++		unsigned int *idx_p)
+ {
+ 	unsigned int idx;
+ 
+@@ -541,9 +542,10 @@ static unsigned int __resolve_freq(struct cpufreq_policy *policy,
+ 		return target_freq;
+ 
+ 	idx = cpufreq_frequency_table_target(policy, target_freq, relation);
+-	policy->cached_resolved_idx = idx;
+-	policy->cached_target_freq = policy->freq_table[idx].frequency;
+-	return policy->cached_target_freq;
++	if (idx_p)
++		*idx_p = idx;
++
++	return policy->freq_table[idx].frequency;
+ }
+ 
+ /**
+@@ -560,7 +562,10 @@ static unsigned int __resolve_freq(struct cpufreq_policy *policy,
+ unsigned int cpufreq_driver_resolve_freq(struct cpufreq_policy *policy,
+ 					 unsigned int target_freq)
+ {
+-	return __resolve_freq(policy, target_freq, CPUFREQ_RELATION_L);
++	policy->cached_target_freq = __resolve_freq(policy, target_freq,
++						    CPUFREQ_RELATION_L,
++						    &policy->cached_resolved_idx);
++	return policy->cached_target_freq;
+ }
+ EXPORT_SYMBOL_GPL(cpufreq_driver_resolve_freq);
+ 
+@@ -2313,11 +2318,12 @@ int __cpufreq_driver_target(struct cpufreq_policy *policy,
+ 			    unsigned int relation)
+ {
+ 	unsigned int old_target_freq = target_freq;
++	unsigned int idx = 0;
+ 
+ 	if (cpufreq_disabled())
+ 		return -ENODEV;
+ 
+-	target_freq = __resolve_freq(policy, target_freq, relation);
++	target_freq = __resolve_freq(policy, target_freq, relation, &idx);
+ 
+ 	pr_debug("target for CPU %u: %u kHz, relation %u, requested %u kHz\n",
+ 		 policy->cpu, target_freq, relation, old_target_freq);
+@@ -2338,7 +2344,7 @@ int __cpufreq_driver_target(struct cpufreq_policy *policy,
+ 	if (!cpufreq_driver->target_index)
+ 		return -EINVAL;
+ 
+-	return __target_index(policy, policy->cached_resolved_idx);
++	return __target_index(policy, idx);
+ }
+ EXPORT_SYMBOL_GPL(__cpufreq_driver_target);
+ 
+@@ -2607,12 +2613,10 @@ static int cpufreq_set_policy(struct cpufreq_policy *policy,
+ 	 */
+ 	policy->min = new_data.min;
+ 	policy->max = new_data.max;
+-	policy->min = __resolve_freq(policy, policy->min, CPUFREQ_RELATION_L);
+-	policy->max = __resolve_freq(policy, policy->max, CPUFREQ_RELATION_H);
++	policy->min = __resolve_freq(policy, policy->min, CPUFREQ_RELATION_L, NULL);
++	policy->max = __resolve_freq(policy, policy->max, CPUFREQ_RELATION_H, NULL);
+ 	trace_cpu_frequency_limits(policy);
+ 
+-	policy->cached_target_freq = UINT_MAX;
+-
+ 	pr_debug("new min and max freqs are %u - %u kHz\n",
+ 		 policy->min, policy->max);
+ 
+@@ -2638,6 +2642,12 @@ static int cpufreq_set_policy(struct cpufreq_policy *policy,
+ 		cpufreq_exit_governor(policy);
+ 	}
+ 
++	/*
++	 * Initialize cached_target_freq while no governor is running to avoid
++	 * racing with cpufreq_driver_resolve_freq(), which updates it.
++	 */
++	policy->cached_target_freq = UINT_MAX;
++
+ 	/* start new governor */
+ 	policy->governor = new_gov;
+ 	ret = cpufreq_init_governor(policy);
+-- 
+2.53.0
+

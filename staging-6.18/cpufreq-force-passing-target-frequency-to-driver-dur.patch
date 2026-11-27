@@ -1,0 +1,138 @@
+From 81a62fb3731cc193d642c4fee7fb06e5d80b3e62 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 25 Nov 2026 11:27:12 -0500
+Subject: cpufreq: Force passing target frequency to driver during resume
+
+From: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+
+[ Upstream commit 342d3a73c5dbc2f1cd0c5142e2d11bda4dc54cd7 ]
+
+The policy->cur value preserved across a system suspend-resume cycle
+may become stale in some cases and it may prevent the CPU performance
+scaling logic from being updated due to the target_freq == policy->cur
+check in __cpufreq_driver_target() [1].
+
+To address this, adjust the existing mechanism to force the invocation
+of the driver .target() callback in __cpufreq_driver_target() and make
+cpufreq_resume_policy() use it.
+
+This involves renaming update_limits in struct cpufreq_policy to
+force_target and moving the driver CPUFREQ_NEED_UPDATE_LIMITS flag check
+from __cpufreq_driver_target() to cpufreq_set_policy(), where it is used
+as a condition for setting policy->force_target.
+
+In cpufreq_resume_policy(), policy->force_target is set for drivers that
+implement the .target() callback, but don't implement the .get() one,
+which is the case when the driver callback needs to run if policy->cur
+becomes stale while suspended.
+
+Fixes: 2f0aea936360 ("cpufreq: suspend governors on system suspend/hibernate")
+Link: https://lore.kernel.org/linux-pm/20261027143725.3763827-1-zakbrightonknight@gmail.com/ [1]
+Reported-by: Zak Brighton Knight <zakbrightonknight@gmail.com>
+Reported-by: Doug Smythies <dsmythies@telus.net>
+Cc: All applicable <stable@vger.kernel.org> # eee2a44e4e2b cpufreq: Improve suspend-resume synchronization
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Tested-by: Zak Brighton Knight <zakbrightonknight@gmail.com>
+Reviewed-by: Zhongqiu Han <zhongqiu.han@oss.qualcomm.com>
+Acked-by: Viresh Kumar <viresh.kumar@linaro.org>
+Tested-by: Doug Smythies <dsmythies@telus.net>
+Tested-by: Christian Loehle <christian.loehle@arm.com>
+Link: https://patch.msgid.link/1995295.tdWV9SEqCh@rafael.j.wysocki
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/cpufreq/cpufreq.c | 33 +++++++++++++++++++++------------
+ include/linux/cpufreq.h   |  4 ++--
+ 2 files changed, 23 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/cpufreq/cpufreq.c b/drivers/cpufreq/cpufreq.c
+index 94f611512cfc8..cd2eb696548b7 100644
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@ -2029,6 +2029,15 @@ static void cpufreq_resume_policy(struct cpufreq_policy *policy, bool start)
+ 	if (!start)
+ 		return;
+ 
++	/*
++	 * Force executing the driver .target() callback, if present, in the
++	 * next invocation of __cpufreq_driver_target() in case policy->cur has
++	 * become stale while suspended, but do it only for drivers without a
++	 * .get() callback for which cpufreq_verify_current_freq() is a NOP.
++	 */
++	if (cpufreq_driver->target && !cpufreq_driver->get)
++		policy->force_target = true;
++
+ 	if (cpufreq_start_governor(policy))
+ 		pr_err("%s: Failed to start governor for CPU%u's policy\n",
+ 		       __func__, policy->cpu);
+@@ -2402,17 +2411,14 @@ int __cpufreq_driver_target(struct cpufreq_policy *policy,
+ 		 policy->cpu, target_freq, relation, old_target_freq);
+ 
+ 	/*
+-	 * This might look like a redundant call as we are checking it again
+-	 * after finding index. But it is left intentionally for cases where
+-	 * exactly same freq is called again and so we can save on few function
+-	 * calls.
++	 * Unless invoking the target callback is forced, skip the update if the
++	 * frequency is not really changing.
+ 	 */
+-	if (target_freq == policy->cur) {
+-		if (!(cpufreq_driver->flags & CPUFREQ_NEED_UPDATE_LIMITS) ||
+-		    !policy->update_limits)
+-			return 0;
+-
+-		policy->update_limits = false;
++	if (policy->force_target) {
++		/* Avoid forcing the driver callback unnecessarily next time. */
++		policy->force_target = false;
++	} else if (target_freq == policy->cur) {
++		return 0;
+ 	}
+ 
+ 	if (cpufreq_driver->target) {
+@@ -2671,6 +2677,7 @@ static int cpufreq_set_policy(struct cpufreq_policy *policy,
+ 			      struct cpufreq_governor *new_gov,
+ 			      unsigned int new_pol)
+ {
++	bool need_update_limits = cpufreq_driver->flags & CPUFREQ_NEED_UPDATE_LIMITS;
+ 	struct cpufreq_policy_data new_data;
+ 	struct cpufreq_governor *old_gov;
+ 	unsigned int freq;
+@@ -2710,7 +2717,8 @@ static int cpufreq_set_policy(struct cpufreq_policy *policy,
+ 			      CPUFREQ_RELATION_H);
+ 	if (freq != policy->max) {
+ 		WRITE_ONCE(policy->max, freq);
+-		policy->update_limits = true;
++		if (need_update_limits)
++			policy->force_target = true;
+ 	}
+ 
+ 	freq = __resolve_freq(policy, new_data.min, new_data.min, new_data.max,
+@@ -2718,7 +2726,8 @@ static int cpufreq_set_policy(struct cpufreq_policy *policy,
+ 	freq = min(freq, policy->max);
+ 	if (freq != policy->min) {
+ 		WRITE_ONCE(policy->min, freq);
+-		policy->update_limits = true;
++		if (need_update_limits)
++			policy->force_target = true;
+ 	}
+ 
+ 	trace_cpu_frequency_limits(policy);
+diff --git a/include/linux/cpufreq.h b/include/linux/cpufreq.h
+index fa5d92d408a8c..2b896d30c35d8 100644
+--- a/include/linux/cpufreq.h
++++ b/include/linux/cpufreq.h
+@@ -145,8 +145,8 @@ struct cpufreq_policy {
+ 	/* Per policy boost supported flag. */
+ 	bool			boost_supported;
+ 
+-	/* Pending policy->min/max update for the driver */
+-	bool			update_limits;
++	/* Force passing target frequency to the driver. */
++	bool			force_target;
+ 
+ 	/* The policy has been suspended. */
+ 	bool			suspended;
+-- 
+2.53.0
+

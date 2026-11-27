@@ -1,0 +1,130 @@
+From e0804445e9786b66976ed89504bcee4ff2d2f743 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 20 Mar 2026 17:34:25 +0000
+Subject: mm/page_alloc: don't increase highatomic reserve after pcp alloc
+
+From: Frank van der Linden <fvdl@google.com>
+
+[ Upstream commit b480cbb071020bd590a0dc0166635b448e9fc46b ]
+
+Higher order GFP_ATOMIC allocations can be served through a PCP list with
+ALLOC_HIGHATOMIC set.  Such an allocation can e.g.  happen if a zone is
+between the low and min watermarks, and get_page_from_freelist is retried
+after the alloc_flags are relaxed.
+
+The call to reserve_highatomic_pageblock() after such a PCP allocation
+will result in an increase every single time: the page from the
+(unmovable) PCP list will never have migrate type MIGRATE_HIGHATOMIC,
+since MIGRATE_HIGHATOMIC pages do not appear on the unmovable PCP list.
+So a new pageblock is converted to MIGRATE_HIGHATOMIC.
+
+Eventually that leads to the maximum of 1% of the zone being used up by
+(often mostly free) MIGRATE_HIGHATOMIC pageblocks, for no good reason.
+Since this space is not available for normal allocations, this wastes
+memory and will push things in to reclaim too soon.
+
+This was observed on a system that ran a test with bursts of memory
+activity, paired with GFP_ATOMIC SLUB activity.  These would lead to a new
+slab being allocated with GFP_ATOMIC, sometimes hitting the
+get_page_from_freelist retry path by being below the low watermark.  While
+the frequency of those allocations was low, it kept adding up over time,
+and the number of MIGRATE_ATOMIC pageblocks kept increasing.
+
+If a higher order atomic allocation can be served by the unmovable PCP
+list, there is probably no need yet to extend the reserves.  So, move the
+check and possible extension of the highatomic reserves to the buddy case
+only, and do not refill the PCP list for ALLOC_HIGHATOMIC if it's empty.
+This way, the PCP list is tried for ALLOC_HIGHATOMIC for a fast atomic
+allocation.  But it will immediately fall back to rmqueue_buddy() if it's
+empty.  In rmqueue_buddy(), the MIGRATE_HIGHATOMIC buddy lists are tried
+first (as before), and the reserves are extended only if that fails.
+
+With this change, the test was stable.  Highatomic reserves were built up,
+but to a normal level.  No highatomic failures were seen.
+
+This is similar to the patch proposed in [1] by Zhiguo Jiang, but
+re-arranged a bit.
+
+Link: https://lkml.kernel.org/r/20260320173426.1831267-1-fvdl@google.com
+Link: https://lore.kernel.org/all/20231122013925.1507-1-justinjiang@vivo.com/ [1]
+Fixes: 44042b449872 ("mm/page_alloc: allow high-order pages to be stored on the per-cpu lists")
+Signed-off-by: Zhiguo Jiang <justinjiang@vivo.com>
+Signed-off-by: Frank van der Linden <fvdl@google.com>
+Reviewed-by: Vlastimil Babka (SUSE) <vbabka@kernel.org>
+Cc: Brendan Jackman <jackmanb@google.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Zhiguo Jiang <justinjiang@vivo.com>
+Cc: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ mm/page_alloc.c | 30 +++++++++++++++++++++++-------
+ 1 file changed, 23 insertions(+), 7 deletions(-)
+
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 074178f4d7a07..6b4a1dd7253e8 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -244,6 +244,8 @@ unsigned int pageblock_order __read_mostly;
+ 
+ static void __free_pages_ok(struct page *page, unsigned int order,
+ 			    fpi_t fpi_flags);
++static void reserve_highatomic_pageblock(struct page *page, int order,
++					 struct zone *zone);
+ 
+ /*
+  * results with 256, 32 in the lowmem_reserve sysctl:
+@@ -3256,6 +3258,13 @@ struct page *rmqueue_buddy(struct zone *preferred_zone, struct zone *zone,
+ 		spin_unlock_irqrestore(&zone->lock, flags);
+ 	} while (check_new_pages(page, order));
+ 
++	/*
++	 * If this is a high-order atomic allocation then check
++	 * if the pageblock should be reserved for the future
++	 */
++	if (unlikely(alloc_flags & ALLOC_HIGHATOMIC))
++		reserve_highatomic_pageblock(page, order, zone);
++
+ 	__count_zid_vm_events(PGALLOC, page_zonenum(page), 1 << order);
+ 	zone_statistics(preferred_zone, zone, 1);
+ 
+@@ -3327,6 +3336,20 @@ struct page *__rmqueue_pcplist(struct zone *zone, unsigned int order,
+ 			int batch = nr_pcp_alloc(pcp, zone, order);
+ 			int alloced;
+ 
++			/*
++			 * Don't refill the list for a higher order atomic
++			 * allocation under memory pressure, as this would
++			 * not build up any HIGHATOMIC reserves, which
++			 * might be needed soon.
++			 *
++			 * Instead, direct it towards the reserves by
++			 * returning NULL, which will make the caller fall
++			 * back to rmqueue_buddy. This will try to use the
++			 * reserves first and grow them if needed.
++			 */
++			if (alloc_flags & ALLOC_HIGHATOMIC)
++				return NULL;
++
+ 			alloced = rmqueue_bulk(zone, order,
+ 					batch, list,
+ 					migratetype, alloc_flags);
+@@ -3955,13 +3978,6 @@ get_page_from_freelist(gfp_t gfp_mask, unsigned int order, int alloc_flags,
+ 		if (page) {
+ 			prep_new_page(page, order, gfp_mask, alloc_flags);
+ 
+-			/*
+-			 * If this is a high-order atomic allocation then check
+-			 * if the pageblock should be reserved for the future
+-			 */
+-			if (unlikely(alloc_flags & ALLOC_HIGHATOMIC))
+-				reserve_highatomic_pageblock(page, order, zone);
+-
+ 			return page;
+ 		} else {
+ 			if (cond_accept_memory(zone, order, alloc_flags))
+-- 
+2.53.0
+

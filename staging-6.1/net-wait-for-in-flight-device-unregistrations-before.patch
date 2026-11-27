@@ -1,0 +1,162 @@
+From bfad016a290424534689517fbd3374accb69932b Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 25 Nov 2026 11:09:24 -0500
+Subject: net: wait for in-flight device unregistrations before netns dismantle
+
+From: Eric Dumazet <edumazet@kernel.org>
+
+[ Upstream commit c164a431a646983275d0076ff5b0e4c326fbc10b ]
+
+A device can be unregistered by a context other than the cleanup_net()
+of its own netns, for instance a veth whose peer in another netns is
+deleted. If references on it are still held, it stays in
+netdev_wait_allrefs_any(), which rebroadcasts NETDEV_UNREGISTER every
+second.
+
+Meanwhile its netns can be dismantled: default_device_exit_batch()
+only takes care of devices still listed in the netns, then pernet exit
+handlers free their state, and finally struct net is freed while the
+device still points to it.
+
+The rebroadcasts then run notifiers against torn down pernet state, or
+freed memory. Three instances were reported so far:
+
+ - netdev_genl_netdevice_event(): net->genl_sock is NULL [1]
+ - nh_netdev_event(): net->nexthop.devhash is NULL [2]
+ - nf_tables netdevice notifiers: use-after-free of the nftables
+   pernet storage [3]
+
+but any notifier using dev_net(dev) is affected, as is
+netdev_wait_allrefs_any() itself (__rtnl_net_lock(dev_net(dev)) with
+CONFIG_DEBUG_NET_SMALL_RTNL=y).
+
+This was prevented by rtnl_lock_unregistering() until I removed it
+in commit 8a4fc54b07d7 ("net: get rid of rtnl_lock_unregistering()"),
+considering only the loopback dependency, and missing the notifiers one.
+
+Restore a per-netns counter of devices sitting in netdev_run_todo(),
+and make default_device_exit_batch() wait for it to reach zero, after
+it has unregistered all devices of the dying netns(es). At this point
+no new unregistration can be started for these netns.
+
+Unlike the old barrier, this only waits for devices of the netns being
+dismantled and runs after their own devices are gone.
+
+Tested on a KASAN kernel with a debug-only hack holding a reference
+on a veth device for 5 seconds after its unregistration: a nexthop
+on the veth in netns X, delete its peer from init_net, then delete X.
+Without this patch, the nexthop_flush_dev() null-ptr-deref from [2]
+triggers. With it, no splat; netns churn and dismantle of a netns
+whose own device is held still work.
+
+[1] https://lore.kernel.org/netdev/6adf9f64.6200f071.51519.0ed1.GAE@google.com/
+[2] https://lore.kernel.org/netdev/20261105114707.3030737-1-bsdhenrymartin@gmail.com/
+[3] https://lore.kernel.org/netdev/20261105114817.3033625-1-bsdhenrymartin@gmail.com/
+
+Fixes: 8a4fc54b07d7 ("net: get rid of rtnl_lock_unregistering()")
+Cc: stable@vger.kernel.org
+Reported-by: syzbot+1269fe6cc2016008124e@syzkaller.appspotmail.com
+Closes: https://lore.kernel.org/netdev/6adf9f64.6200f071.51519.0ed1.GAE@google.com/
+Reported-by: Henry Martin <bsdhenrymartin@gmail.com>
+Closes: https://lore.kernel.org/netdev/20261105114707.3030737-1-bsdhenrymartin@gmail.com/
+Closes: https://lore.kernel.org/netdev/20261105114817.3033625-1-bsdhenrymartin@gmail.com/
+Signed-off-by: Eric Dumazet <edumazet@kernel.org>
+Reviewed-by: Naman Gulati <namangulati@google.com>
+Link: https://patch.msgid.link/20261105144543.1624238-1-edumazet@kernel.org
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+[ sashal: Adapted to the older per-netns dev_unreg_count and existing helpers, so no new dev_unreg_pending field is added and net_unreg_done() reuses the existing counter and wakeup. ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ net/core/dev.c | 37 ++++++++++++++++++++++++++++++++++---
+ 1 file changed, 34 insertions(+), 3 deletions(-)
+
+diff --git a/net/core/dev.c b/net/core/dev.c
+index a06af07f9d369..e41dd9c18cc2d 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -9729,6 +9729,13 @@ static void net_set_todo(struct net_device *dev)
+ 	atomic_inc(&dev_net(dev)->dev_unreg_count);
+ }
+ 
++/* Paired with net_set_todo(). @net must not be used after this call. */
++static void net_unreg_done(struct net *net)
++{
++	if (atomic_dec_and_test(&net->dev_unreg_count))
++		wake_up(&netdev_unregistering_wq);
++}
++
+ static netdev_features_t netdev_sync_upper_features(struct net_device *lower,
+ 	struct net_device *upper, netdev_features_t features)
+ {
+@@ -10579,6 +10586,7 @@ void netdev_run_todo(void)
+ 		if (unlikely(dev->reg_state != NETREG_UNREGISTERING)) {
+ 			netdev_WARN(dev, "run_todo but not unregistering\n");
+ 			list_del(&dev->todo_list);
++			net_unreg_done(dev_net(dev));
+ 			continue;
+ 		}
+ 
+@@ -10589,8 +10597,11 @@ void netdev_run_todo(void)
+ 	}
+ 
+ 	while (!list_empty(&list)) {
++		struct net *net;
++
+ 		dev = netdev_wait_allrefs_any(&list);
+ 		list_del(&dev->todo_list);
++		net = dev_net(dev);
+ 
+ 		/* paranoia */
+ 		BUG_ON(netdev_refcnt_read(dev) != 1);
+@@ -10605,11 +10616,10 @@ void netdev_run_todo(void)
+ 		if (dev->needs_free_netdev)
+ 			free_netdev(dev);
+ 
+-		if (atomic_dec_and_test(&dev_net(dev)->dev_unreg_count))
+-			wake_up(&netdev_unregistering_wq);
+-
+ 		/* Free network device */
+ 		kobject_put(&dev->dev.kobj);
++
++		net_unreg_done(net);
+ 	}
+ }
+ 
+@@ -11574,6 +11584,17 @@ static void __net_exit default_device_exit_net(struct net *net)
+ 	}
+ }
+ 
++static bool __net_exit netns_dev_unreg_pending(const struct list_head *net_list)
++{
++	struct net *net;
++
++	list_for_each_entry(net, net_list, exit_list) {
++		if (atomic_read(&net->dev_unreg_count))
++			return true;
++	}
++	return false;
++}
++
+ static void __net_exit default_device_exit_batch(struct list_head *net_list)
+ {
+ 	/* At exit all network devices most be removed from a network
+@@ -11601,6 +11622,16 @@ static void __net_exit default_device_exit_batch(struct list_head *net_list)
+ 	}
+ 	unregister_netdevice_many(&dev_kill_list);
+ 	rtnl_unlock();
++
++	/* Devices of these netns unregistered from another context
++	 * (e.g. a veth whose peer was deleted) can still be waiting
++	 * in netdev_run_todo() for their last references, while
++	 * NETDEV_UNREGISTER is rebroadcast for them. Wait for them
++	 * before pernet exit handlers tear down the state used by
++	 * netdevice notifiers, and before the netns is freed.
++	 * No new unregistration can start: all devices are unlisted.
++	 */
++	wait_event(netdev_unregistering_wq, !netns_dev_unreg_pending(net_list));
+ }
+ 
+ static struct pernet_operations __net_initdata default_device_ops = {
+-- 
+2.53.0
+

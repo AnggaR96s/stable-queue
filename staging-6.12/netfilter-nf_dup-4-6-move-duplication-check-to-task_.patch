@@ -1,0 +1,171 @@
+From 03ab2ee76ab8980f0897f186e7d29fc31f752514 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 25 Nov 2026 11:01:21 -0500
+Subject: netfilter: nf_dup{4, 6}: Move duplication check to task_struct
+
+From: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+
+[ Upstream commit a1f1acb9c5db9b385c9b3eb1f27f897c06df49ae ]
+
+nf_skb_duplicated is a per-CPU variable and relies on disabled BH for its
+locking. Without per-CPU locking in local_bh_disable() on PREEMPT_RT
+this data structure requires explicit locking.
+
+Due to the recursion involved, the simplest change is to make it a
+per-task variable.
+
+Move the per-CPU variable nf_skb_duplicated to task_struct and name it
+in_nf_duplicate. Add it to the existing bitfield so it doesn't use
+additional memory.
+
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Juri Lelli <juri.lelli@redhat.com>
+Cc: Vincent Guittot <vincent.guittot@linaro.org>
+Cc: Dietmar Eggemann <dietmar.eggemann@arm.com>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Cc: Ben Segall <bsegall@google.com>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: Valentin Schneider <vschneid@redhat.com>
+Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+Stable-dep-of: 82052e5b5ec3 ("netfilter: nf_dup: preserve guard across NFQUEUE reinjection")
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/linux/netfilter.h        | 11 -----------
+ include/linux/sched.h            |  1 +
+ net/ipv4/netfilter/ip_tables.c   |  2 +-
+ net/ipv4/netfilter/nf_dup_ipv4.c |  6 +++---
+ net/ipv6/netfilter/ip6_tables.c  |  2 +-
+ net/ipv6/netfilter/nf_dup_ipv6.c |  6 +++---
+ net/netfilter/core.c             |  3 ---
+ 7 files changed, 9 insertions(+), 22 deletions(-)
+
+diff --git a/include/linux/netfilter.h b/include/linux/netfilter.h
+index 9b3357d8d8c3e..3ca1996a6daba 100644
+--- a/include/linux/netfilter.h
++++ b/include/linux/netfilter.h
+@@ -499,17 +499,6 @@ struct nf_defrag_hook {
+ extern const struct nf_defrag_hook __rcu *nf_defrag_v4_hook;
+ extern const struct nf_defrag_hook __rcu *nf_defrag_v6_hook;
+ 
+-/*
+- * nf_skb_duplicated - TEE target has sent a packet
+- *
+- * When a xtables target sends a packet, the OUTPUT and POSTROUTING
+- * hooks are traversed again, i.e. nft and xtables are invoked recursively.
+- *
+- * This is used by xtables TEE target to prevent the duplicated skb from
+- * being duplicated again.
+- */
+-DECLARE_PER_CPU(bool, nf_skb_duplicated);
+-
+ /*
+  * Contains bitmask of ctnetlink event subscribers, if any.
+  * Can't be pernet due to NETLINK_LISTEN_ALL_NSID setsockopt flag.
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index efee6139c6af6..139735e265c5d 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1021,6 +1021,7 @@ struct task_struct {
+ 	/* delay due to memory thrashing */
+ 	unsigned                        in_thrashing:1;
+ #endif
++	unsigned			in_nf_duplicate:1;
+ #ifdef CONFIG_PREEMPT_RT
+ 	struct netdev_xmit		net_xmit;
+ #endif
+diff --git a/net/ipv4/netfilter/ip_tables.c b/net/ipv4/netfilter/ip_tables.c
+index 4320f67df7baa..412419a249dad 100644
+--- a/net/ipv4/netfilter/ip_tables.c
++++ b/net/ipv4/netfilter/ip_tables.c
+@@ -270,7 +270,7 @@ ipt_do_table(void *priv,
+ 	 * but it is no problem since absolute verdict is issued by these.
+ 	 */
+ 	if (static_key_false(&xt_tee_enabled))
+-		jumpstack += private->stacksize * __this_cpu_read(nf_skb_duplicated);
++		jumpstack += private->stacksize * current->in_nf_duplicate;
+ 
+ 	e = get_entry(table_base, private->hook_entry[hook]);
+ 
+diff --git a/net/ipv4/netfilter/nf_dup_ipv4.c b/net/ipv4/netfilter/nf_dup_ipv4.c
+index ec94ee1051c77..d11d7e2e1307b 100644
+--- a/net/ipv4/netfilter/nf_dup_ipv4.c
++++ b/net/ipv4/netfilter/nf_dup_ipv4.c
+@@ -54,7 +54,7 @@ void nf_dup_ipv4(struct net *net, struct sk_buff *skb, unsigned int hooknum,
+ 	struct iphdr *iph;
+ 
+ 	local_bh_disable();
+-	if (this_cpu_read(nf_skb_duplicated))
++	if (current->in_nf_duplicate)
+ 		goto out;
+ 	/*
+ 	 * Copy the skb, and route the copy. Will later return %XT_CONTINUE for
+@@ -86,9 +86,9 @@ void nf_dup_ipv4(struct net *net, struct sk_buff *skb, unsigned int hooknum,
+ 		--iph->ttl;
+ 
+ 	if (nf_dup_ipv4_route(net, skb, gw, oif)) {
+-		__this_cpu_write(nf_skb_duplicated, true);
++		current->in_nf_duplicate = true;
+ 		ip_local_out(net, skb->sk, skb);
+-		__this_cpu_write(nf_skb_duplicated, false);
++		current->in_nf_duplicate = false;
+ 	} else {
+ 		kfree_skb(skb);
+ 	}
+diff --git a/net/ipv6/netfilter/ip6_tables.c b/net/ipv6/netfilter/ip6_tables.c
+index fb375ce7f916d..9110392c83f6d 100644
+--- a/net/ipv6/netfilter/ip6_tables.c
++++ b/net/ipv6/netfilter/ip6_tables.c
+@@ -292,7 +292,7 @@ ip6t_do_table(void *priv, struct sk_buff *skb,
+ 	 * but it is no problem since absolute verdict is issued by these.
+ 	 */
+ 	if (static_key_false(&xt_tee_enabled))
+-		jumpstack += private->stacksize * __this_cpu_read(nf_skb_duplicated);
++		jumpstack += private->stacksize * current->in_nf_duplicate;
+ 
+ 	e = get_entry(table_base, private->hook_entry[hook]);
+ 
+diff --git a/net/ipv6/netfilter/nf_dup_ipv6.c b/net/ipv6/netfilter/nf_dup_ipv6.c
+index a8bb04bd94cf2..6da3102b7c1b3 100644
+--- a/net/ipv6/netfilter/nf_dup_ipv6.c
++++ b/net/ipv6/netfilter/nf_dup_ipv6.c
+@@ -48,7 +48,7 @@ void nf_dup_ipv6(struct net *net, struct sk_buff *skb, unsigned int hooknum,
+ 		 const struct in6_addr *gw, int oif)
+ {
+ 	local_bh_disable();
+-	if (this_cpu_read(nf_skb_duplicated))
++	if (current->in_nf_duplicate)
+ 		goto out;
+ 	skb = pskb_copy(skb, GFP_ATOMIC);
+ 	if (skb == NULL)
+@@ -64,9 +64,9 @@ void nf_dup_ipv6(struct net *net, struct sk_buff *skb, unsigned int hooknum,
+ 		--iph->hop_limit;
+ 	}
+ 	if (nf_dup_ipv6_route(net, skb, gw, oif)) {
+-		__this_cpu_write(nf_skb_duplicated, true);
++		current->in_nf_duplicate = true;
+ 		ip6_local_out(net, skb->sk, skb);
+-		__this_cpu_write(nf_skb_duplicated, false);
++		current->in_nf_duplicate = false;
+ 	} else {
+ 		kfree_skb(skb);
+ 	}
+diff --git a/net/netfilter/core.c b/net/netfilter/core.c
+index f8346fee36b6b..49694f4b1baa4 100644
+--- a/net/netfilter/core.c
++++ b/net/netfilter/core.c
+@@ -31,9 +31,6 @@
+ const struct nf_ipv6_ops __rcu *nf_ipv6_ops __read_mostly;
+ EXPORT_SYMBOL_GPL(nf_ipv6_ops);
+ 
+-DEFINE_PER_CPU(bool, nf_skb_duplicated);
+-EXPORT_SYMBOL_GPL(nf_skb_duplicated);
+-
+ #ifdef CONFIG_JUMP_LABEL
+ struct static_key nf_hooks_needed[NFPROTO_NUMPROTO][NF_MAX_HOOKS];
+ EXPORT_SYMBOL(nf_hooks_needed);
+-- 
+2.53.0
+

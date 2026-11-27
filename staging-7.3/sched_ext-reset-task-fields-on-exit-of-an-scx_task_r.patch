@@ -1,0 +1,104 @@
+From e271ccec34a5413ee61ed5dc96137db3f7989f90 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Fri, 27 Nov 2026 00:26:57 +0800
+Subject: sched_ext: Reset task fields on exit of an SCX_TASK_READY task
+
+From: Rahad Bhuiya <rahadbhuiya2021@gmail.com>
+
+commit 564405c424f49d70b13debe7fe5b550234ad6b84 upstream.
+
+Tasks in SCX_TASK_READY are attached to a scheduler but outside the ext
+class, such as RT/DL tasks, or non-SCHED_EXT tasks under a partial switch.
+The scheduler's BPF code can still update their dsq_vtime and slice (for
+instance, via ops.cgroup_move() as done by scx_flatcg).
+
+Because __scx_disable_and_exit_task() currently breaks out of the state
+switch for SCX_TASK_READY without calling scx_reset_task_fields(), these
+fields are not cleared when the task leaves the scheduler. If the task is
+subsequently moved to another cgroup/sub-scheduler and later switches to
+SCHED_NORMAL, the new scheduler's ops.enable() sees stale dsq_vtime from
+the previous scheduler's clock.
+
+Call scx_reset_task_fields() in the SCX_TASK_READY case of
+__scx_disable_and_exit_task() to ensure SCX-managed fields are properly
+reset when leaving the scheduler.
+
+Fixes: 5771e79e461e ("sched_ext: Reset dsq_vtime and slice when a task leaves SCX")
+Signed-off-by: Rahad Bhuiya <rahadbhuiya2021@gmail.com>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+[ chengyang: 7.3 lacks scx_reset_task_fields(), so factor it out of
+  scx_disable_task() ]
+Signed-off-by: Cheng-Yang Chou <yphbchou0911@gmail.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ kernel/sched/ext/ext.c | 40 ++++++++++++++++++++++++----------------
+ 1 file changed, 24 insertions(+), 16 deletions(-)
+
+diff --git a/kernel/sched/ext/ext.c b/kernel/sched/ext/ext.c
+index cc8d09924fa13..1049a0914d600 100644
+--- a/kernel/sched/ext/ext.c
++++ b/kernel/sched/ext/ext.c
+@@ -4159,6 +4159,27 @@ void scx_enable_task(struct scx_sched *sch, struct task_struct *p)
+ 	scx_set_task_state(p, SCX_TASK_ENABLED);
+ }
+ 
++/*
++ * Reset the SCX-managed fields when @p leaves the BPF scheduler's control.
++ */
++static void scx_reset_task_fields(struct rq *rq, struct task_struct *p)
++{
++	lockdep_assert_rq_held(rq);
++
++	p->scx.dsq_vtime = 0;
++	scx_task_slice_ended(rq, p);
++	scx_set_task_slice(p, 0);
++	p->scx.reenq_cnt = 0;
++
++	/*
++	 * If @p is runnable but not running, its wait started at runnable_at,
++	 * which ops_dequeue() didn't reset. Leaving the scheduler ends the
++	 * wait. Reset runnable_at the next time @p is enqueued on SCX, so that
++	 * the watchdog doesn't count the time @p spends elsewhere.
++	 */
++	p->scx.flags |= SCX_TASK_RESET_RUNNABLE_AT;
++}
++
+ static void scx_disable_task(struct scx_sched *sch, struct task_struct *p)
+ {
+ 	struct rq *rq = task_rq(p);
+@@ -4172,22 +4193,8 @@ static void scx_disable_task(struct scx_sched *sch, struct task_struct *p)
+ 		SCX_CALL_OP_TASK(sch, disable, rq, p);
+ 	scx_set_task_state(p, SCX_TASK_READY);
+ 
+-	/*
+-	 * Reset the SCX-managed fields when @p leaves the BPF scheduler's
+-	 * control, after ops.disable() has observed their final values.
+-	 */
+-	p->scx.dsq_vtime = 0;
+-	scx_task_slice_ended(rq, p);
+-	scx_set_task_slice(p, 0);
+-	p->scx.reenq_cnt = 0;
+-
+-	/*
+-	 * If @p is runnable but not running, its wait started at runnable_at,
+-	 * which ops_dequeue() didn't reset. Leaving @sch ends the wait. Reset
+-	 * runnable_at the next time @p is enqueued on SCX, so that the watchdog
+-	 * doesn't count the time @p spends elsewhere.
+-	 */
+-	p->scx.flags |= SCX_TASK_RESET_RUNNABLE_AT;
++	/* after ops.disable() has observed the final values */
++	scx_reset_task_fields(rq, p);
+ 
+ 	/*
+ 	 * Verify the task is not in BPF scheduler's custody. If flag
+@@ -4213,6 +4220,7 @@ void __scx_disable_and_exit_task(struct scx_sched *sch, struct task_struct *p)
+ 		args.cancelled = true;
+ 		break;
+ 	case SCX_TASK_READY:
++		scx_reset_task_fields(task_rq(p), p);
+ 		break;
+ 	case SCX_TASK_ENABLED:
+ 		scx_disable_task(sch, p);
+-- 
+2.53.0
+

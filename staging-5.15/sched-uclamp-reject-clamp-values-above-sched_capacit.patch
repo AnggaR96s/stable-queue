@@ -1,0 +1,166 @@
+From 9b63f0c208fd9456e5bacdf8ee4a47c223562af1 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 25 Nov 2026 12:57:47 -0500
+Subject: sched/uclamp: Reject clamp values above SCHED_CAPACITY_SCALE
+
+From: Andrea Parri <parri.andrea@gmail.com>
+
+[ Upstream commit 8127ec8458df29bd702db602473042ccb9e619b9 ]
+
+sched_setattr() accepts sched_util_min and sched_util_max values that do
+not fit in uclamp_se::value. A single thread can do:
+
+  sched_setattr(max = 800)		returns 0
+  sched_setattr(min = 0xfffffffe)	returns 0
+  sched_getattr()			min=2046 max=800
+
+which leaves the minimum above both SCHED_CAPACITY_SCALE and the task's own
+maximum.
+
+The range check in uclamp_validate() relies on the + 1 wrapping -1, the
+reset value, to 0:
+
+	if (util_min + 1 > SCHED_CAPACITY_SCALE + 1)
+
+That only works for an unsigned type. util_min and util_max are int and
+SCHED_CAPACITY_SCALE is a long, so every negative value passes the check,
+and so does INT_MAX, whose + 1 wraps.
+
+uclamp_se_set() then truncates what got through to the 11 bits of
+uclamp_se::value, but computes the bucket from the full value. A minimum
+of 0xfffff800 is stored as 0 in the top bucket, where uclamp_rq_max_value()
+takes it for the highest active clamp once a higher value leaves the rq.
+The rq clamp falls below what the remaining tasks requested, and emptying
+their bucket trips the WARN_ON_ONCE() in uclamp_rq_dec_id(), without any
+privilege:
+
+  WARNING: kernel/sched/core.c:1862 at dequeue_task+0x2a3/0x2b0, CPU#0: repro/126
+  Call Trace:
+   __schedule+0x933/0x1320
+   schedule+0x36/0x100
+   do_nanosleep+0x61/0x190
+   hrtimer_nanosleep+0xb5/0x1d0
+
+Make util_min and util_max unsigned int, so that -1 is the only value that
+wraps. The pair check below is unaffected, since it skips -1 explicitly and
+anything else is at most SCHED_CAPACITY_SCALE by then.
+
+Requests that were only accepted because of this now fail with -EINVAL.
+
+The following program triggers the warning when run by any user outside
+a child cpu cgroup. With this applied, its 0xfffff800 request fails with
+-EINVAL and the warning no longer appears:
+
+  #define _GNU_SOURCE
+  #include <pthread.h>
+  #include <sched.h>
+  #include <stdint.h>
+  #include <sys/syscall.h>
+  #include <time.h>
+  #include <unistd.h>
+
+  struct attr {
+      uint32_t size, policy;
+      uint64_t flags;
+      int32_t nice;
+      uint32_t prio;
+      uint64_t runtime, deadline, period;
+      uint32_t util_min, util_max;
+  };
+
+  static volatile int stop;
+
+  static void set_min(uint32_t v)
+  {
+      /* KEEP_POLICY | KEEP_PARAMS | UTIL_CLAMP_MIN */
+      struct attr a = { .size = sizeof(a), .flags = 0x38, .util_min = v };
+
+      syscall(SYS_sched_setattr, 0, &a, 0);
+  }
+
+  static void burn(long us)
+  {
+      struct timespec s, n;
+
+      clock_gettime(CLOCK_MONOTONIC, &s);
+      do
+          clock_gettime(CLOCK_MONOTONIC, &n);
+      while ((n.tv_sec - s.tv_sec) * 1000000 +
+             (n.tv_nsec - s.tv_nsec) / 1000 < us);
+  }
+
+  static void *bogus(void *arg)
+  {
+      set_min(0xfffff800);
+      while (!stop)
+          burn(1000);
+      return arg;
+  }
+
+  static void *worker(void *arg)
+  {
+      long v = (long)arg;
+
+      set_min(v);
+      while (!stop) {
+          burn(v == 800 ? 300 : 1500);
+          usleep(100);
+      }
+      return arg;
+  }
+
+  int main(void)
+  {
+      pthread_t t[3];
+      cpu_set_t c;
+      int i;
+
+      CPU_ZERO(&c);
+      CPU_SET(0, &c);
+      sched_setaffinity(0, sizeof(c), &c);
+      pthread_create(&t[0], NULL, bogus, NULL);
+      usleep(50000);
+      pthread_create(&t[1], NULL, worker, (void *)500L);
+      pthread_create(&t[2], NULL, worker, (void *)800L);
+      sleep(15);
+      stop = 1;
+      for (i = 0; i < 3; i++)
+          pthread_join(t[i], NULL);
+      return 0;
+  }
+
+An LLM helped find the warning and write this patch and its tests.
+
+Fixes: 480a6ca2dc6e ("sched/uclamp: Allow to reset a task uclamp constraint value")
+Reported-by: Sashiko <sashiko-bot@kernel.org>
+Signed-off-by: Andrea Parri <parri.andrea@gmail.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Reviewed-by: Vincent Guittot <vincent.guittot@linaro.org>
+Cc: stable@vger.kernel.org
+Link: https://sashiko.dev/#/patchset/20261016062629.2102883-1-sh_def%40163.com
+Link: https://patch.msgid.link/20261102134831.243255-1-parri.andrea@gmail.com
+[ sashal: Moved the uclamp_validate() hunk from kernel/sched/syscalls.c to kernel/sched/core.c, where the function lives in this tree; the code change itself is unchanged. ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ kernel/sched/core.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 3e5e0bdf62365..8a1383fa25aba 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -1781,8 +1781,8 @@ int sysctl_sched_uclamp_handler(struct ctl_table *table, int write,
+ static int uclamp_validate(struct task_struct *p,
+ 			   const struct sched_attr *attr)
+ {
+-	int util_min = p->uclamp_req[UCLAMP_MIN].value;
+-	int util_max = p->uclamp_req[UCLAMP_MAX].value;
++	unsigned int util_min = p->uclamp_req[UCLAMP_MIN].value;
++	unsigned int util_max = p->uclamp_req[UCLAMP_MAX].value;
+ 
+ 	if (attr->sched_flags & SCHED_FLAG_UTIL_CLAMP_MIN) {
+ 		util_min = attr->sched_util_min;
+-- 
+2.53.0
+

@@ -1,0 +1,92 @@
+From 676ec27553def5a06f34464aaa2ceef6eb8471b1 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Tue, 24 Nov 2026 16:03:17 -0500
+Subject: mm/page_alloc: retry alloc_contig_pages() when the zonelist is
+ rebuilt
+
+From: Gregory Price (Meta) <gourry@gourry.net>
+
+[ Upstream commit da0d7a895e9021dc2cffa90fb6fafd8b9379e544 ]
+
+Onlining the first block of a zone rebuilds every zonelist in place,
+shifting the slots after the new zone.
+alloc_contig_frozen_pages_noprof() approves a slot by the caller's gfp
+and nodemask, then loads the zone from it:
+
+  CPU 0                             CPU 1
+  alloc_contig_frozen_pages_noprof(GFP_HIGHUSER | __GFP_THISNODE)
+    slot 0 (NORMAL1) approved
+                                    online_pages()
+                                      build_all_zonelists()
+                                        [NORMAL1]
+                                        -> [MOVABLE1, NORMAL1]
+    zone = zonelist_zone(slot 0)    /* MOVABLE1 */
+    alloc_contig_frozen_range(MOVABLE1 pfns)
+
+A gigantic hugetlb page can then land in ZONE_MOVABLE, and a nodemask
+caller can get a range from another node.  Gigantic pages are kept out
+of ZONE_MOVABLE since commit 79b63f12abcb ("mm, hugetlb: do not allocate
+non-migrateable gigantic pages from movable zones").
+
+Check zonelist_update_seq before using each zone, and restart the walk
+if it changed, as the hugetlb pool walk does.  Check again before
+escalating to the pass that may migrate hugetlb pages, so a pass a
+rebuild cut short is redone rather than escalated.
+
+With kprobes holding the walk across the online, the base kernel put the
+1G page in ZONE_MOVABLE in 3 of 3 runs, and this change put it in
+ZONE_NORMAL in 3 of 3.  Direct GFP_KERNEL calls with nodemask {1} and
+{2} got a ZONE_MOVABLE range and a node 1 range on base, 3 of 3 each,
+and neither with this change.
+
+Fixes: 5e27a2df03b8 ("mm/page_alloc: add alloc_contig_pages()")
+Cc: stable@vger.kernel.org
+Signed-off-by: Gregory Price (Meta) <gourry@gourry.net>
+Reviewed-by: Vlastimil Babka (SUSE) <vbabka@kernel.org>
+Link: https://patch.msgid.link/20261101021340.2251928-11-gourry@gourry.net
+Acked-by: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Vlastimil Babka (SUSE) <vbabka@kernel.org>
+[ sashal: adapted to the older alloc_contig_pages() function, adding the retry label and moving the zonelist retry check to the end of the zone loop since there is no hugetlb skip pass. ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ mm/page_alloc.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index f016cc37182a7..cd7cfc6094b5c 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -9431,13 +9431,20 @@ struct page *alloc_contig_pages(unsigned long nr_pages, gfp_t gfp_mask,
+ 				int nid, nodemask_t *nodemask)
+ {
+ 	unsigned long ret, pfn, flags;
++	unsigned int zonelist_cookie;
+ 	struct zonelist *zonelist;
+ 	struct zone *zone;
+ 	struct zoneref *z;
+ 
++retry:
+ 	zonelist = node_zonelist(nid, gfp_mask);
++	zonelist_cookie = zonelist_iter_begin();
+ 	for_each_zone_zonelist_nodemask(zone, z, zonelist,
+ 					gfp_zone(gfp_mask), nodemask) {
++		/* A rebuild may have shifted an ineligible zone into this slot. */
++		if (unlikely(check_retry_zonelist(zonelist_cookie)))
++			goto retry;
++
+ 		spin_lock_irqsave(&zone->lock, flags);
+ 
+ 		pfn = ALIGN(zone->zone_start_pfn, nr_pages);
+@@ -9461,6 +9468,9 @@ struct page *alloc_contig_pages(unsigned long nr_pages, gfp_t gfp_mask,
+ 		}
+ 		spin_unlock_irqrestore(&zone->lock, flags);
+ 	}
++	/* Redo a pass that a rebuild cut short. */
++	if (unlikely(check_retry_zonelist(zonelist_cookie)))
++		goto retry;
+ 	return NULL;
+ }
+ #endif /* CONFIG_CONTIG_ALLOC */
+-- 
+2.53.0
+

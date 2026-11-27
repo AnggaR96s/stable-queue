@@ -1,0 +1,171 @@
+From 52cd34bbaf1d441ed9f4c7afbc491c8bf5378836 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 25 Nov 2026 12:54:57 -0500
+Subject: sched/core: Fix cpuset_mutex double unlock in __sched_setscheduler()
+
+From: Andrea Parri <parri.andrea@gmail.com>
+
+[ Upstream commit f7141257dd67d4936f906a6cfd1d0007721f6898 ]
+
+A sched_setattr() with SCHED_FLAG_KEEP_POLICY on a SCHED_DEADLINE task
+unlocks cpuset_mutex twice if the task's policy changes concurrently:
+
+  WARNING: bad unlock balance detected!
+  7.4.0-rc1 #1 Not tainted
+  -------------------------------------
+  repro/126 is trying to release lock (cpuset_mutex) at:
+  [<ffffffff9a17cacc>] __sched_setscheduler+0x9cc/0xc40
+  but there are no more locks to release!
+  ...
+  Call Trace:
+   print_unlock_imbalance_bug.part.0+0xfb/0x110
+   lock_release+0x286/0x2e0
+   __mutex_unlock_slowpath+0x1a/0x400
+   __sched_setscheduler+0x9cc/0xc40
+   __x64_sys_sched_setattr+0xa3/0x1b0
+   do_syscall_64+0x106/0x5f0
+   entry_SYSCALL_64_after_hwframe+0x77/0x7f
+
+__sched_setscheduler() samples p->policy before taking any lock, and
+restarts from the recheck label if p->policy differs under the rq lock.
+The restart drops cpuset_mutex but leaves cpuset_locked set, so a pass
+that no longer needs the mutex still unlocks it on its way out:
+
+  CPU 1                                CPU 2
+  __sched_setscheduler(KEEP_POLICY)
+    policy = p->policy /* DEADLINE */
+                                       __sched_setscheduler(SCHED_OTHER)
+                                         p->policy = SCHED_OTHER
+    cpuset_locked = true
+    cpuset_lock()
+    rq = task_rq_lock(p)
+    oldpolicy != p->policy
+      cpuset_unlock()
+      goto recheck
+    /* no cpuset_lock() this time */
+    ...
+    if (cpuset_locked)
+      cpuset_unlock()
+
+Without CONFIG_DEBUG_MUTEXES, or CONFIG_DEBUG_RT_MUTEXES on PREEMPT_RT,
+nothing warns. The second unlock still clears the owner field regardless
+of who holds the mutex, so another task can lose cpuset_mutex inside its
+critical section. Entering SCHED_DEADLINE needs CAP_SYS_NICE, but a
+racing caller that owns the task does not need it if it samples a policy
+other than SCHED_DEADLINE.
+
+Clear cpuset_locked when dropping the mutex for the restart. This should be
+safe because the flag is only tested on the paths leaving the next pass,
+after that pass has set it again if it took the mutex.
+
+The following program, run as root, reproduces the splat, which no longer
+appears with this applied. On PREEMPT_RT it crashes the kernel within
+seconds, which this also fixes:
+
+  #define _GNU_SOURCE
+  #include <pthread.h>
+  #include <stdint.h>
+  #include <sys/syscall.h>
+  #include <unistd.h>
+
+  struct attr {
+      uint32_t size, policy;
+      uint64_t flags;
+      int32_t nice;
+      uint32_t prio;
+      uint64_t runtime, deadline, period;
+  };
+
+  static volatile int stop;
+  static volatile pid_t target;
+
+  static void set(struct attr a)
+  {
+      a.size = sizeof(a);
+      syscall(SYS_sched_setattr, target, &a, 0);
+  }
+
+  static void *sleeper(void *arg)
+  {
+      target = syscall(SYS_gettid);
+      while (!stop)
+          usleep(1000);
+      return arg;
+  }
+
+  static void *switcher(void *arg)
+  {
+      while (!stop) {
+          /* SCHED_DEADLINE, 2us every 1s */
+          set((struct attr){ .policy = 6, .runtime = 2000,
+                             .deadline = 1000000000,
+                             .period = 1000000000 });
+          set((struct attr){ .policy = 0 }); /* SCHED_OTHER */
+      }
+      return arg;
+  }
+
+  static void *racer(void *arg)
+  {
+      /* KEEP_POLICY | KEEP_PARAMS */
+      while (!stop)
+          set((struct attr){ .flags = 0x18 });
+      return arg;
+  }
+
+  int main(void)
+  {
+      pthread_t t[5];
+      int i;
+
+      pthread_create(&t[0], NULL, sleeper, NULL);
+      while (!target)
+          usleep(100);
+      pthread_create(&t[1], NULL, switcher, NULL);
+      for (i = 2; i < 5; i++)
+          pthread_create(&t[i], NULL, racer, NULL);
+      sleep(30);
+      stop = 1;
+      for (i = 0; i < 5; i++)
+          pthread_join(t[i], NULL);
+      return 0;
+  }
+
+An LLM helped find the PREEMPT_RT crash and write this patch and its test.
+
+Fixes: 111cd11bbc54 ("sched/cpuset: Bring back cpuset_mutex")
+Reported-by: Sashiko <sashiko-bot@kernel.org>
+Signed-off-by: Andrea Parri <parri.andrea@gmail.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Reviewed-by: Waiman Long <longman@redhat.com>
+Reviewed-by: Kayra Cizmeci <kayracizmeci@gmail.com>
+Reviewed-by: Juri Lelli <juri.lelli@redhat.com>
+Cc: stable@vger.kernel.org
+Link: https://sashiko.dev/#/patchset/20261016062629.2102883-1-sh_def%40163.com
+Link: https://patch.msgid.link/20261102134606.242743-1-parri.andrea@gmail.com
+[ sashal: adjusted the file path and function context from kernel/sched/syscalls.c to kernel/sched/core.c, where __sched_setscheduler() is static in this tree. ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ kernel/sched/core.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index cf470ac63af72..9a338369262b5 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -7673,8 +7673,10 @@ static int __sched_setscheduler(struct task_struct *p,
+ 	if (unlikely(oldpolicy != -1 && oldpolicy != p->policy)) {
+ 		policy = oldpolicy = -1;
+ 		task_rq_unlock(rq, p, &rf);
+-		if (cpuset_locked)
++		if (cpuset_locked) {
+ 			cpuset_unlock();
++			cpuset_locked = false;
++		}
+ 		goto recheck;
+ 	}
+ 
+-- 
+2.53.0
+

@@ -1,0 +1,106 @@
+From 10c9380ce768daa383ae26ee2be1377b04c81f8c Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 25 Nov 2026 11:05:28 -0500
+Subject: netfilter: nf_dup: preserve guard across NFQUEUE reinjection
+
+From: Zihan Xi <zihanx@nebusec.ai>
+
+[ Upstream commit 82052e5b5ec36504fe1b9c3c28a711a78fcacf37 ]
+
+NFQUEUE can suspend traversal of a duplicated packet while the task-local
+duplication guard is set. The output call then returns and clears the guard
+before a later verdict resumes hook traversal.
+
+Save the guard in the queue entry and restore it while reinjection
+continues hook traversal. Preserve and restore the verdict task's prior
+state, including nested synchronous reinjection.
+
+Fixes: cd58bcd9787e ("netfilter: xt_TEE: have cloned packet travel through Xtables too")
+Cc: stable@vger.kernel.org
+Reported-by: Vega <vega@nebusec.ai>
+Assisted-by: LLM
+Co-developed-by: Luxing Yin <root@tr0jan.top>
+Signed-off-by: Luxing Yin <root@tr0jan.top>
+Signed-off-by: Zihan Xi <zihanx@nebusec.ai>
+Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+[ sashal: Replaced the per-task in_nf_duplicate guard with the per-CPU nf_skb_duplicated, moved the nf_reinject() edits into nf_queue.c, and dropped the DEBUG_NET_WARN_ONCE assertion and its missing header. ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/net/netfilter/nf_queue.h |  1 +
+ net/netfilter/nf_queue.c         | 13 ++++++++++---
+ 2 files changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/include/net/netfilter/nf_queue.h b/include/net/netfilter/nf_queue.h
+index 3e0b166747516..6ff855d21d563 100644
+--- a/include/net/netfilter/nf_queue.h
++++ b/include/net/netfilter/nf_queue.h
+@@ -21,6 +21,7 @@ struct nf_queue_entry {
+ 	struct net_device	*physout;
+ #endif
+ 	struct nf_hook_state	state;
++	bool			in_nf_duplicate;
+ 	u16			size; /* sizeof(entry) + saved route keys */
+ 
+ 	/* extra space to store route keys */
+diff --git a/net/netfilter/nf_queue.c b/net/netfilter/nf_queue.c
+index 74d85f7a4f557..eec4a4bcf67f6 100644
+--- a/net/netfilter/nf_queue.c
++++ b/net/netfilter/nf_queue.c
+@@ -220,6 +220,7 @@ static int __nf_queue(struct sk_buff *skb, const struct nf_hook_state *state,
+ 	*entry = (struct nf_queue_entry) {
+ 		.skb	= skb,
+ 		.skb_dev = skb->dev,
++		.in_nf_duplicate = this_cpu_read(nf_skb_duplicated),
+ 		.state	= *state,
+ 		.hook_index = index,
+ 		.size	= sizeof(*entry) + route_key_size,
+@@ -317,21 +318,26 @@ void nf_reinject(struct nf_queue_entry *entry, unsigned int verdict)
+ 	const struct nf_hook_entry *hook_entry;
+ 	const struct nf_hook_entries *hooks;
+ 	struct sk_buff *skb = entry->skb;
++	bool old_in_nf_duplicate;
+ 	const struct net *net;
+ 	unsigned int i;
+ 	int err;
+ 	u8 pf;
+ 
++	local_bh_disable();
++	old_in_nf_duplicate = __this_cpu_read(nf_skb_duplicated);
++
+ 	net = entry->state.net;
+ 	pf = entry->state.pf;
+ 
++	__this_cpu_write(nf_skb_duplicated, entry->in_nf_duplicate);
+ 	hooks = nf_hook_entries_head(net, pf, entry->state.hook);
+ 
+ 	i = entry->hook_index;
+ 	if (WARN_ON_ONCE(!hooks || i >= hooks->num_hook_entries)) {
+ 		kfree_skb(skb);
+ 		nf_queue_entry_free(entry);
+-		return;
++		goto out;
+ 	}
+ 
+ 	hook_entry = &hooks->hooks[i];
+@@ -354,9 +360,7 @@ void nf_reinject(struct nf_queue_entry *entry, unsigned int verdict)
+ 	switch (verdict & NF_VERDICT_MASK) {
+ 	case NF_ACCEPT:
+ 	case NF_STOP:
+-		local_bh_disable();
+ 		entry->state.okfn(entry->state.net, entry->state.sk, skb);
+-		local_bh_enable();
+ 		break;
+ 	case NF_QUEUE:
+ 		err = nf_queue(skb, &entry->state, i, verdict);
+@@ -370,5 +374,8 @@ void nf_reinject(struct nf_queue_entry *entry, unsigned int verdict)
+ 	}
+ 
+ 	nf_queue_entry_free(entry);
++out:
++	__this_cpu_write(nf_skb_duplicated, old_in_nf_duplicate);
++	local_bh_enable();
+ }
+ EXPORT_SYMBOL(nf_reinject);
+-- 
+2.53.0
+

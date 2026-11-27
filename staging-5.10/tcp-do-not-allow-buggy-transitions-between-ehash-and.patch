@@ -1,0 +1,114 @@
+From c65516f24edc54916cac25f0f67b34704e45c5a5 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 25 Nov 2026 22:22:04 +0900
+Subject: tcp: Do not allow buggy transitions between ehash and lhash2.
+
+From: Kuniyuki Iwashima <kuniyu@google.com>
+
+[ Upstream commit 8cc3aef0cb198049805ecc061a2cc7b79b0ae43e ]
+
+The following state transitions have long been a playground for
+syzbot, and recently AI joined in, reporting a lot more bugs.
+
+  * listen() + shutdown() + connect()
+  * connect() + connect(AF_UNSPEC) + listen()
+
+All the fix attempts would add more code to the fast path, which
+is not worth it.
+
+Instead of playing whack-a-mole with these edge-case bugs,
+let's disallow these transitions.
+
+Note that unhashed_state is placed in the 4-byte hole after
+icsk_pmtu_cookie.
+
+  $ pahole -C inet_connection_sock vmlinux
+  struct inet_connection_sock {
+  ...
+	__u32                      icsk_pmtu_cookie;     /*  1208     4 */
+	unsigned char              unhashed_state;       /*  1212     1 */
+
+	/* XXX 3 bytes hole, try to pack */
+
+Reported-by: Kyle Zeng <kylebot@openai.com>
+Closes: https://lore.kernel.org/netdev/20260731140512.566464-1-david.lee@trailofbits.com/
+Reported-by: Michal Luczaj <mhal@rbox.co>
+Closes: https://lore.kernel.org/netdev/20260803-sockmap-lookup-tcp-leak-v2-0-306e025bfe66@rbox.co/
+Reported-by: Hyunwoo Kim <imv4bel@gmail.com>
+Closes: https://lore.kernel.org/netdev/20260824033331.1084971-1-imv4bel@gmail.com/
+Signed-off-by: Kuniyuki Iwashima <kuniyu@google.com>
+Link: https://patch.msgid.link/20260904033543.2635540-2-kuniyu@google.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+[ Hyunwoo Kim: Check __inet_hash() for IPv4 and IPv6 on 5.10.y;
+  record the state in __inet_unhash() after its locked
+  unhashed check. ]
+Signed-off-by: Hyunwoo Kim <imv4bel@gmail.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/net/inet_connection_sock.h |  1 +
+ net/ipv4/inet_connection_sock.c    |  1 +
+ net/ipv4/inet_hashtables.c         | 10 ++++++++++
+ 3 files changed, 12 insertions(+)
+
+diff --git a/include/net/inet_connection_sock.h b/include/net/inet_connection_sock.h
+index 2614ef5e922e4..13534bf5d0d8e 100644
+--- a/include/net/inet_connection_sock.h
++++ b/include/net/inet_connection_sock.h
+@@ -93,6 +93,7 @@ struct inet_connection_sock {
+ 	__u32                     icsk_rto_min;
+ 	__u32                     icsk_delack_max;
+ 	__u32			  icsk_pmtu_cookie;
++	unsigned char		  unhashed_state;
+ 	const struct tcp_congestion_ops *icsk_ca_ops;
+ 	const struct inet_connection_sock_af_ops *icsk_af_ops;
+ 	const struct tcp_ulp_ops  *icsk_ulp_ops;
+diff --git a/net/ipv4/inet_connection_sock.c b/net/ipv4/inet_connection_sock.c
+index b3a847838e750..508e8000d50a3 100644
+--- a/net/ipv4/inet_connection_sock.c
++++ b/net/ipv4/inet_connection_sock.c
+@@ -870,6 +870,7 @@ struct sock *inet_csk_clone_lock(const struct sock *sk,
+ 		struct inet_connection_sock *newicsk = inet_csk(newsk);
+ 
+ 		newsk->sk_wait_pending = 0;
++		newicsk->unhashed_state = 0;
+ 		inet_sk_set_state(newsk, TCP_SYN_RECV);
+ 		newicsk->icsk_bind_hash = NULL;
+ 
+diff --git a/net/ipv4/inet_hashtables.c b/net/ipv4/inet_hashtables.c
+index ff5c972d7deab..3ca1a896ab0f8 100644
+--- a/net/ipv4/inet_hashtables.c
++++ b/net/ipv4/inet_hashtables.c
+@@ -650,6 +650,11 @@ int __inet_hash(struct sock *sk, struct sock *osk)
+ 		return 0;
+ 	}
+ 	WARN_ON(!sk_unhashed(sk));
++
++	if (unlikely(inet_csk(sk)->unhashed_state &&
++		     inet_csk(sk)->unhashed_state != TCP_LISTEN))
++		return -EINVAL;
++
+ 	ilb = &hashinfo->listening_hash[inet_sk_listen_hashfn(sk)];
+ 
+ 	spin_lock(&ilb->lock);
+@@ -690,6 +695,8 @@ static void __inet_unhash(struct sock *sk, struct inet_listen_hashbucket *ilb)
+ 	if (sk_unhashed(sk))
+ 		return;
+ 
++	inet_csk(sk)->unhashed_state = sk->sk_state;
++
+ 	if (rcu_access_pointer(sk->sk_reuseport_cb))
+ 		reuseport_detach_sock(sk);
+ 	if (ilb) {
+@@ -758,6 +765,9 @@ int __inet_hash_connect(struct inet_timewait_death_row *death_row,
+ 	int l3mdev;
+ 	u32 index;
+ 
++	if (unlikely(inet_csk(sk)->unhashed_state == TCP_LISTEN))
++		return -EINVAL;
++
+ 	if (port) {
+ 		local_bh_disable();
+ 		ret = check_established(death_row, sk, port, NULL);
+-- 
+2.53.0
+

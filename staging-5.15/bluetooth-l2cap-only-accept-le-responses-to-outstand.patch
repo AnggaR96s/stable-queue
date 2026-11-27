@@ -1,0 +1,204 @@
+From e7d45b16549876630bf46b6e04c06bfb775cf89c Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 25 Nov 2026 11:38:56 -0500
+Subject: Bluetooth: L2CAP: Only accept LE responses to outstanding requests
+
+From: Zhao Li <enderaoelyther@gmail.com>
+
+[ Upstream commit f50b32aa233d4687af2d241ddcb572da969e8989 ]
+
+The LE and ECRED response handlers match channels by identifier without
+checking whether they sent the request. An incoming channel stores the
+identifier chosen by the peer, so an unsolicited response can bypass
+deferred setup, delete an established channel, or leave an unaccepted
+socket and channel allocated after l2cap_chan_del().
+
+Extend the BR/EDR lookup from commit a518b9a9ef6e ("Bluetooth: L2CAP:
+Only accept connection responses to outstanding requests") to LE.
+Require the matching connect-request flag and add a reconfigure-request
+flag. Check reconfigure identifiers under the channel lock, since
+BT_RCVMTU can replace a request without the connection lock. Match all
+members of a rejected ECRED request, which share one identifier.
+
+A reconfigure request can outlive close(). Complete it even in
+BT_DISCONN, and call the close callback after deletion to release an
+orphaned socket. Otherwise deletion cancels the timer and removes the
+channel before the disconnect response or the channel timeout can close
+it.
+
+AI assistance was used.
+
+Fixes: f1496dee9cbd ("Bluetooth: Add initial code for LE L2CAP Connect Request")
+Fixes: 71fb419724fa ("Bluetooth: Fix handling of L2CAP Command Reject over LE")
+Fixes: 15f02b910562 ("Bluetooth: L2CAP: Add initial code for Enhanced Credit Based Mode")
+Cc: <stable@vger.kernel.org> # 5.7.x: a518b9a9ef6e: Bluetooth: L2CAP: Only accept connection responses to outstanding requests
+Cc: <stable@vger.kernel.org> # 5.7.x
+Signed-off-by: Zhao Li <enderaoelyther@gmail.com>
+Signed-off-by: Luiz Augusto von Dentz <luiz.von.dentz@intel.com>
+[ sashal: Adapted to the older locking: added chan_lock around the channel loop in l2cap_ecred_reconf_rsp(), dropped the conn->lock assertion, and kept __l2cap_get_chan_by_ident() since it still has a user. ]
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/net/bluetooth/l2cap.h |  1 +
+ net/bluetooth/l2cap_core.c    | 69 ++++++++++++++++++++++-------------
+ 2 files changed, 44 insertions(+), 26 deletions(-)
+
+diff --git a/include/net/bluetooth/l2cap.h b/include/net/bluetooth/l2cap.h
+index 57315b9dc059e..16fdd88d61fa4 100644
+--- a/include/net/bluetooth/l2cap.h
++++ b/include/net/bluetooth/l2cap.h
+@@ -774,6 +774,7 @@ enum {
+ 	FLAG_DEFER_SETUP,
+ 	FLAG_LE_CONN_REQ_SENT,
+ 	FLAG_ECRED_CONN_REQ_SENT,
++	FLAG_ECRED_RECONF_REQ_SENT,
+ 	FLAG_PENDING_SECURITY,
+ 	FLAG_HOLD_HCI_CONN,
+ 	FLAG_DEL,
+diff --git a/net/bluetooth/l2cap_core.c b/net/bluetooth/l2cap_core.c
+index 8aaa30e65b5b6..179559dfbcca2 100644
+--- a/net/bluetooth/l2cap_core.c
++++ b/net/bluetooth/l2cap_core.c
+@@ -189,7 +189,8 @@ static struct l2cap_chan *l2cap_get_chan_by_ident(struct l2cap_conn *conn,
+ static bool l2cap_chan_connect_pending(struct l2cap_chan *chan)
+ {
+ 	return chan->state == BT_CONNECT &&
+-	       test_bit(CONF_CONNECT_PEND, &chan->conf_state);
++	       (test_bit(CONF_CONNECT_PEND, &chan->conf_state) ||
++		test_bit(FLAG_LE_CONN_REQ_SENT, &chan->flags));
+ }
+ 
+ /* Other channels may hold the same ident for a response they still have
+@@ -201,7 +202,7 @@ static struct l2cap_chan *__l2cap_get_connect_chan_by_ident(struct l2cap_conn *c
+ 	struct l2cap_chan *c;
+ 
+ 	list_for_each_entry(c, &conn->chan_l, list) {
+-		if (c->ident == ident && l2cap_chan_connect_pending(c))
++		if (l2cap_chan_connect_pending(c) && c->ident == ident)
+ 			return c;
+ 	}
+ 	return NULL;
+@@ -5819,7 +5820,7 @@ static int l2cap_le_connect_rsp(struct l2cap_conn *conn,
+ 
+ 	mutex_lock(&conn->chan_lock);
+ 
+-	chan = __l2cap_get_chan_by_ident(conn, cmd->ident);
++	chan = __l2cap_get_connect_chan_by_ident(conn, cmd->ident);
+ 	if (!chan) {
+ 		err = -EBADSLT;
+ 		goto unlock;
+@@ -6381,9 +6382,10 @@ static inline int l2cap_ecred_conn_rsp(struct l2cap_conn *conn,
+ 		struct l2cap_chan *orig;
+ 		u16 dcid;
+ 
+-		if (chan->ident != cmd->ident ||
++		if (chan->state != BT_CONNECT ||
+ 		    chan->mode != L2CAP_MODE_EXT_FLOWCTL ||
+-		    chan->state == BT_CONNECTED)
++		    !test_bit(FLAG_ECRED_CONN_REQ_SENT, &chan->flags) ||
++		    chan->ident != cmd->ident)
+ 			continue;
+ 
+ 		l2cap_chan_hold(chan);
+@@ -6600,28 +6602,33 @@ static inline int l2cap_ecred_reconf_rsp(struct l2cap_conn *conn,
+ 
+ 	BT_DBG("result 0x%4.4x", result);
+ 
+-	if (!result) {
+-		list_for_each_entry(chan, &conn->chan_l, list) {
+-			if (chan->ident == cmd->ident)
+-				chan->ident = 0;
+-		}
+-		return 0;
+-	}
++	mutex_lock(&conn->chan_lock);
+ 
+ 	list_for_each_entry_safe(chan, tmp, &conn->chan_l, list) {
+-		if (chan->ident != cmd->ident)
++		/* Reconfiguration updates ident with only chan->lock held. */
++		if (data_race(READ_ONCE(chan->ident)) != cmd->ident)
+ 			continue;
+ 
+ 		if (!l2cap_chan_hold_unless_zero(chan))
+ 			continue;
+ 		l2cap_chan_lock(chan);
+ 
+-		l2cap_chan_del(chan, ECONNRESET);
++		if (chan->ident == cmd->ident &&
++		    test_and_clear_bit(FLAG_ECRED_RECONF_REQ_SENT, &chan->flags)) {
++			if (result) {
++				l2cap_chan_del(chan, ECONNRESET);
++				chan->ops->close(chan);
++			} else {
++				chan->ident = 0;
++			}
++		}
+ 
+ 		l2cap_chan_unlock(chan);
+ 		l2cap_chan_put(chan);
+ 	}
+ 
++	mutex_unlock(&conn->chan_lock);
++
+ 	return 0;
+ }
+ 
+@@ -6630,27 +6637,36 @@ static inline int l2cap_le_command_rej(struct l2cap_conn *conn,
+ 				       u8 *data)
+ {
+ 	struct l2cap_cmd_rej_unk *rej = (struct l2cap_cmd_rej_unk *) data;
+-	struct l2cap_chan *chan;
++	struct l2cap_chan *chan, *tmp;
+ 
+ 	if (cmd_len < sizeof(*rej))
+ 		return -EPROTO;
+ 
+ 	mutex_lock(&conn->chan_lock);
+ 
+-	chan = __l2cap_get_chan_by_ident(conn, cmd->ident);
+-	if (!chan)
+-		goto done;
++	list_for_each_entry_safe(chan, tmp, &conn->chan_l, list) {
++		/* Reconfiguration updates ident with only chan->lock held. */
++		if (data_race(READ_ONCE(chan->ident)) != cmd->ident)
++			continue;
+ 
+-	chan = l2cap_chan_hold_unless_zero(chan);
+-	if (!chan)
+-		goto done;
++		if (!l2cap_chan_hold_unless_zero(chan))
++			continue;
+ 
+-	l2cap_chan_lock(chan);
+-	l2cap_chan_del(chan, ECONNREFUSED);
+-	l2cap_chan_unlock(chan);
+-	l2cap_chan_put(chan);
++		l2cap_chan_lock(chan);
++
++		if (chan->ident == cmd->ident &&
++		    ((chan->state == BT_CONNECT &&
++		      (test_bit(FLAG_LE_CONN_REQ_SENT, &chan->flags) ||
++		       test_bit(FLAG_ECRED_CONN_REQ_SENT, &chan->flags))) ||
++		     test_bit(FLAG_ECRED_RECONF_REQ_SENT, &chan->flags))) {
++			l2cap_chan_del(chan, ECONNREFUSED);
++			chan->ops->close(chan);
++		}
++
++		l2cap_chan_unlock(chan);
++		l2cap_chan_put(chan);
++	}
+ 
+-done:
+ 	mutex_unlock(&conn->chan_lock);
+ 	return 0;
+ }
+@@ -8493,6 +8509,7 @@ static void l2cap_ecred_reconfigure(struct l2cap_chan *chan)
+ 	pdu.scid    = cpu_to_le16(chan->scid);
+ 
+ 	chan->ident = l2cap_get_ident(conn);
++	set_bit(FLAG_ECRED_RECONF_REQ_SENT, &chan->flags);
+ 
+ 	l2cap_send_cmd(conn, chan->ident, L2CAP_ECRED_RECONF_REQ,
+ 		       sizeof(pdu), &pdu);
+-- 
+2.53.0
+

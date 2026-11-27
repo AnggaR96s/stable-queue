@@ -1,0 +1,144 @@
+From 03da3b23a2104b723674440b5e2f1985dc35abe2 Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Thu, 26 Nov 2026 04:34:53 +0000
+Subject: perf/bpf: Call BPF handler directly, not through overflow machinery
+
+From: Kyle Huey <me@kylehuey.com>
+
+[ Upstream commit f11f10bfa1ca23b32020b2073aa13131a27978fe ]
+
+To ultimately allow BPF programs attached to perf events to completely
+suppress all of the effects of a perf event overflow (rather than just the
+sample output, as they do today), call bpf_overflow_handler() from
+__perf_event_overflow() directly rather than modifying struct perf_event's
+overflow_handler. Return the BPF program's return value from
+bpf_overflow_handler() so that __perf_event_overflow() knows how to
+proceed. Remove the now unnecessary orig_overflow_handler from struct
+perf_event.
+
+This patch is solely a refactoring and results in no behavior change.
+
+Suggested-by: Namhyung Kim <namhyung@kernel.org>
+Signed-off-by: Kyle Huey <khuey@kylehuey.com>
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Acked-by: Song Liu <song@kernel.org>
+Acked-by: Jiri Olsa <jolsa@kernel.org>
+Acked-by: Andrii Nakryiko <andrii@kernel.org>
+Link: https://lore.kernel.org/r/20240412015019.7060-5-khuey@kylehuey.com
+Signed-off-by: Luo Gengkun <luogengkun@huaweicloud.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ include/linux/perf_event.h |  6 +-----
+ kernel/events/core.c       | 27 +++++++++++----------------
+ 2 files changed, 12 insertions(+), 21 deletions(-)
+
+diff --git a/include/linux/perf_event.h b/include/linux/perf_event.h
+index b504d7eec86fd..f3bf97c4877bf 100644
+--- a/include/linux/perf_event.h
++++ b/include/linux/perf_event.h
+@@ -809,7 +809,6 @@ struct perf_event {
+ 	u64				(*clock)(void);
+ 	perf_overflow_handler_t		overflow_handler;
+ 	void				*overflow_handler_context;
+-	perf_overflow_handler_t		orig_overflow_handler;
+ 	struct bpf_prog			*prog;
+ 	u64				bpf_cookie;
+ 
+@@ -1352,10 +1351,7 @@ __is_default_overflow_handler(perf_overflow_handler_t overflow_handler)
+ #ifdef CONFIG_BPF_SYSCALL
+ static inline bool uses_default_overflow_handler(struct perf_event *event)
+ {
+-	if (likely(is_default_overflow_handler(event)))
+-		return true;
+-
+-	return __is_default_overflow_handler(event->orig_overflow_handler);
++	return is_default_overflow_handler(event);
+ }
+ #else
+ #define uses_default_overflow_handler(event) \
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index 047c0eaf18464..dcc4d4f07912f 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -9605,9 +9605,9 @@ static inline bool sample_is_allowed(struct perf_event *event, struct pt_regs *r
+ }
+ 
+ #ifdef CONFIG_BPF_SYSCALL
+-static void bpf_overflow_handler(struct perf_event *event,
+-				 struct perf_sample_data *data,
+-				 struct pt_regs *regs)
++static int bpf_overflow_handler(struct perf_event *event,
++				struct perf_sample_data *data,
++				struct pt_regs *regs)
+ {
+ 	struct bpf_perf_event_data_kern ctx = {
+ 		.data = data,
+@@ -9628,10 +9628,8 @@ static void bpf_overflow_handler(struct perf_event *event,
+ 	rcu_read_unlock();
+ out:
+ 	__this_cpu_dec(bpf_prog_active);
+-	if (!ret)
+-		return;
+ 
+-	event->orig_overflow_handler(event, data, regs);
++	return ret;
+ }
+ 
+ static int perf_event_set_bpf_handler(struct perf_event *event,
+@@ -9667,8 +9665,6 @@ static int perf_event_set_bpf_handler(struct perf_event *event,
+ 
+ 	event->prog = prog;
+ 	event->bpf_cookie = bpf_cookie;
+-	event->orig_overflow_handler = READ_ONCE(event->overflow_handler);
+-	WRITE_ONCE(event->overflow_handler, bpf_overflow_handler);
+ 	return 0;
+ }
+ 
+@@ -9679,15 +9675,15 @@ static void perf_event_free_bpf_handler(struct perf_event *event)
+ 	if (!prog)
+ 		return;
+ 
+-	WRITE_ONCE(event->overflow_handler, event->orig_overflow_handler);
+ 	event->prog = NULL;
+ 	bpf_prog_put(prog);
+ }
+ #else
+-static void bpf_overflow_handler(struct perf_event *event,
+-				 struct perf_sample_data *data,
+-				 struct pt_regs *regs)
++static int bpf_overflow_handler(struct perf_event *event,
++				struct perf_sample_data *data,
++				struct pt_regs *regs)
+ {
++	return 1;
+ }
+ 
+ static int perf_event_set_bpf_handler(struct perf_event *event,
+@@ -9771,7 +9767,8 @@ static int __perf_event_overflow(struct perf_event *event,
+ 		irq_work_queue(&event->pending_irq);
+ 	}
+ 
+-	READ_ONCE(event->overflow_handler)(event, data, regs);
++	if (!(event->prog && !bpf_overflow_handler(event, data, regs)))
++		READ_ONCE(event->overflow_handler)(event, data, regs);
+ 
+ 	if (*perf_event_fasync(event) && event->pending_kill) {
+ 		event->pending_wakeup = 1;
+@@ -12126,13 +12123,11 @@ perf_event_alloc(struct perf_event_attr *attr, int cpu,
+ 		overflow_handler = parent_event->overflow_handler;
+ 		context = parent_event->overflow_handler_context;
+ #if defined(CONFIG_BPF_SYSCALL) && defined(CONFIG_EVENT_TRACING)
+-		if (overflow_handler == bpf_overflow_handler) {
++		if (parent_event->prog) {
+ 			struct bpf_prog *prog = parent_event->prog;
+ 
+ 			bpf_prog_inc(prog);
+ 			event->prog = prog;
+-			event->orig_overflow_handler =
+-				parent_event->orig_overflow_handler;
+ 		}
+ #endif
+ 	}
+-- 
+2.53.0
+

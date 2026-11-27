@@ -1,0 +1,89 @@
+From 6f15531ce5ed2819ca700255e0ef021c69c94f9a Mon Sep 17 00:00:00 2001
+From: Sasha Levin <sashal@kernel.org>
+Date: Wed, 25 Nov 2026 13:46:16 +0000
+Subject: sched_ext: Read exit_kind before flushing in scx_flush_disable_work()
+
+From: Kuba Piecuch <jpiecuch@google.com>
+
+[ Upstream commit 3133107d98057595c0af39ff907c852134926912 ]
+
+scx_disable_workfn() sets exit_kind to SCX_EXIT_DONE before it tears the
+scheduler down. scx_flush_disable_work() reads exit_kind after syncing
+disable_irq_work and flushing disable_work, so it can observe DONE from
+a disable_work that was queued after its flush and return while the
+teardown is still running:
+
+  CPU A                          CPU B
+  -----                          -----
+  scx_vexit()
+    scx_claim_exit() -> true
+                                 bpf_struct_ops_map_link_detach()
+                                   bpf_scx_unreg()
+                                     scx_disable()
+                                       scx_claim_exit() -> false
+                                     scx_flush_disable_work()
+                                       irq_work_sync()      // not queued
+                                       kthread_flush_work() // not queued
+    irq_work_queue()
+  scx_disable_irq_workfn()
+    kthread_queue_work()
+  scx_disable_workfn()
+    exit_kind = SCX_EXIT_DONE
+    scx_root_disable()
+                                       atomic_read() -> SCX_EXIT_DONE
+                                   bpf_map_put()
+
+Once bpf_scx_unreg() returns, its caller drops the struct_ops map
+reference, and the struct_ops trampolines can be freed while
+scx_root_disable() is still running and can still call into the BPF
+scheduler, e.g. ops.exit().
+
+Read exit_kind before syncing and flushing, with acquire ordering paired
+with the atomic_try_cmpxchg() in scx_disable_workfn(). DONE is only set
+from disable_work, so once it is observed, the following
+kthread_flush_work() sees the queued work and waits for the teardown to
+finish.
+
+This patch was created with the help of an AI coding assistant.
+
+Fixes: d99f7a32f09d ("sched_ext: Fix scx_flush_disable_work() UAF race")
+Cc: stable@vger.kernel.org # v7.1+
+Reported-by: Sashiko <sashiko-bot@kernel.org>
+Closes: https://lore.kernel.org/all/sashiko-outbox-195908@kernel.org/
+Signed-off-by: Kuba Piecuch <jpiecuch@google.com>
+Reviewed-by: Andrea Righi <arighi@nvidia.com>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+[ jpiecuch: applied kernel/sched/ext/ext.c hunk to kernel/sched/ext.c;
+  kept error_irq_work instead of disable_irq_work. ]
+Signed-off-by: Kuba Piecuch <jpiecuch@google.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ kernel/sched/ext.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/kernel/sched/ext.c b/kernel/sched/ext.c
+index b3a6d60709403..64a68d698b823 100644
+--- a/kernel/sched/ext.c
++++ b/kernel/sched/ext.c
+@@ -4247,10 +4247,17 @@ static void scx_flush_disable_work(struct scx_sched *sch)
+ {
+ 	int kind;
+ 
++	/*
++	 * scx_disable_workfn() sets SCX_EXIT_DONE before tearing down. Read
++	 * exit_kind with acquire ordering (paired with atomic_try_cmpxchg() in
++	 * scx_disable_workfn()) before syncing and flushing so that, once DONE
++	 * is seen, the following flush observes the queued work and waits for
++	 * the teardown to finish.
++	 */
+ 	do {
++		kind = atomic_read_acquire(&sch->exit_kind);
+ 		irq_work_sync(&sch->error_irq_work);
+ 		kthread_flush_work(&sch->disable_work);
+-		kind = atomic_read(&sch->exit_kind);
+ 	} while (kind != SCX_EXIT_NONE && kind != SCX_EXIT_DONE);
+ }
+ 
+-- 
+2.53.0
+
